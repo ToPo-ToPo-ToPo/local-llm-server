@@ -138,19 +138,6 @@ def test_start_gateway_background_spawns_detached(monkeypatch, tmp_path):
         assert captured["kw"]["start_new_session"] is True         # POSIX: setsid で切り離し
 
 
-def test_cli_start_background_skips_when_running(monkeypatch):
-    from local_llm_server import cli
-
-    monkeypatch.setattr(cli, "server_status", lambda *a, **k: {"ready": True, "pids": [1]})
-
-    class _G:
-        host = "127.0.0.1"
-        port = 8799
-        models: list = []
-
-    assert cli._start_background(_G()) == 0
-
-
 # --- クリックして起動できるランチャ（アプリ）の生成 ------------------------
 def test_install_macos_app_writes_bundle(tmp_path, monkeypatch):
     import os

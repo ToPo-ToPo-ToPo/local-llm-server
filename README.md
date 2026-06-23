@@ -55,18 +55,35 @@ backend = "mlx-vlm"
 
 MTP（投機的デコード）による高速化 → [docs/mtp.md](docs/mtp.md)。
 
-### 2. ゲートウェイを起動
+### 2. アプリを作って起動（操作はアプリに一本化）
 
-`gateway.toml` のあるディレクトリで起動する（管理者の唯一の操作）。**バックグラウンド常駐**
-（Ollama 流。ターミナルを占有しない）と**フォアグラウンド**のどちらでも:
+ゲートウェイの**起動・停止・監視はすべてアプリ**（メニューバー/トレイ常駐）から行う。まず一度だけ
+クリック起動アプリを作る:
 
 ```bash
-uv run local-llm-server --start   # バックグラウンド常駐（推奨。すぐプロンプトに戻る）
-uv run local-llm-server           # フォアグラウンド（Ctrl+C で停止。デバッグ向き）
+uv add "local-llm-server[gui]"              # pystray / pillow（各 OS のバックエンドも）
+uv run local-llm-server-gui --install-app   # gateway.toml のあるディレクトリで1度だけ
 ```
 
-`--start` は端末から切り離した別プロセスで起動し、ログを `./.local-llm-server/gateway-<port>.log`
-に書く。停止は `--stop`、設定変更の反映は `--restart`。常駐の起動/停止/監視はトレイ GUI からもできる。
+- **macOS** … `~/Applications/Local LLM Gateway.app`（専用アイコン付きの普通のアプリ。Dock 表示・
+  Cmd+Tab 対応）。Finder で **Dock にドラッグすれば常設**。Dock に出さずメニューバーだけにしたい
+  ときは `--install-app --menubar-only`。
+- **Linux** … `~/.local/share/applications/*.desktop`／**Windows** … デスクトップに `.cmd`。
+
+あとは**アプリをダブルクリック**するだけ。ゲートウェイがバックグラウンドで常駐し、メニューバー
+（macOS）/通知領域（Windows）/トレイ（Linux）にアイコンが出る:
+
+- アイコンの**色**で状態（🟢 応答可 / 🟡 起動中 / ⚫ 停止）、**数字**でロード済みモデル数。
+- メニューから **起動 / 停止 / 再起動 / ログを開く / 更新**。各モデルの loaded・処理中数・PID・
+  運用方針（max_resident・idle_timeout）も表示。
+- アプリ（トレイ）を閉じてもゲートウェイは常駐し続ける。止めるときはメニューの **停止**。
+- 同一バンドル ID なので、起動中に再度クリックしても二重起動しない。
+
+> ゲートウェイ本体は `local-llm-server`（`./gateway.toml` を読むフォアグラウンド実行）で、アプリが
+> 端末から切り離して起動・常駐させる（ログは `./.local-llm-server/gateway-<port>.log`）。状態は
+> `GET /admin/status` から取得。Linux はトレイ表示にシステムトレイが要る（GNOME は AppIndicator
+> 拡張など）。アプリは作成時の **このリポジトリのパスと Python（venv）を固定**するので、クリック
+> 時の場所に依存しない。クリック起動をやめるときは作ったランチャを消すだけ。
 
 1 つの公開ポート（例 `http://127.0.0.1:8799/v1`）でカタログのモデルを束ねる。**各モデルは
 初回リクエスト時に遅延起動**し、2 回目以降は常駐して即応答。`max_resident` 超過は LRU 退避、
@@ -86,57 +103,6 @@ print(llm.respond("ローカルLLMの利点を3つ。"))
 ```
 
 高度操作 → [docs/connecting.md](docs/connecting.md)。
-
-### 運用（start / status / stop / restart）
-
-```bash
-uv run local-llm-server --start     # バックグラウンド常駐で起動（既に起動済みなら何もしない）
-uv run local-llm-server --status    # 稼働確認（カタログ＝全モデル・pid・ログパス）
-uv run local-llm-server --stop      # 停止（配下のモデルサーバーも全て止める）
-uv run local-llm-server --restart   # 停止して再起動（gateway.toml の変更を反映）
-```
-
-`Ctrl+C` / `kill` でも、起動済みのモデルサーバーまで一緒に止まる（孫プロセスは残らない）。
-`--start` / `--stop` は **macOS / Linux / Windows** で動く（起動は端末から切り離した別プロセス、
-停止はポート→PID 特定を lsof / netstat、終了をプロセスグループ / `taskkill /T` で実施）。
-
-#### トレイ GUI（Windows / macOS / Linux）
-
-ターミナルを開かずにゲートウェイを操作・監視する常駐アプリ。システムトレイ（macOS は
-メニューバー、Windows は通知領域、Linux はトレイ）にアイコンを出し、色でゲートウェイ状態
-（🟢 応答可 / 🟡 起動中 / ⚫ 停止）を、ロード済みモデル数を数字で表す。クリックで各モデルの
-常駐状態（loaded / idle）と処理中リクエスト数、PID・運用方針（max_resident・idle_timeout）を
-表示し、メニューから**起動**・**停止**・**再起動**（バックグラウンド常駐）・**ログを開く**・
-**再読込**ができる。ウィンドウを占有しないので他の作業の邪魔にならない。
-
-```bash
-uv add "local-llm-server[gui]"        # pystray / pillow（各 OS のバックエンドも）
-uv run local-llm-server-gui           # gateway.toml のあるディレクトリで
-```
-
-状態は GUI 用の読み取り口 `GET /admin/status`（各モデルの loaded / inflight ＋運用方針を
-JSON で返す）から取得する。CLI と同じく **カレントディレクトリの `./gateway.toml`** を読む。
-Linux はトレイ表示にシステムトレイが要る（GNOME は AppIndicator 拡張など）。
-
-#### クリックして起動できるアプリにする
-
-ターミナルを開かずアイコンのクリックで起動したいときは、ランチャ（macOS は `.app`、Linux は
-`.desktop`、Windows は `.cmd`）を 1 度だけ作る:
-
-```bash
-uv run local-llm-server-gui --install-app   # gateway.toml のあるディレクトリで
-```
-
-- macOS … `~/Applications/Local LLM Gateway.app` を作成（**専用アイコン付きの普通のアプリ**）。
-  **ダブルクリックで「ゲートウェイをバックグラウンド起動＋メニューバー常駐」**。Dock に表示され
-  Cmd+Tab にも出る。Finder で **Dock へドラッグすれば常設ショートカット**になる（同一バンドル ID
-  なので二重起動しない）。Dock に出さずメニューバーだけにしたいときは `--menubar-only` を付ける。
-- Linux … `~/.local/share/applications/local-llm-gateway.desktop`／Windows … デスクトップに
-  `Local LLM Gateway.cmd`。
-
-ランチャは作成時の **このリポジトリのパスと Python（venv）を固定**して起動する（クリック時に
-作業ディレクトリへ `cd` するので、ターミナルの場所に依存しない）。クリック起動を無効化したい
-ときは作ったランチャを消すだけ。
 
 ## ライセンス
 
