@@ -1,12 +1,11 @@
-"""LLMClient / build_user_content / to_image_url のテスト（urllib をモック）。
+"""LLMClient / build_user_content / to_image_url のテスト（openai をモック）。
 
-openai 等の追加依存は不要（client は標準ライブラリのみで動く）。
+openai はコア依存なので常に import できる前提。実サーバーには繋がず、土台の
+OpenAI クライアントをフェイクに差し替える。
 """
 from __future__ import annotations
 
 import base64
-import io
-import json
 
 import pytest
 
@@ -38,72 +37,96 @@ def test_to_image_url_missing_file_raises():
         to_image_url("/no/such/file.png")
 
 
-# --- respond（urllib.request.urlopen をフェイクに差し替え） ----------------
-class _FakeResp(io.BytesIO):
-    """urlopen の戻り（context manager かつ iterable）。"""
+# --- respond（openai クライアントをフェイクに差し替え） --------------------
+class _FakeMessage:
+    def __init__(self, content):
+        self.content = content
 
-    def __enter__(self):
-        return self
 
-    def __exit__(self, *exc):
-        self.close()
-        return False
+class _FakeChoice:
+    def __init__(self, content):
+        self.message = _FakeMessage(content)
+
+
+class _FakeResp:
+    def __init__(self, content):
+        self.choices = [_FakeChoice(content)]
+
+
+class _FakeDelta:
+    def __init__(self, content):
+        self.content = content
+
+
+class _FakeStreamChoice:
+    def __init__(self, content):
+        self.delta = _FakeDelta(content)
+
+
+class _FakeStreamChunk:
+    def __init__(self, content):
+        self.choices = [_FakeStreamChoice(content)]
+
+
+class _FakeCompletions:
+    def __init__(self):
+        self.calls = []
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        if kwargs.get("stream"):
+            return iter([_FakeStreamChunk("こん"), _FakeStreamChunk("にちは")])
+        return _FakeResp("done")
+
+
+class _FakeChat:
+    def __init__(self):
+        self.completions = _FakeCompletions()
+
+
+class _FakeOpenAI:
+    def __init__(self, *a, **k):
+        self.init_kwargs = k
+        self.chat = _FakeChat()
 
 
 @pytest.fixture
-def captured(monkeypatch):
-    """送信ペイロードを記録し、固定レスポンスを返す urlopen を仕込む。"""
-    sent: dict = {}
-
-    def fake_urlopen(req, timeout=None):
-        sent["url"] = req.full_url
-        sent["headers"] = dict(req.header_items())
-        sent["payload"] = json.loads(req.data.decode("utf-8"))
-        if sent["payload"].get("stream"):
-            body = (
-                'data: {"choices":[{"delta":{"content":"こん"}}]}\n'
-                'data: {"choices":[{"delta":{"content":"にちは"}}]}\n'
-                "data: [DONE]\n"
-            ).encode("utf-8")
-        else:
-            body = json.dumps(
-                {"choices": [{"message": {"content": "done"}}]}
-            ).encode("utf-8")
-        return _FakeResp(body)
-
-    monkeypatch.setattr(client_mod.urllib.request, "urlopen", fake_urlopen)
-    return sent
+def fake_openai(monkeypatch):
+    monkeypatch.setattr(client_mod, "OpenAI", _FakeOpenAI)
 
 
-def test_respond_non_stream_returns_text(captured):
+def test_respond_non_stream_returns_text(fake_openai):
     llm = LLMClient(model="m")
     assert llm.respond("hi") == "done"
-    assert captured["url"].endswith("/v1/chat/completions")
-    assert captured["payload"]["messages"][-1] == {"role": "user", "content": "hi"}
+    sent = llm.openai.chat.completions.calls[0]
+    assert sent["messages"][-1] == {"role": "user", "content": "hi"}
 
 
-def test_respond_includes_system_prompt(captured):
-    LLMClient(model="m").respond("hi", system_prompt="be brief")
-    assert captured["payload"]["messages"][0] == {"role": "system", "content": "be brief"}
+def test_respond_includes_system_prompt(fake_openai):
+    llm = LLMClient(model="m")
+    llm.respond("hi", system_prompt="be brief")
+    msgs = llm.openai.chat.completions.calls[0]["messages"]
+    assert msgs[0] == {"role": "system", "content": "be brief"}
 
 
-def test_respond_stream_yields_pieces(captured):
-    out = list(LLMClient(model="m").respond("hi", stream=True))
-    assert out == ["こん", "にちは"]
-    assert captured["payload"]["stream"] is True
+def test_respond_stream_yields_pieces(fake_openai):
+    llm = LLMClient(model="m")
+    assert list(llm.respond("hi", stream=True)) == ["こん", "にちは"]
 
 
-def test_respond_passes_images(captured):
-    LLMClient(model="m").respond("見て", images=["https://example.com/a.png"])
-    content = captured["payload"]["messages"][-1]["content"]
+def test_respond_passes_images(fake_openai):
+    llm = LLMClient(model="m")
+    llm.respond("見て", images=["https://example.com/a.png"])
+    content = llm.openai.chat.completions.calls[0]["messages"][-1]["content"]
     assert isinstance(content, list) and content[1]["type"] == "image_url"
 
 
-def test_max_tokens_forwarded(captured):
+def test_max_tokens_forwarded(fake_openai):
     LLMClient(model="m", max_tokens=128).respond("hi")
-    assert captured["payload"]["max_tokens"] == 128
+    assert LLMClient(model="m", max_tokens=128).max_tokens == 128
 
 
-def test_authorization_header_set(captured):
-    LLMClient(model="m", api_key="secret").respond("hi")
-    assert captured["headers"].get("Authorization") == "Bearer secret"
+def test_openai_client_accessible(fake_openai):
+    # 土台の openai クライアントに直接アクセスできる（高度操作用）。
+    llm = LLMClient(model="m", base_url="http://127.0.0.1:8080/v1")
+    assert llm.openai.init_kwargs["base_url"] == "http://127.0.0.1:8080/v1"

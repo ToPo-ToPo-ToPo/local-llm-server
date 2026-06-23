@@ -7,7 +7,8 @@ MTP（投機的デコード）を備える。
 
 - 既定モデル `Qwen3.6-27B-4bit` はマルチモーダル。mac (Apple Silicon) では**何もせず
   画像入力までそのまま動く**（既定バックエンド `mlx-vlm`）。
-- コア（サーバー起動・router・MTP 解決）は**標準ライブラリのみ**で動作。
+- サーバー起動・router・MTP 解決は**標準ライブラリのみ**、高レベルクライアントは
+  公式 `openai` SDK（コア依存）を土台にする。推論バックエンドだけ extra で導入。
 
 ## インストール（[uv](https://docs.astral.sh/uv/)）
 
@@ -19,11 +20,12 @@ extras 指定はクォート必須（zsh の glob 展開回避）。内訳:
 
 | extra | 入るもの | 用途 |
 |---|---|---|
-| （無し） | コアのみ（標準ライブラリ） | 起動・router・MTP 解決・組み込みクライアント |
+| （無し） | コア（標準ライブラリ ＋ `openai`） | 起動・router・MTP・`connect`/`LLMClient` まで全部 |
 | `mlx` | `mlx-lm` / `mlx-vlm` | Apple Silicon で実際に推論する |
 
-ライブラリ機能（`connect` / `LLMClient` / `ensure_server` …）はすべて**標準ライブラリ
-のみ**で動く。追加の client 用 extra は不要。
+`connect` / `LLMClient` などライブラリ機能は `uv add "local-llm-server[mlx]"` だけで
+すべて使える（client 用の追加 extra は不要）。高レベルクライアントは公式 `openai`
+SDK を土台にしており、自動リトライ・型付き応答・ツール呼び出し/構造化出力も使える。
 
 ## 使い方
 
@@ -59,7 +61,7 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
   }' | python3 -c "import sys, json; print(json.load(sys.stdin)['choices'][0]['message']['content'])"
 ```
 
-Python（組み込みの `LLMClient`。追加依存なし）:
+Python（組み込みの `LLMClient`。`openai` SDK を土台にする）:
 
 ```python
 from local_llm_server import LLMClient
@@ -71,7 +73,8 @@ for piece in llm.respond("もっと詳しく", stream=True):         # ストリ
     print(piece, end="", flush=True)
 ```
 
-`openai` など他の OpenAI 互換クライアントでも同じ base_url にそのまま繋がる。
+土台の openai クライアントには `llm.openai` で直接アクセスできる（embeddings /
+tool calling / 構造化出力 / async など高度な操作はこちらを使う）。
 
 ### 3. 停止する
 
@@ -88,7 +91,7 @@ uv run local-llm-server --stop
 ## （任意）Python から自動起動する
 
 「サーバーが無ければ自分で起動し、終了時に止める」を 1 呼び出しで済ませたいとき。
-上記の手順 1〜3 を内包する利便機能（追加依存なし）。
+上記の手順 1〜3 を内包する利便機能。
 
 ```python
 from local_llm_server import connect

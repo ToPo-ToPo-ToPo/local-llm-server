@@ -6,10 +6,11 @@
   - LLM 実行          : LocalServer / ServerConfig / ServerPool（mlx / mlx-vlm / llama.cpp）
   - ゲートウェイ      : RouterServer（テキスト/vision 振り分け）, ensure_server（相乗り/自動起動）
   - MTP（投機的デコード）: resolve_drafter / MTP_DRAFTERS
-  - 高レベルクライアント : LLMClient / connect（標準ライブラリのみ。追加依存なし）
+  - 高レベルクライアント : LLMClient / connect（公式 openai SDK を土台。コア依存）
 
-公開 API は __all__ に列挙したものだけ。すべて標準ライブラリのみで動く
-（推論バックエンド本体だけ extra `local-llm-server[mlx]` で導入）。
+公開 API は __all__ に列挙したものだけ。サーバー起動・ゲートウェイ・MTP 解決は標準
+ライブラリのみ、高レベルクライアントは openai（コア依存）を使う。推論バックエンド本体
+だけ extra `local-llm-server[mlx]` で導入する。
 """
 from __future__ import annotations
 

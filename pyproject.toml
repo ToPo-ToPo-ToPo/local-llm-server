@@ -1,6 +1,6 @@
 [project]
 name = "local-llm-server"
-version = "0.3.0"
+version = "0.4.0"
 description = "ローカルLLM（mlx / mlx-vlm / llama.cpp / router）を OpenAI 互換 API として起動・管理する拡張サーバーライブラリ（相乗り/自動起動・MTP・高レベルクライアント付き）"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -17,14 +17,16 @@ classifiers = [
     "Topic :: Software Development",
     "Operating System :: OS Independent",
 ]
-# コア機能（サーバーの起動・監視・router プロキシ）は標準ライブラリのみで動く。
-# 実際に推論するバックエンド本体は extras で導入する（環境マーカーで Apple Silicon
-# のときだけ自動選択。他OSは llama.cpp を各自インストール）。
-dependencies = []
+# 高レベルクライアント（LLMClient / connect）は公式 openai SDK を土台にするため、
+# openai をコア依存とする（自動リトライ・型付き応答・ツール呼び出し/構造化出力が使える）。
+# 推論バックエンド本体は extras で導入する（環境マーカーで Apple Silicon のときだけ
+# 自動選択。他OSは llama.cpp を各自インストール）。
+dependencies = [
+    "openai>=1.0",
+]
 
 [project.optional-dependencies]
 # Apple Silicon 向け mlx 系バックエンド（テキスト/vision/STT）。
-# 高レベルクライアント（LLMClient / connect）は標準ライブラリのみで動くため extra 不要。
 mlx = [
     "mlx-lm>=0.31.3 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
     "mlx-vlm>=0.5.0 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
