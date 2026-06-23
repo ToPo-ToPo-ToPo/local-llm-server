@@ -24,3 +24,13 @@ def _env_bool(name: str, default: bool) -> bool:
     if value is None:
         return default
     return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def project_cache_dir() -> str:
+    """プロジェクト内（カレントディレクトリ）のキャッシュ/ログ用ディレクトリ `./.local-llm-server`。
+
+    ゲートウェイが起動するモデルサーバーのログ等を、ホーム（`~/.cache`）ではなく起動した
+    ディレクトリの中に置く。ディレクトリは呼び出し側が必要時に作る。モデル本体は HF/mlx の
+    共有キャッシュ（`~/.cache/huggingface`）に置かれ、これには含めない。
+    """
+    return os.path.join(os.getcwd(), ".local-llm-server")

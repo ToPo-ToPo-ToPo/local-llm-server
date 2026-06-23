@@ -1,0 +1,45 @@
+# ゲートウェイのモデルカタログ（リポジトリ直下の ./gateway.toml）。
+# サーバーはカレントディレクトリの ./gateway.toml を読む。リポジトリ直下で:
+#
+#   uv run local-llm-server
+#
+# 1 つの公開エンドポイント（下記 port）で複数モデルを束ね、リクエストの `model` を見て
+# そのモデルのローカルサーバーへ振り分ける。各モデルは初回リクエスト時に遅延起動し、
+# max_resident はハード上限で、空き枠が無ければ古いものから停止（LRU）。全て処理中なら空くまで
+# 待つ（OOM 回避。load_timeout で打ち切り→503）。外部アプリ（Ollama /
+# LM Studio 等）に依存しない。管理者はこのゲートウェイ 1 プロセスだけを起動/停止する。
+#
+# 各クライアントは（クライアントはサーバーを起動せず接続するだけ）:
+#   base_url = "http://127.0.0.1:8799/v1"        # ← 全クライアント共通（ゲートウェイ）
+#   model    = "mlx-community/Qwen3.6-27B-4bit"  # ← クライアントごとに選ぶ
+
+host = "127.0.0.1"          # 公開ホスト（省略時 127.0.0.1）
+port = 8799                 # 公開ポート（省略時 8799）。クライアントの base_url はここ
+max_resident = 1            # 同時常駐モデル数のハード上限。空きが無ければ LRU 退避、全て処理中なら待つ（省略時 無制限）
+load_timeout = 300          # 全枠処理中のとき空くのを待つ最大秒数（超過で 503。省略時 300）
+idle_timeout = 600          # この秒数（=10分）使われないモデルは自動アンロードしてメモリ解放（0/省略で無効）
+internal_base_port = 9001   # 内部モデルサーバーの割当開始ポート（9001, 9002, ... と連番）
+# default_model = "mlx-community/Qwen3.6-27B-4bit"  # `model` 省略リクエスト時のモデル（任意）
+
+# MTP（投機的デコード）の既定。各 [[models]] が draft_model を持たなければこれを継承し、
+# 本体名から対応ドラフターを自動選択する（mlx-vlm のみ有効。出力は変えず高速化）。
+# 個別に上書き（HF id 指定）や "off" で無効化もできる。
+draft_model = "auto"
+
+[[models]]
+model = "mlx-community/Qwen3.6-27B-4bit"        # マルチモーダル（テキスト＋画像）
+backend = "mlx-vlm"
+# draft_model 省略 → 上の既定 "auto" を継承（Qwen3.6 の MTP で ~2倍速）
+
+[[models]]
+model = "mlx-community/gemma-4-26B-A4B-it-qat-4bit"  # 別クライアント用の例（こちらも MTP 対応）
+backend = "mlx-vlm"
+# draft_model 省略 → "auto" を継承。MTP を切るなら draft_model = "off"
+
+# 画像を使わない用途は、テキスト専用 LLM（backend = "mlx"）にすると軽い・速い。
+# vision 専用の VLM ではないので画像リクエストはエラーになる。MTP は mlx-vlm 専用なので
+# mlx では無視される（"off" を明示しておくと起動時の警告も出ない）。使うなら下のコメントを外す:
+# [[models]]
+# model = "mlx-community/Qwen3.5-27B-4bit"   # テキスト専用 LLM（VLM ではない）
+# backend = "mlx"
+# draft_model = "off"

@@ -14,7 +14,7 @@ import urllib.request
 from dataclasses import dataclass, field, replace
 
 # 起動可能なバックエンド一覧は同梱の constants から取得（OpenAI互換APIの公開値）。
-from .constants import BACKENDS  # noqa: F401
+from .constants import BACKENDS, project_cache_dir  # noqa: F401
 
 
 def default_backend() -> str:
@@ -377,6 +377,10 @@ class LocalServer:
                 prefix="local-llm-server-", suffix=".log"
             )
             os.close(fd)
+        else:
+            # 明示ログパス（ゲートウェイの daemon_log_path 等）は親ディレクトリが
+            # 無いことがあるので作る（project_cache_dir は呼び出し側が作る設計）。
+            os.makedirs(os.path.dirname(self.log_path) or ".", exist_ok=True)
         try:
             self._log_file = open(self.log_path, "a", encoding="utf-8")
             self._proc = subprocess.Popen(
@@ -493,3 +497,56 @@ class ServerPool:
 
     def __exit__(self, *exc: object) -> None:
         self.stop()
+
+
+# --- マルチモデルゲートウェイ（daemon）用ヘルパ -----------------------------
+def ignore_shutdown_signals() -> None:
+    """SIGTERM / SIGHUP / SIGINT を一旦無視（SIG_IGN）にする。
+
+    後始末（配下のサーバー停止など）の最中に再度シグナルが届いても中断されないよう、
+    クリーンアップ開始時に呼ぶ。`--stop` の killpg や端末クローズで複数シグナルが連続して
+    届いても、停止処理を最後までやり切って孫プロセスを残さないための保険。
+    install_shutdown_handlers() の対（同じくメインスレッドからのみ有効）。
+    """
+    for name in ("SIGTERM", "SIGHUP", "SIGINT"):
+        sig = getattr(signal, name, None)  # SIGHUP は Windows に無い
+        if sig is None:
+            continue
+        try:
+            signal.signal(sig, signal.SIG_IGN)
+        except (ValueError, OSError):
+            pass  # メインスレッド以外などでは登録できない
+
+
+def daemon_log_path(port: int) -> str:
+    """ゲートウェイが起動するモデルサーバーのログ保存先（ポート別の固定パス）。
+
+    `--status` から参照できるよう、ランダムな tempfile ではなくポートで決まる固定パスにする。
+    プロジェクト内（`./.local-llm-server/`、カレントディレクトリ相対）に置き、ホーム等の外部には
+    書かない。同じポートのサーバーは同じログに追記する。
+    """
+    return os.path.join(project_cache_dir(), f"server-{port}.log")
+
+
+def server_status(host: str = "127.0.0.1", port: int = 8799) -> dict | None:
+    """ポートで動いているローカルサーバーの状態をまとめて返す（`--status` 表示用）。
+
+    応答もせず LISTEN しているプロセスも無ければ None。応答可否・PID 一覧・提供モデル・
+    ログパス（存在すれば）を1つの dict にまとめる。PID は POSIX で lsof が使えるときのみ
+    （取得不能でも応答していれば ready=True で報告する）。
+    """
+    base_url = f"http://{host}:{port}/v1"
+    ready = is_ready(base_url)
+    pids = find_pids_on_port(port)
+    if not ready and not pids:
+        return None
+    log = daemon_log_path(port)
+    return {
+        "host": host,
+        "port": port,
+        "base_url": base_url,
+        "ready": ready,
+        "pids": pids,
+        "models": list_models(base_url) if ready else [],
+        "log_path": log if os.path.exists(log) else None,
+    }

@@ -28,7 +28,9 @@ from .server import (
     build_pool_configs,
     default_backend,
     find_pids_on_port,
+    daemon_log_path,
     install_shutdown_handlers,
+    ignore_shutdown_signals,
     is_ready,
     list_models,
     model_available,
@@ -37,7 +39,19 @@ from .server import (
     parse_host_port,
     resolve_drafter,
     running_model,
+    server_status,
     stop_pid,
+)
+from .constants import project_cache_dir
+
+# --- マルチモデルゲートウェイ（gateway.toml で複数モデルを 1 ポートに束ねる） ----
+from .daemon import (
+    CapacityError,
+    GatewayConfig,
+    GatewayServer,
+    ModelManager,
+    load_gateway_config,
+    run_gateway,
 )
 
 # --- ゲートウェイ -----------------------------------------------------------
@@ -87,13 +101,24 @@ __all__ = [
     # MTP（投機的デコード）
     "resolve_drafter",
     "MTP_DRAFTERS",
-    # ゲートウェイ
+    # クライアント側ゲートウェイ（相乗り/自動起動）
     "RouterServer",
     "needs_vision",
     "ensure_server",
     "ServerHandle",
     "ServerNotRunningError",
     "check_model_served",
+    # マルチモデルゲートウェイ（gateway.toml）＋運用ヘルパ
+    "GatewayServer",
+    "GatewayConfig",
+    "ModelManager",
+    "CapacityError",
+    "load_gateway_config",
+    "run_gateway",
+    "server_status",
+    "daemon_log_path",
+    "ignore_shutdown_signals",
+    "project_cache_dir",
     # 高レベルクライアント（公式 openai SDK を土台）＋ リクエスト整形ヘルパ
     "LLMClient",
     "connect",
