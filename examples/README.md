@@ -1,21 +1,32 @@
 # examples
 
 実LLMを使った動作サンプル。Apple Silicon（mlx-vlm バックエンド）向け。
+どちらも [PEP 723](https://peps.python.org/pep-0723/) のインライン依存を埋め込んであるので
+`uv run` するだけで動く（初回は本体 `Qwen3.6-27B-4bit` と MTP ドラフター
+`Qwen3.6-27B-MTP-4bit` を自動ダウンロード、数GB）。
 
-## generate_with_mtp.py — LLM + MTP で生成する
+| ファイル | レベル | 内容 |
+|---|---|---|
+| `connect_and_generate.py` | 高レベル | `connect()` 1 呼び出しで「サーバー用意 → ストリーミング生成」 |
+| `generate_with_mtp.py` | 低レベル | `LocalServer` + `openai` を手書きし、tok/s も表示 |
 
-local-automata が既定で使っていた構成（**Qwen3.6-27B-4bit ＋ MTP ドラフター**による
-投機的デコード）をそのまま単体で再現するサンプル。サーバーの起動・待機・停止を
-`LocalServer` に任せ、生成は `openai` クライアントで行う。
+## connect_and_generate.py — 高レベル API で生成する（最短）
+
+```bash
+uv run examples/connect_and_generate.py
+```
+
+`connect(model=..., draft_model="auto")` が「既存サーバーに相乗り or MTP 付きで自動起動」
+してから生成する。最も短い書き方。
+
+## generate_with_mtp.py — LLM + MTP で生成する（低レベル）
+
+サーバーの起動・待機・停止を `LocalServer` に任せ、生成は `openai` クライアントで行う。
+速度（tok/s）も表示して MTP の効果を確認できる。
 
 ```bash
 uv run examples/generate_with_mtp.py
 ```
-
-[PEP 723](https://peps.python.org/pep-0723/) のインライン依存を埋め込んであるので、
-`uv run` するだけで `local-llm-server[mlx]` と `openai` を含む一時環境が用意される。
-初回は本体（`Qwen3.6-27B-4bit`）とドラフター（`Qwen3.6-27B-MTP-4bit`）の2モデルが
-自動ダウンロードされる（数GB）。
 
 ### MTP（Multi-Token Prediction）とは
 
