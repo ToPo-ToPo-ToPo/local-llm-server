@@ -62,6 +62,7 @@ class View:
     state: str = "down"           # ready / starting / down / error
     loaded: int = 0               # ロード済みモデル数（アイコンの数字）
     summary: str = ""             # ゲートウェイ行
+    metrics: str = ""             # 起動経過・累計リクエスト数の行
     policy: str = ""              # max_resident / idle-unload 行
     model_lines: list[str] = field(default_factory=list)
     stop_enabled: bool = False    # 起動中なら停止/再起動できる
@@ -76,6 +77,17 @@ def _fmt_seconds(sec) -> str:
     if sec >= 60 and sec % 60 == 0:
         return f"{int(sec // 60)}m"
     return f"{sec:g}s"
+
+
+def _fmt_dur(sec) -> str:
+    """経過/残り時間を短く（45s / 12m / 1h03m）。"""
+    sec = int(max(0, sec))
+    if sec < 60:
+        return f"{sec}s"
+    if sec < 3600:
+        return f"{sec // 60}m"
+    h, m = divmod(sec // 60, 60)
+    return f"{h}h{m:02d}m" if m else f"{h}h"
 
 
 def build_view(
@@ -112,28 +124,63 @@ def build_view(
     pids = ", ".join(str(p) for p in st["pids"]) or "?"
     summary = f"Gateway {'ready' if ready else 'starting…'}  (:{port}, pid {pids})"
 
+    idle_timeout = admin.get("idle_timeout") if admin else None
     lines: list[str] = []
     for model in model_ids:
         info = live.get(model)
         if info is None:
             lines.append(f"{model}   {'idle' if ready else '—'}")
             continue
-        mark = "loaded" if info.get("loaded") else "idle"
-        inflight = info.get("inflight") or 0
-        suffix = f" ({inflight} in-flight)" if inflight else ""
-        lines.append(f"{model}   {mark}{suffix}")
+        lines.append(_model_line(model, info, idle_timeout))
 
+    metrics = ""
     policy = ""
     if admin:
+        # ゲートウェイ指標: 起動経過 + 累計リクエスト数。
+        bits = []
+        if admin.get("uptime") is not None:
+            bits.append(f"up {_fmt_dur(admin['uptime'])}")
+        reqs = admin.get("requests")
+        if reqs is not None:
+            bits.append(f"{reqs} request{'s' if reqs != 1 else ''}")
+        metrics = "   ·   ".join(bits)
         cap = admin.get("max_resident")
         cap_s = "∞" if cap is None else str(cap)
         policy = (
-            f"resident {loaded}/{cap_s}   idle-unload {_fmt_seconds(admin.get('idle_timeout'))}"
+            f"resident {loaded}/{cap_s}   idle-unload {_fmt_seconds(idle_timeout)}"
         )
 
     return View(state="ready" if ready else "starting", loaded=loaded,
-                summary=summary, policy=policy, model_lines=lines,
+                summary=summary, metrics=metrics, policy=policy, model_lines=lines,
                 stop_enabled=True, start_enabled=False)
+
+
+def _model_line(model: str, info: dict, idle_timeout) -> str:
+    """1 モデルの表示行（バックエンド:内部ポート・loaded/idle・処理中・自動解放残り・累計）。"""
+    parts = [model]
+    backend = info.get("backend")
+    port = info.get("port")
+    if backend:
+        parts.append(f"{backend}:{port}" if port else str(backend))
+
+    if info.get("loaded"):
+        inflight = info.get("inflight") or 0
+        if inflight:
+            parts.append(f"loaded · {inflight} in-flight")
+        else:
+            idle_for = info.get("idle_for")
+            # アイドル中なら自動アンロードまでの残り時間を出す。
+            if idle_timeout and idle_for is not None:
+                parts.append(f"loaded · unload in {_fmt_dur(idle_timeout - idle_for)}")
+            else:
+                parts.append("loaded")
+    else:
+        parts.append("idle")
+
+    reqs = info.get("requests")
+    if reqs:
+        parts.append(f"{reqs} req")
+    return "   ·   ".join(parts)
 
 
 def _make_image(state: str, count: int):
@@ -233,6 +280,8 @@ class TrayApp:
         # 表示専用行（enabled=False でグレー表示・押せない）。テキストは callable。
         rows = [
             item(lambda _i: self._view.summary, None, enabled=False),
+            item(lambda _i: self._view.metrics, None, enabled=False,
+                 visible=lambda _i: bool(self._view.metrics)),
             sep,
         ]
         for k in range(len(self.model_ids)):

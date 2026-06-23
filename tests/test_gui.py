@@ -32,20 +32,31 @@ def test_build_view_ready_with_live_models(monkeypatch):
         "ready": True, "pids": [4242], "log_path": None,
     })
     monkeypatch.setattr(gui, "gateway_admin_status", lambda *a, **k: {
-        "max_resident": 1, "idle_timeout": 1200,
+        "max_resident": 1, "idle_timeout": 1200, "uptime": 750, "requests": 5,
         "models": [
-            {"model": "m/A", "loaded": True, "inflight": 3},
-            {"model": "m/B", "loaded": False, "inflight": 0},
+            {"model": "m/A", "backend": "mlx-vlm", "port": 9001,
+             "loaded": True, "inflight": 3, "requests": 4, "idle_for": None},
+            {"model": "m/B", "backend": "mlx", "port": 9002,
+             "loaded": True, "inflight": 0, "requests": 1, "idle_for": 300},
         ],
     })
     v = gui.build_view("127.0.0.1", 8799, ["m/A", "m/B"])
-    assert v.state == "ready"
-    assert v.loaded == 1
-    assert v.stop_enabled is True
+    assert v.state == "ready" and v.loaded == 2
     assert "pid 4242" in v.summary
-    assert v.model_lines[0] == "m/A   loaded (3 in-flight)"
-    assert v.model_lines[1] == "m/B   idle"
-    assert v.policy == "resident 1/1   idle-unload 20m"
+    assert v.metrics == "up 12m   ·   5 requests"           # 起動経過＋累計リクエスト
+    # 処理中のモデル: バックエンド:内部ポート + in-flight + 累計
+    assert "mlx-vlm:9001" in v.model_lines[0]
+    assert "3 in-flight" in v.model_lines[0] and "4 req" in v.model_lines[0]
+    # アイドルのロード済み: 自動アンロードまでの残り（1200-300=900s=15m）
+    assert "unload in 15m" in v.model_lines[1]
+    assert v.policy == "resident 2/1   idle-unload 20m"
+
+
+def test_fmt_dur():
+    assert gui._fmt_dur(45) == "45s"
+    assert gui._fmt_dur(750) == "12m"
+    assert gui._fmt_dur(3780) == "1h03m"
+    assert gui._fmt_dur(-5) == "0s"
 
 
 def test_build_view_ready_without_admin_endpoint(monkeypatch):

@@ -172,9 +172,13 @@ def test_admin_status_reports_live_model_state():
     assert data["object"] == "gateway.status"
     assert data["max_resident"] == 1
     assert data["idle_timeout"] == 1200
+    assert data["uptime"] >= 0                 # 起動経過（秒）
+    assert data["requests"] == 0               # acquire を通していないので 0
     by_model = {m["model"]: m for m in data["models"]}
     assert by_model["org/A"]["loaded"] is True
     assert by_model["org/A"]["inflight"] == 2
+    assert by_model["org/A"]["requests"] == 0
+    assert "idle_for" in by_model["org/A"]     # 処理中なので None
     assert by_model["org/B"]["loaded"] is False
 
 
