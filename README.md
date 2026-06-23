@@ -7,15 +7,14 @@
 - **モデルは初回リクエスト時に遅延起動**、`max_resident` 超過で LRU 退避、`idle_timeout` で自動アンロード。
 - クライアントは公開ポートに繋いで `model` を選ぶだけ。
 
-> **サポートする使い方は 2 つ**:（1）ゲートウェイの運用 — `local-llm-server`（起動/停止/状態）と
-> `local-llm-server-gui`（監視 GUI）。ゲートウェイは**このリポジトリで 1 つ起動する**運用が前提。
-> （2）クライアント接続 — `LLMClient` で公開ポートに繋ぐ（エージェントごとの再実装を防ぐ共通
-> クライアント。素の `openai` SDK で base_url を指してもよい）。`connect()` は起動中ゲートウェイに
-> 繋ぐワンライナーで、未起動なら親切なエラー（**サーバーは自前で起動しない**）。
+> **このパッケージはゲートウェイ・サーバー専用**。操作は `local-llm-server`（フォアグラウンド起動）と
+> `local-llm-server-gui`（起動/停止/監視のアプリ。クリック起動アプリも作れる）の 2 コマンド。
+> ゲートウェイ本体は標準ライブラリのみで動き、**`openai` などのコア依存は無い**。
 >
-> **サーバーを自前で起動する経路**（`ensure_server` の自動起動 / `LocalServer` / `ServerPool` /
-> `RouterServer` 等）は**非公開・サポート対象外**（サーバーを立てるのはゲートウェイ 1 箇所だけ、
-> という運用にするため。後方互換で import は残すが `__all__` 非公開）。
+> **接続する側（クライアント）は別パッケージ [llm-gateway-client](https://github.com/ToPo-ToPo-ToPo/llm-gateway-client)**
+> に分離した。エージェントはそちらの `LLMClient` / `connect` を使う（または素の `openai` SDK で
+> `base_url` を指す）。サーバーを自前で起動する低レベル経路（`ensure_server` / `LocalServer` /
+> `RouterServer` 等）は非公開・サポート対象外（後方互換で import は残す）。
 
 ## インストール
 [uv](https://docs.astral.sh/uv/)を使用する。
@@ -99,18 +98,23 @@ uv run local-llm-server-gui --install-app   # gateway.toml のあるディレク
 
 ### 3. 接続（ `model` で選ぶ）
 
-公開ポートに繋ぎ、`model` で使うモデルを選ぶ。
-```python
-from local_llm_server import LLMClient
+公開ポートの OpenAI 互換 API に繋ぎ、`model` で使うモデルを選ぶ。**接続用クライアントは別パッケージ
+[llm-gateway-client](https://github.com/ToPo-ToPo-ToPo/llm-gateway-client)**（エージェント共通の
+`LLMClient` / `connect`）。
 
-llm = LLMClient(
-  model="mlx-community/Qwen3.6-27B-4bit",
-  base_url="http://127.0.0.1:8799/v1"
-)
+```bash
+uv add llm-gateway-client
+```
+```python
+from llm_gateway_client import LLMClient
+
+llm = LLMClient(model="mlx-community/Qwen3.6-27B-4bit",
+                base_url="http://127.0.0.1:8799/v1")
 print(llm.respond("ローカルLLMの利点を3つ。"))
 ```
 
-高度操作 → [docs/connecting.md](docs/connecting.md)。
+このパッケージ（`local-llm-server`）を入れなくても、素の `openai` SDK で `base_url` を指すだけでも
+接続できる。
 
 ## アンインストール
 

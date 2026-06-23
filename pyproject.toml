@@ -1,7 +1,7 @@
 [project]
 name = "local-llm-server"
-version = "0.11.0"
-description = "ローカルLLM（mlx / mlx-vlm / llama.cpp）を OpenAI 互換 API で束ねるマルチモデルゲートウェイ。gateway.toml のカタログを 1 ポートで配信し、model で振り分け・遅延起動・LRU 退避・MTP 高速化（Ollama 流の共有デーモン）"
+version = "0.12.0"
+description = "ローカルLLM（mlx / mlx-vlm / llama.cpp）を OpenAI 互換 API で束ねるマルチモデルゲートウェイ（サーバー）。gateway.toml のカタログを 1 ポートで配信し、model で振り分け・遅延起動・LRU 退避・MTP 高速化（Ollama 流の共有デーモン）。接続用クライアントは別パッケージ llm-gateway-client。"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
@@ -17,13 +17,10 @@ classifiers = [
     "Topic :: Software Development",
     "Operating System :: OS Independent",
 ]
-# 高レベルクライアント（LLMClient / connect）は公式 openai SDK を土台にするため、
-# openai をコア依存とする（自動リトライ・型付き応答・ツール呼び出し/構造化出力が使える）。
-# 推論バックエンド本体は extras で導入する（環境マーカーで Apple Silicon のときだけ
-# 自動選択。他OSは llama.cpp を各自インストール）。
-dependencies = [
-    "openai>=1.0",
-]
+# ゲートウェイ本体は標準ライブラリのみで動く（純粋な HTTP 転送＋プロセス管理）。コア依存なし。
+# 推論バックエンド本体は extras で導入する（環境マーカーで Apple Silicon のときだけ自動選択。
+# 他 OS は llama.cpp を各自インストール）。接続用クライアントは別パッケージ llm-gateway-client。
+dependencies = []
 
 [project.optional-dependencies]
 # Apple Silicon 向け mlx 系バックエンド（テキスト/vision/STT）。
