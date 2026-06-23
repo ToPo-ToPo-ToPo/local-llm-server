@@ -50,8 +50,14 @@ from .gateway import (
     ensure_server,
 )
 
-# --- 高レベルクライアント（標準ライブラリのみ） ----------------------------
-from .client import LLMClient, build_user_content, connect, to_image_url
+# --- 高レベルクライアント + リクエスト整形ヘルパ ---------------------------
+from .client import (
+    LLMClient,
+    build_user_content,
+    connect,
+    thinking_extra_body,
+    to_image_url,
+)
 
 __all__ = [
     # 定数
@@ -88,9 +94,10 @@ __all__ = [
     "ServerHandle",
     "ServerNotRunningError",
     "check_model_served",
-    # 高レベルクライアント（標準ライブラリのみ・追加依存なし）
+    # 高レベルクライアント（公式 openai SDK を土台）＋ リクエスト整形ヘルパ
     "LLMClient",
     "connect",
     "to_image_url",
     "build_user_content",
+    "thinking_extra_body",
 ]

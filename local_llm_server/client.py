@@ -68,6 +68,24 @@ def build_user_content(
     return parts
 
 
+def thinking_extra_body(enable: bool) -> dict[str, Any]:
+    """思考(thinking)モードの ON/OFF をサーバーへ渡す extra_body を作る。
+
+    バックエンドによって解釈するキーが異なる（これはバックエンドの protocol 知識で、
+    どのキーを使うかを知っているのは推論サーバー側＝本ライブラリの責務）:
+      - mlx-vlm      … トップレベル enable_thinking（chat_template_kwargs は無視）
+      - mlx_lm/llama … chat_template_kwargs.enable_thinking
+    未知キーはどのサーバーも無視するため両形式を併記して安全。常に明示送信することで、
+    既定 OFF も enable_thinking=true での ON 化も全バックエンドで確実に効く。
+
+    chat.completions.create(..., extra_body=thinking_extra_body(False)) のように渡す。
+    """
+    return {
+        "enable_thinking": enable,
+        "chat_template_kwargs": {"enable_thinking": enable},
+    }
+
+
 class LLMClient:
     """OpenAI 互換エンドポイントへ繋ぐクライアント（公式 openai SDK を土台にする）。
 
@@ -84,12 +102,18 @@ class LLMClient:
         api_key: str = "not-needed",
         temperature: float = 0.0,
         max_tokens: int | None = None,
+        timeout: Any = None,
     ) -> None:
         self.model = model
         self.base_url = base_url
         self.temperature = float(temperature)
         self.max_tokens = max_tokens
-        self.openai = OpenAI(base_url=base_url, api_key=api_key)
+        # timeout は float / httpx.Timeout / None。None のときは openai の既定に任せる
+        # （ローカルの巨大モデルは初回応答が遅いので、長め/無制限を渡せるようにする）。
+        client_kwargs: dict[str, Any] = {"base_url": base_url, "api_key": api_key}
+        if timeout is not None:
+            client_kwargs["timeout"] = timeout
+        self.openai = OpenAI(**client_kwargs)
         self._handle: ServerHandle | None = None  # connect() が起動を紐づけるとき用
 
     def respond(
@@ -147,6 +171,7 @@ def connect(
     draft_model: str | None = None,
     temperature: float = 0.0,
     max_tokens: int | None = None,
+    timeout: Any = None,
     **ensure_kwargs: Any,
 ) -> LLMClient:
     """サーバーを用意（相乗り or 自動起動）してから、繋がった LLMClient を返す。
@@ -169,6 +194,7 @@ def connect(
         base_url=handle.base_url,
         temperature=temperature,
         max_tokens=max_tokens,
+        timeout=timeout,
     )
     client._handle = handle
     return client

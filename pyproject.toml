@@ -1,6 +1,6 @@
 [project]
 name = "local-llm-server"
-version = "0.4.0"
+version = "0.5.0"
 description = "ローカルLLM（mlx / mlx-vlm / llama.cpp / router）を OpenAI 互換 API として起動・管理する拡張サーバーライブラリ（相乗り/自動起動・MTP・高レベルクライアント付き）"
 readme = "README.md"
 requires-python = ">=3.11"

@@ -10,7 +10,12 @@ import base64
 import pytest
 
 from local_llm_server import client as client_mod
-from local_llm_server.client import LLMClient, build_user_content, to_image_url
+from local_llm_server.client import (
+    LLMClient,
+    build_user_content,
+    thinking_extra_body,
+    to_image_url,
+)
 
 
 # --- マルチモーダル content 構築 -------------------------------------------
@@ -130,3 +135,19 @@ def test_openai_client_accessible(fake_openai):
     # 土台の openai クライアントに直接アクセスできる（高度操作用）。
     llm = LLMClient(model="m", base_url="http://127.0.0.1:8080/v1")
     assert llm.openai.init_kwargs["base_url"] == "http://127.0.0.1:8080/v1"
+
+
+def test_timeout_passed_to_openai(fake_openai):
+    # timeout を渡したときだけ openai クライアントへ伝える（None なら既定に任せる）。
+    assert "timeout" not in LLMClient(model="m").openai.init_kwargs
+    assert LLMClient(model="m", timeout=42.0).openai.init_kwargs["timeout"] == 42.0
+
+
+# --- thinking_extra_body（バックエンド protocol ヘルパ） --------------------
+def test_thinking_extra_body_emits_both_forms():
+    on = thinking_extra_body(True)
+    assert on["enable_thinking"] is True                       # mlx-vlm 形式
+    assert on["chat_template_kwargs"]["enable_thinking"] is True  # mlx_lm/llama 形式
+    off = thinking_extra_body(False)
+    assert off["enable_thinking"] is False
+    assert off["chat_template_kwargs"]["enable_thinking"] is False
