@@ -32,10 +32,11 @@ def _resolve_config() -> str | None:
 
 
 def _stop_servers(ports: list[int]) -> int:
-    """指定ポートで動いているゲートウェイを探して停止する（--stop 用）。
+    """指定ポートで動いているプロセスを探して停止する（--stop 用）。
 
-    ポートを LISTEN しているプロセスを lsof で特定し、プロセスグループごと
-    SIGTERM→SIGKILL で止める（ゲートウェイは終了時に配下のモデルサーバーも止める）。
+    公開ポート（ゲートウェイ）と内部モデルポートを LISTEN しているプロセスを lsof で
+    特定し、プロセスグループごと SIGTERM→SIGKILL で止める。ゲートウェイは終了時に配下の
+    モデルサーバーも止めるが、ここで内部ポートも直接止めることで取り残しを防ぐ。
     1つでも止めれば 0、見つからなければ 1 を返す。
     """
     if os.name != "posix":
@@ -49,12 +50,12 @@ def _stop_servers(ports: list[int]) -> int:
     for port in ports:
         pids = find_pids_on_port(port)
         for pid in pids:
-            print(f"Stopping the gateway on port {port} (pid {pid})...", file=sys.stderr)
+            print(f"Stopping server on port {port} (pid {pid})...", file=sys.stderr)
             if stop_pid(pid):
                 stopped = True
     if not stopped:
         ports_str = ", ".join(str(p) for p in ports)
-        print(f"No running gateway found on port(s): {ports_str}.", file=sys.stderr)
+        print(f"No running server found on port(s): {ports_str}.", file=sys.stderr)
         return 1
     print("Stopped.", file=sys.stderr)
     return 0
@@ -119,7 +120,11 @@ def main(argv: list[str] | None = None) -> int:
 
     # --stop / --status: 設定の host/port を 1 つの真実として、対象を特定する。
     if args.stop:
-        return _stop_servers([gcfg.port])
+        # 公開ポート（ゲートウェイ本体）に加え、配下のモデルサーバーの内部ポートも
+        # 直接止める。ゲートウェイの協調シャットダウン（manager.shutdown）が何らかの
+        # 理由で完走しなくても、ロード済みモデルをメモリに残さないための保険。
+        ports = [gcfg.port] + [m.port for m in gcfg.models]
+        return _stop_servers(ports)
     if args.status:
         return _status_servers(gcfg.host, [gcfg.port])
 
