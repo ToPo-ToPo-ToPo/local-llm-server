@@ -84,6 +84,12 @@ with srv.LocalServer(config) as server:        # サブプロセスで起動
 ストリーミングしたい場合は `stream=True` を渡し、`for chunk in resp:` で
 `chunk.choices[0].delta.content` を逐次受け取る（OpenAI クライアントと同じ作法）。
 
+### MTP（投機的デコード）で高速化する
+
+本体モデルの出力を変えずに ~2倍速にする MTP（Multi-Token Prediction）を使う
+完全な実行サンプルを [`examples/`](examples/) に用意している（`uv run examples/generate_with_mtp.py`）。
+詳しくは [examples/README.md](examples/README.md) を参照。
+
 ## ライセンス
 
 Apache-2.0
