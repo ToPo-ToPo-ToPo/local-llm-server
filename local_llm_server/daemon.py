@@ -316,7 +316,7 @@ class GatewayConfig:
     max_resident: int | None
     default_model: str | None
     models: list[ServerConfig] = field(default_factory=list)
-    idle_timeout: float | None = None  # 秒。これだけ使われないモデルを自動アンロード（None/0 で無効）
+    idle_timeout: float | None = 1200.0  # 秒。これだけ使われないモデルを自動アンロード（既定 1200=20分。None/0 で無効）
     load_timeout: float = 300.0        # 秒。全枠処理中のとき、空くのを待つ最大時間（超過で 503）
 
 
@@ -356,7 +356,7 @@ def load_gateway_config(path: str) -> GatewayConfig:
         port = 8799                 # 公開ポート（省略時 8799）
         max_resident = 2            # 同時常駐モデル数の上限（ハード。省略時 無制限）
         load_timeout = 300          # 全枠処理中のとき空くのを待つ最大秒数（超過で 503。省略時 300）
-        idle_timeout = 600          # この秒数使われないモデルを自動アンロード（省略/0 で無効）
+        idle_timeout = 1200         # この秒数使われないモデルを自動アンロード（省略時 1200=20分。0 で無効）
         internal_base_port = 9001   # 内部サーバーの割当開始ポート（省略時 9001）
         default_model = "..."       # model 省略リクエスト時のモデル（省略可）
         draft_model = "auto"        # 全モデルの MTP ドラフター既定（mlx-vlm のみ有効。省略可）
@@ -385,8 +385,8 @@ def load_gateway_config(path: str) -> GatewayConfig:
         if max_resident < 1:
             raise ValueError("max_resident must be 1 or greater")
     default_model = data.get("default_model")
-    # 一定時間使われないモデルを自動アンロードする秒数（idle TTL）。0/省略で無効。
-    idle_timeout = data.get("idle_timeout")
+    # 一定時間使われないモデルを自動アンロードする秒数（idle TTL）。省略時 1200（=20分）、0 で無効。
+    idle_timeout = data.get("idle_timeout", 1200)
     if idle_timeout is not None:
         idle_timeout = float(idle_timeout)
         if idle_timeout < 0:

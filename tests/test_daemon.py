@@ -189,9 +189,9 @@ def test_load_gateway_config_idle_timeout(tmp_path):
         tmp_path,
         'idle_timeout = 600\n[[models]]\nmodel = "x"\nbackend = "mlx"\n'))
     assert cfg.idle_timeout == 600.0
-    # 0 / 省略 は無効（None）
+    # 省略時は既定 1200、0 は無効（None）
     assert gw.load_gateway_config(_write(
-        tmp_path, '[[models]]\nmodel = "x"\nbackend = "mlx"\n')).idle_timeout is None
+        tmp_path, '[[models]]\nmodel = "x"\nbackend = "mlx"\n')).idle_timeout == 1200.0
     assert gw.load_gateway_config(_write(
         tmp_path, 'idle_timeout = 0\n[[models]]\nmodel = "x"\nbackend = "mlx"\n')).idle_timeout is None
     import pytest
