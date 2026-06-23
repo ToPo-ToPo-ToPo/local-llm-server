@@ -630,3 +630,66 @@ def gateway_admin_status(
     except (urllib.error.URLError, OSError, ValueError):
         return None
     return data if isinstance(data, dict) else None
+
+
+def gateway_log_path(port: int) -> str:
+    """バックグラウンド起動したゲートウェイ本体（公開ポート）の出力ログ保存先。
+
+    モデルサーバーの daemon_log_path（server-<port>.log）と別に、ゲートウェイ自身の
+    起動ログを gateway-<port>.log に逃がす（`--status` / GUI から参照できる固定パス）。
+    """
+    return os.path.join(project_cache_dir(), f"gateway-{port}.log")
+
+
+def start_gateway_background(
+    cwd: str,
+    host: str = "127.0.0.1",
+    port: int = 8799,
+    *,
+    start_timeout: float = 120.0,
+) -> int:
+    """ゲートウェイをデタッチした別プロセスで常駐起動し、応答可能になるまで待つ。
+
+    ターミナルを占有しない常駐起動（Ollama 流）。cwd の ./gateway.toml を読む
+    フォアグラウンド版（`python -m local_llm_server.cli`）を、新セッション（POSIX）/
+    DETACHED_PROCESS（Windows）で起動して端末・親から切り離し、出力は gateway_log_path に
+    逃がす。応答可能になったら PID を返す。既に起動済みなら何もせず既存 PID（不明なら 0）を返す。
+    起動失敗は RuntimeError、時間内に応答しなければ TimeoutError。
+    """
+    base_url = f"http://{host}:{port}/v1"
+    existing = find_pids_on_port(port)
+    if is_ready(base_url) or existing:
+        return existing[0] if existing else 0
+
+    log_path = gateway_log_path(port)
+    os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
+    log_file = open(log_path, "a", encoding="utf-8")
+    popen_kwargs: dict = {
+        "cwd": cwd,
+        "stdin": subprocess.DEVNULL,
+        "stdout": log_file,
+        "stderr": subprocess.STDOUT,
+    }
+    if os.name == "nt":
+        # 端末から切り離し、新プロセスグループにする（stop の taskkill /T と対）。
+        popen_kwargs["creationflags"] = (
+            subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        )
+    else:
+        popen_kwargs["start_new_session"] = True  # setsid: 端末/親から独立
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "local_llm_server.cli"], **popen_kwargs
+        )
+    finally:
+        log_file.close()  # fd は子へ複製済み。親側は閉じてよい
+    deadline = time.monotonic() + start_timeout
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            raise RuntimeError(
+                f"gateway exited early (code {proc.returncode}); see {log_path}"
+            )
+        if is_ready(base_url):
+            return proc.pid
+        time.sleep(0.5)
+    raise TimeoutError(f"gateway not ready within {start_timeout:g}s; see {log_path}")

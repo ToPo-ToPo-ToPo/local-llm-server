@@ -85,6 +85,133 @@ def test_make_image_returns_icon():
     assert img.mode == "RGBA"
 
 
+def test_build_view_down_allows_start(monkeypatch):
+    monkeypatch.setattr(gui, "gateway_admin_status", lambda *a, **k: None)
+    monkeypatch.setattr(gui, "server_status", lambda *a, **k: None)
+    v = gui.build_view("127.0.0.1", 8799, ["m/A"])
+    assert v.start_enabled is True and v.stop_enabled is False
+
+
+def test_build_view_ready_disables_start(monkeypatch):
+    monkeypatch.setattr(gui, "gateway_admin_status", lambda *a, **k: None)
+    monkeypatch.setattr(gui, "server_status", lambda *a, **k: {
+        "ready": True, "pids": [1], "log_path": None,
+    })
+    v = gui.build_view("127.0.0.1", 8799, ["m/A"])
+    assert v.start_enabled is False and v.stop_enabled is True
+
+
+# --- バックグラウンド常駐起動（Ollama 流） ----------------------------------
+def test_start_gateway_background_skips_when_already_running(monkeypatch):
+    monkeypatch.setattr(server, "find_pids_on_port", lambda port: [4242])
+    # 既に LISTEN している → 多重起動せず既存 PID を返す。
+    assert server.start_gateway_background("/tmp", "127.0.0.1", 8799) == 4242
+
+
+def test_start_gateway_background_spawns_detached(monkeypatch, tmp_path):
+    monkeypatch.setattr(server, "find_pids_on_port", lambda port: [])
+    monkeypatch.setattr(server, "gateway_log_path", lambda port: str(tmp_path / "gw.log"))
+    readies = iter([False, True])  # 起動前→起動後
+    monkeypatch.setattr(server, "is_ready", lambda url, *a, **k: next(readies))
+    captured = {}
+
+    class _Proc:
+        pid = 9999
+
+        def poll(self):
+            return None
+
+    def fake_popen(cmd, **kw):
+        captured["cmd"] = cmd
+        captured["kw"] = kw
+        return _Proc()
+
+    monkeypatch.setattr(server.subprocess, "Popen", fake_popen)
+    pid = server.start_gateway_background(str(tmp_path), "127.0.0.1", 8799, start_timeout=5)
+    assert pid == 9999
+    assert captured["cmd"][1:] == ["-m", "local_llm_server.cli"]   # フォアグラウンド版を起動
+    assert captured["kw"]["cwd"] == str(tmp_path)
+    import os as _os
+    if _os.name == "nt":
+        assert "creationflags" in captured["kw"]                   # Windows: DETACHED_PROCESS
+    else:
+        assert captured["kw"]["start_new_session"] is True         # POSIX: setsid で切り離し
+
+
+def test_cli_start_background_skips_when_running(monkeypatch):
+    from local_llm_server import cli
+
+    monkeypatch.setattr(cli, "server_status", lambda *a, **k: {"ready": True, "pids": [1]})
+
+    class _G:
+        host = "127.0.0.1"
+        port = 8799
+        models: list = []
+
+    assert cli._start_background(_G()) == 0
+
+
+# --- クリックして起動できるランチャ（アプリ）の生成 ------------------------
+def test_install_macos_app_writes_bundle(tmp_path, monkeypatch):
+    import os
+    import stat
+
+    monkeypatch.setattr(gui.sys, "platform", "darwin")
+    dest = str(tmp_path / "App.app")
+    out = gui.install_launcher("/proj dir", "/venv/bin/python", start_gateway=True, dest=dest)
+    assert out == dest
+    plist = (tmp_path / "App.app" / "Contents" / "Info.plist").read_text()
+    assert gui.APP_NAME in plist
+    assert "LSUIElement" not in plist                               # 既定は普通の Dock アプリ
+    launch = (tmp_path / "App.app" / "Contents" / "MacOS" / "launch").read_text()
+    assert "cd '/proj dir'" in launch                               # 作業ディレクトリ固定
+    assert "-m local_llm_server.gui --start-gateway" in launch      # 1クリックで常駐
+    mode = os.stat(tmp_path / "App.app" / "Contents" / "MacOS" / "launch").st_mode
+    assert mode & stat.S_IXUSR                                       # 実行ビット
+
+
+def test_install_macos_app_menubar_only(tmp_path):
+    dest = str(tmp_path / "App.app")
+    gui._install_macos_app("/proj", "/py", start_gateway=True, menubar_only=True, dest=dest)
+    plist = (tmp_path / "App.app" / "Contents" / "Info.plist").read_text()
+    assert "LSUIElement" in plist                                   # agent（メニューバー専用）
+
+
+def test_install_macos_app_icon_referenced_when_built(tmp_path):
+    pytest.importorskip("PIL")
+    dest = str(tmp_path / "App.app")
+    gui._install_macos_app("/proj", "/py", start_gateway=True, dest=dest)
+    icns = tmp_path / "App.app" / "Contents" / "Resources" / "icon.icns"
+    plist = (tmp_path / "App.app" / "Contents" / "Info.plist").read_text()
+    # アイコン生成に成功していれば plist が参照する（環境差で失敗しても本体は壊れない）。
+    if icns.exists():
+        assert "CFBundleIconFile" in plist
+    else:
+        assert "CFBundleIconFile" not in plist
+
+
+def test_install_macos_app_without_start_gateway(tmp_path):
+    dest = str(tmp_path / "App.app")
+    gui._install_macos_app("/proj", "/py", start_gateway=False, dest=dest)
+    launch = (tmp_path / "App.app" / "Contents" / "MacOS" / "launch").read_text()
+    assert "--start-gateway" not in launch
+
+
+def test_install_linux_desktop_writes_entry(tmp_path):
+    dest = str(tmp_path / "app.desktop")
+    gui._install_linux_desktop("/proj", "/py", start_gateway=True, dest=dest)
+    body = (tmp_path / "app.desktop").read_text()
+    assert body.startswith("[Desktop Entry]")
+    assert "Terminal=false" in body and "local_llm_server.gui --start-gateway" in body
+
+
+def test_install_windows_cmd_writes_script(tmp_path):
+    dest = str(tmp_path / "app.cmd")
+    gui._install_windows_cmd(r"C:\proj", "C:\\py\\python.exe", start_gateway=True, dest=dest)
+    body = (tmp_path / "app.cmd").read_text()
+    assert 'cd /d "C:\\proj"' in body and "-m local_llm_server.gui --start-gateway" in body
+
+
 # --- クロスプラットフォームなポート→PID 特定 --------------------------------
 def test_find_pids_netstat_parses_listening_lines(monkeypatch):
     sample = (

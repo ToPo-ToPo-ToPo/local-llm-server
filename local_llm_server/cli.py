@@ -15,8 +15,10 @@ import tomllib
 from .daemon import load_gateway_config, run_gateway
 from .server import (
     find_pids_on_port,
+    gateway_log_path,
     install_shutdown_handlers,
     server_status,
+    start_gateway_background,
     stop_pid,
 )
 
@@ -55,6 +57,29 @@ def _stop_servers(ports: list[int]) -> int:
     return 0
 
 
+def _start_background(gcfg) -> int:
+    """ゲートウェイをバックグラウンドで常駐起動する（--start 用）。
+
+    ターミナルを占有せずに常駐させる（Ollama 流）。既に起動済みなら何もしない。
+    起動して応答可能になれば 0、失敗/タイムアウトは 1。
+    """
+    base_url = f"http://{gcfg.host}:{gcfg.port}/v1"
+    if server_status(gcfg.host, gcfg.port) is not None:
+        print(f"Gateway already running on port {gcfg.port} ({base_url}).", file=sys.stderr)
+        return 0
+    print(f"Starting gateway in the background on port {gcfg.port}...", file=sys.stderr)
+    try:
+        pid = start_gateway_background(os.getcwd(), gcfg.host, gcfg.port)
+    except (RuntimeError, TimeoutError) as exc:
+        print(f"Failed to start gateway: {exc}", file=sys.stderr)
+        return 1
+    print(f"Gateway started (pid {pid}).", file=sys.stderr)
+    print(f"  public: {base_url}", file=sys.stderr)
+    print(f"  log:    {gateway_log_path(gcfg.port)}", file=sys.stderr)
+    print("Stop it with `local-llm-server --stop`.", file=sys.stderr)
+    return 0
+
+
 def _status_servers(host: str, ports: list[int]) -> int:
     """指定ポートで動いているゲートウェイの状態を表示する（--status 用）。
 
@@ -74,7 +99,10 @@ def _status_servers(host: str, ports: list[int]) -> int:
         for model in st["models"]:
             print(f"    model: {model}", file=sys.stderr)
         if st["log_path"]:
-            print(f"    log:   {st['log_path']}", file=sys.stderr)
+            print(f"    model log: {st['log_path']}", file=sys.stderr)
+        gw_log = gateway_log_path(port)
+        if os.path.exists(gw_log):
+            print(f"    gateway log: {gw_log}", file=sys.stderr)
     return 0 if any_found else 1
 
 
@@ -86,6 +114,18 @@ def main(argv: list[str] | None = None) -> int:
             "(model catalog). Host, port, models and MTP are all configured in that file. Clients "
             "connect to the public port and select a model via `model`; the client never starts a server."
         ),
+    )
+    parser.add_argument(
+        "--start",
+        action="store_true",
+        help="Start the gateway in the background (detached) and return, instead of running it "
+        "in the foreground. Use this to keep it resident without holding a terminal.",
+    )
+    parser.add_argument(
+        "--restart",
+        action="store_true",
+        help="Stop the running gateway (if any) and start it again in the background. Use after "
+        "editing ./gateway.toml to apply the changes.",
     )
     parser.add_argument(
         "--stop",
@@ -112,18 +152,23 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, ValueError, tomllib.TOMLDecodeError) as exc:
         parser.error(f"Failed to load the gateway config '{config_path}': {exc}")
 
-    # --stop / --status: 設定の host/port を 1 つの真実として、対象を特定する。
+    # --start / --restart / --stop / --status: 設定の host/port を 1 つの真実として対象を特定する。
+    # 公開ポート＋配下モデルの内部ポートをまとめて止めると、協調シャットダウンが完走しなくても
+    # ロード済みモデルをメモリに残さない（取りこぼし防止）。
+    all_ports = [gcfg.port] + [m.port for m in gcfg.models]
     if args.stop:
-        # 公開ポート（ゲートウェイ本体）に加え、配下のモデルサーバーの内部ポートも
-        # 直接止める。ゲートウェイの協調シャットダウン（manager.shutdown）が何らかの
-        # 理由で完走しなくても、ロード済みモデルをメモリに残さないための保険。
-        ports = [gcfg.port] + [m.port for m in gcfg.models]
-        return _stop_servers(ports)
+        return _stop_servers(all_ports)
     if args.status:
         return _status_servers(gcfg.host, [gcfg.port])
+    if args.restart:
+        _stop_servers(all_ports)  # 動いていなければ no-op
+        return _start_background(gcfg)
+    if args.start:
+        return _start_background(gcfg)
 
-    # kill / ターミナルを閉じる（SIGTERM・SIGHUP）でも下流の finally（gateway の
-    # manager.shutdown）を必ず通し、配下のモデルサーバーを孫プロセスとして残さない。
+    # 既定（引数なし）はフォアグラウンド起動。kill / ターミナルを閉じる（SIGTERM・SIGHUP）でも
+    # 下流の finally（gateway の manager.shutdown）を必ず通し、配下のモデルサーバーを孫プロセス
+    # として残さない。バックグラウンド常駐は --start（GUI からも起動できる）。
     install_shutdown_handlers()
     return run_gateway(gcfg)
 
