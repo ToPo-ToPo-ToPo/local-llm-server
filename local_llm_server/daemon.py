@@ -250,12 +250,20 @@ class GatewayServer(ThreadingHTTPServer):
         catalog: list[str],
         default_model: str | None = None,
         timeout_s: float | None = None,
+        max_resident: int | None = None,
+        idle_timeout: float | None = None,
+        load_timeout: float | None = None,
     ) -> None:
         super().__init__(addr, _GatewayHandler)
         self.manager = manager
         self.catalog = catalog            # /v1/models で返すモデル一覧
         self.default_model = default_model
         self.timeout_s = timeout_s        # None なら無制限（長時間生成に備える）
+        # GET /admin/status（GUI 等の監視用）で返すゲートウェイ設定。運用ポリシーを
+        # 添えることで、常駐モデルのライブ状態と一緒に「上限/退避方針」も読み取れる。
+        self.max_resident = max_resident
+        self.idle_timeout = idle_timeout
+        self.load_timeout = load_timeout
 
 
 class _GatewayHandler(BaseHTTPRequestHandler):
@@ -267,12 +275,30 @@ class _GatewayHandler(BaseHTTPRequestHandler):
         pass
 
     def do_GET(self) -> None:
+        path = self.path.rstrip("/")
+        srv = self.server  # type: ignore[assignment]
         # /v1/models は設定済みカタログを合成して返す（is_ready 判定・モデル取り違え
         # 警告に対応）。実モデルは起動していなくてもカタログとして列挙する。
-        if self.path.rstrip("/").endswith("/models"):
+        if path.endswith("/models"):
             data = {
                 "object": "list",
-                "data": [{"id": m, "object": "model"} for m in self.server.catalog],  # type: ignore[attr-defined]
+                "data": [{"id": m, "object": "model"} for m in srv.catalog],
+            }
+            send_json(self, 200, data)
+            return
+        # /admin/status は常駐モデルのライブ状態（loaded/inflight）＋運用ポリシーを返す。
+        # GUI（メニューバー監視）が CLI の --status より詳しい状態を出すための読み取り口。
+        if path.endswith("/admin/status"):
+            host, port = srv.server_address[0], srv.server_address[1]
+            data = {
+                "object": "gateway.status",
+                "host": host,
+                "port": port,
+                "max_resident": srv.max_resident,
+                "idle_timeout": srv.idle_timeout,
+                "load_timeout": srv.load_timeout,
+                "default_model": srv.default_model,
+                "models": srv.manager.status(),
             }
             send_json(self, 200, data)
             return
@@ -463,6 +489,9 @@ def run_gateway(cfg: GatewayConfig) -> int:
         manager,
         catalog=[c.model for c in cfg.models],
         default_model=cfg.default_model,
+        max_resident=cfg.max_resident,
+        idle_timeout=cfg.idle_timeout,
+        load_timeout=cfg.load_timeout,
     )
     public = f"http://{cfg.host}:{cfg.port}/v1"
     print("Gateway ready (lazy multi-model):", file=sys.stderr)

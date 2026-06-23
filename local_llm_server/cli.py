@@ -34,18 +34,12 @@ def _resolve_config() -> str | None:
 def _stop_servers(ports: list[int]) -> int:
     """指定ポートで動いているプロセスを探して停止する（--stop 用）。
 
-    公開ポート（ゲートウェイ）と内部モデルポートを LISTEN しているプロセスを lsof で
-    特定し、プロセスグループごと SIGTERM→SIGKILL で止める。ゲートウェイは終了時に配下の
-    モデルサーバーも止めるが、ここで内部ポートも直接止めることで取り残しを防ぐ。
+    公開ポート（ゲートウェイ）と内部モデルポートを LISTEN しているプロセスを特定し
+    （macOS / Linux は lsof、Windows は netstat）、プロセスツリーごと止める（POSIX は
+    SIGTERM→SIGKILL、Windows は taskkill /T /F）。ゲートウェイは終了時に配下のモデル
+    サーバーも止めるが、ここで内部ポートも直接止めることで取り残しを防ぐ。
     1つでも止めれば 0、見つからなければ 1 を返す。
     """
-    if os.name != "posix":
-        print(
-            "--stop is supported on macOS / Linux only. On Windows, stop the gateway "
-            "from its own window (Ctrl+C) or via Task Manager.",
-            file=sys.stderr,
-        )
-        return 1
     stopped = False
     for port in ports:
         pids = find_pids_on_port(port)
@@ -97,7 +91,7 @@ def main(argv: list[str] | None = None) -> int:
         "--stop",
         action="store_true",
         help="Stop the gateway defined by ./gateway.toml (also stops every model server it started) "
-        "instead of starting one. macOS / Linux only.",
+        "instead of starting one. macOS / Linux / Windows.",
     )
     parser.add_argument(
         "--status",

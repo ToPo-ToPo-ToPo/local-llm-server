@@ -7,6 +7,16 @@
 - **モデルは初回リクエスト時に遅延起動**、`max_resident` 超過で LRU 退避、`idle_timeout` で自動アンロード。
 - クライアントは公開ポートに繋いで `model` を選ぶだけ。
 
+> **サポートする使い方は 2 つ**:（1）ゲートウェイの運用 — `local-llm-server`（起動/停止/状態）と
+> `local-llm-server-gui`（監視 GUI）。ゲートウェイは**このリポジトリで 1 つ起動する**運用が前提。
+> （2）クライアント接続 — `LLMClient` で公開ポートに繋ぐ（エージェントごとの再実装を防ぐ共通
+> クライアント。素の `openai` SDK で base_url を指してもよい）。`connect()` は起動中ゲートウェイに
+> 繋ぐワンライナーで、未起動なら親切なエラー（**サーバーは自前で起動しない**）。
+>
+> **サーバーを自前で起動する経路**（`ensure_server` の自動起動 / `LocalServer` / `ServerPool` /
+> `RouterServer` 等）は**非公開・サポート対象外**（サーバーを立てるのはゲートウェイ 1 箇所だけ、
+> という運用にするため。後方互換で import は残すが `__all__` 非公開）。
+
 ## インストール
 [uv](https://docs.astral.sh/uv/)を使用する。
 ```bash
@@ -18,6 +28,7 @@ extras 指定はクォート必須（zsh の glob 展開回避）。内訳:
 | extra | 入るもの | 用途 |
 |---|---|---|
 | `mlx` | `mlx-lm` / `mlx-vlm` | Apple Silicon で実際に推論する |
+| `gui` | `pystray` / `pillow` | システムトレイ常駐の状態モニタ（Win/mac/Linux） |
 
 ## 使い方
 
@@ -84,6 +95,26 @@ uv run local-llm-server --stop
 ```
 
 `Ctrl+C` / `kill` でも、起動済みのモデルサーバーまで一緒に止まる（孫プロセスは残らない）。
+`--stop` は **macOS / Linux / Windows** で動く（ポート→PID 特定は lsof / netstat、停止は
+プロセスグループ / `taskkill /T`）。
+
+#### トレイ GUI（Windows / macOS / Linux）
+
+`--status` を都度打たずに状況を把握したいとき用の常駐モニタ。システムトレイ（macOS は
+メニューバー、Windows は通知領域、Linux はトレイ）にアイコンを出し、色でゲートウェイ状態
+（🟢 応答可 / 🟡 起動中 / ⚫ 停止）を、ロード済みモデル数を数字で表す。クリックで各モデルの
+常駐状態（loaded / idle）と処理中リクエスト数、PID・運用方針（max_resident・idle_timeout）を
+表示し、メニューから**停止**・**ログを開く**・**再読込**もできる。ウィンドウを占有しないので
+他の作業の邪魔にならない。
+
+```bash
+uv add "local-llm-server[gui]"        # pystray / pillow（各 OS のバックエンドも）
+uv run local-llm-server-gui           # gateway.toml のあるディレクトリで
+```
+
+状態は GUI 用の読み取り口 `GET /admin/status`（各モデルの loaded / inflight ＋運用方針を
+JSON で返す）から取得する。CLI と同じく **カレントディレクトリの `./gateway.toml`** を読む。
+Linux はトレイ表示にシステムトレイが要る（GNOME は AppIndicator 拡張など）。
 
 ## ライセンス
 
