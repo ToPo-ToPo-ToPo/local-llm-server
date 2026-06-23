@@ -1,0 +1,51 @@
+[project]
+name = "local-llm-server"
+version = "0.1.0"
+description = "ローカルLLM（mlx / mlx-vlm / llama.cpp / router）を OpenAI 互換 API として起動・管理する軽量サーバー"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "ToPo-ToPo-ToPo" }]
+keywords = ["llm", "local-llm", "mlx", "mlx-vlm", "llama.cpp", "openai", "server", "inference"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development",
+    "Operating System :: OS Independent",
+]
+# コア機能（サーバーの起動・監視・router プロキシ）は標準ライブラリのみで動く。
+# 実際に推論するバックエンド本体は extras で導入する（環境マーカーで Apple Silicon
+# のときだけ自動選択。他OSは llama.cpp を各自インストール）。
+dependencies = []
+
+[project.optional-dependencies]
+# Apple Silicon 向け mlx 系バックエンド（テキスト/vision/STT）。
+mlx = [
+    "mlx-lm>=0.31.3 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "mlx-vlm>=0.5.0 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[project.urls]
+Repository = "https://github.com/ToPo-ToPo-ToPo/local-llm-server"
+
+[project.scripts]
+local-llm-server = "local_llm_server.cli:main"
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["local_llm_server*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
