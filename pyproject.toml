@@ -1,6 +1,6 @@
 [project]
 name = "local-llm-server"
-version = "0.9.0"
+version = "0.10.0"
 description = "ローカルLLM（mlx / mlx-vlm / llama.cpp）を OpenAI 互換 API で束ねるマルチモデルゲートウェイ。gateway.toml のカタログを 1 ポートで配信し、model で振り分け・遅延起動・LRU 退避・MTP 高速化（Ollama 流の共有デーモン）"
 readme = "README.md"
 requires-python = ">=3.11"
