@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["local-llm-server"]
+# dependencies = ["local-llm-server>=0.6"]
 # ///
 """ゲートウェイに接続して生成する最小サンプル（接続専用。サーバーは起動しない）。
 

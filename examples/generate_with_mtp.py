@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["local-llm-server"]
+# dependencies = ["local-llm-server>=0.6"]
 # ///
 """ゲートウェイ経由で生成し、速度（tok/s）を測るサンプル（接続専用）。
 
