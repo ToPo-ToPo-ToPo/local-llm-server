@@ -143,6 +143,26 @@ def test_timeout_passed_to_openai(fake_openai):
     assert LLMClient(model="m", timeout=42.0).openai.init_kwargs["timeout"] == 42.0
 
 
+# --- connect（起動中ゲートウェイに繋ぐだけ。自動起動しない） ----------------
+def test_connect_returns_client_when_gateway_ready(fake_openai, monkeypatch):
+    import local_llm_server.server as srv
+
+    monkeypatch.setattr(srv, "is_ready", lambda url, *a, **k: True)
+    llm = client_mod.connect(model="m", base_url="http://127.0.0.1:8799/v1")
+    assert isinstance(llm, LLMClient)
+    assert llm.base_url == "http://127.0.0.1:8799/v1"
+
+
+def test_connect_raises_when_gateway_down(monkeypatch):
+    import local_llm_server.server as srv
+    from local_llm_server import ServerNotRunningError
+
+    # 未起動なら自前で立てず、親切なエラーを投げる（サーバーはゲートウェイ 1 箇所だけ）。
+    monkeypatch.setattr(srv, "is_ready", lambda url, *a, **k: False)
+    with pytest.raises(ServerNotRunningError):
+        client_mod.connect(model="m", base_url="http://127.0.0.1:8799/v1")
+
+
 # --- thinking_extra_body（バックエンド protocol ヘルパ） --------------------
 def test_thinking_extra_body_emits_both_forms():
     on = thinking_extra_body(True)

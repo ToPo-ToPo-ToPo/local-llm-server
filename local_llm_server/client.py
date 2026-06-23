@@ -10,11 +10,13 @@
     llm = LLMClient(model="mlx-community/Qwen3.6-27B-4bit")
     print(llm.respond("俳句を一つ詠んでください。"))
 
-サーバーの相乗り/自動起動までまとめるなら connect():
+起動中のゲートウェイに繋ぐワンライナー（未起動なら親切なエラー。サーバーは起動しない）
+なら connect():
 
     from local_llm_server import connect
 
-    llm = connect(model="mlx-community/Qwen3.6-27B-4bit", draft_model="auto")
+    llm = connect(model="mlx-community/Qwen3.6-27B-4bit",
+                  base_url="http://127.0.0.1:8799/v1")
     for piece in llm.respond("ローカルLLMの利点は？", stream=True):
         print(piece, end="", flush=True)
 
@@ -166,35 +168,33 @@ def connect(
     model: str = DEFAULT_MODEL,
     *,
     base_url: str = DEFAULT_BASE_URL,
-    auto_start: bool = True,
-    backend: str | None = None,
-    draft_model: str | None = None,
     temperature: float = 0.0,
     max_tokens: int | None = None,
     timeout: Any = None,
-    **ensure_kwargs: Any,
 ) -> LLMClient:
-    """サーバーを用意（相乗り or 自動起動）してから、繋がった LLMClient を返す。
+    """**起動中のゲートウェイ**に繋いだ LLMClient を返す（サーバーは起動しない）。
 
-    ensure_server() + LLMClient を 1 呼び出しにまとめた入口。自動起動した場合、
-    返り値の .stop()（または with 文）でサーバーを停止できる。
+    挙動は 2 つだけ:
+      1. base_url が応答する … そのゲートウェイに繋いだ LLMClient を返す。
+      2. 応答しない          … ServerNotRunningError を投げる（先にゲートウェイを起動して）。
+
+    サーバーを自前で立てることはしない（サーバーを起動するのはゲートウェイ 1 箇所だけ、
+    という運用のため）。繋ぐ前に死活確認したいときの薄いワンライナーで、挙動は
+    `LLMClient(model, base_url=...)` と同じだが、未起動なら早めに親切なエラーを出す。
     """
-    from .gateway import ensure_server
+    from .server import is_ready
 
-    handle = ensure_server(
-        base_url=base_url,
-        model=model,
-        backend=backend,
-        auto_start=auto_start,
-        draft_model=draft_model,
-        **ensure_kwargs,
-    )
-    client = LLMClient(
+    if not is_ready(base_url):
+        from .gateway import ServerNotRunningError
+
+        raise ServerNotRunningError(
+            f"No gateway responding at {base_url}. Start it first with `local-llm-server` "
+            "in the directory holding gateway.toml, then connect again."
+        )
+    return LLMClient(
         model,
-        base_url=handle.base_url,
+        base_url=base_url,
         temperature=temperature,
         max_tokens=max_tokens,
         timeout=timeout,
     )
-    client._handle = handle
-    return client
