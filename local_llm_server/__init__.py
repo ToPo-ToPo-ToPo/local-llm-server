@@ -1,21 +1,23 @@
-"""local-llm-server — ローカルLLMを OpenAI 互換 API として起動・管理する拡張サーバー。
+"""local-llm-server — gateway.toml で定義するマルチモデルゲートウェイ（サーバー）。
 
-単なる OpenAI 互換サーバーの起動だけでなく、複数エージェントで重複しがちな処理を
-備える:
+このパッケージは**ゲートウェイ・サーバー専用**。サポートするのは次の 2 コマンド:
 
-  - LLM 実行          : LocalServer / ServerConfig / ServerPool（mlx / mlx-vlm / llama.cpp）
-  - ゲートウェイ      : RouterServer（テキスト/vision 振り分け）, ensure_server（相乗り/自動起動）
-  - MTP（投機的デコード）: resolve_drafter / MTP_DRAFTERS
-  - 高レベルクライアント : LLMClient / connect（公式 openai SDK を土台。コア依存）
+  - `local-llm-server`      … ./gateway.toml のゲートウェイをフォアグラウンド起動（cli:main）
+  - `local-llm-server-gui`  … 起動/停止/監視のアプリ（クリック起動アプリも作れる。gui:main）
 
-公開 API は __all__ に列挙したものだけ。サーバー起動・ゲートウェイ・MTP 解決は標準
-ライブラリのみ、高レベルクライアントは openai（コア依存）を使う。推論バックエンド本体
-だけ extra `local-llm-server[mlx]` で導入する。
+**クライアント（接続する側）は別パッケージ `local-llm-client`** に切り出した。エージェントは
+そちらの `LLMClient` / `connect` を使う（または素の `openai` SDK で base_url を指す）。本パッケージは
+`openai` に依存しない（純粋な HTTP 転送＋プロセス管理。推論バックエンドは extra で導入）。
+
+公開 API（`__all__`）はゲートウェイの運用だけ。サーバーを自前で起動する低レベル経路
+（`ensure_server` / `LocalServer` / `ServerPool` / `RouterServer` 等）は後方互換のため import は
+残すが非公開・サポート対象外。推論バックエンドは extra `local-llm-server[mlx]`、監視 GUI は
+`local-llm-server[gui]` で導入する。
 """
 from __future__ import annotations
 
 # --- 既定値・定数 -----------------------------------------------------------
-from .constants import BACKENDS, DEFAULT_MODEL, DEFAULT_VISION_MODEL
+from .constants import BACKENDS, DEFAULT_MODEL, DEFAULT_VISION_MODEL, project_cache_dir
 
 # --- サーバー本体（LLM 実行） ----------------------------------------------
 from .server import (
@@ -42,7 +44,6 @@ from .server import (
     server_status,
     stop_pid,
 )
-from .constants import project_cache_dir
 
 # --- マルチモデルゲートウェイ（gateway.toml で複数モデルを 1 ポートに束ねる） ----
 from .daemon import (
@@ -54,7 +55,7 @@ from .daemon import (
     run_gateway,
 )
 
-# --- ゲートウェイ -----------------------------------------------------------
+# --- 自前起動の経路（非公開・サポート対象外。後方互換のため import は残す） ----
 from .router import RouterServer, needs_vision
 from .gateway import (
     DEFAULT_BASE_URL,
@@ -64,65 +65,11 @@ from .gateway import (
     ensure_server,
 )
 
-# --- 高レベルクライアント + リクエスト整形ヘルパ ---------------------------
-from .client import (
-    LLMClient,
-    build_user_content,
-    connect,
-    thinking_extra_body,
-    to_image_url,
-)
-
+# 公開 API は「ゲートウェイの運用」だけに絞る（サーバー専用パッケージ）。クライアント
+# （LLMClient / connect）は別パッケージ local-llm-client へ移動した。
 __all__ = [
-    # 定数
-    "DEFAULT_MODEL",
-    "DEFAULT_VISION_MODEL",
-    "DEFAULT_BACKEND",
-    "DEFAULT_BASE_URL",
-    "BACKENDS",
-    # LLM 実行
-    "LocalServer",
-    "ServerConfig",
-    "ServerPool",
-    "build_command",
-    "build_pool_configs",
-    "default_backend",
-    "install_shutdown_handlers",
-    "find_pids_on_port",
-    "stop_pid",
-    # 接続状態の確認
-    "is_ready",
-    "list_models",
-    "running_model",
-    "model_available",
-    "models_match",
-    "parallel_supported",
-    "parse_host_port",
-    # MTP（投機的デコード）
-    "resolve_drafter",
-    "MTP_DRAFTERS",
-    # クライアント側ゲートウェイ（相乗り/自動起動）
-    "RouterServer",
-    "needs_vision",
-    "ensure_server",
-    "ServerHandle",
-    "ServerNotRunningError",
-    "check_model_served",
-    # マルチモデルゲートウェイ（gateway.toml）＋運用ヘルパ
-    "GatewayServer",
-    "GatewayConfig",
-    "ModelManager",
-    "CapacityError",
-    "load_gateway_config",
-    "run_gateway",
-    "server_status",
-    "daemon_log_path",
-    "ignore_shutdown_signals",
-    "project_cache_dir",
-    # 高レベルクライアント（公式 openai SDK を土台）＋ リクエスト整形ヘルパ
-    "LLMClient",
-    "connect",
-    "to_image_url",
-    "build_user_content",
-    "thinking_extra_body",
+    "run_gateway",        # gateway.toml のゲートウェイを起動（cli:main が呼ぶ本体）
+    "load_gateway_config",  # ./gateway.toml の読み込み
+    "GatewayConfig",      # 読み込んだゲートウェイ設定
+    "server_status",      # 稼働状態（応答可否・pid・モデル・ログ）
 ]

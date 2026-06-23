@@ -60,6 +60,7 @@ class _Model:
     ready: bool = False
     inflight: int = 0  # 処理中リクエスト数（>0 の間は退避しない）
     last_used: float = 0.0  # time.monotonic()。LRU の基準
+    requests: int = 0  # このモデルに振り分けた累計リクエスト数（表示用）
 
 
 class ModelManager:
@@ -83,6 +84,7 @@ class ModelManager:
         self._models: dict[str, _Model] = {c.model: _Model(config=c) for c in configs}
         self._max_resident = max_resident
         self._load_timeout = load_timeout   # 枠が空くのを待つ最大秒数（None で無期限）
+        self._started = time.monotonic()    # 起動経過時間（uptime 表示用）の基準
         # registry 保護＋「枠が空いた」通知用。release で inflight→0 のとき notify する。
         self._state = threading.Condition()
         self._control = threading.Lock()    # 起動/退避（control plane）の直列化
@@ -105,6 +107,7 @@ class ModelManager:
         with self._state:
             if mm.ready and mm.server is not None:
                 mm.inflight += 1
+                mm.requests += 1
                 mm.last_used = time.monotonic()
                 return (mm.config.host, mm.config.port), mm
         # 低速パス: ロードが要る。control で直列化する。
@@ -112,6 +115,7 @@ class ModelManager:
             with self._state:
                 if mm.ready and mm.server is not None:  # 待っている間に他スレッドがロード済み
                     mm.inflight += 1
+                    mm.requests += 1
                     mm.last_used = time.monotonic()
                     return (mm.config.host, mm.config.port), mm
             self._evict_if_needed(keep=model_id)
@@ -126,6 +130,7 @@ class ModelManager:
                 mm.server = server
                 mm.ready = True
                 mm.inflight += 1
+                mm.requests += 1
                 mm.last_used = time.monotonic()
             return (mm.config.host, mm.config.port), mm
 
@@ -205,18 +210,29 @@ class ModelManager:
                 srv.stop()  # state ロックの外で（最長 ~10s かかるため）
         return len(victims)
 
+    def uptime(self) -> float:
+        """起動からの経過秒数（表示用）。"""
+        return time.monotonic() - self._started
+
     def status(self) -> list[dict]:
+        now = time.monotonic()
         with self._state:
-            return [
-                {
+            out = []
+            for m in self._models.values():
+                loaded = m.server is not None and m.ready
+                # アイドル経過は「ロード済みかつ処理中でない」ときだけ意味がある
+                # （idle_timeout までの残り表示に使う）。それ以外は None。
+                idle_for = round(now - m.last_used, 1) if (loaded and m.inflight == 0) else None
+                out.append({
                     "model": m.config.model,
                     "backend": m.config.backend,
                     "port": m.config.port,
-                    "loaded": m.server is not None and m.ready,
+                    "loaded": loaded,
                     "inflight": m.inflight,
-                }
-                for m in self._models.values()
-            ]
+                    "requests": m.requests,
+                    "idle_for": idle_for,
+                })
+            return out
 
     def shutdown(self) -> None:
         """全モデルサーバーを並列に停止する（ゲートウェイ終了時）。
@@ -250,12 +266,20 @@ class GatewayServer(ThreadingHTTPServer):
         catalog: list[str],
         default_model: str | None = None,
         timeout_s: float | None = None,
+        max_resident: int | None = None,
+        idle_timeout: float | None = None,
+        load_timeout: float | None = None,
     ) -> None:
         super().__init__(addr, _GatewayHandler)
         self.manager = manager
         self.catalog = catalog            # /v1/models で返すモデル一覧
         self.default_model = default_model
         self.timeout_s = timeout_s        # None なら無制限（長時間生成に備える）
+        # GET /admin/status（GUI 等の監視用）で返すゲートウェイ設定。運用ポリシーを
+        # 添えることで、常駐モデルのライブ状態と一緒に「上限/退避方針」も読み取れる。
+        self.max_resident = max_resident
+        self.idle_timeout = idle_timeout
+        self.load_timeout = load_timeout
 
 
 class _GatewayHandler(BaseHTTPRequestHandler):
@@ -267,12 +291,33 @@ class _GatewayHandler(BaseHTTPRequestHandler):
         pass
 
     def do_GET(self) -> None:
+        path = self.path.rstrip("/")
+        srv = self.server  # type: ignore[assignment]
         # /v1/models は設定済みカタログを合成して返す（is_ready 判定・モデル取り違え
         # 警告に対応）。実モデルは起動していなくてもカタログとして列挙する。
-        if self.path.rstrip("/").endswith("/models"):
+        if path.endswith("/models"):
             data = {
                 "object": "list",
-                "data": [{"id": m, "object": "model"} for m in self.server.catalog],  # type: ignore[attr-defined]
+                "data": [{"id": m, "object": "model"} for m in srv.catalog],
+            }
+            send_json(self, 200, data)
+            return
+        # /admin/status は常駐モデルのライブ状態（loaded/inflight）＋運用ポリシーを返す。
+        # GUI（メニューバー監視）が CLI の --status より詳しい状態を出すための読み取り口。
+        if path.endswith("/admin/status"):
+            host, port = srv.server_address[0], srv.server_address[1]
+            models = srv.manager.status()
+            data = {
+                "object": "gateway.status",
+                "host": host,
+                "port": port,
+                "max_resident": srv.max_resident,
+                "idle_timeout": srv.idle_timeout,
+                "load_timeout": srv.load_timeout,
+                "default_model": srv.default_model,
+                "uptime": round(srv.manager.uptime(), 1),
+                "requests": sum(m.get("requests", 0) for m in models),
+                "models": models,
             }
             send_json(self, 200, data)
             return
@@ -463,6 +508,9 @@ def run_gateway(cfg: GatewayConfig) -> int:
         manager,
         catalog=[c.model for c in cfg.models],
         default_model=cfg.default_model,
+        max_resident=cfg.max_resident,
+        idle_timeout=cfg.idle_timeout,
+        load_timeout=cfg.load_timeout,
     )
     public = f"http://{cfg.host}:{cfg.port}/v1"
     print("Gateway ready (lazy multi-model):", file=sys.stderr)

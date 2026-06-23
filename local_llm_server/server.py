@@ -83,12 +83,20 @@ def _signal_process_tree(proc: subprocess.Popen, *, kill: bool) -> None:
 
 
 def find_pids_on_port(port: int) -> list[int]:
-    """指定ポートを LISTEN しているプロセスの PID 一覧を返す（POSIX のみ、lsof を利用）。
+    """指定ポートを LISTEN しているプロセスの PID 一覧を返す（macOS / Linux / Windows）。
 
-    lsof が無い / Windows などでは空リストを返す（呼び出し側で案内する）。
+    POSIX は lsof、Windows は netstat を使う。該当ツールが無い等で特定できなければ
+    空リストを返す（呼び出し側で案内する）。
     """
-    if not _POSIX:
-        return []
+    if _POSIX:
+        return _find_pids_lsof(port)
+    if os.name == "nt":
+        return _find_pids_netstat(port)
+    return []
+
+
+def _find_pids_lsof(port: int) -> list[int]:
+    """lsof で LISTEN 中の PID を引く（macOS / Linux）。"""
     try:
         # プロトコルとポートは 1 つの -i セレクタにまとめる。-iTCP と -i:PORT を
         # 分けると lsof は両者を OR 解釈し、全 TCP プロセスにマッチしてしまう。
@@ -107,11 +115,47 @@ def find_pids_on_port(port: int) -> list[int]:
     return pids
 
 
-def stop_pid(pid: int, timeout: float = 10.0) -> bool:
-    """PID とそのプロセスグループへ SIGTERM→（猶予後）SIGKILL を送って停止する。
+def _find_pids_netstat(port: int) -> list[int]:
+    """netstat -ano で LISTENING 中の PID を引く（Windows）。
 
-    停止を試みたら True、対象が既にいなければ False（POSIX 以外も False）。
+    出力の各行は「Proto  ローカルアドレス  外部アドレス  状態  PID」。ローカルアドレスの
+    ポート（末尾 `:<port>`）が一致し、状態が LISTENING の行から PID 列を集める
+    （0.0.0.0 / [::] / 127.0.0.1 などホスト表記の違いはポート一致で吸収する）。
     """
+    try:
+        result = subprocess.run(
+            ["netstat", "-ano", "-p", "tcp"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return []
+    pids: list[int] = []
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 5 or parts[0].upper() != "TCP":
+            continue
+        local, state, pid = parts[1], parts[3], parts[4]
+        if state.upper() != "LISTENING":
+            continue
+        if local.rsplit(":", 1)[-1] != str(port):
+            continue
+        try:
+            p = int(pid)
+        except ValueError:
+            continue
+        if p and p not in pids:
+            pids.append(p)
+    return pids
+
+
+def stop_pid(pid: int, timeout: float = 10.0) -> bool:
+    """PID（とその子/プロセスグループ）を停止する（macOS / Linux / Windows）。
+
+    POSIX はプロセスグループへ SIGTERM→（猶予後）SIGKILL、Windows は taskkill /T /F で
+    ツリーごと止める。停止を試みたら True、対象が既にいなければ False。
+    """
+    if os.name == "nt":
+        return _stop_pid_windows(pid)
     if not _POSIX:
         return False
     try:
@@ -144,6 +188,22 @@ def stop_pid(pid: int, timeout: float = 10.0) -> bool:
     except (ProcessLookupError, PermissionError):
         pass
     return True
+
+
+def _stop_pid_windows(pid: int) -> bool:
+    """taskkill でプロセスツリー（/T）を強制終了する（Windows）。
+
+    モデルサーバーはゲートウェイの子プロセスなので /T で一緒に止まる。対象が既に
+    いない / taskkill が無いときは False。
+    """
+    try:
+        result = subprocess.run(
+            ["taskkill", "/PID", str(pid), "/T", "/F"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
 
 
 @dataclass
@@ -550,3 +610,86 @@ def server_status(host: str = "127.0.0.1", port: int = 8799) -> dict | None:
         "models": list_models(base_url) if ready else [],
         "log_path": log if os.path.exists(log) else None,
     }
+
+
+def gateway_admin_status(
+    host: str = "127.0.0.1", port: int = 8799, timeout: float = 2.0
+) -> dict | None:
+    """ゲートウェイの GET /admin/status を取得する（常駐モデルのライブ状態＋運用方針）。
+
+    server_status と違い、各モデルの loaded / inflight（処理中数）や max_resident /
+    idle_timeout までゲートウェイ本体から取得できる（→ GUI 監視用）。応答しない・旧版で
+    エンドポイントが無い場合は None を返す（呼び出し側は server_status にフォールバックできる）。
+    """
+    url = f"http://{host}:{port}/admin/status"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            if resp.status != 200:
+                return None
+            data = json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def gateway_log_path(port: int) -> str:
+    """バックグラウンド起動したゲートウェイ本体（公開ポート）の出力ログ保存先。
+
+    モデルサーバーの daemon_log_path（server-<port>.log）と別に、ゲートウェイ自身の
+    起動ログを gateway-<port>.log に逃がす（`--status` / GUI から参照できる固定パス）。
+    """
+    return os.path.join(project_cache_dir(), f"gateway-{port}.log")
+
+
+def start_gateway_background(
+    cwd: str,
+    host: str = "127.0.0.1",
+    port: int = 8799,
+    *,
+    start_timeout: float = 120.0,
+) -> int:
+    """ゲートウェイをデタッチした別プロセスで常駐起動し、応答可能になるまで待つ。
+
+    ターミナルを占有しない常駐起動（Ollama 流）。cwd の ./gateway.toml を読む
+    フォアグラウンド版（`python -m local_llm_server.cli`）を、新セッション（POSIX）/
+    DETACHED_PROCESS（Windows）で起動して端末・親から切り離し、出力は gateway_log_path に
+    逃がす。応答可能になったら PID を返す。既に起動済みなら何もせず既存 PID（不明なら 0）を返す。
+    起動失敗は RuntimeError、時間内に応答しなければ TimeoutError。
+    """
+    base_url = f"http://{host}:{port}/v1"
+    existing = find_pids_on_port(port)
+    if is_ready(base_url) or existing:
+        return existing[0] if existing else 0
+
+    log_path = gateway_log_path(port)
+    os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
+    log_file = open(log_path, "a", encoding="utf-8")
+    popen_kwargs: dict = {
+        "cwd": cwd,
+        "stdin": subprocess.DEVNULL,
+        "stdout": log_file,
+        "stderr": subprocess.STDOUT,
+    }
+    if os.name == "nt":
+        # 端末から切り離し、新プロセスグループにする（stop の taskkill /T と対）。
+        popen_kwargs["creationflags"] = (
+            subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        )
+    else:
+        popen_kwargs["start_new_session"] = True  # setsid: 端末/親から独立
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "local_llm_server.cli"], **popen_kwargs
+        )
+    finally:
+        log_file.close()  # fd は子へ複製済み。親側は閉じてよい
+    deadline = time.monotonic() + start_timeout
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            raise RuntimeError(
+                f"gateway exited early (code {proc.returncode}); see {log_path}"
+            )
+        if is_ready(base_url):
+            return proc.pid
+        time.sleep(0.5)
+    raise TimeoutError(f"gateway not ready within {start_timeout:g}s; see {log_path}")
