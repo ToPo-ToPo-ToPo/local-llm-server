@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import threading
@@ -396,6 +397,27 @@ class TrayApp:
 APP_NAME = "Local LLM Gateway"
 
 
+def _default_launcher_path() -> str:
+    """この OS のランチャの既定パス（install/uninstall で共有）。"""
+    if sys.platform == "darwin":
+        return os.path.expanduser(f"~/Applications/{APP_NAME}.app")
+    if os.name == "nt":
+        return os.path.join(os.path.expanduser("~"), "Desktop", f"{APP_NAME}.cmd")
+    return os.path.expanduser("~/.local/share/applications/local-llm-gateway.desktop")
+
+
+def uninstall_launcher(dest: str | None = None) -> list[str]:
+    """クリック起動ランチャを削除し、消したパス一覧を返す（無ければ空）。"""
+    path = dest or _default_launcher_path()
+    if not os.path.exists(path):
+        return []
+    if os.path.isdir(path):
+        shutil.rmtree(path)
+    else:
+        os.remove(path)
+    return [path]
+
+
 def install_launcher(
     project_dir: str,
     python_exe: str,
@@ -472,7 +494,7 @@ def _write_icns(path: str) -> bool:
 def _install_macos_app(
     project_dir, python_exe, start_gateway, menubar_only=False, dest=None
 ) -> str:
-    dest = dest or os.path.expanduser(f"~/Applications/{APP_NAME}.app")
+    dest = dest or _default_launcher_path()
     contents = os.path.join(dest, "Contents")
     macos = os.path.join(contents, "MacOS")
     resources = os.path.join(contents, "Resources")
@@ -511,9 +533,8 @@ def _install_macos_app(
 
 
 def _install_linux_desktop(project_dir, python_exe, start_gateway, dest=None) -> str:
-    apps = os.path.expanduser("~/.local/share/applications")
-    os.makedirs(apps, exist_ok=True)
-    dest = dest or os.path.join(apps, "local-llm-gateway.desktop")
+    dest = dest or _default_launcher_path()
+    os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
     exec_cmd = (
         f"sh -c {shlex.quote(f'cd {shlex.quote(project_dir)} && exec ' + _gui_command(python_exe, start_gateway))}"
     )
@@ -528,7 +549,7 @@ def _install_linux_desktop(project_dir, python_exe, start_gateway, dest=None) ->
 
 
 def _install_windows_cmd(project_dir, python_exe, start_gateway, dest=None) -> str:
-    dest = dest or os.path.join(os.path.expanduser("~"), "Desktop", f"{APP_NAME}.cmd")
+    dest = dest or _default_launcher_path()
     # pythonw があればコンソール窓を出さずに起動する。
     pyw = python_exe
     if pyw.lower().endswith("python.exe"):
@@ -574,7 +595,22 @@ def main(argv: list[str] | None = None) -> int:
         help="With --install-app on macOS, make a menu-bar-only agent app (no Dock icon) "
         "instead of a normal Dock app.",
     )
+    parser.add_argument(
+        "--uninstall-app",
+        action="store_true",
+        help="Remove the clickable launcher (and stop a running gateway) and exit. "
+        "Add --purge to also delete the gateway logs.",
+    )
+    parser.add_argument(
+        "--purge",
+        action="store_true",
+        help="With --uninstall-app, also delete the gateway logs/cache (./.local-llm-server).",
+    )
     args = parser.parse_args(argv)
+
+    # アンインストールは gateway.toml が無くても動かせる（先に処理する）。
+    if args.uninstall_app:
+        return _uninstall(purge=args.purge)
 
     config_path = _resolve_config()
     if config_path is None:
@@ -601,6 +637,83 @@ def main(argv: list[str] | None = None) -> int:
         app._start_gateway_async()
     app.run()
     return 0
+
+
+def _uninstall(purge: bool = False) -> int:
+    """クリック起動ランチャを削除し、動いていればゲートウェイも止める（--uninstall-app）。
+
+    アプリ・ログを消すだけで跡形なく消える設計（自動起動やシステム改変はしていない）。
+    コード/依存ごと消すにはリポジトリのフォルダを削除する旨を案内する。
+    """
+    # 動いているゲートウェイを止める（gateway.toml があればそのポートを対象に best-effort）。
+    cfg_path = _resolve_config()
+    if cfg_path is not None:
+        try:
+            cfg = load_gateway_config(cfg_path)
+            for port in [cfg.port] + [m.port for m in cfg.models]:
+                for pid in find_pids_on_port(port):
+                    stop_pid(pid)
+        except Exception:  # noqa: BLE001 - 停止は best-effort
+            pass
+
+    removed = uninstall_launcher()
+    if removed:
+        sys.stderr.write("Removed launcher:\n" + "".join(f"  {p}\n" for p in removed))
+    else:
+        sys.stderr.write(f"No launcher found at {_default_launcher_path()}.\n")
+
+    if purge:
+        # リポジトリ内のログ＋（念のため）macOS がアプリ毎に作りうる per-app の場所も掃除。
+        # 通常ここには何も作らない設計だが、「よくわからない箇所のゴミ」を残さないため。
+        swept = []
+        for path in [project_cache_dir(), *_app_data_paths()]:
+            if os.path.isdir(path) or os.path.isfile(path):
+                if os.path.isdir(path):
+                    shutil.rmtree(path, ignore_errors=True)
+                else:
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        continue
+                swept.append(path)
+        if swept:
+            sys.stderr.write("Removed app data:\n" + "".join(f"  {p}\n" for p in swept))
+
+    sys.stderr.write(
+        "Done. If the menu-bar app is still open, choose Quit from its menu.\n"
+        "To remove the code and dependencies too, delete this repository folder.\n"
+    )
+    # モデル本体は HuggingFace の共有キャッシュに入る。他ツールと共用するため、ここは
+    # **一切削除しない**（場所を案内するだけ。purge 対象にも含めない）。
+    hub = os.path.expanduser("~/.cache/huggingface")
+    if os.path.isdir(hub):
+        sys.stderr.write(
+            f"\nModel weights stay in the shared HuggingFace cache ({hub}); this "
+            "uninstaller never touches it because other tools use it too.\n"
+        )
+    return 0
+
+
+def _app_data_paths() -> list[str]:
+    """macOS でアプリ/ライブラリが per-app に作りうる場所（uninstall --purge の掃除対象）。
+
+    現行の実装はここに何も書かないが、過去に試した rumps 等のライブラリが
+    `~/Library/Application Support/local-llm-server` を作ることがある。bundle id 配下の
+    Saved State / Preferences / Caches も含め、取りこぼしを防ぐために列挙する。macOS 以外は空。
+    """
+    if sys.platform != "darwin":
+        return []
+    home = os.path.expanduser("~")
+    lib = os.path.join(home, "Library")
+    bid = "com.local-llm-server.gui"
+    return [
+        os.path.join(lib, "Application Support", "local-llm-server"),
+        os.path.join(lib, "Application Support", bid),
+        os.path.join(lib, "Saved Application State", f"{bid}.savedState"),
+        os.path.join(lib, "Preferences", f"{bid}.plist"),
+        os.path.join(lib, "Caches", bid),
+        os.path.join(lib, "HTTPStorages", bid),
+    ]
 
 
 if __name__ == "__main__":

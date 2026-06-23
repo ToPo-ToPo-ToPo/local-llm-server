@@ -195,6 +195,39 @@ def test_install_macos_app_without_start_gateway(tmp_path):
     assert "--start-gateway" not in launch
 
 
+def test_uninstall_launcher_removes_bundle(tmp_path):
+    dest = tmp_path / "App.app"
+    (dest / "Contents").mkdir(parents=True)
+    (dest / "Contents" / "Info.plist").write_text("x")
+    removed = gui.uninstall_launcher(dest=str(dest))
+    assert removed == [str(dest)]
+    assert not dest.exists()
+
+
+def test_uninstall_launcher_noop_when_absent(tmp_path):
+    assert gui.uninstall_launcher(dest=str(tmp_path / "nope.app")) == []
+
+
+def test_app_data_paths_darwin(monkeypatch):
+    monkeypatch.setattr(gui.sys, "platform", "darwin")
+    paths = gui._app_data_paths()
+    assert any(p.endswith("Application Support/local-llm-server") for p in paths)
+    assert any("com.local-llm-server.gui" in p for p in paths)   # bundle id 配下も掃除
+
+
+def test_app_data_paths_empty_off_darwin(monkeypatch):
+    monkeypatch.setattr(gui.sys, "platform", "linux")
+    assert gui._app_data_paths() == []
+
+
+def test_purge_never_targets_model_cache(monkeypatch):
+    # --purge が消すのはランチャ・リポジトリ内ログ・macOS per-app のみ。共有モデル
+    # キャッシュ（~/.cache/huggingface）は他ツールと共用なので絶対に対象に入れない。
+    monkeypatch.setattr(gui.sys, "platform", "darwin")
+    targets = [gui.project_cache_dir(), *gui._app_data_paths()]
+    assert not any("huggingface" in t or "/.cache/" in t for t in targets)
+
+
 def test_install_linux_desktop_writes_entry(tmp_path):
     dest = str(tmp_path / "app.desktop")
     gui._install_linux_desktop("/proj", "/py", start_gateway=True, dest=dest)
