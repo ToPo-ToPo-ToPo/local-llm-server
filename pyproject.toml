@@ -1,7 +1,7 @@
 [project]
 name = "local-llm-server"
-version = "0.1.0"
-description = "ローカルLLM（mlx / mlx-vlm / llama.cpp / router）を OpenAI 互換 API として起動・管理する軽量サーバー"
+version = "0.2.0"
+description = "ローカルLLM（mlx / mlx-vlm / llama.cpp / router）を OpenAI 互換 API として起動・管理する拡張サーバーライブラリ（相乗り/自動起動・MTP・高レベルクライアント付き）"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
@@ -28,10 +28,15 @@ mlx = [
     "mlx-lm>=0.31.3 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
     "mlx-vlm>=0.5.0 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
 ]
+# 高レベルクライアント（LLMClient / connect）。OpenAI 互換 API を叩く client.py 用。
+client = [
+    "openai>=1.0",
+]
 
 [dependency-groups]
 dev = [
     "pytest>=8.0",
+    "openai>=1.0",  # client.py のテスト用
 ]
 
 [project.urls]

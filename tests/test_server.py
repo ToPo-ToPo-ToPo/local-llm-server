@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 
-import local_llm_server as srv
+import local_llm_server.server as srv
 from local_llm_server import (
     BACKENDS,
     MTP_DRAFTERS,
@@ -119,11 +119,11 @@ def test_default_backend_and_supported():
 
 def test_default_backend_is_vision_on_apple_silicon(monkeypatch):
     # Apple Silicon では既定を vision 対応の mlx-vlm にする（既定モデルが多モーダル）。
-    monkeypatch.setattr("local_llm_server.sys.platform", "darwin")
-    monkeypatch.setattr("local_llm_server.platform.machine", lambda: "arm64")
+    monkeypatch.setattr("local_llm_server.server.sys.platform", "darwin")
+    monkeypatch.setattr("local_llm_server.server.platform.machine", lambda: "arm64")
     assert default_backend() == "mlx-vlm"
     # それ以外は llama.cpp
-    monkeypatch.setattr("local_llm_server.sys.platform", "linux")
+    monkeypatch.setattr("local_llm_server.server.sys.platform", "linux")
     assert default_backend() == "llama-cpp"
 
 
@@ -294,7 +294,7 @@ def test_models_match():
 
 def test_running_model_parses_v1_models(monkeypatch):
     import io
-    import local_llm_server as srv
+    import local_llm_server.server as srv
 
     class _Resp:
         def __init__(self, body):
@@ -330,14 +330,14 @@ class _Resp:
 
 
 def _patch_models(monkeypatch, body):
-    import local_llm_server as srv
+    import local_llm_server.server as srv
     monkeypatch.setattr(
         srv.urllib.request, "urlopen", lambda url, timeout=5.0: _Resp(body)
     )
 
 
 def test_list_models_returns_all_ids(monkeypatch):
-    import local_llm_server as srv
+    import local_llm_server.server as srv
     _patch_models(monkeypatch, '{"data": [{"id": "a/Foo"}, {"id": "b/Bar"}, {"id": "c/Baz"}]}')
     assert srv.list_models("http://x/v1") == ["a/Foo", "b/Bar", "c/Baz"]
 
@@ -348,7 +348,7 @@ def test_list_models_returns_all_ids(monkeypatch):
 
 
 def test_model_available_against_router_catalog(monkeypatch):
-    import local_llm_server as srv
+    import local_llm_server.server as srv
     # ルーター型サーバー: 先頭は別モデルだが、設定モデルはカタログに含まれる → True（誤警告しない）
     _patch_models(
         monkeypatch,

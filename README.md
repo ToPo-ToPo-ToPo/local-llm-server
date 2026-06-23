@@ -1,24 +1,64 @@
 # local-llm-server
 
 ローカルLLM（**mlx** / **mlx-vlm** / **llama.cpp**）を **OpenAI 互換 API** として
-起動・管理する軽量サーバー。テキストと画像（vision）を自動で振り分ける
-**router** モードを備え、任意の OpenAI 互換クライアントからそのまま利用できる。
+起動・管理する**拡張サーバーライブラリ**。素の OpenAI 互換サーバーの起動だけでなく、
+複数のエージェントで重複しがちな処理（相乗り/自動起動・MTP 高速化・マルチモーダル
+生成）を共通機能として備える。
 
-- コア機能（プロセスの起動・監視・graceful shutdown・router プロキシ）は
-  **標準ライブラリのみ**で動作。
-- 実際の推論バックエンドは extras で導入（Apple Silicon では `mlx` を自動選択）。
+- **LLM 実行** — `LocalServer` / `ServerConfig` / `ServerPool`（プロセス起動・監視・graceful shutdown）
+- **ゲートウェイ** — `RouterServer`（テキスト/vision 振り分け）, `ensure_server()`（相乗り or 自動起動）
+- **MTP（投機的デコード）** — `resolve_drafter` / `MTP_DRAFTERS`（本体の出力を変えず ~2倍速）
+- **高レベルクライアント** — `LLMClient` / `connect()`（任意 extra）
+
+コア（起動・ゲートウェイ・MTP 解決）は**標準ライブラリのみ**で動作し、推論バックエンド
+と高レベルクライアントは extras で導入する。
 
 ## インストール（[uv](https://docs.astral.sh/uv/)）
 
 uv プロジェクトの依存に追加する（extras 指定はクォート必須＝zsh の glob 展開回避）。
 
 ```bash
-uv add "local-llm-server[mlx]"
+uv add "local-llm-server[mlx]"            # サーバー + mlx バックエンド
+uv add "local-llm-server[mlx,client]"     # + 高レベルクライアント(LLMClient/connect)
 ```
 
-`[mlx]` は Apple Silicon 向けの mlx / mlx-vlm バックエンドを同梱する extras。
-extras 無し（`local-llm-server`）の場合、コアは標準ライブラリのみで動き、
-推論バックエンド（llama.cpp など）は別途用意する。
+extras の内訳:
+
+| extra | 入るもの | 用途 |
+|---|---|---|
+| （無し） | コアのみ（標準ライブラリ） | 起動・ゲートウェイ・MTP 解決だけ使う |
+| `mlx` | `mlx-lm` / `mlx-vlm` | Apple Silicon で実際に推論する |
+| `client` | `openai` | `LLMClient` / `connect()` で生成まで行う |
+
+## 高レベル API（重複処理の共通化）
+
+複数エージェントが各自書いていた「サーバーを用意して生成する」を 1 呼び出しに:
+
+```python
+# uv add "local-llm-server[mlx,client]"
+from local_llm_server import connect
+
+# 既存サーバーがあれば相乗り、無ければ MTP 付きで自動起動 → 繋がった client を返す
+llm = connect(model="mlx-community/Qwen3.6-27B-4bit", draft_model="auto")
+print(llm.respond("俳句を一つ詠んでください。"))           # 非ストリーム
+for piece in llm.respond("利点は？", stream=True):          # ストリーム
+    print(piece, end="", flush=True)
+llm.stop()   # connect が自動起動した場合のみ停止（相乗りなら無害）
+```
+
+サーバーの用意だけ（クライアントは自前）なら `ensure_server()`:
+
+```python
+from local_llm_server import ensure_server
+
+handle = ensure_server(model="mlx-community/Qwen3.6-27B-4bit", draft_model="auto",
+                       log=print)        # 相乗り判定・モデル整合チェック・自動起動
+try:
+    base_url = handle.base_url           # ここに OpenAI 互換クライアントを向ける
+    for w in handle.warnings:            # 取り違え（モデル不一致）の警告があれば
+        ...
+finally:
+    handle.stop()                        # 自動起動した分だけ停止
 
 ## 使い方
 
