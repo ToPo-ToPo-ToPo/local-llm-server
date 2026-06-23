@@ -19,9 +19,11 @@ extras 指定はクォート必須（zsh の glob 展開回避）。内訳:
 
 | extra | 入るもの | 用途 |
 |---|---|---|
-| （無し） | コアのみ（標準ライブラリ） | 起動・router・MTP 解決だけ使う |
+| （無し） | コアのみ（標準ライブラリ） | 起動・router・MTP 解決・組み込みクライアント |
 | `mlx` | `mlx-lm` / `mlx-vlm` | Apple Silicon で実際に推論する |
-| `client` | `openai` | 後述の「Python から自動起動」を使う場合 |
+
+ライブラリ機能（`connect` / `LLMClient` / `ensure_server` …）はすべて**標準ライブラリ
+のみ**で動く。追加の client 用 extra は不要。
 
 ## 使い方
 
@@ -57,20 +59,19 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
   }' | python3 -c "import sys, json; print(json.load(sys.stdin)['choices'][0]['message']['content'])"
 ```
 
-Python（標準の `openai` クライアント）:
+Python（組み込みの `LLMClient`。追加依存なし）:
 
 ```python
-from openai import OpenAI
+from local_llm_server import LLMClient
 
-client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="not-needed")
-resp = client.chat.completions.create(
-    model="mlx-community/Qwen3.6-27B-4bit",
-    messages=[{"role": "user", "content": "ローカルLLMの利点を3つ。"}],
-)
-print(resp.choices[0].message.content)
+llm = LLMClient(model="mlx-community/Qwen3.6-27B-4bit",
+                base_url="http://127.0.0.1:8080/v1")
+print(llm.respond("ローカルLLMの利点を3つ。"))                # 非ストリーム → str
+for piece in llm.respond("もっと詳しく", stream=True):         # ストリーム → Iterator[str]
+    print(piece, end="", flush=True)
 ```
 
-ストリーミングは `stream=True`、画像は OpenAI と同じ `image_url` content パートで渡す。
+`openai` など他の OpenAI 互換クライアントでも同じ base_url にそのまま繋がる。
 
 ### 3. 停止する
 
@@ -87,7 +88,7 @@ uv run local-llm-server --stop
 ## （任意）Python から自動起動する
 
 「サーバーが無ければ自分で起動し、終了時に止める」を 1 呼び出しで済ませたいとき。
-上記の手順 1〜3 を内包する利便機能で、要 `[client]`（`uv add "local-llm-server[mlx,client]"`）。
+上記の手順 1〜3 を内包する利便機能（追加依存なし）。
 
 ```python
 from local_llm_server import connect

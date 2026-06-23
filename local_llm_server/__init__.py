@@ -6,15 +6,12 @@
   - LLM 実行          : LocalServer / ServerConfig / ServerPool（mlx / mlx-vlm / llama.cpp）
   - ゲートウェイ      : RouterServer（テキスト/vision 振り分け）, ensure_server（相乗り/自動起動）
   - MTP（投機的デコード）: resolve_drafter / MTP_DRAFTERS
-  - 高レベルクライアント : LLMClient / connect（任意 extra `local-llm-server[client]`）
+  - 高レベルクライアント : LLMClient / connect（標準ライブラリのみ。追加依存なし）
 
-公開 API は __all__ に列挙したものだけ。client 系（LLMClient / connect / to_image_url /
-build_user_content）は openai を必要とするため遅延 import で、参照時に初めて読み込む
-（コア import は標準ライブラリのみで完結）。
+公開 API は __all__ に列挙したものだけ。すべて標準ライブラリのみで動く
+（推論バックエンド本体だけ extra `local-llm-server[mlx]` で導入）。
 """
 from __future__ import annotations
-
-from typing import TYPE_CHECKING
 
 # --- 既定値・定数 -----------------------------------------------------------
 from .constants import BACKENDS, DEFAULT_MODEL, DEFAULT_VISION_MODEL
@@ -52,20 +49,8 @@ from .gateway import (
     ensure_server,
 )
 
-if TYPE_CHECKING:  # 型チェック時だけ実体を見せる（実行時は遅延 import）
-    from .client import LLMClient, build_user_content, connect, to_image_url
-
-# openai を必要とする client 系は遅延ロード。コア利用者に openai を強制しない。
-_CLIENT_EXPORTS = {"LLMClient", "connect", "to_image_url", "build_user_content"}
-
-
-def __getattr__(name: str):
-    if name in _CLIENT_EXPORTS:
-        from . import client
-
-        return getattr(client, name)
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
+# --- 高レベルクライアント（標準ライブラリのみ） ----------------------------
+from .client import LLMClient, build_user_content, connect, to_image_url
 
 __all__ = [
     # 定数
@@ -102,7 +87,7 @@ __all__ = [
     "ServerHandle",
     "ServerNotRunningError",
     "check_model_served",
-    # 高レベルクライアント（任意 extra: local-llm-server[client]）
+    # 高レベルクライアント（標準ライブラリのみ・追加依存なし）
     "LLMClient",
     "connect",
     "to_image_url",

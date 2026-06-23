@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["local-llm-server[mlx,client]"]
+# dependencies = ["local-llm-server[mlx]"]
 # ///
 """高レベル API（connect）だけで生成する最小サンプル。
 

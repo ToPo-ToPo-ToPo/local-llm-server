@@ -1,19 +1,15 @@
-"""OpenAI 互換サーバーへ繋ぐ高レベルクライアント（任意 extra）。
+"""OpenAI 互換サーバーへ繋ぐ高レベルクライアント（標準ライブラリのみ）。
 
 各エージェントが個別に書いていた「system / user / 画像をまとめて chat.completions に
-投げ、テキスト（or ストリーム）を受け取る」ラッパーを共通化する。`openai` パッケージ
-が必要なため、コア依存には含めない:
-
-    uv add "local-llm-server[client]"
-
-使い方（サーバーは別途起動済み）:
+投げ、テキスト（or ストリーム）を受け取る」ラッパー。`/v1/chat/completions` に JSON を
+POST し、SSE を読むだけなので **追加依存なし**（urllib で実装）。openai クライアントは不要。
 
     from local_llm_server import LLMClient
 
     llm = LLMClient(model="mlx-community/Qwen3.6-27B-4bit")
     print(llm.respond("俳句を一つ詠んでください。"))
 
-サーバーの相乗り/自動起動までまとめて行うなら connect() を使う:
+サーバーの相乗り/自動起動までまとめるなら connect():
 
     from local_llm_server import connect
 
@@ -24,20 +20,15 @@
 from __future__ import annotations
 
 import base64
+import json
 import mimetypes
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any, Iterator
 
 from .constants import DEFAULT_MODEL
 from .gateway import DEFAULT_BASE_URL, ServerHandle
-
-try:
-    from openai import OpenAI
-except ModuleNotFoundError as exc:  # pragma: no cover - 案内のみ
-    raise ModuleNotFoundError(
-        "local_llm_server.client requires the 'openai' package. "
-        'Install it with: uv add "local-llm-server[client]"'
-    ) from exc
 
 
 def _is_url(ref: str) -> bool:
@@ -75,7 +66,7 @@ def build_user_content(
 
 
 class LLMClient:
-    """OpenAI 互換エンドポイントへ繋ぐ最小クライアント。
+    """OpenAI 互換エンドポイントへ繋ぐ最小クライアント（標準ライブラリのみ）。
 
     respond() は非ストリームでは生成テキスト（str）を、stream=True ではテキスト断片の
     Iterator[str] を返す。マルチモーダルは images にローカルパス/URL を渡す。
@@ -89,14 +80,46 @@ class LLMClient:
         api_key: str = "not-needed",
         temperature: float = 0.0,
         max_tokens: int | None = None,
+        timeout: float | None = None,
     ) -> None:
         self.model = model
-        self.base_url = base_url
+        self.base_url = base_url.rstrip("/")
+        self.api_key = api_key
         self.temperature = float(temperature)
         self.max_tokens = max_tokens
-        self._client = OpenAI(base_url=base_url, api_key=api_key)
+        self.timeout = timeout
         self._handle: ServerHandle | None = None  # connect() が起動を紐づけるとき用
 
+    # --- リクエスト組み立て ---------------------------------------------
+    def _payload(self, user_text, system_prompt, images, stream, kwargs) -> dict:
+        messages: list[dict[str, Any]] = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": build_user_content(user_text, images)})
+        payload: dict[str, Any] = dict(
+            model=self.model, messages=messages, temperature=self.temperature, **kwargs
+        )
+        if self.max_tokens is not None:
+            payload["max_tokens"] = self.max_tokens
+        if stream:
+            payload["stream"] = True
+        return payload
+
+    def _request(self, payload: dict):
+        data = json.dumps(payload).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        req = urllib.request.Request(
+            f"{self.base_url}/chat/completions", data=data, headers=headers
+        )
+        try:
+            return urllib.request.urlopen(req, timeout=self.timeout)
+        except urllib.error.HTTPError as exc:  # 上流のエラーボディを見えるように
+            body = exc.read().decode("utf-8", "replace")
+            raise RuntimeError(f"server returned {exc.code}: {body}") from exc
+
+    # --- 生成 -----------------------------------------------------------
     def respond(
         self,
         user_text: str,
@@ -107,29 +130,33 @@ class LLMClient:
         **kwargs: Any,
     ) -> str | Iterator[str]:
         """1 ターン生成する。stream=True なら断片の Iterator[str] を返す。"""
-        messages: list[dict[str, Any]] = []
-        if system_prompt:
-            messages.append({"role": "system", "content": system_prompt})
-        messages.append({"role": "user", "content": build_user_content(user_text, images)})
-
-        params: dict[str, Any] = dict(
-            model=self.model, messages=messages, temperature=self.temperature, **kwargs
-        )
-        if self.max_tokens is not None:
-            params["max_tokens"] = self.max_tokens
-
+        payload = self._payload(user_text, system_prompt, images, stream, kwargs)
         if stream:
-            return self._stream(params)
-        resp = self._client.chat.completions.create(**params)
-        return resp.choices[0].message.content or ""
+            return self._stream(payload)
+        with self._request(payload) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+        return body["choices"][0]["message"].get("content") or ""
 
-    def _stream(self, params: dict[str, Any]) -> Iterator[str]:
-        for chunk in self._client.chat.completions.create(stream=True, **params):
-            if not chunk.choices:
-                continue
-            delta = chunk.choices[0].delta.content
-            if delta:
-                yield delta
+    def _stream(self, payload: dict) -> Iterator[str]:
+        # SSE: 各行が "data: {json}"、終端は "data: [DONE]"。delta.content を逐次返す。
+        with self._request(payload) as resp:
+            for raw in resp:
+                line = raw.decode("utf-8").strip()
+                if not line or not line.startswith("data:"):
+                    continue
+                data = line[len("data:"):].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                choices = chunk.get("choices") or []
+                if not choices:
+                    continue
+                piece = (choices[0].get("delta") or {}).get("content")
+                if piece:
+                    yield piece
 
     def stop(self) -> None:
         """connect() で自動起動したサーバーがあれば停止する（無ければ無害）。"""
@@ -152,6 +179,7 @@ def connect(
     draft_model: str | None = None,
     temperature: float = 0.0,
     max_tokens: int | None = None,
+    timeout: float | None = None,
     **ensure_kwargs: Any,
 ) -> LLMClient:
     """サーバーを用意（相乗り or 自動起動）してから、繋がった LLMClient を返す。
@@ -174,6 +202,7 @@ def connect(
         base_url=handle.base_url,
         temperature=temperature,
         max_tokens=max_tokens,
+        timeout=timeout,
     )
     client._handle = handle
     return client
