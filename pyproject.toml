@@ -1,7 +1,7 @@
 [project]
 name = "local-llm-server"
 version = "0.12.0"
-description = "ローカルLLM（mlx / mlx-vlm / llama.cpp）を OpenAI 互換 API で束ねるマルチモデルゲートウェイ（サーバー）。gateway.toml のカタログを 1 ポートで配信し、model で振り分け・遅延起動・LRU 退避・MTP 高速化（Ollama 流の共有デーモン）。接続用クライアントは別パッケージ llm-gateway-client。"
+description = "ローカルLLM（mlx / mlx-vlm / llama.cpp）を OpenAI 互換 API で束ねるマルチモデルゲートウェイ（サーバー）。gateway.toml のカタログを 1 ポートで配信し、model で振り分け・遅延起動・LRU 退避・MTP 高速化（Ollama 流の共有デーモン）。接続用クライアントは別パッケージ local-llm-client。"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
@@ -19,7 +19,7 @@ classifiers = [
 ]
 # ゲートウェイ本体は標準ライブラリのみで動く（純粋な HTTP 転送＋プロセス管理）。コア依存なし。
 # 推論バックエンド本体は extras で導入する（環境マーカーで Apple Silicon のときだけ自動選択。
-# 他 OS は llama.cpp を各自インストール）。接続用クライアントは別パッケージ llm-gateway-client。
+# 他 OS は llama.cpp を各自インストール）。接続用クライアントは別パッケージ local-llm-client。
 dependencies = []
 
 [project.optional-dependencies]

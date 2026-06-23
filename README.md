@@ -11,7 +11,7 @@
 > `local-llm-server-gui`（起動/停止/監視のアプリ。クリック起動アプリも作れる）の 2 コマンド。
 > ゲートウェイ本体は標準ライブラリのみで動き、**`openai` などのコア依存は無い**。
 >
-> **接続する側（クライアント）は別パッケージ [llm-gateway-client](https://github.com/ToPo-ToPo-ToPo/llm-gateway-client)**
+> **接続する側（クライアント）は別パッケージ [local-llm-client](https://github.com/ToPo-ToPo-ToPo/local-llm-client)**
 > に分離した。エージェントはそちらの `LLMClient` / `connect` を使う（または素の `openai` SDK で
 > `base_url` を指す）。サーバーを自前で起動する低レベル経路（`ensure_server` / `LocalServer` /
 > `RouterServer` 等）は非公開・サポート対象外（後方互換で import は残す）。
@@ -99,14 +99,14 @@ uv run local-llm-server-gui --install-app   # gateway.toml のあるディレク
 ### 3. 接続（ `model` で選ぶ）
 
 公開ポートの OpenAI 互換 API に繋ぎ、`model` で使うモデルを選ぶ。**接続用クライアントは別パッケージ
-[llm-gateway-client](https://github.com/ToPo-ToPo-ToPo/llm-gateway-client)**（エージェント共通の
+[local-llm-client](https://github.com/ToPo-ToPo-ToPo/local-llm-client)**（エージェント共通の
 `LLMClient` / `connect`）。
 
 ```bash
-uv add llm-gateway-client
+uv add local-llm-client
 ```
 ```python
-from llm_gateway_client import LLMClient
+from local_llm_client import LLMClient
 
 llm = LLMClient(model="mlx-community/Qwen3.6-27B-4bit",
                 base_url="http://127.0.0.1:8799/v1")

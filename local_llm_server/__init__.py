@@ -5,7 +5,7 @@
   - `local-llm-server`      … ./gateway.toml のゲートウェイをフォアグラウンド起動（cli:main）
   - `local-llm-server-gui`  … 起動/停止/監視のアプリ（クリック起動アプリも作れる。gui:main）
 
-**クライアント（接続する側）は別パッケージ `llm-gateway-client`** に切り出した。エージェントは
+**クライアント（接続する側）は別パッケージ `local-llm-client`** に切り出した。エージェントは
 そちらの `LLMClient` / `connect` を使う（または素の `openai` SDK で base_url を指す）。本パッケージは
 `openai` に依存しない（純粋な HTTP 転送＋プロセス管理。推論バックエンドは extra で導入）。
 
@@ -66,7 +66,7 @@ from .gateway import (
 )
 
 # 公開 API は「ゲートウェイの運用」だけに絞る（サーバー専用パッケージ）。クライアント
-# （LLMClient / connect）は別パッケージ llm-gateway-client へ移動した。
+# （LLMClient / connect）は別パッケージ local-llm-client へ移動した。
 __all__ = [
     "run_gateway",        # gateway.toml のゲートウェイを起動（cli:main が呼ぶ本体）
     "load_gateway_config",  # ./gateway.toml の読み込み
