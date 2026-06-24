@@ -10,7 +10,8 @@
 > **このパッケージはゲートウェイ・サーバー専用**。`local-llm-server`（引数なし）で**ターミナルの TUI
 > ダッシュボード**が開き、状態を自動更新表示しつつ起動・停止・再起動を操作できる（`--headless` /
 > `--start` / `--stop` / `--status` / `--restart` も）。必要ならトレイ GUI アプリ `local-llm-server-gui`
-> も選べる。ゲートウェイ本体は標準ライブラリのみで動き、**`openai` などのコア依存は無い**。
+> も選べる。ゲートウェイ本体は標準ライブラリのみで動き（コア依存は TUI 用の `textual` のみ、
+> **`openai` 等は不要**。`--headless` では textual も読み込まれない）。
 >
 > **接続する側（クライアント）は別パッケージ [local-llm-client](https://github.com/ToPo-ToPo-ToPo/local-automata-core/tree/main/packages/local-llm-client)**
 > に分離した。エージェントはそちらの `LLMClient` / `connect` を使う（または素の `openai` SDK で
@@ -85,7 +86,8 @@ uv run local-llm-server --restart  # 停止→再起動（gateway.toml 変更の
 - いずれも **CWD の `./gateway.toml`** を読む（場所＝設定の単一ルール）。
 - ログは `./.local-llm-server/gateway-<port>.log`。
 - 配下のモデルは初回リクエストで遅延起動し、`idle_timeout` で自動アンロードされる。
-- TUI は標準ライブラリ `curses`（macOS/Linux はそのまま）。Windows のみ `uv add windows-curses`。
+- TUI は [textual](https://textual.textualize.io/) 製（依存に含まれる。角丸枠・truecolor・本物の
+  入力欄・端末リサイズ追従）。`--headless` 実行では読み込まれない。
 
 ### 3.（任意）トレイ GUI アプリ
 

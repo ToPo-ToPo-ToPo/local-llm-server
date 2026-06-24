@@ -17,10 +17,14 @@ classifiers = [
     "Topic :: Software Development",
     "Operating System :: OS Independent",
 ]
-# ゲートウェイ本体は標準ライブラリのみで動く（純粋な HTTP 転送＋プロセス管理）。コア依存なし。
-# 推論バックエンド本体は extras で導入する（環境マーカーで Apple Silicon のときだけ自動選択。
-# 他 OS は llama.cpp を各自インストール）。接続用クライアントは別パッケージ local-llm-client。
-dependencies = []
+# ゲートウェイ本体は標準ライブラリのみで動く（純粋な HTTP 転送＋プロセス管理）。唯一のコア依存は
+# 既定起動の TUI ダッシュボード（tui_app.py）に使う textual（ターミナル運用前提のため core に置く。
+# headless では遅延 import されず読み込まれない）。推論バックエンド本体は extras で導入する
+# （環境マーカーで Apple Silicon のときだけ自動選択。他 OS は llama.cpp を各自）。接続用クライアントは
+# 別パッケージ local-llm-client。
+dependencies = [
+    "textual>=8.2.7",
+]
 
 [project.optional-dependencies]
 # Apple Silicon 向け mlx 系バックエンド（テキスト/vision/STT）。
