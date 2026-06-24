@@ -7,11 +7,13 @@
 - **モデルは初回リクエスト時に遅延起動**、`max_resident` 超過で LRU 退避、`idle_timeout` で自動アンロード。
 - クライアントは公開ポートに繋いで `model` を選ぶだけ。
 
-> **このパッケージはゲートウェイ・サーバー専用**。操作は `local-llm-server`（フォアグラウンド起動）と
-> `local-llm-server-gui`（起動/停止/監視のアプリ。クリック起動アプリも作れる）の 2 コマンド。
-> ゲートウェイ本体は標準ライブラリのみで動き、**`openai` などのコア依存は無い**。
+> **このパッケージはゲートウェイ・サーバー専用**。`local-llm-server`（引数なし）で**ターミナルの TUI
+> ダッシュボード**が開き、状態を自動更新表示しつつ起動・停止・再起動を操作できる（`--headless` /
+> `--start` / `--stop` / `--status` / `--restart` も）。必要ならトレイ GUI アプリ `local-llm-server-gui`
+> も選べる。ゲートウェイ本体は標準ライブラリのみで動き（コア依存は TUI 用の `textual` のみ、
+> **`openai` 等は不要**。`--headless` では textual も読み込まれない）。
 >
-> **接続する側（クライアント）は別パッケージ [local-llm-client](https://github.com/ToPo-ToPo-ToPo/agent-core/tree/main/packages/local-llm-client)**
+> **接続する側（クライアント）は別パッケージ [local-llm-client](https://github.com/ToPo-ToPo-ToPo/local-automata-core/tree/main/packages/local-llm-client)**
 > に分離した。エージェントはそちらの `LLMClient` / `connect` を使う（または素の `openai` SDK で
 > `base_url` を指す）。サーバーを自前で起動する低レベル経路（`ensure_server` / `LocalServer` /
 > `RouterServer` 等）は非公開・サポート対象外（後方互換で import は残す）。
@@ -54,10 +56,45 @@ backend = "mlx-vlm"
 
 MTP（投機的デコード）による高速化 → [docs/mtp.md](docs/mtp.md)。
 
-### 2. アプリを作って起動（操作はアプリに一本化）
+### 2. 起動・運用（ターミナル）
 
-ゲートウェイの**起動・停止・監視はすべてアプリ**（メニューバー/トレイ常駐）から行う。まず一度だけ
-クリック起動アプリを作る。**`make` を使えば 1 コマンド**（macOS / Linux）:
+`gateway.toml` のあるディレクトリで、**引数なしで起動すると TUI ダッシュボード**が開く。
+ゲートウェイを裏で常駐させ、状態を自動更新表示しながらキー操作できる（ターミナル版の常駐モニタ。
+**リポジトリのコードだけで完結**し、外部にアプリやランチャを一切置かない）。
+
+```bash
+uv run local-llm-server            # TUI ダッシュボード（既定）
+```
+
+- 上部にゲートウェイ（応答状態・port・起動経過・累計リクエスト）と各モデルの表
+  （loaded/idle/unloaded・内部ポート・処理中数・アイドル自動解放までの残り・累計）を**毎秒自動更新**。
+- 操作は単キー **`s`停止 / `r`再起動 / `g`起動 / `l`ログ / `q`終了**、`:` で打ち込みコマンド
+  （`stop`/`restart`/`start`/`log`/`quit`）。
+- `q` で終了してもゲートウェイは常駐し続ける（停止は `s` か下の `--stop`）。
+
+スクリプト用途や TUI を出したくないとき（パイプ/CI/裏起動）は運用フラグを使う。**非対話端末では
+自動でフォアグラウンド実行**になる:
+
+```bash
+uv run local-llm-server --headless # TUI なしでフォアグラウンド実行（Ctrl-C で停止）
+uv run local-llm-server --start    # バックグラウンド常駐起動（端末を離す。Ollama 流）
+uv run local-llm-server --status   # 応答可否・PID・提供モデル・ログパス
+uv run local-llm-server --stop     # 停止（配下のモデルサーバーも止める）
+uv run local-llm-server --restart  # 停止→再起動（gateway.toml 変更の反映に）
+```
+
+- いずれも **CWD の `./gateway.toml`** を読む（場所＝設定の単一ルール）。
+- ログは `./.local-llm-server/gateway-<port>.log`。
+- 配下のモデルは初回リクエストで遅延起動し、`idle_timeout` で自動アンロードされる。
+- TUI は [textual](https://textual.textualize.io/) 製（依存に含まれる。角丸枠・truecolor・本物の
+  入力欄・端末リサイズ追従）。`--headless` 実行では読み込まれない。
+
+### 3.（任意）トレイ GUI アプリ
+
+ターミナルを使わず、デスクトップで状態をひと目で見たい場合の代替。メニューバー（macOS）/通知領域
+（Windows）/トレイ（Linux）に常駐し、起動・停止・監視をクリックで行える。CLI と同じ `./gateway.toml`
+を読み、同じ運用基盤を共有する。まず一度だけクリック起動アプリを作る。**`make` を使えば 1 コマンド**
+（macOS / Linux）:
 
 ```bash
 make install        # 依存(mlx+gui)を入れて → クリック起動アプリを作成
@@ -96,10 +133,10 @@ uv run local-llm-server-gui --install-app   # gateway.toml のあるディレク
 初回リクエスト時に遅延起動**し、2 回目以降は常駐して即応答。`max_resident` 超過は LRU 退避、
 `idle_timeout` で自動アンロード。
 
-### 3. 接続（ `model` で選ぶ）
+### 4. 接続（ `model` で選ぶ）
 
 公開ポートの OpenAI 互換 API に繋ぎ、`model` で使うモデルを選ぶ。**接続用クライアントは別パッケージ
-[local-llm-client](https://github.com/ToPo-ToPo-ToPo/agent-core/tree/main/packages/local-llm-client)**（エージェント共通の
+[local-llm-client](https://github.com/ToPo-ToPo-ToPo/local-automata-core/tree/main/packages/local-llm-client)**（エージェント共通の
 `LLMClient` / `connect`）。
 
 ```bash

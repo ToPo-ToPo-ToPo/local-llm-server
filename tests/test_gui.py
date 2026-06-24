@@ -140,7 +140,8 @@ def test_start_gateway_background_spawns_detached(monkeypatch, tmp_path):
     monkeypatch.setattr(server.subprocess, "Popen", fake_popen)
     pid = server.start_gateway_background(str(tmp_path), "127.0.0.1", 8799, start_timeout=5)
     assert pid == 9999
-    assert captured["cmd"][1:] == ["-m", "local_llm_server.cli"]   # フォアグラウンド版を起動
+    # --headless 必須: 裏起動は非 TTY なので TUI を出さずゲートウェイ本体を回す。
+    assert captured["cmd"][1:] == ["-m", "local_llm_server.cli", "--headless"]
     assert captured["kw"]["cwd"] == str(tmp_path)
     import os as _os
     if _os.name == "nt":

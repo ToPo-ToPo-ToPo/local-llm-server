@@ -678,8 +678,9 @@ def start_gateway_background(
     else:
         popen_kwargs["start_new_session"] = True  # setsid: 端末/親から独立
     try:
+        # --headless 必須: 裏起動は出力をログへ逃がす非 TTY なので TUI を出さずゲートウェイ本体を回す。
         proc = subprocess.Popen(
-            [sys.executable, "-m", "local_llm_server.cli"], **popen_kwargs
+            [sys.executable, "-m", "local_llm_server.cli", "--headless"], **popen_kwargs
         )
     finally:
         log_file.close()  # fd は子へ複製済み。親側は閉じてよい
