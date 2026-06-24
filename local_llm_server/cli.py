@@ -7,14 +7,17 @@
 
 ターミナルだけで完結する運用フラグを備える:
 
-  * 引数なし   … フォアグラウンド実行（ターミナルを占有。Ctrl-C で停止）
+  * 引数なし   … TUI ダッシュボードを起動（対話端末のとき。ゲートウェイを裏で常駐させ、状態を
+                 自動更新表示しつつ s/r/g/l/q と `:` コマンドで操作する → tui.py）
+  * --headless … TUI を使わずフォアグラウンドでゲートウェイ実行（パイプ/CI/裏起動向け。
+                 端末が非 TTY のときは自動でこちらになる）
   * --start    … バックグラウンド常駐起動（ターミナルを離す。Ollama 流）
   * --stop     … 停止（配下のモデルサーバーも含めて止める）
   * --status   … 状態表示（応答可否・PID・提供モデル・ログパス）
   * --restart  … 停止してからバックグラウンド再起動（gateway.toml 変更の反映に）
 
 デスクトップで状態をひと目で見たい場合は、別途トレイ GUI アプリ（`local-llm-server-gui`）も
-選べる（CLI と同じ ./gateway.toml を読む）。CLI と GUI は同じ運用基盤（server.py）を共有する。
+選べる（CLI と同じ ./gateway.toml を読む）。CLI・TUI・GUI は同じ運用基盤（server.py）を共有する。
 """
 from __future__ import annotations
 
@@ -32,6 +35,18 @@ from .server import (
     start_gateway_background,
     stop_pid,
 )
+
+
+def _interactive_tty() -> bool:
+    """TUI を出してよい対話端末か（stdin/stdout が TTY）。
+
+    バックグラウンド起動（出力をログへリダイレクト）やパイプ・CI では False になり、
+    呼び出し側はフォアグラウンドのゲートウェイ実行に落とす（curses は端末が要る）。
+    """
+    try:
+        return sys.stdin.isatty() and sys.stdout.isatty()
+    except (AttributeError, ValueError):
+        return False
 
 
 def _resolve_config() -> str | None:
@@ -153,6 +168,12 @@ def main(argv: list[str] | None = None) -> int:
         help="Show the status of the gateway defined by ./gateway.toml (ready state, pid, served "
         "models, log path) instead of starting one.",
     )
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="Run the gateway in the foreground without the TUI dashboard (for pipes, CI, or "
+        "background launch). A non-interactive terminal selects this automatically.",
+    )
     args = parser.parse_args(argv)
 
     config_path = _resolve_config()
@@ -180,9 +201,22 @@ def main(argv: list[str] | None = None) -> int:
     if args.start:
         return _start_background(gcfg)
 
-    # 既定（引数なし）はフォアグラウンド起動。kill / ターミナルを閉じる（SIGTERM・SIGHUP）でも
-    # 下流の finally（gateway の manager.shutdown）を必ず通し、配下のモデルサーバーを孫プロセス
-    # として残さない。バックグラウンド常駐は --start（GUI からも起動できる）。
+    # 既定（引数なし）: 対話端末なら TUI ダッシュボード（ゲートウェイを裏で常駐させて監視・操作）。
+    # それ以外（--headless / 非 TTY / 裏起動・パイプ・CI）はフォアグラウンドでゲートウェイを実行する。
+    if not args.headless and _interactive_tty():
+        try:
+            from .tui import run_tui
+        except ImportError:
+            print(
+                "TUI is unavailable (curses not found; on Windows: `uv add windows-curses`). "
+                "Running headless instead.",
+                file=sys.stderr,
+            )
+        else:
+            return run_tui(gcfg)
+
+    # フォアグラウンド実行。kill / ターミナルを閉じる（SIGTERM・SIGHUP）でも下流の finally
+    # （gateway の manager.shutdown）を必ず通し、配下のモデルサーバーを孫プロセスとして残さない。
     install_shutdown_handlers()
     return run_gateway(gcfg)
 

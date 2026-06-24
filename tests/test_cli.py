@@ -26,12 +26,35 @@ def test_missing_gateway_toml_errors(tmp_path, monkeypatch):
         cli.main(["--status"])
 
 
-def test_default_runs_foreground(in_gateway_dir, monkeypatch):
+def test_default_runs_foreground_when_not_tty(in_gateway_dir, monkeypatch):
+    # 非対話端末（パイプ/CI/裏起動）では TUI を出さずフォアグラウンド実行に落ちる。
+    monkeypatch.setattr(cli, "_interactive_tty", lambda: False)
     called = {}
     monkeypatch.setattr(cli, "install_shutdown_handlers", lambda: called.update(sig=True))
     monkeypatch.setattr(cli, "run_gateway", lambda cfg: called.update(port=cfg.port) or 0)
     assert cli.main([]) == 0
     assert called == {"sig": True, "port": 8799}
+
+
+def test_default_opens_tui_when_interactive(in_gateway_dir, monkeypatch):
+    from local_llm_server import tui
+    monkeypatch.setattr(cli, "_interactive_tty", lambda: True)
+    seen = {}
+    monkeypatch.setattr(tui, "run_tui", lambda cfg: seen.update(port=cfg.port) or 0)
+    monkeypatch.setattr(cli, "run_gateway", lambda cfg: pytest.fail("must not run foreground"))
+    assert cli.main([]) == 0
+    assert seen["port"] == 8799
+
+
+def test_headless_forces_foreground_even_on_tty(in_gateway_dir, monkeypatch):
+    from local_llm_server import tui
+    monkeypatch.setattr(cli, "_interactive_tty", lambda: True)  # 端末でも
+    monkeypatch.setattr(tui, "run_tui", lambda cfg: pytest.fail("must not open TUI"))
+    ran = {}
+    monkeypatch.setattr(cli, "install_shutdown_handlers", lambda: None)
+    monkeypatch.setattr(cli, "run_gateway", lambda cfg: ran.update(ok=True) or 0)
+    assert cli.main(["--headless"]) == 0
+    assert ran["ok"]
 
 
 def test_status_dispatches(in_gateway_dir, monkeypatch):
