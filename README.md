@@ -7,11 +7,12 @@
 - **モデルは初回リクエスト時に遅延起動**、`max_resident` 超過で LRU 退避、`idle_timeout` で自動アンロード。
 - クライアントは公開ポートに繋いで `model` を選ぶだけ。
 
-> **このパッケージはゲートウェイ・サーバー専用**。操作は `local-llm-server`（フォアグラウンド起動）と
-> `local-llm-server-gui`（起動/停止/監視のアプリ。クリック起動アプリも作れる）の 2 コマンド。
-> ゲートウェイ本体は標準ライブラリのみで動き、**`openai` などのコア依存は無い**。
+> **このパッケージはゲートウェイ・サーバー専用**。`local-llm-server` をターミナルから起動・運用でき
+> （フォアグラウンド／`--start`・`--stop`・`--status`・`--restart`）、必要ならトレイ GUI アプリ
+> `local-llm-server-gui`（クリック起動アプリも作れる）も選べる。ゲートウェイ本体は標準ライブラリのみ
+> で動き、**`openai` などのコア依存は無い**。
 >
-> **接続する側（クライアント）は別パッケージ [local-llm-client](https://github.com/ToPo-ToPo-ToPo/agent-core/tree/main/packages/local-llm-client)**
+> **接続する側（クライアント）は別パッケージ [local-llm-client](https://github.com/ToPo-ToPo-ToPo/local-automata-core/tree/main/packages/local-llm-client)**
 > に分離した。エージェントはそちらの `LLMClient` / `connect` を使う（または素の `openai` SDK で
 > `base_url` を指す）。サーバーを自前で起動する低レベル経路（`ensure_server` / `LocalServer` /
 > `RouterServer` 等）は非公開・サポート対象外（後方互換で import は残す）。
@@ -54,10 +55,33 @@ backend = "mlx-vlm"
 
 MTP（投機的デコード）による高速化 → [docs/mtp.md](docs/mtp.md)。
 
-### 2. アプリを作って起動（操作はアプリに一本化）
+### 2. 起動・運用（ターミナル）
 
-ゲートウェイの**起動・停止・監視はすべてアプリ**（メニューバー/トレイ常駐）から行う。まず一度だけ
-クリック起動アプリを作る。**`make` を使えば 1 コマンド**（macOS / Linux）:
+`gateway.toml` のあるディレクトリで起動する。
+
+```bash
+uv run local-llm-server            # フォアグラウンド起動（Ctrl-C で停止）
+```
+
+ターミナルを離して常駐させたい・運用したいときは（Ollama 流）:
+
+```bash
+uv run local-llm-server --start    # バックグラウンド常駐起動（端末を離す）
+uv run local-llm-server --status   # 応答可否・PID・提供モデル・ログパス
+uv run local-llm-server --stop     # 停止（配下のモデルサーバーも止める）
+uv run local-llm-server --restart  # 停止→再起動（gateway.toml 変更の反映に）
+```
+
+- いずれも **CWD の `./gateway.toml`** を読む（場所＝設定の単一ルール）。
+- `--start` のログは `./.local-llm-server/gateway-<port>.log`。
+- 配下のモデルは初回リクエストで遅延起動し、`idle_timeout` で自動アンロードされる。
+
+### 3.（任意）トレイ GUI アプリ
+
+ターミナルを使わず、デスクトップで状態をひと目で見たい場合の代替。メニューバー（macOS）/通知領域
+（Windows）/トレイ（Linux）に常駐し、起動・停止・監視をクリックで行える。CLI と同じ `./gateway.toml`
+を読み、同じ運用基盤を共有する。まず一度だけクリック起動アプリを作る。**`make` を使えば 1 コマンド**
+（macOS / Linux）:
 
 ```bash
 make install        # 依存(mlx+gui)を入れて → クリック起動アプリを作成
@@ -96,10 +120,10 @@ uv run local-llm-server-gui --install-app   # gateway.toml のあるディレク
 初回リクエスト時に遅延起動**し、2 回目以降は常駐して即応答。`max_resident` 超過は LRU 退避、
 `idle_timeout` で自動アンロード。
 
-### 3. 接続（ `model` で選ぶ）
+### 4. 接続（ `model` で選ぶ）
 
 公開ポートの OpenAI 互換 API に繋ぎ、`model` で使うモデルを選ぶ。**接続用クライアントは別パッケージ
-[local-llm-client](https://github.com/ToPo-ToPo-ToPo/agent-core/tree/main/packages/local-llm-client)**（エージェント共通の
+[local-llm-client](https://github.com/ToPo-ToPo-ToPo/local-automata-core/tree/main/packages/local-llm-client)**（エージェント共通の
 `LLMClient` / `connect`）。
 
 ```bash
