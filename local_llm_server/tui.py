@@ -301,7 +301,7 @@ def _draw(stdscr, gcfg, view, colors, *, busy, msg, cmd_mode, cmd_buf) -> None:
     put(0, 2, "◆", A["accent"])
     put(0, 3, " local-llm-server ", A["text"])    # 前後の空白で罫線（─）を消してタイトルを浮かせる
     put(0, 21, "· gateway monitor ", A["dim"])
-    refresh = "⟳ starting" if busy else "⟳ live"
+    refresh = "updating" if busy else "live"   # フォント依存の記号は避け、どの端末でも読める語に
     put_r(0, W - 2, " " + refresh + " ", A["amber"] if busy else A["dim"])
 
     # 状態行
