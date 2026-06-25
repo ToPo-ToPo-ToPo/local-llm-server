@@ -15,34 +15,29 @@
 > [local-llm-client](https://pypi.org/project/local-llm-client/)（または素の `openai` SDK）で
 > 起動中のゲートウェイのポートに接続します。
 
-[uv](https://docs.astral.sh/uv/) で入れる。**目的に応じて 3 通り**（Apple Silicon は推論バックエンドの
-extra `[mlx]` を付ける。`[ ]` は zsh の glob 展開を避けるためクォート）。他 OS は付けず、llama.cpp を
-別途用意する → 末尾の注記。
+[uv](https://docs.astral.sh/uv/) を使う。**このリポジトリをクローンして、ソースから動かすのが基本。**
+Apple Silicon は推論バックエンドの extra `--extra mlx` を付ける（他 OS は付けず llama.cpp を別途用意 → 末尾の注記）。
 
-**A. コマンドとして入れる（最も手軽。普通はこれ）**
-どこでも使える `local-llm-server` コマンドになる:
 ```bash
-uv tool install "local-llm-server[mlx]"
-```
-
-**B. ゲートウェイ用フォルダに入れる（uv プロジェクトとして管理したいとき）**
-`gateway.toml` を置く**新規フォルダ**を作り、その依存として入れる:
-```bash
-mkdir my-gateway && cd my-gateway
-uv init
-uv add "local-llm-server[mlx]"
-```
-
-**C. ソースから動かす（このリポジトリをクローンした場合）**
-クローンした**フォルダの中**では `uv add` ではなく `uv sync`（自分自身を依存に足さない）:
-```bash
-cd local-llm-server          # クローンしたフォルダ
+git clone https://github.com/ToPo-ToPo-ToPo/local-llm-server
+cd local-llm-server          # クローンしたフォルダの中で実行（uv add ではなく uv sync）
 uv sync --extra mlx
 ```
 
-> **他 OS（Linux / Windows / Intel Mac）＝ llama.cpp** は上記の `[mlx]` / `--extra mlx` を外す。
-> 推論には `llama-server` を別途インストールして PATH に通し（OS 別手順は
-> [docs/llama-cpp.md](docs/llama-cpp.md)）、`gateway.toml` の `[[models]]` で `backend = "llama-cpp"` を指定する。
+以降このフォルダで `gateway.toml` を編集し、`uv run local-llm-server` で起動する（→ [使い方](#使い方)）。
+
+> **他 OS（Linux / Windows / Intel Mac）＝ llama.cpp** は `--extra mlx` を外す。推論には `llama-server` を
+> 別途インストールして PATH に通し（OS 別手順は [docs/llama-cpp.md](docs/llama-cpp.md)）、`gateway.toml` の
+> `[[models]]` で `backend = "llama-cpp"` を指定する。
+
+<details>
+<summary>クローンせず PyPI の公開パッケージを使う場合（任意）</summary>
+
+- **コマンドとして入れる**: `uv tool install "local-llm-server[mlx]"` → どこでも `local-llm-server` で起動。
+- **別プロジェクトの依存として入れる**: `gateway.toml` を置く新規フォルダで `uv init` → `uv add "local-llm-server[mlx]"` → `uv run local-llm-server`。
+
+（`[ ]` は zsh の glob 展開を避けるためクォート。他 OS は `[mlx]` を外す。）
+</details>
 
 ## 使い方
 
@@ -61,12 +56,13 @@ backend = "mlx-vlm"
 
 ### 2. 起動
 
-`gateway.toml` のあるフォルダで起動する。**A（tool install）は `local-llm-server`、B・C は `uv run` を付ける**:
+クローンしたフォルダ（`gateway.toml` のある場所）で起動する:
 
 ```bash
-local-llm-server            # A の場合。TUI ダッシュボード（状態を自動更新表示）
-uv run local-llm-server     # B / C の場合（プロジェクトの venv 経由）
+uv run local-llm-server     # TUI ダッシュボード（状態を自動更新表示）
 ```
+
+（PyPI の `uv tool install` で入れた場合は `local-llm-server` だけで起動。）
 
 ### 3. 接続
 
