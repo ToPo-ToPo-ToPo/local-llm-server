@@ -6,18 +6,24 @@
 - 導入後は `gateway.toml` の `[[models]]` で `backend = "llama-cpp"`、`model` に GGUF を指定する
 （→ [docs/gateway.md](gateway.md)）。
 
-## model の書き方（実パス / HF repo-id）
+## model の書き方（HF repo-id を基本に）
 
-`model` は次のどちらでも書ける:
+**基本は HF repo-id（`org/repo`）で書く。** **DL 済みキャッシュ**から実 GGUF を解決して
+`llama-server -m` に渡す（`-hf` の自動DLには依存しない＝トークン不要・401 回避）。クライアントに
+見せるモデル ID も repo-id になり、長いパスより読みやすい。
 
-- **実ファイルパス**: `/path/to/model.gguf`
-- **HF repo-id**: `org/repo`（例 `google/gemma-4-26B-A4B-it-qat-q4_0-gguf`）。**DL 済みキャッシュ**から
-  実 GGUF を解決して `llama-server -m` に渡す（`-hf` の自動DLには依存しない＝トークン不要・401 回避）。
-  クライアントに見せるモデル ID も repo-id になり読みやすい。
+```toml
+[[models]]
+model = "google/gemma-4-26B-A4B-it-qat-q4_0-gguf"   # ← org/repo を基本に
+backend = "llama-cpp"
+```
 
 repo に GGUF が複数ある（量子化違い・MTP ヘッド等）ときは **`org/repo:セレクタ`** でファイル名の一部を
 指定して 1 つに絞る（例 `unsloth/gemma-4-26B-A4B-it-qat-GGUF:Q4_K_XL`）。セレクタ無しのときは mmproj と
 MTP ヘッドを除いた「本体」を選ぶ（1 つに定まらなければ候補を挙げてエラー）。
+
+> 実ファイルパス（`/path/to/model.gguf`）も指定できるが、キャッシュ外の置き場所を使う等の例外用。
+> 通常は repo-id を使う。
 
 > 同一ファイル（同一 ID）は複数エントリに登録できない。MTP あり/なしを併存させたい等は、**repo を分ける**
 > （例: 公式版 `google/...`、MTP 版 `unsloth/...`）と ID が衝突しない。
@@ -90,9 +96,9 @@ llama.cpp 既定の `draft-simple` になる。無効化は `draft_model` を省
 
 ```toml
 [[models]]
-model = "/models/gemma-4-26B_q4_0-it.gguf"
+model = "unsloth/gemma-4-26B-A4B-it-qat-GGUF"            # org/repo を基本に
 backend = "llama-cpp"
-draft_model = "/models/gemma-4-26B-A4B-it-F16-MTP.gguf"  # MTP ヘッド → draft-mtp 自動
+draft_model = "unsloth/gemma-4-26B-A4B-it-qat-GGUF:F16-MTP"  # MTP ヘッド → draft-mtp 自動
 ```
 
 実測（Gemma 4 26B-A4B QAT q4_0, Apple M3 Ultra）: MTP なし ~108 tok/s → あり ~132 tok/s
