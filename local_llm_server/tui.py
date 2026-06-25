@@ -24,33 +24,41 @@ def merge_status(gcfg, admin: dict | None) -> dict:
     """
     live = {m["model"]: m for m in (admin or {}).get("models", [])}
     idle_timeout = gcfg.idle_timeout
-    rows = []
-    for c in gcfg.models:
-        m = live.get(c.model)
+
+    def _row(model, backend, port, m):
+        """ライブ状態 m（None=未ロード）から表示用の 1 行を作る。"""
         if not m or not m.get("loaded"):
-            state, inflight, requests, remaining = "unloaded", 0, (m or {}).get("requests", 0), None
+            return {
+                "model": model, "backend": backend, "port": port,
+                "state": "unloaded", "inflight": 0,
+                "requests": (m or {}).get("requests", 0), "idle_remaining": None,
+            }
+        inflight = int(m.get("inflight", 0))
+        idle_for = m.get("idle_for")
+        if inflight > 0:
+            state, remaining = "busy", None
         else:
-            inflight = int(m.get("inflight", 0))
-            requests = int(m.get("requests", 0))
-            idle_for = m.get("idle_for")
-            if inflight > 0:
-                state, remaining = "busy", None
-            else:
-                state = "idle"
-                remaining = (
-                    max(0.0, idle_timeout - idle_for)
-                    if (idle_timeout and idle_for is not None)
-                    else None
-                )
-        rows.append({
-            "model": c.model,
-            "backend": c.backend,
-            "port": c.port,
-            "state": state,
-            "inflight": inflight,
-            "requests": requests,
-            "idle_remaining": remaining,
-        })
+            state = "idle"
+            remaining = (
+                max(0.0, idle_timeout - idle_for)
+                if (idle_timeout and idle_for is not None) else None
+            )
+        return {
+            "model": model, "backend": backend, "port": port,
+            "state": state, "inflight": inflight,
+            "requests": int(m.get("requests", 0)), "idle_remaining": remaining,
+        }
+
+    rows = []
+    listed = set()
+    # 事前登録モデル（未ロードでも unloaded で見せる）。
+    for c in gcfg.models:
+        listed.add(c.model)
+        rows.append(_row(c.model, c.backend, c.port, live.get(c.model)))
+    # 動的ロードされたモデル（事前登録に無い、現在管理中のものを追加表示）。
+    for model, m in live.items():
+        if model not in listed:
+            rows.append(_row(model, m.get("backend", "?"), m.get("port"), m))
     ready = bool(admin) or is_ready(f"http://{gcfg.host}:{gcfg.port}/v1")
     return {
         "ready": ready,

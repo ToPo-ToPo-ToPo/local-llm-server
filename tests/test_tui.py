@@ -20,6 +20,27 @@ _TWO_MODELS = (
 )
 
 
+def test_merge_includes_dynamic_loaded_models(tmp_path):
+    # 事前登録に無い動的ロードモデルも、ライブ状態にあれば表示に追加される
+    gcfg = _gcfg(tmp_path, _TWO_MODELS)
+    admin = {
+        "uptime": 5.0, "requests": 3,
+        "models": [
+            {"model": "org/A", "backend": "mlx", "port": 9001,
+             "loaded": True, "inflight": 1, "requests": 2, "idle_for": None},
+            {"model": "dyn/NEW-GGUF", "backend": "llama-cpp", "port": 9003,
+             "loaded": True, "inflight": 0, "requests": 1, "idle_for": 3.0},
+        ],
+    }
+    view = tui.merge_status(gcfg, admin)
+    rows = {r["model"]: r for r in view["models"]}
+    # 事前登録 2 つ＋動的 1 つ
+    assert set(rows) == {"org/A", "org/B", "dyn/NEW-GGUF"}
+    assert rows["dyn/NEW-GGUF"]["backend"] == "llama-cpp"
+    assert rows["dyn/NEW-GGUF"]["state"] == "idle"
+    assert rows["org/A"]["state"] == "busy"
+
+
 def test_merge_marks_unlisted_models_unloaded(tmp_path):
     gcfg = _gcfg(tmp_path, _TWO_MODELS)
     admin = {
