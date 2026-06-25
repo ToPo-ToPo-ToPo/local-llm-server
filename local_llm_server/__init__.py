@@ -1,9 +1,8 @@
 """local-llm-server — gateway.toml で定義するマルチモデルゲートウェイ（サーバー）。
 
-このパッケージは**ゲートウェイ・サーバー専用**。サポートするのは次の 2 コマンド:
+このパッケージは**ゲートウェイ・サーバー専用**。サポートするコマンドは 1 つ:
 
-  - `local-llm-server`      … ./gateway.toml のゲートウェイをフォアグラウンド起動（cli:main）
-  - `local-llm-server-gui`  … 起動/停止/監視のアプリ（クリック起動アプリも作れる。gui:main）
+  - `local-llm-server`      … ./gateway.toml のゲートウェイを起動（cli:main）
 
 **クライアント（接続する側）は別パッケージ `local-llm-client`** に切り出した。エージェントは
 そちらの `LLMClient` / `connect` を使う（または素の `openai` SDK で base_url を指す）。本パッケージは
@@ -11,8 +10,7 @@
 
 公開 API（`__all__`）はゲートウェイの運用だけ。サーバーを自前で起動する低レベル経路
 （`ensure_server` / `LocalServer` / `ServerPool` / `RouterServer` 等）は後方互換のため import は
-残すが非公開・サポート対象外。推論バックエンドは extra `local-llm-server[mlx]`、監視 GUI は
-`local-llm-server[gui]` で導入する。
+残すが非公開・サポート対象外。推論バックエンドは extra `local-llm-server[mlx]` で導入する。
 """
 from __future__ import annotations
 

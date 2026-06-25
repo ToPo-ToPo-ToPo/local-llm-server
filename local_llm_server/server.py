@@ -725,7 +725,7 @@ def gateway_admin_status(
     """ゲートウェイの GET /admin/status を取得する（常駐モデルのライブ状態＋運用方針）。
 
     server_status と違い、各モデルの loaded / inflight（処理中数）や max_resident /
-    idle_timeout までゲートウェイ本体から取得できる（→ GUI 監視用）。応答しない・旧版で
+    idle_timeout までゲートウェイ本体から取得できる（→ TUI 監視用）。応答しない・旧版で
     エンドポイントが無い場合は None を返す（呼び出し側は server_status にフォールバックできる）。
     """
     url = f"http://{host}:{port}/admin/status"
@@ -743,7 +743,7 @@ def gateway_log_path(port: int) -> str:
     """バックグラウンド起動したゲートウェイ本体（公開ポート）の出力ログ保存先。
 
     モデルサーバーの daemon_log_path（server-<port>.log）と別に、ゲートウェイ自身の
-    起動ログを gateway-<port>.log に逃がす（`--status` / GUI から参照できる固定パス）。
+    起動ログを gateway-<port>.log に逃がす（`--status` / TUI から参照できる固定パス）。
     """
     return os.path.join(project_cache_dir(), f"gateway-{port}.log")
 

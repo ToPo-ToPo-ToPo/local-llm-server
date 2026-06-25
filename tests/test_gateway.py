@@ -138,7 +138,7 @@ def test_check_model_served_served_no_warning(monkeypatch):
     assert check_model_served("http://x/v1", MODEL) == []
 
 
-# --- GET /admin/status（GUI 監視用エンドポイント） --------------------------
+# --- GET /admin/status（TUI 監視用エンドポイント） --------------------------
 def test_admin_status_reports_live_model_state():
     """/admin/status が常駐状態（loaded/inflight）＋運用方針を返す。"""
     import threading
@@ -183,7 +183,7 @@ def test_admin_status_reports_live_model_state():
 
 
 def test_gateway_admin_status_none_when_down():
-    """応答が無ければ None（GUI は server_status にフォールバックできる）。"""
+    """応答が無ければ None（TUI は server_status にフォールバックできる）。"""
     from local_llm_server.server import gateway_admin_status
 
     # 使われていないであろうポート。urlopen が失敗して None。
