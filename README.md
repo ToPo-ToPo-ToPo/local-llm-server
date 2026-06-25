@@ -24,8 +24,8 @@ uv add "local-llm-server[mlx]"
 ```bash
 uv add local-llm-server
 ```
-推論には llama.cpp の `llama-server` を別途インストールして PATH に通す（例: `brew install llama.cpp`、
-公式リリース、ソースビルド）。`gateway.toml` の `[[models]]` で `backend = "llama-cpp"` を指定する。
+推論には llama.cpp の `llama-server` を別途インストールして PATH に通す（OS 別の導入手順は
+[docs/llama-cpp.md](docs/llama-cpp.md)）。`gateway.toml` の `[[models]]` で `backend = "llama-cpp"` を指定する。
 
 ## 使い方
 
@@ -67,6 +67,7 @@ print(llm.respond("ローカルLLMの利点を3つ。"))
 ## ドキュメント
 
 - [docs/gateway.md](docs/gateway.md) — `gateway.toml` の全フィールドと振る舞い
+- [docs/llama-cpp.md](docs/llama-cpp.md) — llama.cpp（`llama-server`）の OS 別導入・最新モデル追従
 - [docs/operation.md](docs/operation.md) — 起動・停止・監視（ターミナル／GUI アプリ）・アンインストール
 - [docs/mtp.md](docs/mtp.md) — MTPによる高速化
 
