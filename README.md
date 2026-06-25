@@ -10,11 +10,6 @@
 
 ## インストール
 
-> **これは import するライブラリではなく、別プロセスで動かすサーバー（ゲートウェイ）です。**
-> LLM を使うアプリ側には入れません。アプリは別パッケージ
-> [local-llm-client](https://pypi.org/project/local-llm-client/)（または素の `openai` SDK）で
-> 起動中のゲートウェイのポートに接続します。
-
 [uv](https://docs.astral.sh/uv/) を使う。**このリポジトリをクローンして、ソースから動かすのが基本。**
 Apple Silicon は推論バックエンドの extra `--extra mlx` を付ける（他 OS は付けず llama.cpp を別途用意 → 末尾の注記）。
 
