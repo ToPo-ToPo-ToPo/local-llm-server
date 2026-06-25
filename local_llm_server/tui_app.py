@@ -12,23 +12,72 @@ from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Container
+from textual.containers import Container, VerticalScroll
+from textual.screen import ModalScreen
 from textual.widgets import DataTable, Footer, Input, Static
 
 from .server import (
     find_pids_on_port,
     gateway_admin_status,
+    gateway_log_path,
     server_status,
     start_gateway_background,
     stop_pid,
 )
-from .tui import _fmt_hms, _open_log_in_pager, merge_status
+from .tui import _fmt_hms, merge_status, read_log_tail
 
 _GREEN = "#7fc99a"
 _AMBER = "#e0b46a"
 _RED = "#d8645f"
 _ACCENT = "#d8a45f"
 _DIM = "#83838c"
+
+
+class LogScreen(ModalScreen):
+    """ゲートウェイログをアプリ内のスクロール画面で表示する（外部ページャを使わない）。
+
+    `q` / `Esc` でダッシュボードに戻る。`r` で再読込。端末状態を壊さず、戻り方も明示する。
+    """
+
+    CSS = """
+    LogScreen { align: center middle; }
+    #logbox { width: 92%; height: 90%; border: round #3a3a40; background: #16161a; padding: 0 1; }
+    #loghead { padding: 0 0 1 0; color: #83838c; }
+    #logbody { height: 1fr; background: #16161a; }
+    """
+
+    BINDINGS = [
+        Binding("escape", "close", "back"),
+        Binding("q", "close", "back"),
+        Binding("r", "reload", "reload"),
+    ]
+
+    def __init__(self, port: int):
+        super().__init__()
+        self._port = port
+
+    def compose(self) -> ComposeResult:
+        with Container(id="logbox"):
+            head = Text()
+            head.append("log ", style="bold")
+            head.append(gateway_log_path(self._port), style=_DIM)
+            head.append("    (q / Esc で戻る · r 更新)", style=_ACCENT)
+            yield Static(head, id="loghead")
+            with VerticalScroll(id="logbody"):
+                yield Static(id="logtext")
+
+    def on_mount(self) -> None:
+        self.action_reload()
+
+    def action_reload(self) -> None:
+        self.query_one("#logtext", Static).update(read_log_tail(self._port))
+        # レイアウト確定後に末尾までスクロール（最新行を見せる）。
+        self.call_after_refresh(
+            self.query_one("#logbody", VerticalScroll).scroll_end, animate=False
+        )
+
+    def action_close(self) -> None:
+        self.dismiss()
 
 
 class GatewayMonitor(App):
@@ -117,6 +166,9 @@ class GatewayMonitor(App):
 
         table = self.query_one("#models", DataTable)
         table.clear()
+        # 表示するモデルが無いとき（起動直後・全アンロード）は表ごと隠す（ヘッダも出さない）。
+        # モデルがロードされたら表が現れる。
+        table.display = bool(view["models"])
         for r in view["models"]:
             # モデル ID はフル表示（org/repo[:量子化] まで出す）。末尾だけだと org や
             # 量子化が分からず取り違えるため、多少長くても省略しない。
@@ -171,8 +223,9 @@ class GatewayMonitor(App):
         self._run("restarting…", _restart)
 
     def action_log(self) -> None:
-        with self.suspend():
-            _open_log_in_pager(self.port)
+        # 外部ページャを suspend で開くと表示が壊れ戻り方も分かりにくいので、
+        # アプリ内のスクロール画面で表示する（q/Esc で戻る）。
+        self.push_screen(LogScreen(self.port))
 
     def action_quit(self) -> None:
         self.exit()

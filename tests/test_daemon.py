@@ -48,8 +48,43 @@ def test_load_gateway_config_llama_draft_passthrough(tmp_path):
 
 
 def test_load_gateway_config_rejects_empty_models(tmp_path):
+    # dynamic を切ると [[models]] 必須（旧挙動）
     with pytest.raises(ValueError, match="non-empty"):
-        gw.load_gateway_config(_write(tmp_path, "port = 8080\n"))
+        gw.load_gateway_config(_write(tmp_path, "port = 8080\ndynamic = false\n"))
+
+
+def test_load_gateway_config_empty_models_ok_when_dynamic(tmp_path):
+    # 既定（dynamic = true）では [[models]] 無しでも OK（全て動的ロード）
+    cfg = gw.load_gateway_config(_write(tmp_path, "port = 8080\n"))
+    assert cfg.dynamic is True and cfg.models == []
+
+
+def test_dynamic_register_infers_backend_and_allocates_port(tmp_path):
+    # 動的登録: ID からバックエンド推論＋内部ポート割当（事前登録の続き番号）。
+    cfg = gw.load_gateway_config(_write(
+        tmp_path,
+        'port = 8799\ninternal_base_port = 9001\ndisable_thinking = true\n'
+        '[[models]]\nmodel = "mlx-community/A"\nbackend = "mlx"\n'))
+    mgr = gw.ModelManager(
+        cfg.models, dynamic=cfg.dynamic,
+        default_disable_thinking=cfg.disable_thinking,
+        internal_base_port=cfg.internal_base_port, public_port=cfg.port,
+    )
+    gguf = mgr._register_dynamic_locked("unsloth/Foo-GGUF:Q4")
+    assert gguf.config.backend == "llama-cpp"   # gguf → llama-cpp
+    assert gguf.config.port == 9002             # 事前登録(9001)の次
+    assert gguf.config.disable_thinking is True  # 動的既定を継承
+    assert gguf.dynamic is True
+    mlx = mgr._register_dynamic_locked("mlx-community/Bar")
+    assert mlx.config.backend == "mlx-vlm" and mlx.config.port == 9003
+
+
+def test_acquire_unknown_raises_when_dynamic_disabled(tmp_path):
+    cfg = gw.load_gateway_config(_write(
+        tmp_path, 'dynamic = false\n[[models]]\nmodel = "org/A"\nbackend = "mlx"\n'))
+    mgr = gw.ModelManager(cfg.models, dynamic=cfg.dynamic)
+    with pytest.raises(KeyError):
+        mgr.acquire("org/unknown")
 
 
 def test_load_gateway_config_rejects_duplicate_and_bad_backend(tmp_path):
@@ -74,10 +109,12 @@ def test_load_gateway_config_rejects_internal_port_collision(tmp_path):
 
 
 def test_load_gateway_config_rejects_unknown_default_model(tmp_path):
+    # dynamic を切ると default_model は事前登録に在ることが必須
     with pytest.raises(ValueError, match="default_model"):
         gw.load_gateway_config(_write(
             tmp_path,
-            'default_model = "ghost"\n[[models]]\nmodel = "x"\nbackend = "mlx"\n'))
+            'dynamic = false\ndefault_model = "ghost"\n'
+            '[[models]]\nmodel = "x"\nbackend = "mlx"\n'))
 
 
 # --- MTP（draft_model）の継承・上書き・無効化・検証 -------------------------

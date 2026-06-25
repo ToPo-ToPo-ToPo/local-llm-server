@@ -28,6 +28,8 @@ from .server import (
     ServerConfig,
     daemon_log_path,
     ignore_shutdown_signals,
+    infer_backend,
+    parallel_supported,
     resolve_drafter,
 )
 
@@ -61,6 +63,7 @@ class _Model:
     inflight: int = 0  # 処理中リクエスト数（>0 の間は退避しない）
     last_used: float = 0.0  # time.monotonic()。LRU の基準
     requests: int = 0  # このモデルに振り分けた累計リクエスト数（表示用）
+    dynamic: bool = False  # 未登録モデルを動的登録したもの（アンロード時に登録ごと消す）
 
 
 class ModelManager:
@@ -80,14 +83,56 @@ class ModelManager:
         configs: list[ServerConfig],
         max_resident: int | None = None,
         load_timeout: float | None = None,
+        *,
+        dynamic: bool = False,
+        default_disable_thinking: bool = False,
+        internal_base_port: int = 9001,
+        public_port: int | None = None,
     ) -> None:
         self._models: dict[str, _Model] = {c.model: _Model(config=c) for c in configs}
         self._max_resident = max_resident
         self._load_timeout = load_timeout   # 枠が空くのを待つ最大秒数（None で無期限）
         self._started = time.monotonic()    # 起動経過時間（uptime 表示用）の基準
+        # 未登録モデルの動的ロード（IDからバックエンド推論。ロード時に表示へ追加・アンロードで消す）。
+        self._dynamic = dynamic
+        self._default_disable_thinking = default_disable_thinking
+        self._public_port = public_port
+        # 動的モデルの内部ポート割当カーソル（事前登録分の次から）。
+        self._next_port = internal_base_port + len(configs)
         # registry 保護＋「枠が空いた」通知用。release で inflight→0 のとき notify する。
         self._state = threading.Condition()
         self._control = threading.Lock()    # 起動/退避（control plane）の直列化
+
+    def _alloc_port_locked(self) -> int:
+        """動的モデルに内部ポートを割り当てる（state ロック保持下で呼ぶ）。"""
+        used = {m.config.port for m in self._models.values()}
+        if self._public_port is not None:
+            used.add(self._public_port)
+        p = self._next_port
+        while p in used:
+            p += 1
+        self._next_port = p + 1
+        return p
+
+    def _register_dynamic_locked(self, model_id: str) -> _Model:
+        """未登録モデルを動的登録する（control＋state ロック保持下で呼ぶ）。
+
+        ID からバックエンドを推論し、内部ポートを割り当てて _Model を作る。個別オプション
+        （MTP/parallel 等）は付かない（必要なら gateway.toml に事前登録する）。
+        """
+        backend = infer_backend(model_id)
+        cfg = ServerConfig(
+            backend=backend,
+            model=model_id,
+            host="127.0.0.1",
+            port=self._alloc_port_locked(),
+            parallel=None,
+            disable_thinking=self._default_disable_thinking,
+            draft_model=None,
+        )
+        mm = _Model(config=cfg, dynamic=True)
+        self._models[model_id] = mm
+        return mm
 
     @property
     def model_ids(self) -> list[str]:
@@ -97,23 +142,27 @@ class ModelManager:
         """model_id のサーバーを（必要なら起動して）確保し、(内部アドレス, ハンドル) を返す。
 
         呼び出し側は転送後に必ず release(ハンドル) すること（inflight を戻すため）。
-        未知のモデルは KeyError、起動失敗は RuntimeError/TimeoutError、空き枠が
-        `load_timeout` 内に得られなければ CapacityError（→ 503）を投げる。
+        未登録モデルは、dynamic 有効なら ID からバックエンドを推論して動的にロードする
+        （無効なら KeyError）。起動失敗は RuntimeError/TimeoutError、空き枠が `load_timeout`
+        内に得られなければ CapacityError（→ 503）を投げる。
         """
-        mm = self._models.get(model_id)
-        if mm is None:
-            raise KeyError(model_id)
         # 高速パス: 既にロード済みなら state ロックのみ。
         with self._state:
-            if mm.ready and mm.server is not None:
+            mm = self._models.get(model_id)
+            if mm is not None and mm.ready and mm.server is not None:
                 mm.inflight += 1
                 mm.requests += 1
                 mm.last_used = time.monotonic()
                 return (mm.config.host, mm.config.port), mm
-        # 低速パス: ロードが要る。control で直列化する。
+        # 低速パス: ロード（または動的登録）が要る。control で直列化する。
         with self._control:
             with self._state:
-                if mm.ready and mm.server is not None:  # 待っている間に他スレッドがロード済み
+                mm = self._models.get(model_id)
+                if mm is None:
+                    if not self._dynamic:
+                        raise KeyError(model_id)
+                    mm = self._register_dynamic_locked(model_id)
+                elif mm.ready and mm.server is not None:  # 待つ間に他スレッドがロード済み
                     mm.inflight += 1
                     mm.requests += 1
                     mm.last_used = time.monotonic()
@@ -123,8 +172,13 @@ class ModelManager:
             try:
                 server.start()
                 server.wait_until_ready()
-            except (RuntimeError, TimeoutError):
+            except (RuntimeError, TimeoutError, ValueError):
+                # ValueError は build_command の解決失敗（未キャッシュの repo-id 等）。
                 server.stop()
+                # 動的登録の起動失敗は登録ごと取り消す（誤った model 名を残さない）。
+                if mm.dynamic:
+                    with self._state:
+                        self._models.pop(model_id, None)
                 raise
             with self._state:
                 mm.server = server
@@ -158,6 +212,8 @@ class ModelManager:
         )
         while True:
             victim_srv = None
+            victim_id = None
+            victim_dynamic = False
             with self._state:
                 resident = sum(1 for m in self._models.values() if m.server is not None)
                 if resident < self._max_resident:
@@ -170,6 +226,8 @@ class ModelManager:
                 if candidates:
                     victim = min(candidates, key=lambda m: m.last_used)
                     victim_srv = victim.server
+                    victim_id = victim.config.model
+                    victim_dynamic = victim.dynamic
                     victim.server = None
                     victim.ready = False
                 else:
@@ -184,6 +242,9 @@ class ModelManager:
                     continue  # 起きたら再判定
             if victim_srv is not None:
                 victim_srv.stop()  # state ロックの外で（最長 ~10s）。停止後にループ再確認。
+                if victim_dynamic:  # 動的モデルは登録ごと消す（表示から外す）
+                    with self._state:
+                        self._models.pop(victim_id, None)
 
     def evict_idle(self, timeout: float) -> int:
         """最終利用から `timeout` 秒を超えて使われていないモデルを停止する（idle TTL）。
@@ -203,11 +264,14 @@ class ModelManager:
                         m.server is not None and m.ready and m.inflight == 0
                         and (now - m.last_used) > timeout
                     ):
-                        victims.append(m.server)
+                        victims.append((m.server, m.config.model, m.dynamic))
                         m.server = None
                         m.ready = False
-            for srv in victims:
+            for srv, mid, dyn in victims:
                 srv.stop()  # state ロックの外で（最長 ~10s かかるため）
+                if dyn:  # 動的モデルは登録ごと消す（表示から外す）
+                    with self._state:
+                        self._models.pop(mid, None)
         return len(victims)
 
     def uptime(self) -> float:
@@ -296,9 +360,11 @@ class _GatewayHandler(BaseHTTPRequestHandler):
         # /v1/models は設定済みカタログを合成して返す（is_ready 判定・モデル取り違え
         # 警告に対応）。実モデルは起動していなくてもカタログとして列挙する。
         if path.endswith("/models"):
+            # 事前登録カタログ＋現在管理中（動的ロード分）を重複なく列挙する。
+            ids = list(dict.fromkeys(srv.catalog + srv.manager.model_ids))
             data = {
                 "object": "list",
-                "data": [{"id": m, "object": "model"} for m in srv.catalog],
+                "data": [{"id": m, "object": "model"} for m in ids],
             }
             send_json(self, 200, data)
             return
@@ -341,6 +407,10 @@ class _GatewayHandler(BaseHTTPRequestHandler):
         except KeyError:
             send_error(self, 404, f"model '{model}' is not configured in the gateway")
             return
+        except ValueError as exc:
+            # モデル指定/解決の不正（未キャッシュの repo-id 等）。
+            send_error(self, 400, f"cannot load model '{model}': {exc}")
+            return
         except CapacityError as exc:
             # 全枠が処理中で空かなかった → 混雑（後で再試行を促す）。
             send_error(self, 503, f"gateway busy: {exc}")
@@ -363,6 +433,9 @@ class GatewayConfig:
     models: list[ServerConfig] = field(default_factory=list)
     idle_timeout: float | None = 1200.0  # 秒。これだけ使われないモデルを自動アンロード（既定 1200=20分。None/0 で無効）
     load_timeout: float = 300.0        # 秒。全枠処理中のとき、空くのを待つ最大時間（超過で 503）
+    dynamic: bool = True               # 未登録モデルを ID 推論で動的ロードする（false で事前登録のみ）
+    disable_thinking: bool = False     # 動的ロード時の既定（思考抑制）。事前登録は各 [[models]] が優先
+    internal_base_port: int = 9001     # 内部サーバーの割当開始ポート（動的モデルもこの続きから割り当て）
 
 
 def _resolve_model_draft(
@@ -449,13 +522,21 @@ def load_gateway_config(path: str) -> GatewayConfig:
     load_timeout = float(data.get("load_timeout", 300.0))
     if load_timeout < 1:
         raise ValueError("load_timeout must be 1 or greater")
+    # 未登録モデルを ID 推論で動的ロードするか（既定 true）。false なら事前登録のみ（旧挙動）。
+    dynamic = bool(data.get("dynamic", True))
+    # 動的ロード時の既定 disable_thinking（事前登録の [[models]] は各自の値が優先）。
+    dyn_disable_thinking = bool(data.get("disable_thinking", False))
     # ゲートウェイ全体の MTP ドラフター既定。各 [[models]] が draft_model を持たなければ
     # これを継承する（"auto" で本体名から自動選択）。個別に "" / "off" / "none" で無効化。
     default_draft = data.get("draft_model")
 
-    entries = data.get("models")
-    if not isinstance(entries, list) or not entries:
-        raise ValueError("gateway config needs a non-empty [[models]] array")
+    entries = data.get("models") or []
+    if not isinstance(entries, list):
+        raise ValueError("[[models]] must be an array")
+    if not entries and not dynamic:
+        raise ValueError(
+            "gateway config needs a non-empty [[models]] array (or set dynamic = true)"
+        )
 
     configs: list[ServerConfig] = []
     seen: set[str] = set()
@@ -492,11 +573,15 @@ def load_gateway_config(path: str) -> GatewayConfig:
             )
         )
 
-    if default_model is not None and default_model not in seen:
+    # dynamic 無効のときだけ default_model が事前登録に在ることを要求する
+    # （dynamic 有効なら未登録でも動的ロードされる）。
+    if default_model is not None and not dynamic and default_model not in seen:
         raise ValueError(f"default_model '{default_model}' is not listed in [[models]]")
 
     return GatewayConfig(
-        host, port, max_resident, default_model, configs, idle_timeout, load_timeout
+        host, port, max_resident, default_model, configs, idle_timeout, load_timeout,
+        dynamic=dynamic, disable_thinking=dyn_disable_thinking,
+        internal_base_port=internal_base,
     )
 
 
@@ -508,7 +593,9 @@ def run_gateway(cfg: GatewayConfig) -> int:
     `kill` や `--stop`、端末クローズでも下の finally を通って後始末する。
     """
     manager = ModelManager(
-        cfg.models, max_resident=cfg.max_resident, load_timeout=cfg.load_timeout
+        cfg.models, max_resident=cfg.max_resident, load_timeout=cfg.load_timeout,
+        dynamic=cfg.dynamic, default_disable_thinking=cfg.disable_thinking,
+        internal_base_port=cfg.internal_base_port, public_port=cfg.port,
     )
     server = GatewayServer(
         (cfg.host, cfg.port),

@@ -1,10 +1,53 @@
-"""TUI ダッシュボードの純ロジック（catalog × ライブ状態のマージ・時間整形）。
-
-curses 描画は端末が要るのでテストしない。ここでは描画に渡す前のデータ統合（merge_status）と
-整形（_fmt_hms）だけを検証する。
+"""TUI ダッシュボードの純ロジック（catalog × ライブ状態のマージ・時間整形・ログ末尾）と、
+アプリ内ログ画面の開閉（textual pilot）を検証する。
 """
+import asyncio
+
 from local_llm_server import tui
 from local_llm_server.daemon import load_gateway_config
+
+
+def test_read_log_tail(tmp_path, monkeypatch):
+    log = tmp_path / "gw.log"
+    log.write_text("\n".join(f"line {i}" for i in range(1, 2001)) + "\n", encoding="utf-8")
+    monkeypatch.setattr(tui, "gateway_log_path", lambda port: str(log))
+    out = tui.read_log_tail(123, max_lines=10)
+    lines = out.strip().splitlines()
+    assert lines[-1] == "line 2000" and len(lines) == 10
+    # ファイルが無いときは案内文
+    monkeypatch.setattr(tui, "gateway_log_path", lambda port: str(tmp_path / "nope.log"))
+    assert tui.read_log_tail(123).startswith("(ログはまだ")
+
+
+def test_log_screen_opens_and_closes(tmp_path, monkeypatch):
+    # 外部ページャでなくアプリ内画面でログを出し、q / Esc でダッシュボードに戻れること。
+    from textual.app import App
+    from local_llm_server import tui_app
+
+    log = tmp_path / "gw.log"
+    log.write_text("hello log\n", encoding="utf-8")
+    monkeypatch.setattr(tui, "gateway_log_path", lambda port: str(log))
+    monkeypatch.setattr(tui_app, "gateway_log_path", lambda port: str(log))
+
+    class Host(App):
+        def on_mount(self):
+            self.push_screen(tui_app.LogScreen(8799))
+
+    async def scenario():
+        app = Host()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert type(app.screen).__name__ == "LogScreen"
+            await pilot.press("q")
+            await pilot.pause()
+            assert type(app.screen).__name__ != "LogScreen"   # q で戻る
+            app.push_screen(tui_app.LogScreen(8799))
+            await pilot.pause()
+            await pilot.press("escape")
+            await pilot.pause()
+            assert type(app.screen).__name__ != "LogScreen"   # Esc でも戻る
+
+    asyncio.run(scenario())
 
 
 def _gcfg(tmp_path, body):
@@ -18,6 +61,27 @@ _TWO_MODELS = (
     '[[models]]\nmodel = "org/A"\nbackend = "mlx"\n'
     '[[models]]\nmodel = "org/B"\nbackend = "mlx"\n'
 )
+
+
+def test_merge_includes_dynamic_loaded_models(tmp_path):
+    # 事前登録に無い動的ロードモデルも、ライブ状態にあれば表示に追加される
+    gcfg = _gcfg(tmp_path, _TWO_MODELS)
+    admin = {
+        "uptime": 5.0, "requests": 3,
+        "models": [
+            {"model": "org/A", "backend": "mlx", "port": 9001,
+             "loaded": True, "inflight": 1, "requests": 2, "idle_for": None},
+            {"model": "dyn/NEW-GGUF", "backend": "llama-cpp", "port": 9003,
+             "loaded": True, "inflight": 0, "requests": 1, "idle_for": 3.0},
+        ],
+    }
+    view = tui.merge_status(gcfg, admin)
+    rows = {r["model"]: r for r in view["models"]}
+    # 事前登録 2 つ＋動的 1 つ
+    assert set(rows) == {"org/A", "org/B", "dyn/NEW-GGUF"}
+    assert rows["dyn/NEW-GGUF"]["backend"] == "llama-cpp"
+    assert rows["dyn/NEW-GGUF"]["state"] == "idle"
+    assert rows["org/A"]["state"] == "busy"
 
 
 def test_merge_marks_unlisted_models_unloaded(tmp_path):

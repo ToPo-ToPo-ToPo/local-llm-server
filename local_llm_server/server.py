@@ -33,6 +33,21 @@ def default_backend() -> str:
 # サーバー未起動・バックエンド未指定のときに使う既定バックエンド（OSで自動判定）
 DEFAULT_BACKEND = default_backend()
 
+
+def infer_backend(model: str) -> str:
+    """登録の無いモデル ID からバックエンドを推論する（動的ロード用）。
+
+    - GGUF（id に 'gguf' を含む）→ llama-cpp
+    - mlx（id に 'mlx' を含む。例 `mlx-community/...`・`*-MLX-*`）→ mlx-vlm（vision 兼テキスト）
+    - それ以外 → OS 既定（Apple Silicon: mlx-vlm / 他: llama-cpp）
+    """
+    low = model.lower()
+    if "gguf" in low:
+        return "llama-cpp"
+    if "mlx" in low:
+        return "mlx-vlm"
+    return default_backend()
+
 # POSIX（macOS / Linux）か。プロセスグループ操作（killpg / setsid）の可否に使う。
 _POSIX = os.name == "posix"
 

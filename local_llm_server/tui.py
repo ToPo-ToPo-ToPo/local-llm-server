@@ -7,9 +7,6 @@ textual を遅延 import する起動口だけを持つ（merge_status 等は端
 """
 from __future__ import annotations
 
-import os
-import shutil
-import subprocess
 import sys
 
 from .server import gateway_log_path, is_ready
@@ -24,33 +21,41 @@ def merge_status(gcfg, admin: dict | None) -> dict:
     """
     live = {m["model"]: m for m in (admin or {}).get("models", [])}
     idle_timeout = gcfg.idle_timeout
-    rows = []
-    for c in gcfg.models:
-        m = live.get(c.model)
+
+    def _row(model, backend, port, m):
+        """ライブ状態 m（None=未ロード）から表示用の 1 行を作る。"""
         if not m or not m.get("loaded"):
-            state, inflight, requests, remaining = "unloaded", 0, (m or {}).get("requests", 0), None
+            return {
+                "model": model, "backend": backend, "port": port,
+                "state": "unloaded", "inflight": 0,
+                "requests": (m or {}).get("requests", 0), "idle_remaining": None,
+            }
+        inflight = int(m.get("inflight", 0))
+        idle_for = m.get("idle_for")
+        if inflight > 0:
+            state, remaining = "busy", None
         else:
-            inflight = int(m.get("inflight", 0))
-            requests = int(m.get("requests", 0))
-            idle_for = m.get("idle_for")
-            if inflight > 0:
-                state, remaining = "busy", None
-            else:
-                state = "idle"
-                remaining = (
-                    max(0.0, idle_timeout - idle_for)
-                    if (idle_timeout and idle_for is not None)
-                    else None
-                )
-        rows.append({
-            "model": c.model,
-            "backend": c.backend,
-            "port": c.port,
-            "state": state,
-            "inflight": inflight,
-            "requests": requests,
-            "idle_remaining": remaining,
-        })
+            state = "idle"
+            remaining = (
+                max(0.0, idle_timeout - idle_for)
+                if (idle_timeout and idle_for is not None) else None
+            )
+        return {
+            "model": model, "backend": backend, "port": port,
+            "state": state, "inflight": inflight,
+            "requests": int(m.get("requests", 0)), "idle_remaining": remaining,
+        }
+
+    rows = []
+    listed = set()
+    # 事前登録モデル（未ロードでも unloaded で見せる）。
+    for c in gcfg.models:
+        listed.add(c.model)
+        rows.append(_row(c.model, c.backend, c.port, live.get(c.model)))
+    # 動的ロードされたモデル（事前登録に無い、現在管理中のものを追加表示）。
+    for model, m in live.items():
+        if model not in listed:
+            rows.append(_row(model, m.get("backend", "?"), m.get("port"), m))
     ready = bool(admin) or is_ready(f"http://{gcfg.host}:{gcfg.port}/v1")
     return {
         "ready": ready,
@@ -72,16 +77,21 @@ def _fmt_hms(seconds) -> str:
     return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
 
 
-def _open_log_in_pager(port: int) -> None:
-    """ゲートウェイログをページャ（$PAGER / less / more）で開く（ターミナル内で完結）。"""
+def read_log_tail(port: int, max_lines: int = 1000) -> str:
+    """ゲートウェイログの末尾（最大 max_lines 行）を返す（TUI 内のログ画面で表示用）。
+
+    外部ページャ（less 等）には頼らず、textual アプリ内のスクロール画面に出すための純データ。
+    ログがまだ無い／空のときは案内文を返す。
+    """
     path = gateway_log_path(port)
-    if not os.path.exists(path):
-        return
-    pager = os.environ.get("PAGER") or shutil.which("less") or shutil.which("more")
-    if not pager:
-        return
-    args = [pager, "+G", path] if os.path.basename(pager).startswith("less") else [pager, path]
-    subprocess.call(args)
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()
+    except OSError:
+        return f"(ログはまだありません: {path})"
+    if not lines:
+        return f"(ログは空です: {path})"
+    return "".join(lines[-max_lines:])
 
 
 def run_tui(gcfg) -> int:
