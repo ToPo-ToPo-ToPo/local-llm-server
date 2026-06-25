@@ -6,15 +6,15 @@
 - 導入後は `gateway.toml` の `[[models]]` で `backend = "llama-cpp"`、`model` に GGUF を指定する
 （→ [docs/gateway.md](gateway.md)）。
 
-## model の書き方（HF repo-id を基本に）
+## model の書き方（HF repo-id）
 
-**基本は HF repo-id（`org/repo`）で書く。** **DL 済みキャッシュ**から実 GGUF を解決して
-`llama-server -m` に渡す（`-hf` の自動DLには依存しない＝トークン不要・401 回避）。クライアントに
-見せるモデル ID も repo-id になり、長いパスより読みやすい。
+`model` は **HF repo-id（`org/repo`）で指定する**（実ファイルパスは非対応）。**DL 済みキャッシュ**から
+実 GGUF を解決して `llama-server -m` に渡す（`-hf` の自動DLには依存しない＝トークン不要・401 回避）。
+クライアントに見せるモデル ID も repo-id になり読みやすい。
 
 ```toml
 [[models]]
-model = "google/gemma-4-26B-A4B-it-qat-q4_0-gguf"   # ← org/repo を基本に
+model = "google/gemma-4-26B-A4B-it-qat-q4_0-gguf"
 backend = "llama-cpp"
 ```
 
@@ -22,16 +22,16 @@ repo に GGUF が複数ある（量子化違い・MTP ヘッド等）ときは *
 指定して 1 つに絞る（例 `unsloth/gemma-4-26B-A4B-it-qat-GGUF:Q4_K_XL`）。セレクタ無しのときは mmproj と
 MTP ヘッドを除いた「本体」を選ぶ（1 つに定まらなければ候補を挙げてエラー）。
 
-> 実ファイルパス（`/path/to/model.gguf`）も指定できるが、キャッシュ外の置き場所を使う等の例外用。
-> 通常は repo-id を使う。
+> **指定した repo-id がローカルキャッシュに無いとエラーになる**（取得方法は下の「HF からダウンロード」）。
+> repo-id 形式でない値（実パス等）もエラー。
 
-> 同一ファイル（同一 ID）は複数エントリに登録できない。MTP あり/なしを併存させたい等は、**repo を分ける**
+> 同一 ID は複数エントリに登録できない。MTP あり/なしを併存させたい等は、**repo を分ける**
 > （例: 公式版 `google/...`、MTP 版 `unsloth/...`）と ID が衝突しない。
 
 ## モデル（GGUF）を HF からダウンロード
 
-llama-cpp の `model` に repo-id を書く場合、その GGUF が **HF キャッシュに DL 済み**である必要がある
-（mlx と違い `-hf` 自動DLには依存しない）。`huggingface_hub` の `hf` CLI で取得する:
+llama-cpp の `model`（repo-id）は、その GGUF が **HF キャッシュに DL 済み**である必要がある
+（mlx と違い `-hf` 自動DLには依存しない。未取得だと起動時にエラー）。`huggingface_hub` の `hf` CLI で取得する:
 
 ```bash
 # huggingface_hub を入れる（uv なら）

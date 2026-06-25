@@ -291,27 +291,31 @@ def _hf_hub_cache() -> str:
 
 
 def resolve_gguf(model: str) -> str:
-    """llama.cpp の `model` を実ファイルパスに解決する。
+    """llama.cpp の `model`（HF repo-id）を DL 済みキャッシュの実 GGUF パスに解決する。
 
-    - 既存のローカルパスならそのまま返す。
-    - `org/repo` 形式なら HF キャッシュ（既にDL済みの GGUF）から該当ファイルを探して返す。
-      `-hf` の自動DLには依存しない（トークン不要・401 回避）。
-    - `org/repo:selector` でファイル名の一部（量子化名や `F16-MTP` 等）を指定できる。
-      セレクタ無しのときは mmproj と MTP ヘッドを除いた「本体」GGUF を選ぶ（1つに定まらなければ
-      候補を挙げて ValueError）。キャッシュに無い／repo 形式でなければ入力をそのまま返す
-      （呼び出し側で「実行ファイル/モデルが見つからない」と分かるエラーになる）。
+    `model` は必ず **HF repo-id（`org/repo[:セレクタ]`）**で指定する（実ファイルパスは非対応）。
+    HF キャッシュ（`hf download` 済み）から該当 GGUF を探して返す。`-hf` の自動DLには依存しない
+    （トークン不要・401 回避）。次の場合はいずれも ValueError（取得方法を案内）:
+
+    - repo-id 形式でない（実パス等）／キャッシュに無い／該当 GGUF が無い。
+    - `org/repo` に GGUF が複数あって 1 つに定まらない（`:セレクタ` で絞る）。
+
+    `org/repo:selector` はファイル名の一部（量子化名や `F16-MTP` 等）。セレクタ無しのときは mmproj と
+    MTP ヘッドを除いた「本体」GGUF を選ぶ。
     """
-    if os.path.exists(model):
-        return model
-    repo, sep, selector = model.partition(":")
-    if "/" not in repo:
-        return model
+    spec = model.strip()
+    repo, _sep, selector = spec.partition(":")
+    if repo.startswith(("/", "./", "../", "~")) or repo.count("/") != 1 or not all(repo.split("/")):
+        raise ValueError(
+            f"model は HF repo-id（org/repo[:量子化名]）で指定してください（実パス非対応）: {model!r}"
+        )
     org, name = repo.split("/", 1)
-    cache_dir = os.path.join(
-        _hf_hub_cache(), f"models--{org}--{name.replace('/', '--')}", "snapshots"
-    )
+    cache_dir = os.path.join(_hf_hub_cache(), f"models--{org}--{name}", "snapshots")
     if not os.path.isdir(cache_dir):
-        return model
+        raise ValueError(
+            f"'{repo}' がローカルキャッシュにありません。先に取得してください: "
+            f"hf download {repo} <ファイル名.gguf>"
+        )
     ggufs: list[str] = []
     for root, _dirs, files in os.walk(cache_dir):
         for f in files:
@@ -333,7 +337,11 @@ def resolve_gguf(model: str) -> str:
         by_blob.setdefault(os.path.realpath(g), g)
     pool = sorted(by_blob.values())
     if not pool:
-        return model
+        hint = f"（セレクタ '{selector}' に一致なし）" if selector else ""
+        raise ValueError(
+            f"'{model}' に該当する GGUF がキャッシュにありません{hint}。"
+            f"hf download {repo} <ファイル名.gguf> で取得してください。"
+        )
     if len(pool) > 1:
         names = sorted(os.path.basename(g) for g in pool)
         raise ValueError(
@@ -400,8 +408,8 @@ def build_command(config: ServerConfig) -> list[str]:
         if drafter:
             command += ["--draft-model", drafter, "--draft-kind", "mtp"]
     elif config.backend == "llama-cpp":
-        # model は実パスでも HF repo-id（org/repo[:selector]）でも可。後者は DL 済み
-        # キャッシュから実 GGUF を解決する（クライアントに見せる ID は repo-id のまま）。
+        # model は HF repo-id（org/repo[:selector]）。DL 済みキャッシュから実 GGUF を解決する
+        # （キャッシュに無ければ ValueError。クライアントに見せる ID は repo-id のまま）。
         model_path = resolve_gguf(config.model)
         command = [
             "llama-server",
@@ -427,8 +435,8 @@ def build_command(config: ServerConfig) -> list[str]:
                 mmproj = find_sibling_mmproj(model_path)
                 if mmproj:
                     command += ["--mmproj", mmproj]
-            # 別ヘッド方式のspeculative decoding（gemma4 等）。draft_model にドラフト GGUF のパス
-            # または HF repo-id（org/repo:F16-MTP 等）を指定すると有効化（-md）。ファイル名に
+            # 別ヘッド方式の speculative decoding（gemma4 等）。draft_model に MTP ヘッドの
+            # HF repo-id（org/repo:F16-MTP 等）を指定すると有効化（-md）。ファイル名に
             # "mtp" を含めば MTP ヘッドとみなし --spec-type draft-mtp を付ける（それ以外は
             # llama.cpp 既定の draft-simple）。
             if config.draft_model and "-md" not in config.extra_args:

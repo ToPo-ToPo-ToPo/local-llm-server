@@ -22,18 +22,10 @@ def test_build_command_mlx():
     assert cmd[0] == "mlx_lm.server" and "--model" in cmd and "8080" in cmd
 
 
-def test_build_command_llama_parallel_and_thinking():
-    c = ServerConfig("llama-cpp", "/m.gguf", parallel=4, disable_thinking=True)
-    cmd = build_command(c)
-    assert cmd[0] == "llama-server"
-    assert "--parallel" in cmd and "4" in cmd
-    assert "--chat-template-kwargs" in cmd
-
-
 def _make_hf_cache(tmp_path, repo, files):
     """HF キャッシュ風のレイアウトを作る: models--org--name/snapshots/rev/<files>。"""
     org, name = repo.split("/", 1)
-    snap = tmp_path / "hub" / f"models--{org}--{name.replace('/', '--')}" / "snapshots" / "rev1"
+    snap = tmp_path / "hub" / f"models--{org}--{name}" / "snapshots" / "rev1"
     for f in files:
         p = snap / f
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -41,27 +33,47 @@ def _make_hf_cache(tmp_path, repo, files):
     return snap
 
 
-def test_resolve_gguf_passthrough(tmp_path, monkeypatch):
+@pytest.fixture
+def hf_cache(tmp_path, monkeypatch):
+    """HF_HUB_CACHE を隔離し、`make(repo, files)` で repo を用意できるようにする。"""
     monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path / "hub"))
-    existing = tmp_path / "x.gguf"
-    existing.write_bytes(b"")
-    assert srv.resolve_gguf(str(existing)) == str(existing)  # 実パスはそのまま
-    assert srv.resolve_gguf("just-a-name") == "just-a-name"  # repo 形式でない
-    assert srv.resolve_gguf("org/not-cached") == "org/not-cached"  # 未キャッシュ
+    return lambda repo, files: _make_hf_cache(tmp_path, repo, files)
 
 
-def test_resolve_gguf_repo_id_single_base(tmp_path, monkeypatch):
-    monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path / "hub"))
-    snap = _make_hf_cache(tmp_path, "google/gemma-4-x-gguf",
-                          ["gemma-4-x_q4_0.gguf", "gemma-4-x-mmproj.gguf"])
+def test_build_command_llama_parallel_and_thinking(hf_cache):
+    hf_cache("org/m-gguf", ["m-Q4_K_M.gguf"])
+    c = ServerConfig("llama-cpp", "org/m-gguf", parallel=4, disable_thinking=True)
+    cmd = build_command(c)
+    assert cmd[0] == "llama-server"
+    assert "--parallel" in cmd and "4" in cmd
+    assert "--chat-template-kwargs" in cmd
+
+
+def test_resolve_gguf_rejects_non_repo_id(hf_cache):
+    # model は HF repo-id 専用。実パスや repo-id 形式でないものは弾く
+    for bad in ["/abs/model.gguf", "./rel.gguf", "just-a-name", "a/b/c"]:
+        with pytest.raises(ValueError):
+            srv.resolve_gguf(bad)
+
+
+def test_resolve_gguf_errors_when_not_cached(hf_cache):
+    # repo-id だがキャッシュに無ければエラー
+    with pytest.raises(ValueError):
+        srv.resolve_gguf("org/not-cached")
+    # repo はあるがセレクタに一致する GGUF が無ければエラー
+    hf_cache("org/m-gguf", ["m-Q4_K_M.gguf"])
+    with pytest.raises(ValueError):
+        srv.resolve_gguf("org/m-gguf:NOPE")
+
+
+def test_resolve_gguf_repo_id_single_base(hf_cache):
+    snap = hf_cache("google/gemma-4-x-gguf", ["gemma-4-x_q4_0.gguf", "gemma-4-x-mmproj.gguf"])
     # mmproj/MTP を除いた本体を選ぶ
     assert srv.resolve_gguf("google/gemma-4-x-gguf") == str(snap / "gemma-4-x_q4_0.gguf")
 
 
-def test_resolve_gguf_selector_and_ambiguity(tmp_path, monkeypatch):
-    monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path / "hub"))
-    snap = _make_hf_cache(tmp_path, "unsloth/g-gguf",
-                          ["base-Q4_K_XL.gguf", "base-Q8_0.gguf", "MTP/g-F16-MTP.gguf"])
+def test_resolve_gguf_selector_and_ambiguity(hf_cache):
+    snap = hf_cache("unsloth/g-gguf", ["base-Q4_K_XL.gguf", "base-Q8_0.gguf", "MTP/g-F16-MTP.gguf"])
     # セレクタでファイルを 1 つに絞れる（MTP ヘッドも選べる）
     assert srv.resolve_gguf("unsloth/g-gguf:F16-MTP") == str(snap / "MTP" / "g-F16-MTP.gguf")
     # セレクタ無しで本体が複数あると曖昧エラー
@@ -69,39 +81,43 @@ def test_resolve_gguf_selector_and_ambiguity(tmp_path, monkeypatch):
         srv.resolve_gguf("unsloth/g-gguf")
 
 
-def test_build_command_llama_resolves_repo_id(tmp_path, monkeypatch):
-    monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path / "hub"))
-    snap = _make_hf_cache(tmp_path, "google/g-gguf", ["g_q4_0.gguf", "g-mmproj.gguf"])
+def test_build_command_llama_resolves_repo_id(hf_cache):
+    snap = hf_cache("google/g-gguf", ["g_q4_0.gguf", "g-mmproj.gguf"])
     cmd = build_command(ServerConfig("llama-cpp", "google/g-gguf"))
     assert "-m" in cmd and str(snap / "g_q4_0.gguf") in cmd
     # 同スナップショットの mmproj も自動検出される
     assert "--mmproj" in cmd and str(snap / "g-mmproj.gguf") in cmd
 
 
-def test_build_command_llama_mtp_draft():
-    # ファイル名に mtp を含むドラフトは --spec-type draft-mtp を自動付与
-    c = ServerConfig("llama-cpp", "/m.gguf", draft_model="/d/gemma-F16-MTP.gguf")
+def test_build_command_llama_mtp_draft(hf_cache):
+    # MTP ヘッド repo-id を draft に指定 → -md ＋ --spec-type draft-mtp
+    hf_cache("org/m-gguf", ["m.gguf"])
+    hf_cache("org/d-gguf", ["d-F16-MTP.gguf"])
+    c = ServerConfig("llama-cpp", "org/m-gguf", draft_model="org/d-gguf:F16-MTP")
     cmd = build_command(c)
-    assert "-md" in cmd and "/d/gemma-F16-MTP.gguf" in cmd
+    assert "-md" in cmd
     assert "--spec-type" in cmd and "draft-mtp" in cmd
 
 
-def test_build_command_llama_embedded_mtp():
+def test_build_command_llama_embedded_mtp(hf_cache):
     # draft_model="self"/"mtp" は埋め込み MTP。-md 無しで --spec-type draft-mtp のみ。
     # vision(--mmproj) と parallel>1 は llama.cpp 側未対応なので付けない。
-    c = ServerConfig("llama-cpp", "/m.gguf", parallel=4, draft_model="self")
+    hf_cache("org/m-gguf", ["m.gguf"])
+    c = ServerConfig("llama-cpp", "org/m-gguf", parallel=4, draft_model="self")
     cmd = build_command(c)
     assert "--spec-type" in cmd and "draft-mtp" in cmd
     assert "-md" not in cmd
     assert "--parallel" not in cmd
-    assert build_command(ServerConfig("llama-cpp", "/m.gguf", draft_model="mtp")).count("--spec-type") == 1
+    assert build_command(ServerConfig("llama-cpp", "org/m-gguf", draft_model="mtp")).count("--spec-type") == 1
 
 
-def test_build_command_llama_plain_draft():
+def test_build_command_llama_plain_draft(hf_cache):
     # mtp を含まないドラフトは -md のみ（spec-type は llama.cpp 既定の draft-simple）
-    c = ServerConfig("llama-cpp", "/m.gguf", draft_model="/d/small-draft.gguf")
+    hf_cache("org/m-gguf", ["m.gguf"])
+    hf_cache("org/draft-gguf", ["small-draft.gguf"])
+    c = ServerConfig("llama-cpp", "org/m-gguf", draft_model="org/draft-gguf")
     cmd = build_command(c)
-    assert "-md" in cmd and "/d/small-draft.gguf" in cmd
+    assert "-md" in cmd
     assert "draft-mtp" not in cmd
 
 
@@ -115,22 +131,17 @@ def test_find_sibling_mmproj(tmp_path):
     assert srv.find_sibling_mmproj(str(model)) == str(mm)
 
 
-def test_build_command_llama_auto_mmproj(tmp_path):
-    model = tmp_path / "model.gguf"
-    model.write_bytes(b"")
-    mm = tmp_path / "mmproj-model.gguf"
-    mm.write_bytes(b"")
+def test_build_command_llama_auto_mmproj(hf_cache):
+    snap = hf_cache("org/m-gguf", ["model.gguf", "mmproj-model.gguf"])
     # 隣の mmproj を自動検出して --mmproj に渡す（手動設定不要）
-    cmd = build_command(ServerConfig("llama-cpp", str(model)))
-    assert "--mmproj" in cmd and str(mm) in cmd
+    cmd = build_command(ServerConfig("llama-cpp", "org/m-gguf"))
+    assert "--mmproj" in cmd and str(snap / "mmproj-model.gguf") in cmd
 
 
-def test_build_command_llama_no_mmproj_optout(tmp_path):
-    model = tmp_path / "model.gguf"
-    model.write_bytes(b"")
-    (tmp_path / "mmproj-model.gguf").write_bytes(b"")
+def test_build_command_llama_no_mmproj_optout(hf_cache):
+    hf_cache("org/m-gguf", ["model.gguf", "mmproj-model.gguf"])
     # 明示的に --no-mmproj を渡したら自動付与しない
-    c = ServerConfig("llama-cpp", str(model), extra_args=["--no-mmproj"])
+    c = ServerConfig("llama-cpp", "org/m-gguf", extra_args=["--no-mmproj"])
     cmd = build_command(c)
     assert "--mmproj" not in cmd and "--no-mmproj" in cmd
 
