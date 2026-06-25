@@ -55,11 +55,18 @@ llama.cpp は**投機的デコード**に対応し、ドラフトモデルで本
 （出力は本体が検証するので**ロスレス＝品質は変わらない**）。`[[models]]` の `draft_model` に
 ドラフト GGUF のパスを指定すると有効になる（`llama-server -md <path>`）。
 
-- **MTP**（Multi-Token Prediction）ヘッドを使う場合、ファイル名に `mtp` を含めば
-  自動で `--spec-type draft-mtp` が付く（例: `gemma-4-26B-A4B-it-F16-MTP.gguf`）。
-- それ以外のドラフト（同系統の小型モデル等）は `-md` のみで llama.cpp 既定の `draft-simple`。
-- 無効化は `draft_model` を省略するか `"off"`。グローバル既定の `draft_model = "auto"` は
-  mlx-vlm 専用なので、llama-cpp では無視される（MTP を使うには明示パスが要る）。
+MTP には 2 方式ある:
+
+- **別ヘッド方式**（例: Gemma 4）— MTP ヘッドが本体と別 GGUF。`draft_model` にその GGUF を指定する
+  （ファイル名に `mtp` を含めば自動で `--spec-type draft-mtp`）。vision(`--mmproj`) と併用できる。
+- **埋め込み方式**（例: Qwen3.6）— MTP ヘッドが本体 GGUF に内蔵。`draft_model = "self"`（または `"mtp"`）
+  で有効化＝別ドラフト不要（`--spec-type draft-mtp` のみ付く）。**この方式は llama.cpp 側で
+  `--mmproj`（vision）と `--parallel>1` が未対応**なので、本サーバーは自動的にそれらを付けない。
+  vision も使いたいときは MTP 版とは別に「MTP なし」エントリ（別 repo / 別 quant）を立てる。
+
+その他のドラフト（同系統の小型モデル等）は `draft_model` にそのパス/ID を指定すると `-md` のみで
+llama.cpp 既定の `draft-simple` になる。無効化は `draft_model` を省略するか `"off"`。グローバル既定の
+`draft_model = "auto"` は mlx-vlm 専用なので llama-cpp では無視される（MTP を使うには明示指定が要る）。
 
 ```toml
 [[models]]

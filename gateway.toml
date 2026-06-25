@@ -41,12 +41,22 @@ backend = "mlx-vlm"
 # ある repo は `org/repo:量子化名` で 1 つに絞る）。backend = "llama-cpp"。disable_thinking = true で
 # 思考を抑制し直答に。マルチモーダル（画像入力）は本体の隣に mmproj(.gguf) があれば自動検出して有効化
 # （手動設定不要。テキストのみ入力では速度・精度に影響なし）。無効化は extra_args = ["--no-mmproj"]。
-# Qwen3.6 GGUF（vision 対応。MTP なし）:
+# Qwen3.6 GGUF（unsloth）。Qwen3.6 は MTP が本体に内蔵されているが、llama.cpp では MTP と
+# vision(--mmproj)/parallel>1 が併用不可。そこで用途別に 2 エントリに分ける（repo が違えば ID 衝突なし）。
+# (1) vision 版（MTP なし・画像入力可・parallel 可）:
 [[models]]
-model = "lmstudio-community/Qwen3.6-27B-GGUF"
+model = "unsloth/Qwen3.6-27B-GGUF:UD-Q4_K_XL"
 backend = "llama-cpp"
 parallel = 4            # 同時処理スロット（llama.cpp のみ）
 disable_thinking = true # 思考を抑制して直答に（任意）
+
+# (2) MTP 版（埋め込み MTP・テキスト専用・~1.5-2倍速）。draft_model="self" で本体内蔵の MTP ヘッドを
+# 使う（別ドラフト不要）。この方式は vision/parallel>1 不可なので自動的に付けない。
+[[models]]
+model = "unsloth/Qwen3.6-27B-MTP-GGUF:UD-Q4_K_XL"
+backend = "llama-cpp"
+disable_thinking = true
+draft_model = "self"    # 本体内蔵 MTP を使う（--spec-type draft-mtp）
 
 # Gemma 4 GGUF（公式 QAT q4_0・vision 対応・MTP なし）。同梱 mmproj を自動検出。
 [[models]]

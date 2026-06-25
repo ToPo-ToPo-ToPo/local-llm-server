@@ -86,6 +86,17 @@ def test_build_command_llama_mtp_draft():
     assert "--spec-type" in cmd and "draft-mtp" in cmd
 
 
+def test_build_command_llama_embedded_mtp():
+    # draft_model="self"/"mtp" は埋め込み MTP。-md 無しで --spec-type draft-mtp のみ。
+    # vision(--mmproj) と parallel>1 は llama.cpp 側未対応なので付けない。
+    c = ServerConfig("llama-cpp", "/m.gguf", parallel=4, draft_model="self")
+    cmd = build_command(c)
+    assert "--spec-type" in cmd and "draft-mtp" in cmd
+    assert "-md" not in cmd
+    assert "--parallel" not in cmd
+    assert build_command(ServerConfig("llama-cpp", "/m.gguf", draft_model="mtp")).count("--spec-type") == 1
+
+
 def test_build_command_llama_plain_draft():
     # mtp を含まないドラフトは -md のみ（spec-type は llama.cpp 既定の draft-simple）
     c = ServerConfig("llama-cpp", "/m.gguf", draft_model="/d/small-draft.gguf")

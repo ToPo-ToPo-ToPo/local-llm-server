@@ -409,25 +409,33 @@ def build_command(config: ServerConfig) -> list[str]:
             "--host", config.host,
             "--port", str(config.port),
         ]
-        if config.parallel is not None:
+        # 埋め込み MTP（Qwen3.6 等、本体 GGUF に MTP ヘッドが内蔵）。draft_model="self"/"mtp"
+        # で有効化＝別ドラフトファイル不要（--spec-type draft-mtp のみ）。この方式は llama.cpp 側で
+        # --mmproj（vision）と --parallel>1 が未対応なので、両者は付けない（付けると起動失敗する）。
+        embedded_mtp = bool(config.draft_model) and \
+            config.draft_model.strip().lower() in ("self", "mtp")
+        if config.parallel is not None and not embedded_mtp:
             command += ["--parallel", str(config.parallel)]
         if config.disable_thinking:
             command += ["--chat-template-kwargs", '{"enable_thinking": false}']
-        # マルチモーダル: 本体の隣に mmproj があれば自動で渡す（手動設定不要）。
-        # ユーザーが extra_args で明示制御していれば（--mmproj / --no-mmproj）尊重する。
-        if not any(a in ("--mmproj", "-mm", "--no-mmproj") for a in config.extra_args):
-            mmproj = find_sibling_mmproj(model_path)
-            if mmproj:
-                command += ["--mmproj", mmproj]
-        # 投機的デコード（高速化・出力はロスレス）。draft_model にドラフト GGUF のパス
-        # または HF repo-id（org/repo:F16-MTP 等）を指定すると有効化（-md）。ファイル名に
-        # "mtp" を含めば MTP ヘッドとみなし --spec-type draft-mtp を付ける（それ以外は
-        # llama.cpp 既定の draft-simple）。
-        if config.draft_model and "-md" not in config.extra_args:
-            draft_path = resolve_gguf(config.draft_model)
-            command += ["-md", draft_path]
-            if "mtp" in os.path.basename(draft_path).lower():
-                command += ["--spec-type", "draft-mtp"]
+        if embedded_mtp:
+            command += ["--spec-type", "draft-mtp"]
+        else:
+            # マルチモーダル: 本体の隣に mmproj があれば自動で渡す（手動設定不要）。
+            # ユーザーが extra_args で明示制御していれば（--mmproj / --no-mmproj）尊重する。
+            if not any(a in ("--mmproj", "-mm", "--no-mmproj") for a in config.extra_args):
+                mmproj = find_sibling_mmproj(model_path)
+                if mmproj:
+                    command += ["--mmproj", mmproj]
+            # 別ヘッド方式の投機的デコード（gemma4 等）。draft_model にドラフト GGUF のパス
+            # または HF repo-id（org/repo:F16-MTP 等）を指定すると有効化（-md）。ファイル名に
+            # "mtp" を含めば MTP ヘッドとみなし --spec-type draft-mtp を付ける（それ以外は
+            # llama.cpp 既定の draft-simple）。
+            if config.draft_model and "-md" not in config.extra_args:
+                draft_path = resolve_gguf(config.draft_model)
+                command += ["-md", draft_path]
+                if "mtp" in os.path.basename(draft_path).lower():
+                    command += ["--spec-type", "draft-mtp"]
     else:
         raise ValueError(
             f"unknown backend: {config.backend!r} (choose from {BACKENDS})"
