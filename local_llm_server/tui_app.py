@@ -117,6 +117,9 @@ class GatewayMonitor(App):
 
         table = self.query_one("#models", DataTable)
         table.clear()
+        # 表示するモデルが無いとき（起動直後・全アンロード）は表ごと隠す（ヘッダも出さない）。
+        # モデルがロードされたら表が現れる。
+        table.display = bool(view["models"])
         for r in view["models"]:
             # モデル ID はフル表示（org/repo[:量子化] まで出す）。末尾だけだと org や
             # 量子化が分からず取り違えるため、多少長くても省略しない。
