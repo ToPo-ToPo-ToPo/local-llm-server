@@ -28,6 +28,36 @@ def test_build_command_llama_parallel_and_thinking():
     assert "--chat-template-kwargs" in cmd
 
 
+def test_find_sibling_mmproj(tmp_path):
+    model = tmp_path / "Qwen3.6-27B-Q4_K_M.gguf"
+    model.write_bytes(b"")
+    # 隣に mmproj が無ければ None
+    assert srv.find_sibling_mmproj(str(model)) is None
+    mm = tmp_path / "mmproj-Qwen3.6-27B-BF16.gguf"
+    mm.write_bytes(b"")
+    assert srv.find_sibling_mmproj(str(model)) == str(mm)
+
+
+def test_build_command_llama_auto_mmproj(tmp_path):
+    model = tmp_path / "model.gguf"
+    model.write_bytes(b"")
+    mm = tmp_path / "mmproj-model.gguf"
+    mm.write_bytes(b"")
+    # 隣の mmproj を自動検出して --mmproj に渡す（手動設定不要）
+    cmd = build_command(ServerConfig("llama-cpp", str(model)))
+    assert "--mmproj" in cmd and str(mm) in cmd
+
+
+def test_build_command_llama_no_mmproj_optout(tmp_path):
+    model = tmp_path / "model.gguf"
+    model.write_bytes(b"")
+    (tmp_path / "mmproj-model.gguf").write_bytes(b"")
+    # 明示的に --no-mmproj を渡したら自動付与しない
+    c = ServerConfig("llama-cpp", str(model), extra_args=["--no-mmproj"])
+    cmd = build_command(c)
+    assert "--mmproj" not in cmd and "--no-mmproj" in cmd
+
+
 def test_build_command_mlx_disable_thinking():
     cmd = build_command(ServerConfig("mlx", "m", disable_thinking=True))
     assert "--chat-template-args" in cmd

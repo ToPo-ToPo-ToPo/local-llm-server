@@ -39,15 +39,15 @@ backend = "mlx-vlm"
 # llama.cpp（GGUF）の例。model はローカルの .gguf ファイルパスを指定する（mlx と違い HF id では
 # 自動DLされない＝クライアントもこのパス文字列を model に指定する）。backend = "llama-cpp"。
 # MTP は mlx-vlm 専用なので無効（"off"）。disable_thinking = true で思考モデルの思考を抑制し直答に。
-# マルチモーダル（画像入力）は extra_args の --mmproj に vision projector(.gguf) を渡すと有効になる。
-# Qwen3.6 GGUF（vision 対応。mmproj 同梱）:
+# マルチモーダル（画像入力）は本体の隣に mmproj(.gguf) があれば自動検出して有効化する（手動設定不要。
+# テキストのみ入力では速度・精度に影響なし）。無効化したいときだけ extra_args = ["--no-mmproj"]。
+# Qwen3.6 GGUF（vision 対応。同梱の mmproj を自動検出）:
 [[models]]
 model = "/Users/octopus/.cache/huggingface/hub/models--lmstudio-community--Qwen3.6-27B-GGUF/snapshots/58c6607d9c4cae8b071b3781c73be633fb3dee36/Qwen3.6-27B-Q4_K_M.gguf"
 backend = "llama-cpp"
 parallel = 4            # 同時処理スロット（llama.cpp のみ）
 disable_thinking = true # 思考を抑制して直答に（任意）
 draft_model = "off"     # MTP は llama-cpp では無効
-extra_args = ["--mmproj", "/Users/octopus/.cache/huggingface/hub/models--lmstudio-community--Qwen3.6-27B-GGUF/snapshots/58c6607d9c4cae8b071b3781c73be633fb3dee36/mmproj-Qwen3.6-27B-BF16.gguf"]
 
 # Gemma 4 GGUF を使う場合（※未キャッシュ。先に .gguf を入手してパスを指定する）。テキスト専用なら
 # extra_args の --mmproj 行を省く。使うなら下のコメントを外してパスを実ファイルに合わせる:

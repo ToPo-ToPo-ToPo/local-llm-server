@@ -282,6 +282,26 @@ def resolve_drafter(model: str, draft_model: str | None) -> str | None:
     return drafter
 
 
+def find_sibling_mmproj(model_path: str) -> str | None:
+    """GGUF 本体と同じディレクトリにある vision projector（mmproj）を探す。
+
+    llama.cpp のマルチモーダルは本体 GGUF とは別に mmproj(.gguf) が要る。HF の GGUF
+    リポジトリは慣例的に `mmproj-*.gguf` / `*mmproj*.gguf` を本体と同梱するため、本体の
+    隣を探して見つかれば自動で `--mmproj` に渡す（テキストのみ入力でも速度・精度に影響は
+    無く、画像が来たときだけ使われる）。本体がローカルファイルでない／隣に無ければ None。
+    """
+    directory = os.path.dirname(model_path)
+    if not directory or not os.path.isdir(directory):
+        return None
+    candidates = sorted(
+        name for name in os.listdir(directory)
+        if "mmproj" in name.lower() and name.lower().endswith(".gguf")
+    )
+    if not candidates:
+        return None
+    return os.path.abspath(os.path.join(directory, candidates[0]))
+
+
 def build_command(config: ServerConfig) -> list[str]:
     """バックエンドに応じた起動コマンドを組み立てる。
 
@@ -329,6 +349,12 @@ def build_command(config: ServerConfig) -> list[str]:
             command += ["--parallel", str(config.parallel)]
         if config.disable_thinking:
             command += ["--chat-template-kwargs", '{"enable_thinking": false}']
+        # マルチモーダル: 本体の隣に mmproj があれば自動で渡す（手動設定不要）。
+        # ユーザーが extra_args で明示制御していれば（--mmproj / --no-mmproj）尊重する。
+        if not any(a in ("--mmproj", "-mm", "--no-mmproj") for a in config.extra_args):
+            mmproj = find_sibling_mmproj(config.model)
+            if mmproj:
+                command += ["--mmproj", mmproj]
     else:
         raise ValueError(
             f"unknown backend: {config.backend!r} (choose from {BACKENDS})"

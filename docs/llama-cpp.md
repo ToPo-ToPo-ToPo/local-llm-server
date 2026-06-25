@@ -8,6 +8,20 @@ PATH に通っていること」だけ。Python バインディング（`llama-c
 導入後は `gateway.toml` の `[[models]]` で `backend = "llama-cpp"`、`model` に GGUF を指定する
 （→ [docs/gateway.md](gateway.md)）。
 
+## マルチモーダル（画像入力）
+
+Qwen3.6 のような vision 対応モデルは、本体 GGUF とは別に **vision projector（`mmproj-*.gguf`）**が要る。
+本サーバーは **本体 `model` と同じディレクトリに `*mmproj*.gguf` があれば自動検出して `--mmproj` を
+付与する**（手動設定不要）。HF の GGUF リポジトリは慣例で mmproj を本体と同梱するため、通常は
+何もしなくても画像入力が有効になる。
+
+- **テキストのみ入力でも mmproj は無害**：画像が来たときだけ使われ、テキスト生成の速度・精度に
+  影響しない（実測でも生成 tok/s・出力ともに mmproj 有無で実質差なし）。コストは vision エンコーダを
+  保持する数百 MB〜1GB 程度の追加 RAM のみ。なので常に有効でよい。
+- 自動付与を**無効化**したいときだけ `extra_args = ["--no-mmproj"]` を指定する。
+- mmproj を明示指定したいときは `extra_args = ["--mmproj", "/path/to/mmproj.gguf"]`（この場合は
+  自動検出より優先）。
+
 ## OS 別の主導線
 
 | OS | 普段使い（手軽） | 当日公開モデルを最速で追う |
