@@ -1,11 +1,9 @@
 # llama.cpp バックエンドの導入
 
-`backend = "llama-cpp"` のモデルは、llama.cpp の **`llama-server` バイナリ**を呼び出して提供する。
-ゲートウェイ本体は `llama-server` を **PATH 上から実行するだけ**なので、必要なのは「`llama-server` が
-PATH に通っていること」だけ。Python バインディング（`llama-cpp-python` の `python -m llama_cpp.server`）
-とは**別物**なので、pip では入らない点に注意。
-
-導入後は `gateway.toml` の `[[models]]` で `backend = "llama-cpp"`、`model` に GGUF を指定する
+- `backend = "llama-cpp"` のモデルは、llama.cpp の **`llama-server` バイナリ**を呼び出して提供する。
+- ゲートウェイ本体は `llama-server` を **PATH 上から実行するだけ**なので、必要なのは「`llama-server` が　PATH に通っていること」だけ。
+- Python バインディング（`llama-cpp-python`）とは別物なので、uv add ではでは使えない点に注意。
+- 導入後は `gateway.toml` の `[[models]]` で `backend = "llama-cpp"`、`model` に GGUF を指定する
 （→ [docs/gateway.md](gateway.md)）。
 
 ## model の書き方（実パス / HF repo-id）
@@ -49,12 +47,10 @@ hf download unsloth/gemma-4-26B-A4B-it-qat-GGUF MTP/gemma-4-26B-A4B-it-F16-MTP.g
 - 取得先は共有キャッシュ `~/.cache/huggingface/hub/`（`HF_HOME` / `HF_HUB_CACHE` で変更可）。本サーバーは
   ここから repo-id を解決する。ファイル名を省いて `hf download <repo>` だと repo 全体（全量子化）を
   落とすので、**使う量子化だけ名指し**するのが無難。
-- どの量子化を選ぶかや、信頼できる配布元（unsloth / bartowski / lmstudio-community 等）の選び方は
-  README とこのファイル上部を参照。private/gated repo は `hf auth login`（または `HF_TOKEN`）が要る。
 
 ## マルチモーダル（画像入力）
 
-Qwen3.6 のような vision 対応モデルは、本体 GGUF とは別に **vision projector（`mmproj-*.gguf`）**が要る。
+Qwen3.6 のような vision 対応モデルは、本体 GGUF とは別に vision projector（`mmproj-*.gguf`）が要る。
 本サーバーは **本体 `model` と同じディレクトリに `*mmproj*.gguf` があれば自動検出して `--mmproj` を
 付与する**（手動設定不要）。HF の GGUF リポジトリは慣例で mmproj を本体と同梱するため、通常は
 何もしなくても画像入力が有効になる。
@@ -72,10 +68,6 @@ Qwen3.6 のような vision 対応モデルは、本体 GGUF とは別に **visi
 |---|---|---|
 | Qwen3.6-27B | `lmstudio-community/Qwen3.6-27B-GGUF` | `mmproj-Qwen3.6-27B-BF16.gguf` |
 | Gemma 4 26B-A4B | `google/gemma-4-26B-A4B-it-qat-q4_0-gguf` | `gemma-4-26B-it-mmproj.gguf` |
-
-> llama.cpp の `-hf` 自動DLはトークン次第で 401 になることがある。確実なのは `huggingface_hub`
-> （`hf download <repo> <file>`）で本体と mmproj を同じスナップショットに落とし、その `.gguf` パスを
-> `model` に指定する方法。同ディレクトリに mmproj が並ぶので自動検出が効く。
 
 ## speculative decoding（MTP / draft）による高速化
 
@@ -175,25 +167,3 @@ llama-server --version      # version: 9780 (xxxxxxxxx) のように出る
 ```
 
 `version` のビルド番号が、使いたいモデルの対応コミットを含むか（= 十分新しいか）の目安になる。
-
-## 「その日に公開されたモデル」を動かせるかの考え方
-
-動くかどうかは、llama.cpp の入れ方とは別に **2 つの条件**で決まる:
-
-1. **GGUF ファイルが存在するか**（変換）— 誰かが GGUF に変換・量子化してアップする必要がある。
-   人気モデルは作者やコミュニティ（bartowski / unsloth など）が数時間以内に出すことが多い。
-   他人の GGUF を使うなら、自分は `llama-server` を更新するだけでよい。
-2. **llama.cpp 本体がそのアーキテクチャに対応しているか**（本命）— 既存系統の新版や
-   ファインチューンなら少し新しめのバイナリで動く。**全く新しいアーキ**は、対応が
-   llama.cpp に**マージされるまでどのビルドでも動かない**（古いバイナリは "unknown architecture"
-   等でエラー）。
-
-> 自分で GGUF 変換する場合は `convert_hf_to_gguf.py` も最新が要る → バイナリだけでなく
-> ソース側（変換スクリプト）も更新する必要がある。
-
-## バージョンずれの考え方
-
-- **ずれの主因は brew の遅さより「ローカルを更新していないこと」**が多い。使う前に
-  `brew upgrade llama.cpp`（またはバイナリ差し替え）を回す習慣で大半は足りる。
-- brew formula と Releases の差は通常わずか（数ビルド）。最先端を急ぐ瞬間だけ
-  Releases バイナリを使い、普段は brew / winget で十分。
