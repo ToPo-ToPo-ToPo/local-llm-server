@@ -118,7 +118,9 @@ class GatewayMonitor(App):
         table = self.query_one("#models", DataTable)
         table.clear()
         for r in view["models"]:
-            name = r["model"].split("/")[-1]
+            # モデル ID はフル表示（org/repo[:量子化] まで出す）。末尾だけだと org や
+            # 量子化が分からず取り違えるため、多少長くても省略しない。
+            name = r["model"]
             sym, col = {
                 "busy": ("●", _GREEN), "idle": ("○", _AMBER), "unloaded": ("·", _DIM),
             }.get(r["state"], ("·", _DIM))
