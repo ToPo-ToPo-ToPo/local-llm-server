@@ -384,6 +384,13 @@ def _resolve_model_draft(
         return None
     if backend == _MTP_BACKEND:
         return resolve_drafter(model, raw)  # auto を解決＆未対応なら ValueError
+    if backend == "llama-cpp":
+        # llama.cpp の投機的デコードはドラフト GGUF のパスを直接指定する（-md）。
+        # MTP ヘッドのファイル名は build_command 側で検出して --spec-type draft-mtp を付ける。
+        # "auto" の自動解決表は llama.cpp には無いので、明示パス以外は無効扱い。
+        if raw == "auto":
+            return None
+        return raw
     if has_own:
         print(
             f"Warning: draft_model (MTP) is ignored for backend '{backend}' "

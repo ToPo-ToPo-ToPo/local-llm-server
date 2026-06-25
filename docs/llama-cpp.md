@@ -33,6 +33,38 @@ Qwen3.6 のような vision 対応モデルは、本体 GGUF とは別に **visi
 > （`hf download <repo> <file>`）で本体と mmproj を同じスナップショットに落とし、その `.gguf` パスを
 > `model` に指定する方法。同ディレクトリに mmproj が並ぶので自動検出が効く。
 
+## 投機的デコード（MTP / draft）による高速化
+
+llama.cpp は**投機的デコード**に対応し、ドラフトモデルで本体の生成を先読みして高速化する
+（出力は本体が検証するので**ロスレス＝品質は変わらない**）。`[[models]]` の `draft_model` に
+ドラフト GGUF のパスを指定すると有効になる（`llama-server -md <path>`）。
+
+- **MTP**（Multi-Token Prediction）ヘッドを使う場合、ファイル名に `mtp` を含めば
+  自動で `--spec-type draft-mtp` が付く（例: `gemma-4-26B-A4B-it-F16-MTP.gguf`）。
+- それ以外のドラフト（同系統の小型モデル等）は `-md` のみで llama.cpp 既定の `draft-simple`。
+- 無効化は `draft_model` を省略するか `"off"`。グローバル既定の `draft_model = "auto"` は
+  mlx-vlm 専用なので、llama-cpp では無視される（MTP を使うには明示パスが要る）。
+
+```toml
+[[models]]
+model = "/models/gemma-4-26B_q4_0-it.gguf"
+backend = "llama-cpp"
+draft_model = "/models/gemma-4-26B-A4B-it-F16-MTP.gguf"  # MTP ヘッド → draft-mtp 自動
+```
+
+実測（Gemma 4 26B-A4B QAT q4_0, Apple M3 Ultra）: MTP なし ~108 tok/s → あり ~132 tok/s
+（コード生成。ドラフト受理率 ~0.72、平均受理長 3.15）。**MoE で元々高速なモデルでも約1.2倍**。
+予測しやすい出力（コード・定型文）ほど受理率が上がり伸びる。MTP ヘッドの GGUF は本体と
+同系統のもの（例: `unsloth/gemma-4-26B-A4B-it-qat-GGUF` の `MTP/*.gguf`）を使う。
+
+## 複数モデルの同時利用
+
+`llama-server` 単体は **1 プロセス = 1 モデル**（モデルを束ねる router 機能は無い）。本サーバーは
+ゲートウェイが `[[models]]` ごとに `llama-server` を**個別プロセスで遅延起動**するため、複数 GGUF を
+1 つの公開ポートで同時に提供できる（`model` で振り分け）。同時常駐数は `max_resident` で制限し、
+超過分は LRU で退避・`idle_timeout` で自動アンロードされる（→ [docs/gateway.md](gateway.md)）。
+mlx 系と llama-cpp を混在させてもよい。RAM が許す範囲で `max_resident` を上げれば本当の同時常駐になる。
+
 ## OS 別の主導線
 
 | OS | 普段使い（手軽） | 当日公開モデルを最速で追う |

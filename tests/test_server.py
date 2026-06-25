@@ -28,6 +28,22 @@ def test_build_command_llama_parallel_and_thinking():
     assert "--chat-template-kwargs" in cmd
 
 
+def test_build_command_llama_mtp_draft():
+    # ファイル名に mtp を含むドラフトは --spec-type draft-mtp を自動付与
+    c = ServerConfig("llama-cpp", "/m.gguf", draft_model="/d/gemma-F16-MTP.gguf")
+    cmd = build_command(c)
+    assert "-md" in cmd and "/d/gemma-F16-MTP.gguf" in cmd
+    assert "--spec-type" in cmd and "draft-mtp" in cmd
+
+
+def test_build_command_llama_plain_draft():
+    # mtp を含まないドラフトは -md のみ（spec-type は llama.cpp 既定の draft-simple）
+    c = ServerConfig("llama-cpp", "/m.gguf", draft_model="/d/small-draft.gguf")
+    cmd = build_command(c)
+    assert "-md" in cmd and "/d/small-draft.gguf" in cmd
+    assert "draft-mtp" not in cmd
+
+
 def test_find_sibling_mmproj(tmp_path):
     model = tmp_path / "Qwen3.6-27B-Q4_K_M.gguf"
     model.write_bytes(b"")

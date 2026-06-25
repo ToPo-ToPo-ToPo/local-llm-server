@@ -355,6 +355,13 @@ def build_command(config: ServerConfig) -> list[str]:
             mmproj = find_sibling_mmproj(config.model)
             if mmproj:
                 command += ["--mmproj", mmproj]
+        # 投機的デコード（高速化・出力はロスレス）。draft_model にドラフト GGUF のパスを
+        # 指定すると有効化（-md）。ファイル名に mmproj ならぬ "mtp" を含めば MTP ヘッドと
+        # みなし --spec-type draft-mtp を付ける（それ以外は llama.cpp 既定の draft-simple）。
+        if config.draft_model and "-md" not in config.extra_args:
+            command += ["-md", config.draft_model]
+            if "mtp" in os.path.basename(config.draft_model).lower():
+                command += ["--spec-type", "draft-mtp"]
     else:
         raise ValueError(
             f"unknown backend: {config.backend!r} (choose from {BACKENDS})"
