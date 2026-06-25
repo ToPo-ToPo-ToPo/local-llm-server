@@ -10,22 +10,39 @@
 
 ## インストール
 
-[uv](https://docs.astral.sh/uv/) を使う。
-`[backend]` は推論バックエンドを入れる extra。
-`[ ]` はシェル（zsh）の glob 展開を避けるためクォートする。
+> **これは import するライブラリではなく、別プロセスで動かすサーバー（ゲートウェイ）です。**
+> LLM を使うアプリ側には入れません。アプリは別パッケージ
+> [local-llm-client](https://pypi.org/project/local-llm-client/)（または素の `openai` SDK）で
+> 起動中のゲートウェイのポートに接続します。
 
-#### 1. Apple Silicon で推論する（mlx-lm / mlx-vlm）
+[uv](https://docs.astral.sh/uv/) で入れる。**目的に応じて 3 通り**（Apple Silicon は推論バックエンドの
+extra `[mlx]` を付ける。`[ ]` は zsh の glob 展開を避けるためクォート）。他 OS は付けず、llama.cpp を
+別途用意する → 末尾の注記。
+
+**A. コマンドとして入れる（最も手軽。普通はこれ）**
+どこでも使える `local-llm-server` コマンドになる:
 ```bash
+uv tool install "local-llm-server[mlx]"
+```
+
+**B. ゲートウェイ用フォルダに入れる（uv プロジェクトとして管理したいとき）**
+`gateway.toml` を置く**新規フォルダ**を作り、その依存として入れる:
+```bash
+mkdir my-gateway && cd my-gateway
+uv init
 uv add "local-llm-server[mlx]"
 ```
 
-#### 2. その他の OS（Linux / Windows / Intel Mac）— llama.cpp
-ゲートウェイ本体だけ入れる（バックエンド extra は不要）:
+**C. ソースから動かす（このリポジトリをクローンした場合）**
+クローンした**フォルダの中**では `uv add` ではなく `uv sync`（自分自身を依存に足さない）:
 ```bash
-uv add local-llm-server
+cd local-llm-server          # クローンしたフォルダ
+uv sync --extra mlx
 ```
-推論には llama.cpp の `llama-server` を別途インストールして PATH に通す（OS 別の導入手順は
-[docs/llama-cpp.md](docs/llama-cpp.md)）。`gateway.toml` の `[[models]]` で `backend = "llama-cpp"` を指定する。
+
+> **他 OS（Linux / Windows / Intel Mac）＝ llama.cpp** は上記の `[mlx]` / `--extra mlx` を外す。
+> 推論には `llama-server` を別途インストールして PATH に通し（OS 別手順は
+> [docs/llama-cpp.md](docs/llama-cpp.md)）、`gateway.toml` の `[[models]]` で `backend = "llama-cpp"` を指定する。
 
 ## 使い方
 
@@ -44,8 +61,11 @@ backend = "mlx-vlm"
 
 ### 2. 起動
 
+`gateway.toml` のあるフォルダで起動する。**A（tool install）は `local-llm-server`、B・C は `uv run` を付ける**:
+
 ```bash
-uv run local-llm-server     # TUI ダッシュボード（状態を自動更新表示）
+local-llm-server            # A の場合。TUI ダッシュボード（状態を自動更新表示）
+uv run local-llm-server     # B / C の場合（プロジェクトの venv 経由）
 ```
 
 ### 3. 接続
