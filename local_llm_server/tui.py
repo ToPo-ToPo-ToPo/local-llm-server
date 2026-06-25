@@ -7,9 +7,6 @@ textual を遅延 import する起動口だけを持つ（merge_status 等は端
 """
 from __future__ import annotations
 
-import os
-import shutil
-import subprocess
 import sys
 
 from .server import gateway_log_path, is_ready
@@ -80,16 +77,21 @@ def _fmt_hms(seconds) -> str:
     return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
 
 
-def _open_log_in_pager(port: int) -> None:
-    """ゲートウェイログをページャ（$PAGER / less / more）で開く（ターミナル内で完結）。"""
+def read_log_tail(port: int, max_lines: int = 1000) -> str:
+    """ゲートウェイログの末尾（最大 max_lines 行）を返す（TUI 内のログ画面で表示用）。
+
+    外部ページャ（less 等）には頼らず、textual アプリ内のスクロール画面に出すための純データ。
+    ログがまだ無い／空のときは案内文を返す。
+    """
     path = gateway_log_path(port)
-    if not os.path.exists(path):
-        return
-    pager = os.environ.get("PAGER") or shutil.which("less") or shutil.which("more")
-    if not pager:
-        return
-    args = [pager, "+G", path] if os.path.basename(pager).startswith("less") else [pager, path]
-    subprocess.call(args)
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()
+    except OSError:
+        return f"(ログはまだありません: {path})"
+    if not lines:
+        return f"(ログは空です: {path})"
+    return "".join(lines[-max_lines:])
 
 
 def run_tui(gcfg) -> int:
