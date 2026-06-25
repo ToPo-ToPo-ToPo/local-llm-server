@@ -1,26 +1,37 @@
 # local-llm-server
 
 ローカルLLM（**mlx** / **mlx-vlm** / **llama.cpp**）を束ねる**マルチモデルゲートウェイ**。
-`gateway.toml` にモデルを並べて 1 プロセス起動するだけで、1 つの OpenAI 互換ポートに複数モデルを配信する。
+`gateway.toml` にモデルを並べて 1 プロセス起動するだけで、1 つの公開ポートに複数モデルを配信する。
 
-- **`gateway.toml`（モデルカタログ）を書いて起動するだけ**。外部アプリ（Ollama / LM Studio 等）に依存しない。
+- **`gateway.toml`（モデルカタログ）を書いて起動するだけ**。
 - 1 つの公開ポートで複数モデルを配信し、リクエストの `model` で振り分ける。
 - モデルは**初回リクエスト時に遅延起動**、`max_resident` 超過で LRU 退避、`idle_timeout` で自動アンロード。
 - 接続側は公開ポートに繋いで `model` を選ぶだけ（接続クライアントは別パッケージ）。
 
 ## インストール
 
-[uv](https://docs.astral.sh/uv/) を使う（extras 指定はクォート必須）。
+[uv](https://docs.astral.sh/uv/) を使う。
+`[backend]` は推論バックエンドを入れる extra。
+`[ ]` はシェル（zsh）の glob 展開を避けるためクォートする。
 
+#### 1. Apple Silicon で推論する（mlx-lm / mlx-vlm）
 ```bash
-uv add "local-llm-server[mlx]"     # Apple Silicon で推論する（mlx-lm / mlx-vlm）
+uv add "local-llm-server[mlx]"
 ```
+
+#### 2. その他の OS（Linux / Windows / Intel Mac）— llama.cpp
+ゲートウェイ本体だけ入れる（バックエンド extra は不要）:
+```bash
+uv add local-llm-server
+```
+推論には llama.cpp の `llama-server` を別途インストールして PATH に通す（例: `brew install llama.cpp`、
+公式リリース、ソースビルド）。`gateway.toml` の `[[models]]` で `backend = "llama-cpp"` を指定する。
 
 ## 使い方
 
 ### 1. gateway.toml を置く
 
-カレントディレクトリに `gateway.toml`（モデルカタログ）を置く。リポジトリ直下に例を同梱（→ [gateway.toml](gateway.toml)）:
+カレントディレクトリに `gateway.toml` を置く。リポジトリ直下に例を同梱（→ [gateway.toml](gateway.toml)）:
 
 ```toml
 host = "127.0.0.1"
@@ -31,22 +42,16 @@ model = "mlx-community/Qwen3.6-27B-4bit"
 backend = "mlx-vlm"
 ```
 
-全フィールドの説明 → **[docs/gateway.md](docs/gateway.md)**。MTP（高速化）→ **[docs/mtp.md](docs/mtp.md)**。
-
 ### 2. 起動
 
 ```bash
 uv run local-llm-server     # TUI ダッシュボード（状態を自動更新表示）
 ```
 
-バックグラウンド常駐・停止・監視（`--start` / `--stop` / `--status` / `--headless`）やトレイ GUI アプリ、
-アンインストール → **[docs/operation.md](docs/operation.md)**。
-
 ### 3. 接続
 
-公開ポートの OpenAI 互換 API に繋ぎ、`model` で使うモデルを選ぶ。接続クライアントは別パッケージ
+公開ポートに繋ぎ、`model` で使うモデルを選ぶ。接続クライアントは別パッケージ
 [local-llm-client](https://github.com/ToPo-ToPo-ToPo/local-automata-core/tree/main/packages/local-llm-client)
-（または素の `openai` SDK で `base_url` を指すだけでも可）:
 
 ```bash
 uv add local-llm-client
@@ -63,7 +68,7 @@ print(llm.respond("ローカルLLMの利点を3つ。"))
 
 - [docs/gateway.md](docs/gateway.md) — `gateway.toml` の全フィールドと振る舞い
 - [docs/operation.md](docs/operation.md) — 起動・停止・監視（ターミナル／GUI アプリ）・アンインストール
-- [docs/mtp.md](docs/mtp.md) — MTP（投機的デコード）による高速化
+- [docs/mtp.md](docs/mtp.md) — MTPによる高速化
 
 ## ライセンス
 
