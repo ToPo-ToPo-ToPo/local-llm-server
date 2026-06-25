@@ -1,6 +1,6 @@
 [project]
 name = "local-llm-server"
-version = "0.13.2"
+version = "0.14.0"
 description = "ローカルLLM（mlx / mlx-vlm / llama.cpp）を OpenAI 互換 API で束ねるマルチモデルゲートウェイ（サーバー）。gateway.toml のカタログを 1 ポートで配信し、model で振り分け・遅延起動・LRU 退避・MTP 高速化（Ollama 流の共有デーモン）。接続用クライアントは別パッケージ local-llm-client。"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -32,16 +32,6 @@ mlx = [
     "mlx-lm>=0.31.3 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
     "mlx-vlm>=0.5.0 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
 ]
-# システムトレイ常駐の状態モニタ GUI（Windows / macOS / Linux）。`local-llm-server-gui` で起動。
-# トレイ描画は pystray、アイコン画像生成に pillow。各 OS のバックエンド依存も合わせて入れる
-# （macOS: pyobjc、Linux: python-xlib による Xorg バックエンド。Windows は追加不要）。
-gui = [
-    "pystray>=0.19",
-    "pillow>=9",
-    "pyobjc-framework-Cocoa>=9 ; sys_platform == 'darwin'",
-    "pyobjc-framework-Quartz>=9 ; sys_platform == 'darwin'",
-    "python-xlib>=0.33 ; sys_platform == 'linux'",
-]
 
 [dependency-groups]
 dev = [
@@ -53,7 +43,6 @@ Repository = "https://github.com/ToPo-ToPo-ToPo/local-llm-server"
 
 [project.scripts]
 local-llm-server = "local_llm_server.cli:main"
-local-llm-server-gui = "local_llm_server.gui:main"
 
 [build-system]
 requires = ["setuptools>=77"]

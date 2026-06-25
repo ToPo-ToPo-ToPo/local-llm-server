@@ -216,7 +216,7 @@ class ServerConfig:
     port: int = 8080
     parallel: int | None = None  # 同時処理スロット数（llama.cpp のみ）
     disable_thinking: bool = False  # Qwen3 系の思考モードを無効化して起動
-    # 投機的デコード（speculative decoding）用ドラフター。今回は公式対応する
+    # speculative decoding 用ドラフター。今回は公式対応する
     # Gemma 4 の MTP（Multi-Token Prediction）ドラフターに限定する。
     # draft_model にドラフターの HF id / パス（例
     # mlx-community/gemma-4-E4B-it-qat-assistant-bf16）を指定すると、本体の出力を
@@ -262,7 +262,7 @@ MTP_DRAFTERS = {
 def resolve_drafter(model: str, draft_model: str | None) -> str | None:
     """draft_model を解決する。
 
-    - None / 空 … ドラフター無し（投機的デコードを使わない）。
+    - None / 空 … ドラフター無し（speculative decodingを使わない）。
     - "auto"   … 本体名 model から対応する MTP ドラフター（Gemma 4 / Qwen3.6）を
                  内蔵表で引く。未収載なら ValueError（HF id を明示するよう促す）。
     - それ以外 … その値（ドラフターの HF id / パス）をそのまま使う。
@@ -280,6 +280,95 @@ def resolve_drafter(model: str, draft_model: str | None) -> str | None:
             " 他のモデルでは draft_model にドラフターの HF id を明示してください。"
         )
     return drafter
+
+
+def _hf_hub_cache() -> str:
+    """HuggingFace Hub のキャッシュ（models--org--name/snapshots/...）ルートを返す。"""
+    if os.environ.get("HF_HUB_CACHE"):
+        return os.environ["HF_HUB_CACHE"]
+    home = os.environ.get("HF_HOME") or os.path.expanduser("~/.cache/huggingface")
+    return os.path.join(home, "hub")
+
+
+def resolve_gguf(model: str) -> str:
+    """llama.cpp の `model`（HF repo-id）を DL 済みキャッシュの実 GGUF パスに解決する。
+
+    `model` は必ず **HF repo-id（`org/repo[:セレクタ]`）**で指定する（実ファイルパスは非対応）。
+    HF キャッシュ（`hf download` 済み）から該当 GGUF を探して返す。`-hf` の自動DLには依存しない
+    （トークン不要・401 回避）。次の場合はいずれも ValueError（取得方法を案内）:
+
+    - repo-id 形式でない（実パス等）／キャッシュに無い／該当 GGUF が無い。
+    - `org/repo` に GGUF が複数あって 1 つに定まらない（`:セレクタ` で絞る）。
+
+    `org/repo:selector` はファイル名の一部（量子化名や `F16-MTP` 等）。セレクタ無しのときは mmproj と
+    MTP ヘッドを除いた「本体」GGUF を選ぶ。
+    """
+    spec = model.strip()
+    repo, _sep, selector = spec.partition(":")
+    if repo.startswith(("/", "./", "../", "~")) or repo.count("/") != 1 or not all(repo.split("/")):
+        raise ValueError(
+            f"model は HF repo-id（org/repo[:量子化名]）で指定してください（実パス非対応）: {model!r}"
+        )
+    org, name = repo.split("/", 1)
+    cache_dir = os.path.join(_hf_hub_cache(), f"models--{org}--{name}", "snapshots")
+    if not os.path.isdir(cache_dir):
+        raise ValueError(
+            f"'{repo}' がローカルキャッシュにありません。先に取得してください: "
+            f"hf download {repo} <ファイル名.gguf>"
+        )
+    ggufs: list[str] = []
+    for root, _dirs, files in os.walk(cache_dir):
+        for f in files:
+            if f.lower().endswith(".gguf"):
+                ggufs.append(os.path.join(root, f))
+    if selector:
+        matched = [g for g in ggufs if selector.lower() in os.path.basename(g).lower()]
+    else:
+        # 本体＝mmproj でも MTP ヘッドでもないもの
+        matched = [
+            g for g in ggufs
+            if "mmproj" not in os.path.basename(g).lower()
+            and "mtp" not in os.path.basename(g).lower()
+        ]
+    # 複数スナップショットが同じ blob を指すことがあるので実体で重複排除する。ただし返すのは
+    # スナップショット側のパス（実ファイル名が残り、隣の mmproj を検出できる）。
+    by_blob: dict[str, str] = {}
+    for g in sorted(matched):
+        by_blob.setdefault(os.path.realpath(g), g)
+    pool = sorted(by_blob.values())
+    if not pool:
+        hint = f"（セレクタ '{selector}' に一致なし）" if selector else ""
+        raise ValueError(
+            f"'{model}' に該当する GGUF がキャッシュにありません{hint}。"
+            f"hf download {repo} <ファイル名.gguf> で取得してください。"
+        )
+    if len(pool) > 1:
+        names = sorted(os.path.basename(g) for g in pool)
+        raise ValueError(
+            f"'{model}' に複数の GGUF が該当します {names}。"
+            f"'{repo}:<量子化名など>' でファイルを 1 つに絞ってください。"
+        )
+    return pool[0]
+
+
+def find_sibling_mmproj(model_path: str) -> str | None:
+    """GGUF 本体と同じディレクトリにある vision projector（mmproj）を探す。
+
+    llama.cpp のマルチモーダルは本体 GGUF とは別に mmproj(.gguf) が要る。HF の GGUF
+    リポジトリは慣例的に `mmproj-*.gguf` / `*mmproj*.gguf` を本体と同梱するため、本体の
+    隣を探して見つかれば自動で `--mmproj` に渡す（テキストのみ入力でも速度・精度に影響は
+    無く、画像が来たときだけ使われる）。本体がローカルファイルでない／隣に無ければ None。
+    """
+    directory = os.path.dirname(model_path)
+    if not directory or not os.path.isdir(directory):
+        return None
+    candidates = sorted(
+        name for name in os.listdir(directory)
+        if "mmproj" in name.lower() and name.lower().endswith(".gguf")
+    )
+    if not candidates:
+        return None
+    return os.path.abspath(os.path.join(directory, candidates[0]))
 
 
 def build_command(config: ServerConfig) -> list[str]:
@@ -311,7 +400,7 @@ def build_command(config: ServerConfig) -> list[str]:
             "--host", config.host,
             "--port", str(config.port),
         ]
-        # Gemma 4 の MTP ドラフターによる投機的デコード。draft_kind は mtp に固定する
+        # Gemma 4 の MTP ドラフターによる speculative decoding。draft_kind は mtp に固定する
         # （他種別＝dflash / eagle3 は今回は対象外）。draft_model="auto" は本体名から
         # 対応ドラフターを自動選択する。指定があれば本体とドラフターの両方を mlx-vlm が
         # 初回に自動ダウンロードする。
@@ -319,16 +408,42 @@ def build_command(config: ServerConfig) -> list[str]:
         if drafter:
             command += ["--draft-model", drafter, "--draft-kind", "mtp"]
     elif config.backend == "llama-cpp":
+        # model は HF repo-id（org/repo[:selector]）。DL 済みキャッシュから実 GGUF を解決する
+        # （キャッシュに無ければ ValueError。クライアントに見せる ID は repo-id のまま）。
+        model_path = resolve_gguf(config.model)
         command = [
             "llama-server",
-            "-m", config.model,
+            "-m", model_path,
             "--host", config.host,
             "--port", str(config.port),
         ]
-        if config.parallel is not None:
+        # 埋め込み MTP（Qwen3.6 等、本体 GGUF に MTP ヘッドが内蔵）。draft_model="self"/"mtp"
+        # で有効化＝別ドラフトファイル不要（--spec-type draft-mtp のみ）。この方式は llama.cpp 側で
+        # --mmproj（vision）と --parallel>1 が未対応なので、両者は付けない（付けると起動失敗する）。
+        embedded_mtp = bool(config.draft_model) and \
+            config.draft_model.strip().lower() in ("self", "mtp")
+        if config.parallel is not None and not embedded_mtp:
             command += ["--parallel", str(config.parallel)]
         if config.disable_thinking:
             command += ["--chat-template-kwargs", '{"enable_thinking": false}']
+        if embedded_mtp:
+            command += ["--spec-type", "draft-mtp"]
+        else:
+            # マルチモーダル: 本体の隣に mmproj があれば自動で渡す（手動設定不要）。
+            # ユーザーが extra_args で明示制御していれば（--mmproj / --no-mmproj）尊重する。
+            if not any(a in ("--mmproj", "-mm", "--no-mmproj") for a in config.extra_args):
+                mmproj = find_sibling_mmproj(model_path)
+                if mmproj:
+                    command += ["--mmproj", mmproj]
+            # 別ヘッド方式の speculative decoding（gemma4 等）。draft_model に MTP ヘッドの
+            # HF repo-id（org/repo:F16-MTP 等）を指定すると有効化（-md）。ファイル名に
+            # "mtp" を含めば MTP ヘッドとみなし --spec-type draft-mtp を付ける（それ以外は
+            # llama.cpp 既定の draft-simple）。
+            if config.draft_model and "-md" not in config.extra_args:
+                draft_path = resolve_gguf(config.draft_model)
+                command += ["-md", draft_path]
+                if "mtp" in os.path.basename(draft_path).lower():
+                    command += ["--spec-type", "draft-mtp"]
     else:
         raise ValueError(
             f"unknown backend: {config.backend!r} (choose from {BACKENDS})"
@@ -618,7 +733,7 @@ def gateway_admin_status(
     """ゲートウェイの GET /admin/status を取得する（常駐モデルのライブ状態＋運用方針）。
 
     server_status と違い、各モデルの loaded / inflight（処理中数）や max_resident /
-    idle_timeout までゲートウェイ本体から取得できる（→ GUI 監視用）。応答しない・旧版で
+    idle_timeout までゲートウェイ本体から取得できる（→ TUI 監視用）。応答しない・旧版で
     エンドポイントが無い場合は None を返す（呼び出し側は server_status にフォールバックできる）。
     """
     url = f"http://{host}:{port}/admin/status"
@@ -636,7 +751,7 @@ def gateway_log_path(port: int) -> str:
     """バックグラウンド起動したゲートウェイ本体（公開ポート）の出力ログ保存先。
 
     モデルサーバーの daemon_log_path（server-<port>.log）と別に、ゲートウェイ自身の
-    起動ログを gateway-<port>.log に逃がす（`--status` / GUI から参照できる固定パス）。
+    起動ログを gateway-<port>.log に逃がす（`--status` / TUI から参照できる固定パス）。
     """
     return os.path.join(project_cache_dir(), f"gateway-{port}.log")
 

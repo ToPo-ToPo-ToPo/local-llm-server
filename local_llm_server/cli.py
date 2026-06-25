@@ -16,8 +16,7 @@
   * --status   … 状態表示（応答可否・PID・提供モデル・ログパス）
   * --restart  … 停止してからバックグラウンド再起動（gateway.toml 変更の反映に）
 
-デスクトップで状態をひと目で見たい場合は、別途トレイ GUI アプリ（`local-llm-server-gui`）も
-選べる（CLI と同じ ./gateway.toml を読む）。CLI・TUI・GUI は同じ運用基盤（server.py）を共有する。
+CLI と TUI は同じ運用基盤（server.py）を共有する。
 """
 from __future__ import annotations
 
@@ -140,8 +139,7 @@ def main(argv: list[str] | None = None) -> int:
             "(model catalog). Host, port, models and MTP are all configured in that file. Clients "
             "connect to the public port and select a model via `model`; the client never starts a "
             "server. Run in the foreground (default), or operate it from the terminal with "
-            "--start / --stop / --status / --restart. A tray GUI app (local-llm-server-gui) is "
-            "an optional alternative for monitoring."
+            "--start / --stop / --status / --restart."
         ),
     )
     parser.add_argument(

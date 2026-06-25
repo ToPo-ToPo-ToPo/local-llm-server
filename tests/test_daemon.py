@@ -31,6 +31,22 @@ def test_load_gateway_config_assigns_internal_ports(tmp_path):
     assert [c.port for c in cfg.models] == [9001, 9002]
 
 
+def test_load_gateway_config_llama_draft_passthrough(tmp_path):
+    # llama-cpp の draft_model は repo-id をそのまま採用（speculative decoding 用）。
+    # グローバル既定 "auto" は llama-cpp では無効化される（自動解決表が無い）。
+    p = _write(
+        tmp_path,
+        'draft_model = "auto"\n'
+        '[[models]]\nmodel = "org/a-gguf"\nbackend = "llama-cpp"\n'
+        'draft_model = "org/d-gguf:F16-MTP"\n'
+        '[[models]]\nmodel = "org/b-gguf"\nbackend = "llama-cpp"\n',
+    )
+    cfg = gw.load_gateway_config(p)
+    drafts = {c.model: c.draft_model for c in cfg.models}
+    assert drafts["org/a-gguf"] == "org/d-gguf:F16-MTP"
+    assert drafts["org/b-gguf"] is None  # "auto" 継承は無効
+
+
 def test_load_gateway_config_rejects_empty_models(tmp_path):
     with pytest.raises(ValueError, match="non-empty"):
         gw.load_gateway_config(_write(tmp_path, "port = 8080\n"))

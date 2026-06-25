@@ -31,7 +31,7 @@ from .server import (
     resolve_drafter,
 )
 
-# MTP（投機的デコード）が効くバックエンド。draft_model は mlx-vlm のみ build_command が
+# MTP（speculative decoding）が効くバックエンド。draft_model は mlx-vlm のみ build_command が
 # 反映する（他は無視）。ゲートウェイはこれを使って継承・検証する。
 _MTP_BACKEND = "mlx-vlm"
 # draft_model を無効化する文字列（ゲートウェイ既定を個別に打ち消すため）。
@@ -275,7 +275,7 @@ class GatewayServer(ThreadingHTTPServer):
         self.catalog = catalog            # /v1/models で返すモデル一覧
         self.default_model = default_model
         self.timeout_s = timeout_s        # None なら無制限（長時間生成に備える）
-        # GET /admin/status（GUI 等の監視用）で返すゲートウェイ設定。運用ポリシーを
+        # GET /admin/status（TUI 等の監視用）で返すゲートウェイ設定。運用ポリシーを
         # 添えることで、常駐モデルのライブ状態と一緒に「上限/退避方針」も読み取れる。
         self.max_resident = max_resident
         self.idle_timeout = idle_timeout
@@ -303,7 +303,7 @@ class _GatewayHandler(BaseHTTPRequestHandler):
             send_json(self, 200, data)
             return
         # /admin/status は常駐モデルのライブ状態（loaded/inflight）＋運用ポリシーを返す。
-        # GUI（メニューバー監視）が CLI の --status より詳しい状態を出すための読み取り口。
+        # TUI が CLI の --status より詳しい状態を出すための読み取り口。
         if path.endswith("/admin/status"):
             host, port = srv.server_address[0], srv.server_address[1]
             models = srv.manager.status()
@@ -384,6 +384,13 @@ def _resolve_model_draft(
         return None
     if backend == _MTP_BACKEND:
         return resolve_drafter(model, raw)  # auto を解決＆未対応なら ValueError
+    if backend == "llama-cpp":
+        # llama.cpp のspeculative decodingはドラフト GGUF のパスを直接指定する（-md）。
+        # MTP ヘッドのファイル名は build_command 側で検出して --spec-type draft-mtp を付ける。
+        # "auto" の自動解決表は llama.cpp には無いので、明示パス以外は無効扱い。
+        if raw == "auto":
+            return None
+        return raw
     if has_own:
         print(
             f"Warning: draft_model (MTP) is ignored for backend '{backend}' "

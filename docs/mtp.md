@@ -1,4 +1,4 @@
-# MTP（投機的デコード）
+# MTP（speculative decoding）
 
 本体モデルの**出力を変えずに**推論を高速化する Multi-Token Prediction。小さなドラフター
 モデルが先読みし、本体がまとめて検証する。Qwen3.6-27B で実測 **~2倍速**（38→75 tok/s、
