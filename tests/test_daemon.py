@@ -32,7 +32,7 @@ def test_load_gateway_config_assigns_internal_ports(tmp_path):
 
 
 def test_load_gateway_config_llama_draft_path_passthrough(tmp_path):
-    # llama-cpp の draft_model はパスをそのまま採用（投機的デコード用）。
+    # llama-cpp の draft_model はパスをそのまま採用（speculative decoding用）。
     # グローバル既定 "auto" は llama-cpp では無効化される（自動解決表が無い）。
     p = _write(
         tmp_path,

@@ -31,7 +31,7 @@ from .server import (
     resolve_drafter,
 )
 
-# MTP（投機的デコード）が効くバックエンド。draft_model は mlx-vlm のみ build_command が
+# MTP（speculative decoding）が効くバックエンド。draft_model は mlx-vlm のみ build_command が
 # 反映する（他は無視）。ゲートウェイはこれを使って継承・検証する。
 _MTP_BACKEND = "mlx-vlm"
 # draft_model を無効化する文字列（ゲートウェイ既定を個別に打ち消すため）。
@@ -385,7 +385,7 @@ def _resolve_model_draft(
     if backend == _MTP_BACKEND:
         return resolve_drafter(model, raw)  # auto を解決＆未対応なら ValueError
     if backend == "llama-cpp":
-        # llama.cpp の投機的デコードはドラフト GGUF のパスを直接指定する（-md）。
+        # llama.cpp のspeculative decodingはドラフト GGUF のパスを直接指定する（-md）。
         # MTP ヘッドのファイル名は build_command 側で検出して --spec-type draft-mtp を付ける。
         # "auto" の自動解決表は llama.cpp には無いので、明示パス以外は無効扱い。
         if raw == "auto":

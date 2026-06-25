@@ -216,7 +216,7 @@ class ServerConfig:
     port: int = 8080
     parallel: int | None = None  # 同時処理スロット数（llama.cpp のみ）
     disable_thinking: bool = False  # Qwen3 系の思考モードを無効化して起動
-    # 投機的デコード（speculative decoding）用ドラフター。今回は公式対応する
+    # speculative decoding 用ドラフター。今回は公式対応する
     # Gemma 4 の MTP（Multi-Token Prediction）ドラフターに限定する。
     # draft_model にドラフターの HF id / パス（例
     # mlx-community/gemma-4-E4B-it-qat-assistant-bf16）を指定すると、本体の出力を
@@ -262,7 +262,7 @@ MTP_DRAFTERS = {
 def resolve_drafter(model: str, draft_model: str | None) -> str | None:
     """draft_model を解決する。
 
-    - None / 空 … ドラフター無し（投機的デコードを使わない）。
+    - None / 空 … ドラフター無し（speculative decodingを使わない）。
     - "auto"   … 本体名 model から対応する MTP ドラフター（Gemma 4 / Qwen3.6）を
                  内蔵表で引く。未収載なら ValueError（HF id を明示するよう促す）。
     - それ以外 … その値（ドラフターの HF id / パス）をそのまま使う。
@@ -392,7 +392,7 @@ def build_command(config: ServerConfig) -> list[str]:
             "--host", config.host,
             "--port", str(config.port),
         ]
-        # Gemma 4 の MTP ドラフターによる投機的デコード。draft_kind は mtp に固定する
+        # Gemma 4 の MTP ドラフターによる speculative decoding。draft_kind は mtp に固定する
         # （他種別＝dflash / eagle3 は今回は対象外）。draft_model="auto" は本体名から
         # 対応ドラフターを自動選択する。指定があれば本体とドラフターの両方を mlx-vlm が
         # 初回に自動ダウンロードする。
@@ -427,7 +427,7 @@ def build_command(config: ServerConfig) -> list[str]:
                 mmproj = find_sibling_mmproj(model_path)
                 if mmproj:
                     command += ["--mmproj", mmproj]
-            # 別ヘッド方式の投機的デコード（gemma4 等）。draft_model にドラフト GGUF のパス
+            # 別ヘッド方式のspeculative decoding（gemma4 等）。draft_model にドラフト GGUF のパス
             # または HF repo-id（org/repo:F16-MTP 等）を指定すると有効化（-md）。ファイル名に
             # "mtp" を含めば MTP ヘッドとみなし --spec-type draft-mtp を付ける（それ以外は
             # llama.cpp 既定の draft-simple）。

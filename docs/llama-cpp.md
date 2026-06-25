@@ -49,9 +49,9 @@ Qwen3.6 のような vision 対応モデルは、本体 GGUF とは別に **visi
 > （`hf download <repo> <file>`）で本体と mmproj を同じスナップショットに落とし、その `.gguf` パスを
 > `model` に指定する方法。同ディレクトリに mmproj が並ぶので自動検出が効く。
 
-## 投機的デコード（MTP / draft）による高速化
+## speculative decoding（MTP / draft）による高速化
 
-llama.cpp は**投機的デコード**に対応し、ドラフトモデルで本体の生成を先読みして高速化する
+llama.cpp は**speculative decoding**に対応し、ドラフトモデルで本体の生成を先読みして高速化する
 （出力は本体が検証するので**ロスレス＝品質は変わらない**）。`[[models]]` の `draft_model` に
 ドラフト GGUF のパスを指定すると有効になる（`llama-server -md <path>`）。
 
