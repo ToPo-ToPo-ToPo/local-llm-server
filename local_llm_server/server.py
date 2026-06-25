@@ -282,6 +282,67 @@ def resolve_drafter(model: str, draft_model: str | None) -> str | None:
     return drafter
 
 
+def _hf_hub_cache() -> str:
+    """HuggingFace Hub のキャッシュ（models--org--name/snapshots/...）ルートを返す。"""
+    if os.environ.get("HF_HUB_CACHE"):
+        return os.environ["HF_HUB_CACHE"]
+    home = os.environ.get("HF_HOME") or os.path.expanduser("~/.cache/huggingface")
+    return os.path.join(home, "hub")
+
+
+def resolve_gguf(model: str) -> str:
+    """llama.cpp の `model` を実ファイルパスに解決する。
+
+    - 既存のローカルパスならそのまま返す。
+    - `org/repo` 形式なら HF キャッシュ（既にDL済みの GGUF）から該当ファイルを探して返す。
+      `-hf` の自動DLには依存しない（トークン不要・401 回避）。
+    - `org/repo:selector` でファイル名の一部（量子化名や `F16-MTP` 等）を指定できる。
+      セレクタ無しのときは mmproj と MTP ヘッドを除いた「本体」GGUF を選ぶ（1つに定まらなければ
+      候補を挙げて ValueError）。キャッシュに無い／repo 形式でなければ入力をそのまま返す
+      （呼び出し側で「実行ファイル/モデルが見つからない」と分かるエラーになる）。
+    """
+    if os.path.exists(model):
+        return model
+    repo, sep, selector = model.partition(":")
+    if "/" not in repo:
+        return model
+    org, name = repo.split("/", 1)
+    cache_dir = os.path.join(
+        _hf_hub_cache(), f"models--{org}--{name.replace('/', '--')}", "snapshots"
+    )
+    if not os.path.isdir(cache_dir):
+        return model
+    ggufs: list[str] = []
+    for root, _dirs, files in os.walk(cache_dir):
+        for f in files:
+            if f.lower().endswith(".gguf"):
+                ggufs.append(os.path.join(root, f))
+    if selector:
+        matched = [g for g in ggufs if selector.lower() in os.path.basename(g).lower()]
+    else:
+        # 本体＝mmproj でも MTP ヘッドでもないもの
+        matched = [
+            g for g in ggufs
+            if "mmproj" not in os.path.basename(g).lower()
+            and "mtp" not in os.path.basename(g).lower()
+        ]
+    # 複数スナップショットが同じ blob を指すことがあるので実体で重複排除する。ただし返すのは
+    # スナップショット側のパス（実ファイル名が残り、隣の mmproj を検出できる）。
+    by_blob: dict[str, str] = {}
+    for g in sorted(matched):
+        by_blob.setdefault(os.path.realpath(g), g)
+    pool = sorted(by_blob.values())
+    if not pool:
+        return model
+    if len(pool) > 1:
+        names = sorted(os.path.basename(g) for g in pool)
+        raise ValueError(
+            f"'{model}' に複数の GGUF が該当します {names}。"
+            f"'{repo}:<量子化名など>' でファイルを 1 つに絞ってください。"
+        )
+    return pool[0]
+
+
 def find_sibling_mmproj(model_path: str) -> str | None:
     """GGUF 本体と同じディレクトリにある vision projector（mmproj）を探す。
 
@@ -339,9 +400,12 @@ def build_command(config: ServerConfig) -> list[str]:
         if drafter:
             command += ["--draft-model", drafter, "--draft-kind", "mtp"]
     elif config.backend == "llama-cpp":
+        # model は実パスでも HF repo-id（org/repo[:selector]）でも可。後者は DL 済み
+        # キャッシュから実 GGUF を解決する（クライアントに見せる ID は repo-id のまま）。
+        model_path = resolve_gguf(config.model)
         command = [
             "llama-server",
-            "-m", config.model,
+            "-m", model_path,
             "--host", config.host,
             "--port", str(config.port),
         ]
@@ -352,15 +416,17 @@ def build_command(config: ServerConfig) -> list[str]:
         # マルチモーダル: 本体の隣に mmproj があれば自動で渡す（手動設定不要）。
         # ユーザーが extra_args で明示制御していれば（--mmproj / --no-mmproj）尊重する。
         if not any(a in ("--mmproj", "-mm", "--no-mmproj") for a in config.extra_args):
-            mmproj = find_sibling_mmproj(config.model)
+            mmproj = find_sibling_mmproj(model_path)
             if mmproj:
                 command += ["--mmproj", mmproj]
-        # 投機的デコード（高速化・出力はロスレス）。draft_model にドラフト GGUF のパスを
-        # 指定すると有効化（-md）。ファイル名に mmproj ならぬ "mtp" を含めば MTP ヘッドと
-        # みなし --spec-type draft-mtp を付ける（それ以外は llama.cpp 既定の draft-simple）。
+        # 投機的デコード（高速化・出力はロスレス）。draft_model にドラフト GGUF のパス
+        # または HF repo-id（org/repo:F16-MTP 等）を指定すると有効化（-md）。ファイル名に
+        # "mtp" を含めば MTP ヘッドとみなし --spec-type draft-mtp を付ける（それ以外は
+        # llama.cpp 既定の draft-simple）。
         if config.draft_model and "-md" not in config.extra_args:
-            command += ["-md", config.draft_model]
-            if "mtp" in os.path.basename(config.draft_model).lower():
+            draft_path = resolve_gguf(config.draft_model)
+            command += ["-md", draft_path]
+            if "mtp" in os.path.basename(draft_path).lower():
                 command += ["--spec-type", "draft-mtp"]
     else:
         raise ValueError(

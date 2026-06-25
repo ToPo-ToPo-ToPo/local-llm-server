@@ -8,6 +8,22 @@ PATH に通っていること」だけ。Python バインディング（`llama-c
 導入後は `gateway.toml` の `[[models]]` で `backend = "llama-cpp"`、`model` に GGUF を指定する
 （→ [docs/gateway.md](gateway.md)）。
 
+## model の書き方（実パス / HF repo-id）
+
+`model` は次のどちらでも書ける:
+
+- **実ファイルパス**: `/path/to/model.gguf`
+- **HF repo-id**: `org/repo`（例 `google/gemma-4-26B-A4B-it-qat-q4_0-gguf`）。**DL 済みキャッシュ**から
+  実 GGUF を解決して `llama-server -m` に渡す（`-hf` の自動DLには依存しない＝トークン不要・401 回避）。
+  クライアントに見せるモデル ID も repo-id になり読みやすい。
+
+repo に GGUF が複数ある（量子化違い・MTP ヘッド等）ときは **`org/repo:セレクタ`** でファイル名の一部を
+指定して 1 つに絞る（例 `unsloth/gemma-4-26B-A4B-it-qat-GGUF:Q4_K_XL`）。セレクタ無しのときは mmproj と
+MTP ヘッドを除いた「本体」を選ぶ（1 つに定まらなければ候補を挙げてエラー）。
+
+> 同一ファイル（同一 ID）は複数エントリに登録できない。MTP あり/なしを併存させたい等は、**repo を分ける**
+> （例: 公式版 `google/...`、MTP 版 `unsloth/...`）と ID が衝突しない。
+
 ## マルチモーダル（画像入力）
 
 Qwen3.6 のような vision 対応モデルは、本体 GGUF とは別に **vision projector（`mmproj-*.gguf`）**が要る。

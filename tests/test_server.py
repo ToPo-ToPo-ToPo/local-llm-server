@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+import pytest
+
 import local_llm_server.server as srv
 from local_llm_server import (
     BACKENDS,
@@ -26,6 +28,54 @@ def test_build_command_llama_parallel_and_thinking():
     assert cmd[0] == "llama-server"
     assert "--parallel" in cmd and "4" in cmd
     assert "--chat-template-kwargs" in cmd
+
+
+def _make_hf_cache(tmp_path, repo, files):
+    """HF キャッシュ風のレイアウトを作る: models--org--name/snapshots/rev/<files>。"""
+    org, name = repo.split("/", 1)
+    snap = tmp_path / "hub" / f"models--{org}--{name.replace('/', '--')}" / "snapshots" / "rev1"
+    for f in files:
+        p = snap / f
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"")
+    return snap
+
+
+def test_resolve_gguf_passthrough(tmp_path, monkeypatch):
+    monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path / "hub"))
+    existing = tmp_path / "x.gguf"
+    existing.write_bytes(b"")
+    assert srv.resolve_gguf(str(existing)) == str(existing)  # 実パスはそのまま
+    assert srv.resolve_gguf("just-a-name") == "just-a-name"  # repo 形式でない
+    assert srv.resolve_gguf("org/not-cached") == "org/not-cached"  # 未キャッシュ
+
+
+def test_resolve_gguf_repo_id_single_base(tmp_path, monkeypatch):
+    monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path / "hub"))
+    snap = _make_hf_cache(tmp_path, "google/gemma-4-x-gguf",
+                          ["gemma-4-x_q4_0.gguf", "gemma-4-x-mmproj.gguf"])
+    # mmproj/MTP を除いた本体を選ぶ
+    assert srv.resolve_gguf("google/gemma-4-x-gguf") == str(snap / "gemma-4-x_q4_0.gguf")
+
+
+def test_resolve_gguf_selector_and_ambiguity(tmp_path, monkeypatch):
+    monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path / "hub"))
+    snap = _make_hf_cache(tmp_path, "unsloth/g-gguf",
+                          ["base-Q4_K_XL.gguf", "base-Q8_0.gguf", "MTP/g-F16-MTP.gguf"])
+    # セレクタでファイルを 1 つに絞れる（MTP ヘッドも選べる）
+    assert srv.resolve_gguf("unsloth/g-gguf:F16-MTP") == str(snap / "MTP" / "g-F16-MTP.gguf")
+    # セレクタ無しで本体が複数あると曖昧エラー
+    with pytest.raises(ValueError):
+        srv.resolve_gguf("unsloth/g-gguf")
+
+
+def test_build_command_llama_resolves_repo_id(tmp_path, monkeypatch):
+    monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path / "hub"))
+    snap = _make_hf_cache(tmp_path, "google/g-gguf", ["g_q4_0.gguf", "g-mmproj.gguf"])
+    cmd = build_command(ServerConfig("llama-cpp", "google/g-gguf"))
+    assert "-m" in cmd and str(snap / "g_q4_0.gguf") in cmd
+    # 同スナップショットの mmproj も自動検出される
+    assert "--mmproj" in cmd and str(snap / "g-mmproj.gguf") in cmd
 
 
 def test_build_command_llama_mtp_draft():
