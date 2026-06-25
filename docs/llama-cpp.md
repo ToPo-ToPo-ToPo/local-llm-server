@@ -22,6 +22,17 @@ Qwen3.6 のような vision 対応モデルは、本体 GGUF とは別に **visi
 - mmproj を明示指定したいときは `extra_args = ["--mmproj", "/path/to/mmproj.gguf"]`（この場合は
   自動検出より優先）。
 
+検証済みの vision 対応 GGUF（いずれも本体と同じディレクトリに mmproj 同梱 → 自動検出される）:
+
+| モデル | GGUF リポジトリ | mmproj |
+|---|---|---|
+| Qwen3.6-27B | `lmstudio-community/Qwen3.6-27B-GGUF` | `mmproj-Qwen3.6-27B-BF16.gguf` |
+| Gemma 4 26B-A4B | `google/gemma-4-26B-A4B-it-qat-q4_0-gguf` | `gemma-4-26B-it-mmproj.gguf` |
+
+> llama.cpp の `-hf` 自動DLはトークン次第で 401 になることがある。確実なのは `huggingface_hub`
+> （`hf download <repo> <file>`）で本体と mmproj を同じスナップショットに落とし、その `.gguf` パスを
+> `model` に指定する方法。同ディレクトリに mmproj が並ぶので自動検出が効く。
+
 ## OS 別の主導線
 
 | OS | 普段使い（手軽） | 当日公開モデルを最速で追う |

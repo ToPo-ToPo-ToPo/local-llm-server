@@ -49,14 +49,13 @@ parallel = 4            # 同時処理スロット（llama.cpp のみ）
 disable_thinking = true # 思考を抑制して直答に（任意）
 draft_model = "off"     # MTP は llama-cpp では無効
 
-# Gemma 4 GGUF を使う場合（※未キャッシュ。先に .gguf を入手してパスを指定する）。テキスト専用なら
-# extra_args の --mmproj 行を省く。使うなら下のコメントを外してパスを実ファイルに合わせる:
-# [[models]]
-# model = "/path/to/gemma-4-27b-it-Q4_K_M.gguf"
-# backend = "llama-cpp"
-# parallel = 4
-# disable_thinking = true
-# draft_model = "off"
+# Gemma 4 GGUF（vision 対応。公式 QAT q4_0。同梱の gemma-4-26B-it-mmproj.gguf を自動検出）:
+[[models]]
+model = "/Users/octopus/.cache/huggingface/hub/models--google--gemma-4-26B-A4B-it-qat-q4_0-gguf/snapshots/dfc00409adc70be497fee9c90bfe76b3ee130f2e/gemma-4-26B_q4_0-it.gguf"
+backend = "llama-cpp"
+parallel = 4            # 同時処理スロット（llama.cpp のみ）
+disable_thinking = true # 思考を抑制して直答に（任意）
+draft_model = "off"     # MTP は llama-cpp では無効
 
 # 画像を使わない用途は、テキスト専用 LLM（backend = "mlx"）にすると軽い・速い。
 # vision 専用の VLM ではないので画像リクエストはエラーになる。MTP は mlx-vlm 専用なので
