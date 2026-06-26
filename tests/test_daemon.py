@@ -471,3 +471,118 @@ def test_gateway_missing_model_returns_400(monkeypatch):
         server.shutdown(); server.server_close(); mgr.shutdown()
         for u in ups:
             u.shutdown(); u.server_close()
+
+
+# --- エージェント在席（セッション）ベースの即時アンロード --------------------
+
+def _wait_unloaded(mgr, model, timeout=2.0):
+    """非同期解放スレッドの完了を待つ（指定モデルが unloaded になるまで）。"""
+    import time
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        st = {s["model"]: s["loaded"] for s in mgr.status()}
+        if not st.get(model, False):
+            return True
+        time.sleep(0.01)
+    return False
+
+
+def test_load_gateway_config_session_ttl(tmp_path):
+    # 明示・既定(90)・無効(0→None)・負数で ValueError。
+    base = '[[models]]\nmodel = "x"\nbackend = "mlx"\n'
+    assert gw.load_gateway_config(_write(tmp_path, 'session_ttl = 30\n' + base)).session_ttl == 30.0
+    assert gw.load_gateway_config(_write(tmp_path, base)).session_ttl == 90.0
+    assert gw.load_gateway_config(_write(tmp_path, 'session_ttl = 0\n' + base)).session_ttl is None
+    with pytest.raises(ValueError, match="session_ttl"):
+        gw.load_gateway_config(_write(tmp_path, 'session_ttl = -1\n' + base))
+
+
+def test_session_last_agent_release_frees_immediately(monkeypatch):
+    created = _patch_fake(monkeypatch)
+    mgr = gw.ModelManager(_configs())
+    mgr.register_session("A", "m1")
+    _, h = mgr.acquire("m1")   # ロードさせる
+    mgr.release(h)
+    assert mgr.status()[0]["loaded"] is True
+    mgr.unregister_session("A")  # 最後の在席 → 即アンロード（別スレッド）
+    assert _wait_unloaded(mgr, "m1")
+    assert {s.config.model: s.stops for s in created}["m1"] == 1
+
+
+def test_session_kept_while_another_agent_present(monkeypatch):
+    _patch_fake(monkeypatch)
+    mgr = gw.ModelManager(_configs())
+    mgr.register_session("A", "m1")
+    mgr.register_session("B", "m1")
+    _, h = mgr.acquire("m1"); mgr.release(h)
+    assert {s["model"]: s["sessions"] for s in mgr.status()}["m1"] == 2
+    mgr.unregister_session("A")        # B がまだ在席 → 維持
+    import time; time.sleep(0.2)
+    st = {s["model"]: s for s in mgr.status()}["m1"]
+    assert st["loaded"] is True and st["sessions"] == 1
+    mgr.unregister_session("B")        # 最後の在席 → 解放
+    assert _wait_unloaded(mgr, "m1")
+
+
+def test_session_not_freed_while_inflight(monkeypatch):
+    _patch_fake(monkeypatch)
+    mgr = gw.ModelManager(_configs())
+    mgr.register_session("A", "m1")
+    _, h = mgr.acquire("m1")           # inflight=1 のまま
+    mgr.unregister_session("A")        # 在席0 でも処理中なので解放しない
+    import time; time.sleep(0.2)
+    assert mgr.status()[0]["loaded"] is True
+    mgr.release(h)
+
+
+def test_reap_sessions_frees_on_heartbeat_timeout(monkeypatch):
+    import time
+    created = _patch_fake(monkeypatch)
+    mgr = gw.ModelManager(_configs())
+    mgr.register_session("A", "m1")
+    _, h = mgr.acquire("m1"); mgr.release(h)
+    # 心拍を過去にして途絶扱いにする。
+    mgr._sessions["A"].last_seen = time.monotonic() - 100
+    assert mgr.reap_sessions(ttl=10) == 1
+    assert mgr.status()[0]["loaded"] is False
+    assert {s.config.model: s.stops for s in created}["m1"] == 1
+
+
+def test_heartbeat_unknown_agent_returns_false(monkeypatch):
+    _patch_fake(monkeypatch)
+    mgr = gw.ModelManager(_configs())
+    assert mgr.heartbeat("ghost") is False
+    mgr.register_session("A", "m1")
+    assert mgr.heartbeat("A") is True
+
+
+def test_session_switch_model_detaches_old(monkeypatch):
+    # 同じ agent が別モデルへ乗り換えたら、旧モデルから外れる（旧モデルが無人なら解放）。
+    _patch_fake(monkeypatch)
+    mgr = gw.ModelManager(_configs())
+    mgr.register_session("A", "m1")
+    _, h = mgr.acquire("m1"); mgr.release(h)
+    mgr.register_session("A", "m2")    # m1 から m2 へ乗り換え
+    assert _wait_unloaded(mgr, "m1")
+    counts = {s["model"]: s["sessions"] for s in mgr.status()}
+    assert counts["m1"] == 0 and counts["m2"] == 1
+
+
+def test_gateway_session_endpoints(monkeypatch):
+    # HTTP 経由で register/heartbeat/release を叩き、最後の解除で即アンロードされる。
+    server, mgr, ups = _start_gateway(monkeypatch)
+    try:
+        port = server.server_address[1]
+        assert _post(port, "/admin/sessions/register", {"agent_id": "A", "model": "m1"})[0] == 200
+        _, h = mgr.acquire("m1"); mgr.release(h)   # ロード
+        assert _post(port, "/admin/sessions/heartbeat", {"agent_id": "A"})[0] == 200
+        assert _post(port, "/admin/sessions/heartbeat", {"agent_id": "ZZ"})[0] == 404
+        # admin/status に sessions と session_ttl が出る
+        _, st = _get(port, "/admin/status")
+        assert {m["model"]: m["sessions"] for m in st["models"]}["m1"] == 1
+        assert _post(port, "/admin/sessions/release", {"agent_id": "A"})[0] == 200
+        assert _wait_unloaded(mgr, "m1")
+    finally:
+        server.shutdown(); server.server_close(); mgr.shutdown()
+        for u in ups:
+            u.shutdown(); u.server_close()

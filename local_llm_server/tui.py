@@ -29,6 +29,7 @@ def merge_status(gcfg, admin: dict | None) -> dict:
                 "model": model, "backend": backend, "port": port,
                 "state": "unloaded", "inflight": 0,
                 "requests": (m or {}).get("requests", 0), "idle_remaining": None,
+                "sessions": (m or {}).get("sessions", 0),
             }
         inflight = int(m.get("inflight", 0))
         idle_for = m.get("idle_for")
@@ -44,6 +45,7 @@ def merge_status(gcfg, admin: dict | None) -> dict:
             "model": model, "backend": backend, "port": port,
             "state": state, "inflight": inflight,
             "requests": int(m.get("requests", 0)), "idle_remaining": remaining,
+            "sessions": int(m.get("sessions", 0)),  # 在席エージェント数（0 で即アンロード対象）
         }
 
     rows = []
