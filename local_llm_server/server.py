@@ -366,6 +366,153 @@ def resolve_gguf(model: str) -> str:
     return pool[0]
 
 
+_DISCOVER_CACHE: dict = {"t": -1e9, "v": []}
+
+# チャット/生成に使わない（埋め込み・STT・分類・エンコーダ）モデルタイプ。発見一覧から除く。
+_NON_CHAT_MODEL_TYPES = frozenset({
+    "bert", "roberta", "xlm-roberta", "distilbert", "deberta", "deberta-v2",
+    "mpnet", "camembert", "electra", "albert", "nomic_bert",
+    "whisper", "wav2vec2", "clip", "siglip", "t5", "mt5",
+})
+
+
+def _is_generative_repo(snap_root: str) -> bool:
+    """スナップショット内の config.json を見て、生成（チャット）系モデルかを判定する。
+
+    埋め込み（e5/MiniLM 等）・STT（whisper）・分類器など非チャットのモデルを発見一覧から
+    除くためのフィルタ。config.json が読めなければ True（取りこぼしを避ける＝控えめに除外）。
+    """
+    cfg_path = None
+    for sroot, _d, files in os.walk(snap_root):
+        if "config.json" in files:
+            cfg_path = os.path.join(sroot, "config.json")
+            break
+    if not cfg_path:
+        return True
+    try:
+        with open(cfg_path, encoding="utf-8") as fh:
+            cfg = json.load(fh)
+    except (OSError, ValueError):
+        return True
+    model_type = str(cfg.get("model_type", "")).lower()
+    if model_type in _NON_CHAT_MODEL_TYPES:
+        return False
+    archs = cfg.get("architectures") or []
+    if not archs:
+        return True  # アーキ不明なら除外しない
+    return any(
+        a.endswith(("ForCausalLM", "ForConditionalGeneration")) for a in archs
+    )
+
+
+def discover_cached_models(ttl: float = 10.0) -> list[dict]:
+    """HF キャッシュにある**実行可能なチャットモデル**を列挙する（発見用）。
+
+    LM Studio / Ollama のように「いま手元で動かせる候補」をクライアントに見せるための一覧。
+    ロード済みかどうかに関わらず、ダウンロード済みモデルを `{"id", "backend"}` のリストで返す。
+    判定はヒューリスティック:
+
+    - GGUF を含む repo → llama-cpp。本体（mmproj / MTP ヘッドを除く）が 1 つなら `org/repo`、
+      複数あれば `org/repo:<ファイル名>` を量子化ごとに列挙（そのままロードできる形）。
+    - `config.json` ＋ 重み（`.safetensors` / `.npz`）を持ち、生成系アーキ（`*ForCausalLM` /
+      `*ForConditionalGeneration`）の repo → mlx 系（mlx-vlm で動的ロード）。埋め込み・STT・
+      分類などの非チャットモデルは除外する（`_is_generative_repo`）。
+
+    `ttl` 秒は結果をキャッシュする（`/admin/status` の毎秒ポーリングで毎回走査しないため）。
+    """
+    now = time.monotonic()
+    if now - _DISCOVER_CACHE["t"] < ttl:
+        return list(_DISCOVER_CACHE["v"])
+    root = _hf_hub_cache()
+    out: list[dict] = []
+    seen: set[str] = set()
+    if os.path.isdir(root):
+        for entry in sorted(os.listdir(root)):
+            if not entry.startswith("models--") or entry.count("--") < 2:
+                continue
+            _, org, name = entry.split("--", 2)
+            repo = f"{org}/{name}"
+            snap_root = os.path.join(root, entry, "snapshots")
+            if not os.path.isdir(snap_root):
+                continue
+            files = [f for _r, _d, fs in os.walk(snap_root) for f in fs]
+            ggufs = [f for f in files if f.lower().endswith(".gguf")]
+            if ggufs:
+                bodies = [
+                    f for f in ggufs
+                    if "mmproj" not in f.lower() and "mtp" not in f.lower()
+                ]
+                if not bodies:
+                    continue  # mmproj / MTP ヘッドだけの repo は本体ではない
+                if len(bodies) == 1:
+                    cands = [repo]
+                else:
+                    cands = [f"{repo}:{os.path.splitext(f)[0]}" for f in sorted(bodies)]
+                backend = "llama-cpp"
+            elif (
+                "config.json" in files
+                and any(f.endswith((".safetensors", ".npz")) for f in files)
+                and _is_generative_repo(snap_root)
+            ):
+                cands = [repo]
+                backend = infer_backend(repo)  # mlx → mlx-vlm、それ以外は OS 既定
+            else:
+                continue
+            for c in cands:
+                if c not in seen:
+                    seen.add(c)
+                    out.append({"id": c, "backend": backend})
+    _DISCOVER_CACHE["t"] = now
+    _DISCOVER_CACHE["v"] = out
+    return list(out)
+
+
+def estimate_model_bytes(config: ServerConfig) -> int | None:
+    """常駐に要するメモリの**概算**（バイト）。重みファイルのサイズを基準にする。
+
+    - llama-cpp: 本体 GGUF（＋自動付与される mmproj、＋ドラフト GGUF）のファイルサイズ合計。
+    - mlx / mlx-vlm: HF キャッシュのスナップショットに在るファイルサイズ合計（blob 実体で重複排除）。
+
+    取得できない（未キャッシュ・未DL 等）ときは `None` を返す（メモリガードはそのモデルを
+    スキップする）。KVキャッシュ・ランタイムバッファは含まない**下限寄りの見積もり**なので、
+    呼び出し側で余裕係数を掛ける前提（→ docs/llama-cpp.md のメモリガード）。
+    """
+    try:
+        if config.backend == "llama-cpp":
+            path = resolve_gguf(config.model)
+            total = os.path.getsize(path)
+            mmproj = find_sibling_mmproj(path)
+            if mmproj and not any(
+                a in ("--no-mmproj",) for a in config.extra_args
+            ):
+                total += os.path.getsize(mmproj)
+            if config.draft_model:
+                try:
+                    total += os.path.getsize(resolve_gguf(config.draft_model))
+                except (ValueError, OSError):
+                    pass  # ドラフトが解決できなくても本体分は数える
+            return total
+        # mlx / mlx-vlm: models--org--name/snapshots/<hash>/ の合計（blob 実体で重複排除）
+        repo = config.model.strip()
+        if repo.count("/") != 1:
+            return None
+        org, name = repo.split("/", 1)
+        snap_root = os.path.join(_hf_hub_cache(), f"models--{org}--{name}", "snapshots")
+        if not os.path.isdir(snap_root):
+            return None  # 未DL（mlx はロード時に自動取得）→ 見積もり不能
+        by_blob: dict[str, int] = {}
+        for root, _dirs, files in os.walk(snap_root):
+            for f in files:
+                p = os.path.join(root, f)
+                try:
+                    by_blob.setdefault(os.path.realpath(p), os.path.getsize(p))
+                except OSError:
+                    pass
+        return sum(by_blob.values()) or None
+    except (ValueError, OSError):
+        return None
+
+
 def find_sibling_mmproj(model_path: str) -> str | None:
     """GGUF 本体と同じディレクトリにある vision projector（mmproj）を探す。
 

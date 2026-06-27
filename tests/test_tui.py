@@ -84,6 +84,22 @@ def test_merge_includes_dynamic_loaded_models(tmp_path):
     assert rows["org/A"]["state"] == "busy"
 
 
+def test_merge_lists_cached_available_models_unloaded(tmp_path):
+    # /admin/status の "available"（DL 済みだが未ロード）も unloaded 候補として一覧に出る。
+    gcfg = _gcfg(tmp_path, _TWO_MODELS)
+    admin = {
+        "uptime": 5.0, "requests": 0, "models": [],
+        "available": [
+            {"id": "org/A", "backend": "mlx"},                 # 事前登録と重複 → 二重に出さない
+            {"id": "mlx-community/Qwen3.6-27B-4bit", "backend": "mlx-vlm"},
+        ],
+    }
+    rows = {r["model"]: r for r in tui.merge_status(gcfg, admin)["models"]}
+    assert set(rows) == {"org/A", "org/B", "mlx-community/Qwen3.6-27B-4bit"}
+    assert rows["mlx-community/Qwen3.6-27B-4bit"]["state"] == "unloaded"
+    assert rows["mlx-community/Qwen3.6-27B-4bit"]["backend"] == "mlx-vlm"
+
+
 def test_merge_marks_unlisted_models_unloaded(tmp_path):
     gcfg = _gcfg(tmp_path, _TWO_MODELS)
     admin = {

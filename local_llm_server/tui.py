@@ -57,7 +57,14 @@ def merge_status(gcfg, admin: dict | None) -> dict:
     # 動的ロードされたモデル（事前登録に無い、現在管理中のものを追加表示）。
     for model, m in live.items():
         if model not in listed:
+            listed.add(model)
             rows.append(_row(model, m.get("backend", "?"), m.get("port"), m))
+    # キャッシュにある DL 済みモデル（まだロードしていない候補。LM Studio 風に「選べる一覧」）。
+    for d in (admin or {}).get("available", []):
+        mid = d.get("id")
+        if mid and mid not in listed:
+            listed.add(mid)
+            rows.append(_row(mid, d.get("backend", "?"), None, None))
     ready = bool(admin) or is_ready(f"http://{gcfg.host}:{gcfg.port}/v1")
     return {
         "ready": ready,

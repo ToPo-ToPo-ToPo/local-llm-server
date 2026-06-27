@@ -1,11 +1,12 @@
 # local-llm-server
 
 ローカルLLM（**mlx** / **mlx-vlm** / **llama.cpp**）を束ねる**マルチモデルゲートウェイ**。
-`gateway.toml` にモデルを並べて 1 プロセス起動するだけで、1 つの公開ポートに複数モデルを配信する。
+1 プロセス起動するだけで、1 つの公開ポートに複数モデルを配信する。
 
-- **`gateway.toml`（モデルカタログ）を書いて起動するだけ**。
+- **モデルの事前登録は不要**。クライアントが指定した `model` をその場でロードする（バックエンドは ID から推論）。画像入力（mmproj 自動検出）も mlx-vlm の MTP（対応モデルは自動で ~2倍速）も設定なしで効く。
 - 1 つの公開ポートで複数モデルを配信し、リクエストの `model` で振り分ける。
-- モデルは**初回リクエスト時に遅延起動**、`max_resident` 超過で LRU 退避、`idle_timeout` で自動アンロード。
+- **`/v1/models` は DL 済みモデルを自動一覧**（LM Studio 風）。未ロードでもクライアントは候補を選べる。
+- モデルは**初回リクエスト時に遅延起動**、`max_resident`（数）/ `max_memory_fraction`（メモリ量）超過で LRU 退避、`idle_timeout` で自動アンロード。
 - エージェントが「使い終わった」と通知すれば、在席が 0 になった瞬間に**待たず即アンロード**してメモリ解放（→ [在席ベースの即時アンロード](docs/gateway.md#在席ベースの即時アンロード)）。
 - 接続側は公開ポートに繋いで `model` を選ぶだけ（接続クライアントは別パッケージ）。
 
@@ -39,15 +40,15 @@ uv sync --extra mlx
 
 ### 1. gateway.toml を置く
 
-カレントディレクトリに `gateway.toml` を置く。リポジトリ直下に例を同梱（→ [gateway.toml](gateway.toml)）:
+カレントディレクトリに `gateway.toml` を置く。リポジトリ直下に例を同梱（→ [gateway.toml](gateway.toml)）。
+モデルは列挙不要 —— 運用方針（ポートや同時常駐数など）だけ書けばよい:
 
 ```toml
 host = "127.0.0.1"
 port = 8799                 # クライアントの base_url はここ
 max_resident = 1            # 同時常駐モデル数の上限（超過は LRU 退避）
-[[models]]
-model = "mlx-community/Qwen3.6-27B-4bit"
-backend = "mlx-vlm"
+# モデルは事前登録不要。クライアントが指定した model をその場でロードする。
+# parallel や llama.cpp の MTP 等、個別の上書きが要るモデルだけ [[models]] に書く（→ docs/gateway.md）。
 ```
 
 ### 2. 起動

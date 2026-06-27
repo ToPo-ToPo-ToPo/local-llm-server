@@ -24,6 +24,8 @@ classifiers = [
 # 別パッケージ local-llm-client。
 dependencies = [
     "textual>=8.2.7",
+    # メモリガード（max_memory_fraction）で総RAM/空き容量を取得する。クロスプラットフォーム。
+    "psutil>=5.9",
 ]
 
 [project.optional-dependencies]

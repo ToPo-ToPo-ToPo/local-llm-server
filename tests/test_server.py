@@ -484,3 +484,74 @@ def test_model_available_against_router_catalog(monkeypatch):
         raise OSError("down")
     monkeypatch.setattr(srv.urllib.request, "urlopen", _boom)
     assert srv.model_available("http://x/v1", "x/y") is None
+
+
+def test_estimate_model_bytes_llama_cpp(monkeypatch, tmp_path):
+    # llama-cpp は本体 GGUF（＋隣の mmproj）のファイルサイズ合計を概算に使う。
+    gguf = tmp_path / "model-Q4.gguf"
+    gguf.write_bytes(b"x" * 1000)
+    mmproj = tmp_path / "mmproj-F16.gguf"
+    mmproj.write_bytes(b"y" * 200)
+    monkeypatch.setattr(srv, "resolve_gguf", lambda m: str(gguf))
+    cfg = ServerConfig(backend="llama-cpp", model="org/repo:Q4")
+    assert srv.estimate_model_bytes(cfg) == 1200  # 本体 1000 ＋ mmproj 200
+
+
+def test_estimate_model_bytes_unknown_returns_none(monkeypatch):
+    # 解決できない（未キャッシュ）なら None（メモリガードはスキップ）。
+    def _boom(m):
+        raise ValueError("not cached")
+    monkeypatch.setattr(srv, "resolve_gguf", _boom)
+    assert srv.estimate_model_bytes(ServerConfig(backend="llama-cpp", model="org/x")) is None
+    # mlx で未DL（スナップショット無し）なら None
+    assert srv.estimate_model_bytes(
+        ServerConfig(backend="mlx-vlm", model="mlx-community/Definitely-Not-Downloaded-xyz")
+    ) is None
+
+
+def _touch(path, data=b"x"):
+    import os
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as fh:
+        fh.write(data)
+
+
+def _config(path, model_type, architectures):
+    import json
+    _touch(path, json.dumps(
+        {"model_type": model_type, "architectures": architectures}).encode())
+
+
+def test_discover_cached_models(monkeypatch, tmp_path):
+    # 疑似 HF キャッシュを作り、ダウンロード済みのチャットモデルだけが発見されることを確認する。
+    root = tmp_path / "hub"
+    # mlx 系（生成アーキ）→ 採用
+    _config(str(root / "models--mlx-community--Qwen3.6-27B-4bit/snapshots/a/config.json"),
+            "qwen3", ["Qwen3ForCausalLM"])
+    _touch(str(root / "models--mlx-community--Qwen3.6-27B-4bit/snapshots/a/model.safetensors"))
+    # llama-cpp（本体 1 つ＋ mmproj は除外）
+    _touch(str(root / "models--unsloth--Foo-GGUF/snapshots/a/Foo-Q4.gguf"))
+    _touch(str(root / "models--unsloth--Foo-GGUF/snapshots/a/mmproj-F16.gguf"))
+    # llama-cpp（本体が複数 → 量子化ごとにセレクタ付きで列挙）
+    _touch(str(root / "models--multi--Bar-GGUF/snapshots/a/Bar-Q4.gguf"))
+    _touch(str(root / "models--multi--Bar-GGUF/snapshots/a/Bar-Q8.gguf"))
+    # 埋め込みモデル（非チャット）→ 除外
+    _config(str(root / "models--intfloat--e5-large/snapshots/a/config.json"),
+            "xlm-roberta", ["XLMRobertaModel"])
+    _touch(str(root / "models--intfloat--e5-large/snapshots/a/model.safetensors"))
+    # 本体の無い repo（mmproj だけ）→ 除外
+    _touch(str(root / "models--x--OnlyProj-GGUF/snapshots/a/mmproj.gguf"))
+    # モデルでない repo（重みなし）→ 除外
+    _touch(str(root / "models--y--JustReadme/snapshots/a/README.md"))
+
+    monkeypatch.setattr(srv, "_hf_hub_cache", lambda: str(root))
+    srv._DISCOVER_CACHE["t"] = -1e9  # キャッシュを無効化して再走査させる
+    found = {d["id"]: d["backend"] for d in srv.discover_cached_models(ttl=0)}
+
+    assert found["mlx-community/Qwen3.6-27B-4bit"] == "mlx-vlm"
+    assert found["unsloth/Foo-GGUF"] == "llama-cpp"
+    assert found["multi/Bar-GGUF:Bar-Q4"] == "llama-cpp"
+    assert found["multi/Bar-GGUF:Bar-Q8"] == "llama-cpp"
+    assert "intfloat/e5-large" not in found     # 埋め込みは除外
+    assert "x/OnlyProj-GGUF" not in found
+    assert "y/JustReadme" not in found

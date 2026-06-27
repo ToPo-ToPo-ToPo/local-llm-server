@@ -1,10 +1,11 @@
 # llama.cpp バックエンドの導入
 
-- `backend = "llama-cpp"` のモデルは、llama.cpp の **`llama-server` バイナリ**を呼び出して提供する。
+- GGUF（`org/repo` に `.gguf` を含む）のモデルは、llama.cpp の **`llama-server` バイナリ**を呼び出して提供する。
 - ゲートウェイ本体は `llama-server` を **PATH 上から実行するだけ**なので、必要なのは「`llama-server` が　PATH に通っていること」だけ。
-- Python バインディング（`llama-cpp-python`）とは別物なので、uv add ではでは使えない点に注意。
-- 導入後は `gateway.toml` の `[[models]]` で `backend = "llama-cpp"`、`model` に GGUF を指定する
-（→ [docs/gateway.md](gateway.md)）。
+- Python バインディング（`llama-cpp-python`）とは別物なので、uv add では使えない点に注意。
+- 導入後は**事前登録なしでよい** —— クライアントが GGUF の repo-id を `model` に指定すれば、バックエンドは
+  ID から llama-cpp と推論されて動的ロードされる（画像入力の mmproj も自動検出）。`parallel` や MTP、
+  `llama-server` への個別フラグが要るモデルだけ `gateway.toml` の `[[models]]` に書く（→ [docs/gateway.md](gateway.md)）。
 
 ## model の書き方（HF repo-id）
 
@@ -106,13 +107,60 @@ draft_model = "unsloth/gemma-4-26B-A4B-it-qat-GGUF:F16-MTP"  # MTP ヘッド →
 予測しやすい出力（コード・定型文）ほど受理率が上がり伸びる。MTP ヘッドの GGUF は本体と
 同系統のもの（例: `unsloth/gemma-4-26B-A4B-it-qat-GGUF` の `MTP/*.gguf`）を使う。
 
+## 並列スロット（parallel）
+
+`llama-server` は **1 プロセスで複数リクエストを同時処理**できる（`--parallel N`）。本サーバーでは
+`parallel` で指定する。`parallel = 1`（既定）だと同じモデルへの同時リクエストは直列化され、`4` に
+すれば最大 4 本を並行処理する。llama.cpp は内部でコンテキスト（KVキャッシュ）を N スロットに分割
+するので、**増やすほど 1 リクエストあたりのコンテキスト長と計算資源は減る**（同時利用人数に合わせて
+決める値）。
+
+- **llama.cpp 専用**。mlx / mlx-vlm は逐次処理でスロットの概念が無いため無視される。
+- **埋め込み MTP（`draft_model = "self"`）とは併用不可**。llama.cpp 側が未対応なので自動で外す。
+- **事前登録なしで効く**: トップレベルに `parallel = 4` を置くと、動的ロードされる **llama-cpp モデル
+  全部**に適用される（mlx 系は無視）。特定モデルだけ変えたいときは `[[models]]` の `parallel` で上書き。
+
+```toml
+parallel = 4                # 動的ロードする llama-cpp モデルの既定（mlx 系は無視）
+
+# 特定モデルだけ別の値にしたいときだけ事前登録:
+# [[models]]
+# model = "unsloth/gemma-4-26B-A4B-it-qat-GGUF"
+# backend = "llama-cpp"
+# parallel = 8
+```
+
+## メモリガード（max_memory_fraction）
+
+複数モデルの同時常駐や `parallel` の引き上げは RAM を食う。`max_memory_fraction` を設定すると、
+**常駐モデルの推定占有量の合計が「総RAM × その割合」を超えるロードを拒否**する（OOM 回避）。
+
+```toml
+max_memory_fraction = 0.66  # 常駐モデルの推定合計を総RAMの2/3までに抑える（0 < x <= 1。省略で無効）
+```
+
+挙動:
+
+- ロード前に新モデルの占有量を見積もり、常駐分との合計が予算を超えるなら、まず **アイドルモデルを
+  LRU で退避**して収めようとする。退避してもなお収まらない（=そのモデル単体で予算超過）なら **503**
+  を返してロードしない。処理中（inflight>0）のモデルは退避しない（空くまで待ち、`load_timeout` 超過で 503）。
+- `max_resident`（常駐**数**の上限）と**併用可**。どちらか一方でも超えれば退避が走る。
+- **全バックエンド共通**の設定（mlx / mlx-vlm / llama-cpp すべてに効く）。Apple Silicon は GPU と RAM が
+  統合メモリなので、総RAMに対する割合がそのまま効く。
+
+> **見積もりは概算**: 占有量は **重みファイルのサイズ基準**（llama-cpp=GGUF＋mmproj＋ドラフト、
+> mlx=HF スナップショット合計）で、KVキャッシュやランタイムバッファは含まない**下限寄り**の値。
+> 余裕をもたせたいときは割合を低めにする。占有量を見積もれないモデル（mlx で未DL 等）はガードを
+> スキップしてロードする。`psutil`（依存に同梱）で総RAMを取得する。
+
 ## 複数モデルの同時利用
 
 `llama-server` 単体は **1 プロセス = 1 モデル**（モデルを束ねる router 機能は無い）。本サーバーは
-ゲートウェイが `[[models]]` ごとに `llama-server` を**個別プロセスで遅延起動**するため、複数 GGUF を
-1 つの公開ポートで同時に提供できる（`model` で振り分け）。同時常駐数は `max_resident` で制限し、
-超過分は LRU で退避・`idle_timeout` で自動アンロードされる（→ [docs/gateway.md](gateway.md)）。
-mlx 系と llama-cpp を混在させてもよい。RAM が許す範囲で `max_resident` を上げれば本当の同時常駐になる。
+ゲートウェイが各モデルごとに `llama-server` を**個別プロセスで遅延起動**するため、複数 GGUF を
+1 つの公開ポートで同時に提供できる（`model` で振り分け）。同時常駐数は `max_resident`（数）と
+`max_memory_fraction`（メモリ量）で制限し、超過分は LRU で退避・`idle_timeout` で自動アンロード
+される（→ [docs/gateway.md](gateway.md)）。mlx 系と llama-cpp を混在させてもよい。RAM が許す範囲で
+`max_resident` を上げれば本当の同時常駐になる。
 
 ## OS 別の主導線
 
