@@ -279,6 +279,19 @@ MTP_DRAFTERS = {
         "mlx-community/Qwen3.6-27B-MTP-4bit",
     "ToPo-ToPo/Qwen3.6-27B-mlx-bf16":
         "mlx-community/Qwen3.6-27B-MTP-4bit",
+    # 自作 ToPo-ToPo 版 gemma 4。各 model card が推奨する Google 公式 MTP ドラフター
+    # google/gemma-4-<size>-it-assistant を使う（mlx-vlm で変換不要・サイズ固有で量子化に依らず共通。
+    # mlx-vlm >= 0.6.3 が必要）。
+    "ToPo-ToPo/gemma-4-31b-it-mlx-4bit": "google/gemma-4-31B-it-assistant",
+    "ToPo-ToPo/gemma-4-31b-it-mlx-8bit": "google/gemma-4-31B-it-assistant",
+    "ToPo-ToPo/gemma-4-31b-it-mlx-bf16": "google/gemma-4-31B-it-assistant",
+    "ToPo-ToPo/gemma-4-31b-it-qat-mlx-4bit": "google/gemma-4-31B-it-assistant",
+    "ToPo-ToPo/gemma-4-26B-A4B-it-mlx-4bit": "google/gemma-4-26B-A4B-it-assistant",
+    "ToPo-ToPo/gemma-4-26B-A4B-it-mlx-8bit": "google/gemma-4-26B-A4B-it-assistant",
+    "ToPo-ToPo/gemma-4-26B-A4B-it-mlx-bf16": "google/gemma-4-26B-A4B-it-assistant",
+    "ToPo-ToPo/gemma-4-26B-A4B-it-qat-mlx-4bit": "google/gemma-4-26B-A4B-it-assistant",
+    "ToPo-ToPo/gemma-4-E4B-it-qat-mlx-4bit": "google/gemma-4-E4B-it-assistant",
+    "ToPo-ToPo/gemma-4-E2B-it-qat-mlx-4bit": "google/gemma-4-E2B-it-assistant",
 }
 
 
