@@ -53,13 +53,15 @@ max_resident = 1            # 同時常駐モデル数の上限（超過は LRU 
 
 ### 2. 起動
 
-クローンしたフォルダ（`gateway.toml` のある場所）で起動する:
+クローンしたフォルダ（`gateway.toml` のある場所）で、**引数なしで起動するのが推奨**。
+TUI ダッシュボードが開き、使えるモデル・ロード状況・処理中数が一目で分かる（停止/再起動も画面内で操作）。
 
 ```bash
-uv run local-llm-server     # TUI ダッシュボード（状態を自動更新表示）
+uv run local-llm-server     # ← 推奨。TUI ダッシュボード（状態を自動更新表示）
 ```
 
-（PyPI の `uv tool install` で入れた場合は `local-llm-server` だけで起動。）
+（PyPI の `uv tool install` で入れた場合は `local-llm-server` だけで起動。バックグラウンド常駐は
+`--start`、TUI なしは `--headless` → [docs/operation.md](docs/operation.md)。）
 
 ### 3. 接続
 

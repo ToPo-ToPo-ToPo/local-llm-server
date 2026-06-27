@@ -2,12 +2,20 @@
 
 ゲートウェイは `./gateway.toml` のあるディレクトリで起動する。**ターミナル**（CLI/TUI）から運用する。
 
-## ターミナル
+## 起動（推奨: TUI ダッシュボード）
+
+**基本は引数なしで起動し、TUI ダッシュボードで運用する。** 状態（使えるモデル・ロード中・処理中数など）
+が一目で分かり、停止/再起動も画面内の単キーでできる。
 
 ```bash
-uv run local-llm-server            # TUI ダッシュボード（既定。状態を毎秒自動更新）
-uv run local-llm-server --headless # TUI なしフォアグラウンド実行（Ctrl-C で停止）
+uv run local-llm-server            # ← 推奨。TUI ダッシュボード（状態を毎秒自動更新）
+```
+
+その他の起動形態（用途に応じて）:
+
+```bash
 uv run local-llm-server --start    # バックグラウンド常駐起動（端末を離す。Ollama 流）
+uv run local-llm-server --headless # TUI なしフォアグラウンド実行（Ctrl-C で停止。CI / スクリプト向け）
 uv run local-llm-server --status   # 応答可否・PID・提供モデル・ログパス
 uv run local-llm-server --stop     # 停止（配下のモデルサーバーも止める）
 uv run local-llm-server --restart  # 停止→再起動（gateway.toml 変更の反映に）
