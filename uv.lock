@@ -385,14 +385,10 @@ name = "local-llm-server"
 version = "0.16.0"
 source = { editable = "." }
 dependencies = [
-    { name = "psutil" },
-    { name = "textual" },
-]
-
-[package.optional-dependencies]
-mlx = [
     { name = "mlx-lm", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'" },
     { name = "mlx-vlm", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'" },
+    { name = "psutil" },
+    { name = "textual" },
 ]
 
 [package.dev-dependencies]
@@ -402,12 +398,11 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "mlx-lm", marker = "platform_machine == 'arm64' and sys_platform == 'darwin' and extra == 'mlx'", specifier = ">=0.31.3" },
-    { name = "mlx-vlm", marker = "platform_machine == 'arm64' and sys_platform == 'darwin' and extra == 'mlx'", specifier = ">=0.5.0" },
+    { name = "mlx-lm", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'", specifier = ">=0.31.3" },
+    { name = "mlx-vlm", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'", specifier = ">=0.5.0" },
     { name = "psutil", specifier = ">=5.9" },
     { name = "textual", specifier = ">=8.2.7" },
 ]
-provides-extras = ["mlx"]
 
 [package.metadata.requires-dev]
 dev = [{ name = "pytest", specifier = ">=8.0" }]

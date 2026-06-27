@@ -3,11 +3,11 @@
 .PHONY: help install stop
 
 help:
-	@echo "make install    Apple Silicon 向け推論バックエンド(mlx)を導入"
+	@echo "make install    依存を導入（mlx は Apple Silicon でのみ自動で入る）"
 	@echo "make stop       常駐ゲートウェイを停止"
 
 install:
-	uv sync --extra mlx
+	uv sync
 
 stop:
 	-uv run local-llm-server --stop

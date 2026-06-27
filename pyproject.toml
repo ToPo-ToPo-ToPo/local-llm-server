@@ -17,20 +17,17 @@ classifiers = [
     "Topic :: Software Development",
     "Operating System :: OS Independent",
 ]
-# ゲートウェイ本体は標準ライブラリのみで動く（純粋な HTTP 転送＋プロセス管理）。唯一のコア依存は
+# ゲートウェイ本体は標準ライブラリのみで動く（純粋な HTTP 転送＋プロセス管理）。コア依存は
 # 既定起動の TUI ダッシュボード（tui_app.py）に使う textual（ターミナル運用前提のため core に置く。
-# headless では遅延 import されず読み込まれない）。推論バックエンド本体は extras で導入する
-# （環境マーカーで Apple Silicon のときだけ自動選択。他 OS は llama.cpp を各自）。接続用クライアントは
-# 別パッケージ local-llm-client。
+# headless では遅延 import されず読み込まれない）と、メモリガード用の psutil。
+# mlx 系バックエンドは環境マーカーで **Apple Silicon (macOS arm64) のときだけ自動インストール**する
+# （他 OS / Intel Mac では入らず、llama.cpp を各自で用意）。なので `uv sync` だけでよく、extra 指定は不要。
+# 接続用クライアントは別パッケージ local-llm-client。
 dependencies = [
     "textual>=8.2.7",
     # メモリガード（max_memory_fraction）で総RAM/空き容量を取得する。クロスプラットフォーム。
     "psutil>=5.9",
-]
-
-[project.optional-dependencies]
-# Apple Silicon 向け mlx 系バックエンド（テキスト/vision/STT）。
-mlx = [
+    # mlx 系バックエンド（テキスト/vision/STT）。Apple Silicon でのみ解決・インストールされる。
     "mlx-lm>=0.31.3 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
     "mlx-vlm>=0.5.0 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
 ]
