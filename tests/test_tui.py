@@ -19,6 +19,97 @@ def test_read_log_tail(tmp_path, monkeypatch):
     assert tui.read_log_tail(123).startswith("(ログはまだ")
 
 
+def test_key_hints_stay_visible_while_typing_command(tmp_path, monkeypatch):
+    # コマンド入力中（Input にフォーカス）でも、stop/start 等のキー凡例が消えないこと。
+    from local_llm_server import tui_app
+
+    gcfg = load_gateway_config(str(_write_cfg(tmp_path, "port = 8799\n")))
+    monkeypatch.setattr(tui_app, "server_status", lambda h, p: {"ready": True})  # 自動起動させない
+    monkeypatch.setattr(tui_app, "gateway_admin_status", lambda h, p: None)
+
+    async def scenario():
+        app = tui_app.GatewayMonitor(gcfg)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            hints = app.query_one("#hints")
+            text = hints.render().plain
+            assert all(w in text for w in ("stop", "restart", "start", "log", "quit"))
+            # 入力欄にフォーカスして打鍵 → 凡例は表示されたまま
+            app.query_one("#cmd").focus()
+            await pilot.pause()
+            await pilot.press("s", "t", "o", "p")
+            await pilot.pause()
+            assert app.query_one("#cmd").value == "stop"
+            assert app.query_one("#hints").display is True
+
+    asyncio.run(scenario())
+
+
+def _write_cfg(tmp_path, body):
+    p = tmp_path / "gateway.toml"
+    p.write_text(body, encoding="utf-8")
+    return p
+
+
+def test_row_click_copies_model_name(tmp_path, monkeypatch):
+    # 表の行をクリックすると、その行のモデル名がコピーされること（行ハイライトは使わない）。
+    from textual.widgets import DataTable
+    from local_llm_server import tui_app
+
+    gcfg = load_gateway_config(str(_write_cfg(tmp_path, "port = 8799\n")))
+    monkeypatch.setattr(tui_app, "server_status", lambda h, p: {"ready": True})
+    monkeypatch.setattr(tui_app, "gateway_admin_status", lambda h, p: None)
+    admin = {
+        "uptime": 1.0, "requests": 0,
+        "models": [{"model": "mlx-community/Foo-4bit", "backend": "mlx-vlm",
+                    "loaded": True, "inflight": 0, "requests": 0, "idle_for": 1.0}],
+        "available": [{"id": "unsloth/Bar-GGUF", "backend": "llama-cpp"}],
+    }
+
+    async def scenario():
+        app = tui_app.GatewayMonitor(gcfg)
+        copied = []
+        async with app.run_test(size=(120, 30)) as pilot:
+            app._copy_model = lambda m: copied.append(m)
+            app._apply(admin)
+            await pilot.pause()
+            table = app.query_one("#models", DataTable)
+            assert table.row_count == 2
+            assert table.cursor_type == "none"          # 行ハイライトを出さない
+            await pilot.click("#models", offset=(3, 1))  # 1 行目（ヘッダの下）= Foo
+            await pilot.pause()
+            await pilot.click("#models", offset=(3, 2))  # 2 行目 = Bar（未ロード候補）
+            await pilot.pause()
+        assert copied == ["mlx-community/Foo-4bit", "unsloth/Bar-GGUF"]
+
+    asyncio.run(scenario())
+
+
+def test_copy_model_uses_pbcopy_on_macos(tmp_path, monkeypatch):
+    from local_llm_server import tui_app
+
+    gcfg = load_gateway_config(str(_write_cfg(tmp_path, "port = 8799\n")))
+    monkeypatch.setattr(tui_app, "server_status", lambda h, p: {"ready": True})
+    monkeypatch.setattr(tui_app, "gateway_admin_status", lambda h, p: None)
+    monkeypatch.setattr(tui_app.sys, "platform", "darwin")
+    recorded = {}
+    monkeypatch.setattr(
+        tui_app.subprocess, "run",
+        lambda cmd, input=None, check=False: recorded.update(cmd=cmd, input=input),
+    )
+
+    async def scenario():
+        app = tui_app.GatewayMonitor(gcfg)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._copy_model("org/My-Model:Q4")
+            await pilot.pause()
+        assert recorded["cmd"] == ["pbcopy"]
+        assert recorded["input"] == b"org/My-Model:Q4"
+
+    asyncio.run(scenario())
+
+
 def test_log_screen_opens_and_closes(tmp_path, monkeypatch):
     # 外部ページャでなくアプリ内画面でログを出し、q / Esc でダッシュボードに戻れること。
     from textual.app import App
@@ -82,6 +173,22 @@ def test_merge_includes_dynamic_loaded_models(tmp_path):
     assert rows["dyn/NEW-GGUF"]["backend"] == "llama-cpp"
     assert rows["dyn/NEW-GGUF"]["state"] == "idle"
     assert rows["org/A"]["state"] == "busy"
+
+
+def test_merge_lists_cached_available_models_unloaded(tmp_path):
+    # /admin/status の "available"（DL 済みだが未ロード）も unloaded 候補として一覧に出る。
+    gcfg = _gcfg(tmp_path, _TWO_MODELS)
+    admin = {
+        "uptime": 5.0, "requests": 0, "models": [],
+        "available": [
+            {"id": "org/A", "backend": "mlx"},                 # 事前登録と重複 → 二重に出さない
+            {"id": "mlx-community/Qwen3.6-27B-4bit", "backend": "mlx-vlm"},
+        ],
+    }
+    rows = {r["model"]: r for r in tui.merge_status(gcfg, admin)["models"]}
+    assert set(rows) == {"org/A", "org/B", "mlx-community/Qwen3.6-27B-4bit"}
+    assert rows["mlx-community/Qwen3.6-27B-4bit"]["state"] == "unloaded"
+    assert rows["mlx-community/Qwen3.6-27B-4bit"]["backend"] == "mlx-vlm"
 
 
 def test_merge_marks_unlisted_models_unloaded(tmp_path):

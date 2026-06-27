@@ -79,12 +79,117 @@ def test_dynamic_register_infers_backend_and_allocates_port(tmp_path):
     assert mlx.config.backend == "mlx-vlm" and mlx.config.port == 9003
 
 
+def test_dynamic_register_auto_enables_mtp_for_supported_mlx_vlm():
+    # 事前登録なしの動的ロードでも、対応表に在る mlx-vlm モデルは MTP が自動で効く
+    # （draft_model="auto" を graceful に解決）。自作 ToPo-ToPo 版も収録済み。
+    mgr = gw.ModelManager([], dynamic=True)
+    m = mgr._register_dynamic_locked("mlx-community/Qwen3.6-27B-4bit")
+    assert m.config.draft_model == "mlx-community/Qwen3.6-27B-MTP-4bit"
+    topo = mgr._register_dynamic_locked("ToPo-ToPo/Qwen3.6-27B-mlx-4bit")
+    assert topo.config.draft_model == "mlx-community/Qwen3.6-27B-MTP-4bit"
+    # ToPo-ToPo 版 gemma 4 は model card 推奨の Google 公式ドラフターに解決する。
+    g = mgr._register_dynamic_locked("ToPo-ToPo/gemma-4-31b-it-mlx-4bit")
+    assert g.config.draft_model == "google/gemma-4-31B-it-assistant"
+
+
+def test_dynamic_register_no_mtp_for_unsupported_or_other_backends():
+    # 対応表に無い mlx-vlm モデルや、MTP 非対応バックエンド（gguf/mlx）は
+    # 動的ロードを失敗させずに MTP なしで起動する。
+    mgr = gw.ModelManager([], dynamic=True)
+    assert mgr._register_dynamic_locked("mlx-community/Unknown-99B").config.draft_model is None
+    assert mgr._register_dynamic_locked("unsloth/Foo-GGUF:Q4").config.draft_model is None
+
+
+def test_dynamic_register_default_draft_off_disables_mtp():
+    # トップレベル draft_model="off" を継承すると、対応モデルでも動的 MTP を切れる。
+    mgr = gw.ModelManager([], dynamic=True, default_draft="off")
+    m = mgr._register_dynamic_locked("mlx-community/Qwen3.6-27B-4bit")
+    assert m.config.draft_model is None
+
+
 def test_acquire_unknown_raises_when_dynamic_disabled(tmp_path):
     cfg = gw.load_gateway_config(_write(
         tmp_path, 'dynamic = false\n[[models]]\nmodel = "org/A"\nbackend = "mlx"\n'))
     mgr = gw.ModelManager(cfg.models, dynamic=cfg.dynamic)
     with pytest.raises(KeyError):
         mgr.acquire("org/unknown")
+
+
+# --- global parallel（動的ロードの並列スロット既定）-------------------------
+
+def test_dynamic_global_parallel_applies_to_llama_cpp_only():
+    # トップレベル parallel は llama-cpp 動的モデルにだけ付き、mlx/mlx-vlm では無視される。
+    mgr = gw.ModelManager([], dynamic=True, default_parallel=4)
+    assert mgr._register_dynamic_locked("unsloth/Foo-GGUF:Q4").config.parallel == 4
+    assert mgr._register_dynamic_locked("mlx-community/Bar").config.parallel is None
+
+
+def test_load_gateway_config_parses_and_validates_parallel(tmp_path):
+    cfg = gw.load_gateway_config(_write(tmp_path, "parallel = 4\n"))
+    assert cfg.parallel == 4
+    with pytest.raises(ValueError, match="parallel must be 1 or greater"):
+        gw.load_gateway_config(_write(tmp_path, "parallel = 0\n"))
+
+
+# --- メモリガード（max_memory_fraction）------------------------------------
+
+class _StubServer:
+    def __init__(self):
+        self.stopped = False
+
+    def stop(self):
+        self.stopped = True
+
+
+def _resident(mgr, model, gb, *, inflight=0, last_used=0.0):
+    """ロード済みモデルを 1 つ手で常駐させる（占有量 gb GB をキャッシュ済みにする）。"""
+    srv = _StubServer()
+    m = gw._Model(
+        config=ServerConfig(backend="mlx-vlm", model=model, port=9000),
+        server=srv, ready=True, inflight=inflight, last_used=last_used,
+        footprint=int(gb * 1e9),
+    )
+    mgr._models[model] = m
+    return m
+
+
+def test_load_gateway_config_validates_memory_fraction(tmp_path):
+    cfg = gw.load_gateway_config(_write(tmp_path, "max_memory_fraction = 0.66\n"))
+    assert cfg.max_memory_fraction == 0.66
+    with pytest.raises(ValueError, match=r"\(0, 1\]"):
+        gw.load_gateway_config(_write(tmp_path, "max_memory_fraction = 1.5\n"))
+
+
+def test_memory_guard_evicts_idle_to_fit():
+    # 予算 66GB（総RAM 100GB × 0.66）。常駐 50GB（アイドル）＋新規 30GB → 超過するので
+    # アイドルを退避して収める。
+    mgr = gw.ModelManager([], dynamic=True, max_memory_fraction=0.66)
+    mgr._mem_total = int(100e9)  # 決定的にするため総RAMを固定
+    idle = _resident(mgr, "old/idle", gb=50)
+    keep = mgr._register_dynamic_locked("new/Big-GGUF:Q4")
+    keep.footprint = int(30e9)
+    mgr._evict_if_needed(keep="new/Big-GGUF:Q4")
+    # idle は退避された（server が外れ、FakeServer.stop が呼ばれた）。非動的なので _models には残る。
+    assert idle.server is None and not idle.ready
+    assert mgr._models["old/idle"] is idle
+
+
+def test_memory_guard_refuses_single_oversized_model():
+    # 退避できる常駐が無く、新規モデル単体で予算超過 → 即 CapacityError（503）。
+    mgr = gw.ModelManager([], dynamic=True, max_memory_fraction=0.5, load_timeout=1)
+    mgr._mem_total = int(40e9)  # 予算 20GB
+    keep = mgr._register_dynamic_locked("huge/Model-GGUF:Q8")
+    keep.footprint = int(35e9)  # 単体で予算超過
+    with pytest.raises(gw.CapacityError, match="memory budget"):
+        mgr._evict_if_needed(keep="huge/Model-GGUF:Q8")
+
+
+def test_memory_guard_allows_when_under_budget():
+    mgr = gw.ModelManager([], dynamic=True, max_memory_fraction=0.66)
+    mgr._mem_total = int(100e9)
+    keep = mgr._register_dynamic_locked("ok/Model-GGUF:Q4")
+    keep.footprint = int(20e9)
+    mgr._evict_if_needed(keep="ok/Model-GGUF:Q4")  # 予算内 → 何も起きず返る
 
 
 def test_load_gateway_config_rejects_duplicate_and_bad_backend(tmp_path):
@@ -448,6 +553,7 @@ def test_gateway_unknown_model_returns_404(monkeypatch):
 
 
 def test_gateway_models_catalog(monkeypatch):
+    # /v1/models は標準どおり「事前登録カタログ＋ロード中」のみ（発見一覧は TUI 専用）。
     server, mgr, ups = _start_gateway(monkeypatch)
     try:
         port = server.server_address[1]

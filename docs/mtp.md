@@ -6,42 +6,56 @@
 
 ## 設定（`gateway.toml`）
 
-`draft_model` で指定する。ゲートウェイ既定と各モデルの個別指定があり、個別 > 既定。
+**対応表に在る mlx-vlm モデルは設定不要** —— 事前登録せず動的ロードしただけで、本体名から
+ドラフターを自動選択して MTP が効く（Qwen3.6-27B なら ~2倍速）。未対応モデルは静かに MTP なしで
+ロードされる。`draft_model` を書くのは、既定を変えたい／個別に上書きしたいときだけ。
 
 ```toml
-draft_model = "auto"        # 全モデルの既定（本体名から対応ドラフターを自動選択）
+# 何も書かなくてよい。mlx-vlm の対応モデルは動的ロード時に MTP が自動で効く。
 
+# ── 既定を変えたいとき（トップレベル）──
+# draft_model = "off"       # 動的ロード時の MTP を一律無効化（省略時は mlx-vlm を "auto"）
+
+# ── 個別に上書きしたいとき（事前登録）──
 [[models]]
-model = "mlx-community/Qwen3.6-27B-4bit"
+model = "ToPo-ToPo/Qwen3.6-27B-mlx-4bit"
 backend = "mlx-vlm"
-# draft_model 省略 → 既定 "auto" を継承（Qwen3.6 の MTP で ~2倍速）
+draft_model = "off"         # このモデルだけ MTP を無効化
 
 [[models]]
-model = "mlx-community/gemma-4-31b-it-4bit"
+model = "ToPo-ToPo/gemma-4-31b-it-mlx-4bit"
 backend = "mlx-vlm"
-draft_model = "mlx-community/gemma-4-31B-it-qat-assistant-bf16"  # HF id で明示
-
-[[models]]
-model = "mlx-community/Qwen3.5-27B-4bit"
-backend = "mlx"
-draft_model = "off"         # このモデルだけ MTP を無効化（mlx は非対応）
+# 対応表に在るので draft_model 省略でも auto で効く。明示するなら Google 公式ドラフター:
+draft_model = "google/gemma-4-31B-it-assistant"  # サイズ固有・mlx-vlm で変換不要
 ```
 
 `draft_model` に取れる値:
 
 | 値 | 意味 |
 |---|---|
-| `"auto"` | 本体名から対応ドラフターを自動選択（対応表 `MTP_DRAFTERS`）。未対応モデルは起動時にエラー |
+| 省略 | 動的ロード時は mlx-vlm が `"auto"` 相当（対応表に在れば自動、無ければ MTP なし）。事前登録の `[[models]]` はトップレベル `draft_model` を継承 |
+| `"auto"` | 本体名から対応ドラフターを自動選択（対応表 `MTP_DRAFTERS`）。`[[models]]` で明示した場合、未対応モデルは起動時にエラー |
 | HF id / パス | そのドラフターを明示指定 |
 | `"off"` / `"none"` / `""` | 無効化（既定の打ち消しにも使える） |
-| 省略 | ゲートウェイ既定 `draft_model` を継承 |
 
-- `backend = "mlx"`（テキスト専用）など mlx-vlm 以外では MTP は無視される。個別に明示した
-  場合だけ起動時に「無視される」旨を警告する。
-- 初回起動時、本体とドラフターの 2 モデルが自動ダウンロードされる。
+- `backend = "mlx"`（テキスト専用）など mlx-vlm 以外では MTP は無視される。`[[models]]` で個別に
+  明示した場合だけ起動時に「無視される」旨を警告する。
+- MTP が効くとき、初回起動時に本体とドラフターの 2 モデルが自動ダウンロードされる。
+- 動的ロードと事前登録（`[[models]]`）で `"auto"` の扱いが少し違う: 動的ロードは未対応モデルでも
+  落とさず MTP なしにフォールバックするが、`[[models]]` に `draft_model="auto"` を明示した場合は
+  「明示したのに引けない」ので起動時エラーにする（設定ミスを早く気付けるように）。
 
 ## 対応モデル（`MTP_DRAFTERS`）
 
-`"auto"` で解決できる本体→ドラフターの対応表。Qwen3.6 / Gemma 4 系を収録（mlx-community で
-検証済み）。一覧は `from local_llm_server import MTP_DRAFTERS` で参照、解決は
-`resolve_drafter(model, "auto")` で行う。未収録モデルは `draft_model` に HF id を明示する。
+`"auto"` で解決できる本体→ドラフターの対応表。Qwen3.6 / Gemma 4 系を収録（mlx-community 版と
+自作 ToPo-ToPo 版の両方）。ドラフターの選び方:
+
+- **Qwen3.6-27B（ToPo-ToPo 版）**: 同じ Qwen3.6-27B ベースなので mlx-community の MTP ヘッド
+  `mlx-community/Qwen3.6-27B-MTP-4bit` を共用する（量子化 4bit/8bit/bf16 とも）。
+- **Gemma 4（ToPo-ToPo 版）**: 各 model card 推奨の **Google 公式ドラフター
+  `google/gemma-4-<size>-it-assistant`**（mlx-vlm で変換不要・サイズ固有で量子化に依らず共通）。
+  `mlx-vlm >= 0.6.3` が必要。ドラフターはサイズ間で互換性が無い（31B / 26B-A4B / E4B / E2B で別）。
+  `google/...` は gated（Gemma ライセンス）なので、自動DLには同意済みの HF トークンが要る場合がある。
+
+一覧は `from local_llm_server import MTP_DRAFTERS` で参照、解決は `resolve_drafter(model, "auto")` で
+行う。未収録モデルは `draft_model` に HF id を明示する。

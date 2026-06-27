@@ -37,9 +37,12 @@ from .proxy import forward, send_error, send_json
 from .server import (
     BACKENDS,
     DEFAULT_BACKEND,
+    MTP_DRAFTERS,
     LocalServer,
     ServerConfig,
     daemon_log_path,
+    discover_cached_models,
+    estimate_model_bytes,
     ignore_shutdown_signals,
     infer_backend,
     parallel_supported,
@@ -62,6 +65,15 @@ __all__ = [
 ]
 
 
+def _total_ram() -> int | None:
+    """物理メモリの総バイト数。psutil が無い／取得不可なら None。"""
+    try:
+        import psutil
+        return int(psutil.virtual_memory().total)
+    except Exception:  # noqa: BLE001 - psutil 不在・取得失敗はメモリガード無効として扱う
+        return None
+
+
 class CapacityError(RuntimeError):
     """常駐枠が全て処理中で、待っても空かず新モデルをロードできなかった（→ 503）。"""
 
@@ -77,6 +89,7 @@ class _Model:
     last_used: float = 0.0  # time.monotonic()。LRU の基準
     requests: int = 0  # このモデルに振り分けた累計リクエスト数（表示用）
     dynamic: bool = False  # 未登録モデルを動的登録したもの（アンロード時に登録ごと消す）
+    footprint: int | None = None  # 概算占有メモリ（バイト）のキャッシュ。0=見積もり不能
 
 
 @dataclass
@@ -113,6 +126,9 @@ class ModelManager:
         *,
         dynamic: bool = False,
         default_disable_thinking: bool = False,
+        default_draft: str | None = None,
+        default_parallel: int | None = None,
+        max_memory_fraction: float | None = None,
         internal_base_port: int = 9001,
         public_port: int | None = None,
     ) -> None:
@@ -123,6 +139,20 @@ class ModelManager:
         # 未登録モデルの動的ロード（IDからバックエンド推論。ロード時に表示へ追加・アンロードで消す）。
         self._dynamic = dynamic
         self._default_disable_thinking = default_disable_thinking
+        # 動的ロード時の MTP ドラフター既定。None なら mlx-vlm は "auto"（対応表 MTP_DRAFTERS
+        # から本体名で自動選択）を試みる。"off"/"none"/"" で無効化、明示 id でその指定を使う。
+        self._default_draft = default_draft
+        # 動的ロード時の並列スロット既定（llama-cpp のみ。他バックエンドでは無視）。
+        self._default_parallel = default_parallel
+        # メモリガード: 常駐モデルの推定占有量の合計が「総RAM × この割合」を超えるロードを
+        # 拒否する（None で無効）。総RAM は psutil から起動時に 1 度だけ取得。
+        self._mem_fraction = max_memory_fraction
+        self._mem_total = _total_ram() if max_memory_fraction else None
+        if max_memory_fraction and not self._mem_total:
+            raise ValueError(
+                "max_memory_fraction is set but total RAM could not be read "
+                "(psutil unavailable?). Install psutil or unset max_memory_fraction."
+            )
         self._public_port = public_port
         # 動的モデルの内部ポート割当カーソル（事前登録分の次から）。
         self._next_port = internal_base_port + len(configs)
@@ -149,8 +179,10 @@ class ModelManager:
     def _register_dynamic_locked(self, model_id: str) -> _Model:
         """未登録モデルを動的登録する（control＋state ロック保持下で呼ぶ）。
 
-        ID からバックエンドを推論し、内部ポートを割り当てて _Model を作る。個別オプション
-        （MTP/parallel 等）は付かない（必要なら gateway.toml に事前登録する）。
+        ID からバックエンドを推論し、内部ポートを割り当てて _Model を作る。MTP（mlx-vlm）は
+        対応表から本体名で自動選択できるため、事前登録なしでも有効化する（下記
+        `_dynamic_draft`）。parallel やマルチモーダルの mmproj 自動付与など他のオプションは
+        付かない（個別チューニングが要るものだけ gateway.toml に事前登録する）。
         """
         backend = infer_backend(model_id)
         cfg = ServerConfig(
@@ -158,13 +190,35 @@ class ModelManager:
             model=model_id,
             host="127.0.0.1",
             port=self._alloc_port_locked(),
-            parallel=None,
+            # 並列スロットは llama-cpp のみ有効（他は逐次処理なので付けない）。
+            parallel=self._default_parallel if parallel_supported(backend) else None,
             disable_thinking=self._default_disable_thinking,
-            draft_model=None,
+            draft_model=self._dynamic_draft(model_id, backend),
         )
         mm = _Model(config=cfg, dynamic=True)
         self._models[model_id] = mm
         return mm
+
+    def _dynamic_draft(self, model_id: str, backend: str) -> str | None:
+        """動的ロードするモデルの MTP ドラフターを解決する（事前登録なしでも有効化）。
+
+        - 既定（`_default_draft` が None）では mlx-vlm のみ `"auto"` を試みる。本体名が対応表
+          `MTP_DRAFTERS` にあればそのドラフターを返し、無ければ静かに None（MTP なし）にする。
+          動的ロードを未対応モデルで失敗させないための graceful な解決（gateway.py の
+          `ensure_server` と同じ方針）。
+        - `_default_draft` を明示していればそれを尊重する（`"off"`/`"none"`/`""` で無効化、
+          HF id で明示指定）。
+        - llama.cpp の MTP は埋め込みヘッドの有無を repo-id から確実に判定できず、未対応 GGUF に
+          `--spec-type draft-mtp` を付けると起動失敗するため、動的ロードでは付けない（要事前登録）。
+        """
+        raw = self._default_draft if self._default_draft is not None else "auto"
+        if isinstance(raw, str) and raw.strip().lower() in _DRAFT_OFF:
+            return None
+        if backend != _MTP_BACKEND:
+            return None
+        if raw == "auto" and model_id not in MTP_DRAFTERS:
+            return None  # 対応表に無い → MTP なしで普通にロード
+        return resolve_drafter(model_id, raw)
 
     @property
     def model_ids(self) -> list[str]:
@@ -228,16 +282,31 @@ class ModelManager:
                     # 枠が空いた可能性。_evict_if_needed で待っているスレッドを起こす。
                     self._state.notify_all()
 
+    def _footprint_locked(self, mm: _Model) -> int:
+        """モデルの概算占有メモリ（バイト）。一度計算したらキャッシュする。0=見積もり不能。"""
+        if mm.footprint is None:
+            mm.footprint = estimate_model_bytes(mm.config) or 0
+        return mm.footprint
+
+    def _mem_budget(self) -> int | None:
+        """メモリガードの上限バイト数（総RAM × max_memory_fraction）。無効なら None。"""
+        if self._mem_fraction is None or not self._mem_total:
+            return None
+        return int(self._mem_total * self._mem_fraction)
+
     def _evict_if_needed(self, keep: str) -> None:
-        """control ロック保持下で呼ぶ。常駐数が上限なら LRU で 1 枠空ける（ハード上限）。
+        """control ロック保持下で呼ぶ。常駐数の上限（max_resident）と推定メモリ占有量の上限
+        （max_memory_fraction）のどちらかを超えるなら、LRU でアイドルモデルを退避して空ける。
 
         退避候補は「ロード済み・処理中でない（inflight==0）・keep 以外」。候補が無い
         （全て処理中）ときは、いずれかが release されて枠が空くまで**待つ**（OOM を避ける）。
-        `load_timeout` 秒以内に空かなければ `CapacityError` を投げる（呼び出し側で 503）。
+        メモリ上限の場合、退避できるモデルが無く（=keep 単体で予算超過）なら待っても無駄なので
+        即 `CapacityError`。`load_timeout` 秒以内に空かなくても同様（呼び出し側で 503）。
         待っている間も `control` は握ったまま（他のロードは直列化）だが、`state` 条件変数は
         手放すので、ロード済みモデルへの高速パス（acquire/release）は進められる。
         """
-        if self._max_resident is None:
+        budget = self._mem_budget()
+        if self._max_resident is None and budget is None:
             return
         deadline = (
             time.monotonic() + self._load_timeout if self._load_timeout else None
@@ -247,13 +316,22 @@ class ModelManager:
             victim_id = None
             victim_dynamic = False
             with self._state:
-                resident = sum(1 for m in self._models.values() if m.server is not None)
-                if resident < self._max_resident:
+                resident_models = [m for m in self._models.values() if m.server is not None]
+                resident = len(resident_models)
+                over_count = (
+                    self._max_resident is not None and resident >= self._max_resident
+                )
+                over_mem = False
+                if budget is not None:
+                    keep_mm = self._models.get(keep)
+                    need = self._footprint_locked(keep_mm) if keep_mm else 0
+                    used = sum(self._footprint_locked(m) for m in resident_models)
+                    over_mem = (used + need) > budget
+                if not over_count and not over_mem:
                     return
                 candidates = [
-                    m for m in self._models.values()
-                    if m.server is not None and m.ready and m.inflight == 0
-                    and m.config.model != keep
+                    m for m in resident_models
+                    if m.ready and m.inflight == 0 and m.config.model != keep
                 ]
                 if candidates:
                     victim = min(candidates, key=lambda m: m.last_used)
@@ -262,13 +340,22 @@ class ModelManager:
                     victim_dynamic = victim.dynamic
                     victim.server = None
                     victim.ready = False
+                elif over_mem and resident == 0:
+                    # 退避できる常駐モデルが無く、keep 単体で予算超過 → 待っても無駄。
+                    raise CapacityError(
+                        f"model '{keep}' needs ~{need / 1e9:.1f}GB but the memory budget is "
+                        f"{budget / 1e9:.1f}GB (max_memory_fraction={self._mem_fraction:g} of "
+                        f"{self._mem_total / 1e9:.1f}GB); not loading to avoid OOM"
+                    )
                 else:
                     # 全て処理中 → 枠が空く（release の notify）まで待つ。
                     remaining = None if deadline is None else deadline - time.monotonic()
                     if remaining is not None and remaining <= 0:
+                        why = "memory budget exceeded" if over_mem else (
+                            f"all {self._max_resident} model slot(s) busy"
+                        )
                         raise CapacityError(
-                            f"all {self._max_resident} model slot(s) busy; could not free one "
-                            f"within {self._load_timeout:g}s"
+                            f"{why}; could not free room within {self._load_timeout:g}s"
                         )
                     self._state.wait(timeout=remaining)
                     continue  # 起きたら再判定
@@ -523,7 +610,8 @@ class _GatewayHandler(BaseHTTPRequestHandler):
         # /v1/models は設定済みカタログを合成して返す（is_ready 判定・モデル取り違え
         # 警告に対応）。実モデルは起動していなくてもカタログとして列挙する。
         if path.endswith("/models"):
-            # 事前登録カタログ＋現在管理中（動的ロード分）を重複なく列挙する。
+            # 事前登録カタログ＋現在管理中（動的ロード分）を重複なく列挙する（標準どおり）。
+            # DL 済みモデルの「発見一覧」は TUI 専用（/admin/status の available）に集約する。
             ids = list(dict.fromkeys(srv.catalog + srv.manager.model_ids))
             data = {
                 "object": "list",
@@ -548,6 +636,8 @@ class _GatewayHandler(BaseHTTPRequestHandler):
                 "uptime": round(srv.manager.uptime(), 1),
                 "requests": sum(m.get("requests", 0) for m in models),
                 "models": models,
+                # キャッシュにある DL 済みモデル（TUI が未ロード候補として一覧する）。
+                "available": discover_cached_models(),
             }
             send_json(self, 200, data)
             return
@@ -661,6 +751,9 @@ class GatewayConfig:
     session_ttl: float | None = 90.0   # 秒。在席エージェントのハートビートがこれだけ途絶えたら無人扱いで掃除（既定 90。None/0 で無効）
     dynamic: bool = True               # 未登録モデルを ID 推論で動的ロードする（false で事前登録のみ）
     disable_thinking: bool = False     # 動的ロード時の既定（思考抑制）。事前登録は各 [[models]] が優先
+    draft_model: str | None = None     # 動的ロード時の MTP 既定。None で mlx-vlm は "auto"（対応表から自動）。"off" で無効
+    parallel: int | None = None        # 動的ロード時の並列スロット既定（llama-cpp のみ。他は無視）
+    max_memory_fraction: float | None = None  # 常駐モデルの推定占有量の合計を総RAMのこの割合に制限（None で無効）
     internal_base_port: int = 9001     # 内部サーバーの割当開始ポート（動的モデルもこの続きから割り当て）
 
 
@@ -714,7 +807,7 @@ def load_gateway_config(path: str) -> GatewayConfig:
         draft_model = "auto"        # 全モデルの MTP ドラフター既定（mlx-vlm のみ有効。省略可）
 
         [[models]]
-        model = "mlx-community/Qwen3.6-27B-4bit"
+        model = "ToPo-ToPo/Qwen3.6-27B-mlx-4bit"
         backend = "mlx-vlm"
         # draft_model 省略 → 上の既定 "auto" を継承（Qwen3.6 の MTP）
 
@@ -765,6 +858,19 @@ def load_gateway_config(path: str) -> GatewayConfig:
     # ゲートウェイ全体の MTP ドラフター既定。各 [[models]] が draft_model を持たなければ
     # これを継承する（"auto" で本体名から自動選択）。個別に "" / "off" / "none" で無効化。
     default_draft = data.get("draft_model")
+    # 動的ロード時の並列スロット既定（llama-cpp のみ。他バックエンドは逐次処理なので無視）。
+    default_parallel = data.get("parallel")
+    if default_parallel is not None:
+        default_parallel = int(default_parallel)
+        if default_parallel < 1:
+            raise ValueError("parallel must be 1 or greater")
+    # メモリガード（→ docs/llama-cpp.md）。常駐モデルの推定占有量の合計を総RAMのこの割合に
+    # 制限する。0 < x <= 1。省略で無効。
+    max_memory_fraction = data.get("max_memory_fraction")
+    if max_memory_fraction is not None:
+        max_memory_fraction = float(max_memory_fraction)
+        if not (0.0 < max_memory_fraction <= 1.0):
+            raise ValueError("max_memory_fraction must be in (0, 1]")
 
     entries = data.get("models") or []
     if not isinstance(entries, list):
@@ -818,6 +924,8 @@ def load_gateway_config(path: str) -> GatewayConfig:
         host, port, max_resident, default_model, configs, idle_timeout, load_timeout,
         session_ttl=session_ttl,
         dynamic=dynamic, disable_thinking=dyn_disable_thinking,
+        draft_model=default_draft, parallel=default_parallel,
+        max_memory_fraction=max_memory_fraction,
         internal_base_port=internal_base,
     )
 
@@ -832,6 +940,8 @@ def run_gateway(cfg: GatewayConfig) -> int:
     manager = ModelManager(
         cfg.models, max_resident=cfg.max_resident, load_timeout=cfg.load_timeout,
         dynamic=cfg.dynamic, default_disable_thinking=cfg.disable_thinking,
+        default_draft=cfg.draft_model, default_parallel=cfg.parallel,
+        max_memory_fraction=cfg.max_memory_fraction,
         internal_base_port=cfg.internal_base_port, public_port=cfg.port,
     )
     server = GatewayServer(
@@ -853,6 +963,14 @@ def run_gateway(cfg: GatewayConfig) -> int:
         f"{cfg.max_resident} (hard; waits up to {cfg.load_timeout:g}s for a slot, else 503)"
     )
     print(f"  max resident models: {cap}", file=sys.stderr)
+    if cfg.max_memory_fraction:
+        total = _total_ram()
+        budget = f"{total * cfg.max_memory_fraction / 1e9:.1f}GB" if total else "?"
+        print(
+            f"  memory cap: {cfg.max_memory_fraction:g} of RAM (~{budget}); "
+            "refuses a load that would exceed it (evicts idle first, else 503)",
+            file=sys.stderr,
+        )
     print(
         f"  idle unload: {f'{cfg.idle_timeout:g}s' if cfg.idle_timeout else 'off'}",
         file=sys.stderr,
