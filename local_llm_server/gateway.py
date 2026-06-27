@@ -6,7 +6,7 @@
 
     from local_llm_server import ensure_server
 
-    handle = ensure_server(model="mlx-community/Qwen3.6-27B-4bit", draft_model="auto")
+    handle = ensure_server(model="ToPo-ToPo/Qwen3.6-27B-mlx-4bit", draft_model="auto")
     try:
         ...  # handle.base_url の OpenAI 互換 API を使う
     finally:

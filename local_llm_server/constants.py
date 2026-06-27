@@ -7,8 +7,8 @@ from __future__ import annotations
 
 import os
 
-# サーバー・モデルが明示されないときに使う既定モデル
-DEFAULT_MODEL = "mlx-community/Qwen3.6-27B-4bit"
+# サーバー・モデルが明示されないときに使う既定モデル（自作 ToPo-ToPo 版 Qwen3.6-27B）
+DEFAULT_MODEL = "ToPo-ToPo/Qwen3.6-27B-mlx-4bit"
 
 # 画像・メディアを処理する vision モデルの既定。
 # 既定モデル(Qwen3.6)はマルチモーダルなので、テキストと共通のものを使う。

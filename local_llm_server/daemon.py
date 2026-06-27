@@ -807,7 +807,7 @@ def load_gateway_config(path: str) -> GatewayConfig:
         draft_model = "auto"        # 全モデルの MTP ドラフター既定（mlx-vlm のみ有効。省略可）
 
         [[models]]
-        model = "mlx-community/Qwen3.6-27B-4bit"
+        model = "ToPo-ToPo/Qwen3.6-27B-mlx-4bit"
         backend = "mlx-vlm"
         # draft_model 省略 → 上の既定 "auto" を継承（Qwen3.6 の MTP）
 

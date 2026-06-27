@@ -81,10 +81,12 @@ def test_dynamic_register_infers_backend_and_allocates_port(tmp_path):
 
 def test_dynamic_register_auto_enables_mtp_for_supported_mlx_vlm():
     # 事前登録なしの動的ロードでも、対応表に在る mlx-vlm モデルは MTP が自動で効く
-    # （draft_model="auto" を graceful に解決）。
+    # （draft_model="auto" を graceful に解決）。自作 ToPo-ToPo 版も収録済み。
     mgr = gw.ModelManager([], dynamic=True)
     m = mgr._register_dynamic_locked("mlx-community/Qwen3.6-27B-4bit")
     assert m.config.draft_model == "mlx-community/Qwen3.6-27B-MTP-4bit"
+    topo = mgr._register_dynamic_locked("ToPo-ToPo/Qwen3.6-27B-mlx-4bit")
+    assert topo.config.draft_model == "mlx-community/Qwen3.6-27B-MTP-4bit"
 
 
 def test_dynamic_register_no_mtp_for_unsupported_or_other_backends():

@@ -51,7 +51,7 @@ dynamic = true
 #
 # mlx-vlm で MTP を個別に無効化／別ドラフターを明示したいときだけ（自動で効くので通常は不要）:
 # [[models]]
-# model = "mlx-community/Qwen3.6-27B-4bit"
+# model = "ToPo-ToPo/Qwen3.6-27B-mlx-4bit"
 # backend = "mlx-vlm"
 # draft_model = "off"       # このモデルだけ MTP を無効化（HF id を書けば別ドラフターを明示）
 #

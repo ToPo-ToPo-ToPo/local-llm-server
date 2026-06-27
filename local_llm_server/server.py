@@ -271,6 +271,14 @@ MTP_DRAFTERS = {
     # Qwen3.6-27B（既定モデル）の MTP ドラフター。実測 ~2倍速（38→75 tok/s, 採択93%）。
     "mlx-community/Qwen3.6-27B-4bit":
         "mlx-community/Qwen3.6-27B-MTP-4bit",
+    # 自作 ToPo-ToPo 版の Qwen3.6-27B（既定運用）。本体は同じ Qwen3.6-27B ベースなので、
+    # ドラフターは mlx-community の MTP ヘッドを共用できる（量子化違いも同一ドラフターで可）。
+    "ToPo-ToPo/Qwen3.6-27B-mlx-4bit":
+        "mlx-community/Qwen3.6-27B-MTP-4bit",
+    "ToPo-ToPo/Qwen3.6-27B-mlx-8bit":
+        "mlx-community/Qwen3.6-27B-MTP-4bit",
+    "ToPo-ToPo/Qwen3.6-27B-mlx-bf16":
+        "mlx-community/Qwen3.6-27B-MTP-4bit",
 }
 
 

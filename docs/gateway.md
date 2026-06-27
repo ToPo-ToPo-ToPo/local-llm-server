@@ -29,7 +29,7 @@ backend = "llama-cpp"                          # mlx / mlx-vlm / llama-cpp
 parallel = 4                                   # 動的ロードでは付かない個別オプションの例
 
 [[models]]
-model = "mlx-community/Qwen3.6-27B-4bit"
+model = "ToPo-ToPo/Qwen3.6-27B-mlx-4bit"
 backend = "mlx-vlm"
 # draft_model = "off"   # MTP は自動で効く。このモデルだけ無効化したいときだけ書く
 ```
