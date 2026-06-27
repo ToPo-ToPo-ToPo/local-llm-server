@@ -68,7 +68,7 @@ uv add local-llm-client
 ```python
 from local_llm_client import LLMClient
 
-llm = LLMClient(model="mlx-community/Qwen3.6-27B-4bit",
+llm = LLMClient(model="ToPo-ToPo/Qwen3.6-27B-mlx-4bit",
                 base_url="http://127.0.0.1:8799/v1")
 print(llm.respond("ローカルLLMの利点を3つ。"))
 ```
