@@ -113,12 +113,13 @@ class GatewayMonitor(App):
         self.all_ports = [self.port] + [m.port for m in gcfg.models]
         self.admin = None
         self.busy = ""
+        self._row_models: list[str] = []  # 表の表示順モデル ID（行クリック→コピー用）
 
     def compose(self) -> ComposeResult:
         with Container(id="dash"):
             yield Static(self._title(), id="title")
             yield Static(id="status")
-            yield DataTable(id="models", show_cursor=True, zebra_stripes=False)
+            yield DataTable(id="models", show_cursor=False, zebra_stripes=False)
             yield Static(id="policy")
         yield Input(placeholder="command — stop · restart · start · log · quit", id="cmd")
         # キーの凡例は固定表示にする（Footer はコマンド入力中に隠れてしまうため）。
@@ -126,7 +127,7 @@ class GatewayMonitor(App):
 
     def on_mount(self) -> None:
         table = self.query_one("#models", DataTable)
-        table.cursor_type = "row"  # 行を選んでモデル名をコピーできるように（行ハイライト）
+        table.cursor_type = "none"  # 行ハイライトは出さない（選択色を「動作中」と誤認しないため）
         table.add_columns("MODEL", "STATE", "INFLT", "AGENTS", "UNLOAD", "REQS")
         # 起動時にゲートウェイを裏で常駐させる（既定起動＝「アプリを開く」感覚）。
         if server_status(self.host, self.port) is None:
@@ -181,8 +182,9 @@ class GatewayMonitor(App):
         self.query_one("#status", Static).update(st)
 
         table = self.query_one("#models", DataTable)
-        prev_row = table.cursor_row  # 1 秒ごとの再描画でカーソル位置を保つ
         table.clear()
+        # 行クリック→コピー用に、表示順のモデル ID を保持する（行ハイライトは使わない）。
+        self._row_models = [r["model"] for r in view["models"]]
         # 表示するモデルが無いとき（起動直後・全アンロード）は表ごと隠す（ヘッダも出さない）。
         # モデルがロードされたら表が現れる。
         table.display = bool(view["models"])
@@ -198,16 +200,12 @@ class GatewayMonitor(App):
             # 在席エージェント数。>0 は緑（解放されない＝使用中）、0 は淡色（即アンロード対象）。
             sess_n = r.get("sessions", 0)
             agents = Text(str(sess_n), style=_GREEN if sess_n else _DIM)
-            # 行キーをモデル ID にする（行選択でそのままコピーできる）。
             table.add_row(
                 Text(name, style="" if r["state"] != "unloaded" else _DIM),
                 state, inflt, agents,
                 Text(_fmt_hms(r["idle_remaining"]), style=_DIM),
                 Text(f"{r['requests']:,}", style=_DIM),
-                key=name,
             )
-        if table.row_count and prev_row is not None:
-            table.move_cursor(row=min(prev_row, table.row_count - 1))
 
         policy = (
             f"max_resident {view['max_resident'] if view['max_resident'] is not None else '∞'}"
@@ -254,11 +252,14 @@ class GatewayMonitor(App):
     def action_quit(self) -> None:
         self.exit()
 
-    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
-        # 行をクリック / Enter で選ぶと、その行のモデル名をクリップボードへコピーする。
-        model = event.row_key.value if event.row_key else None
-        if model:
-            self._copy_model(model)
+    def on_click(self, event) -> None:
+        # 表の行をクリックしたら、その行のモデル名をコピーする（行ハイライトは出さない）。
+        # クリック位置のセル meta から行番号を得る（ヘッダ -1・表外は無視）。
+        meta = getattr(event, "style", None)
+        meta = getattr(meta, "meta", None) or {}
+        row = meta.get("row")
+        if isinstance(row, int) and 0 <= row < len(self._row_models):
+            self._copy_model(self._row_models[row])
 
     def _copy_model(self, model: str) -> None:
         """モデル名をクリップボードへ。macOS は pbcopy、他は端末の OSC52（textual）。"""

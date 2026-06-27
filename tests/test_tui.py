@@ -51,8 +51,8 @@ def _write_cfg(tmp_path, body):
     return p
 
 
-def test_row_selection_copies_model_name(tmp_path, monkeypatch):
-    # 表の行を選ぶ（クリック/Enter）と、その行のモデル名がコピーされること。
+def test_row_click_copies_model_name(tmp_path, monkeypatch):
+    # 表の行をクリックすると、その行のモデル名がコピーされること（行ハイライトは使わない）。
     from textual.widgets import DataTable
     from local_llm_server import tui_app
 
@@ -69,17 +69,18 @@ def test_row_selection_copies_model_name(tmp_path, monkeypatch):
     async def scenario():
         app = tui_app.GatewayMonitor(gcfg)
         copied = []
-        async with app.run_test() as pilot:
+        async with app.run_test(size=(120, 30)) as pilot:
             app._copy_model = lambda m: copied.append(m)
             app._apply(admin)
             await pilot.pause()
             table = app.query_one("#models", DataTable)
             assert table.row_count == 2
-            table.focus()
-            table.move_cursor(row=1)            # 2 行目 = unsloth/Bar-GGUF（未ロード候補）
-            table.action_select_cursor()        # Enter 相当
+            assert table.cursor_type == "none"          # 行ハイライトを出さない
+            await pilot.click("#models", offset=(3, 1))  # 1 行目（ヘッダの下）= Foo
             await pilot.pause()
-        assert copied == ["unsloth/Bar-GGUF"]
+            await pilot.click("#models", offset=(3, 2))  # 2 行目 = Bar（未ロード候補）
+            await pilot.pause()
+        assert copied == ["mlx-community/Foo-4bit", "unsloth/Bar-GGUF"]
 
     asyncio.run(scenario())
 
