@@ -610,10 +610,9 @@ class _GatewayHandler(BaseHTTPRequestHandler):
         # /v1/models は設定済みカタログを合成して返す（is_ready 判定・モデル取り違え
         # 警告に対応）。実モデルは起動していなくてもカタログとして列挙する。
         if path.endswith("/models"):
-            # 事前登録カタログ＋現在管理中（動的ロード分）＋キャッシュにある DL 済みモデル
-            # （発見用。未ロードでも「選べる候補」として見せる）を重複なく列挙する。
-            discovered = [d["id"] for d in discover_cached_models()]
-            ids = list(dict.fromkeys(srv.catalog + srv.manager.model_ids + discovered))
+            # 事前登録カタログ＋現在管理中（動的ロード分）を重複なく列挙する（標準どおり）。
+            # DL 済みモデルの「発見一覧」は TUI 専用（/admin/status の available）に集約する。
+            ids = list(dict.fromkeys(srv.catalog + srv.manager.model_ids))
             data = {
                 "object": "list",
                 "data": [{"id": m, "object": "model"} for m in ids],

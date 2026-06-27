@@ -548,8 +548,7 @@ def test_gateway_unknown_model_returns_404(monkeypatch):
 
 
 def test_gateway_models_catalog(monkeypatch):
-    # 発見（キャッシュ走査）は決定的にするため空に固定する。
-    monkeypatch.setattr(gw, "discover_cached_models", lambda *a, **k: [])
+    # /v1/models は標準どおり「事前登録カタログ＋ロード中」のみ（発見一覧は TUI 専用）。
     server, mgr, ups = _start_gateway(monkeypatch)
     try:
         port = server.server_address[1]
@@ -557,25 +556,6 @@ def test_gateway_models_catalog(monkeypatch):
         assert status == 200
         ids = [m["id"] for m in obj["data"]]
         assert ids == ["m1", "m2"]
-    finally:
-        server.shutdown(); server.server_close(); mgr.shutdown()
-        for u in ups:
-            u.shutdown(); u.server_close()
-
-
-def test_gateway_models_includes_cached_discovered(monkeypatch):
-    # /v1/models は 事前登録カタログ＋キャッシュにある DL 済みモデルを重複なく合成する。
-    monkeypatch.setattr(
-        gw, "discover_cached_models",
-        lambda *a, **k: [{"id": "m1", "backend": "mlx"},          # カタログと重複→1回だけ
-                         {"id": "mlx-community/New-4bit", "backend": "mlx-vlm"}],
-    )
-    server, mgr, ups = _start_gateway(monkeypatch)
-    try:
-        port = server.server_address[1]
-        status, obj = _get(port, "/v1/models")
-        ids = [m["id"] for m in obj["data"]]
-        assert ids == ["m1", "m2", "mlx-community/New-4bit"]
     finally:
         server.shutdown(); server.server_close(); mgr.shutdown()
         for u in ups:
