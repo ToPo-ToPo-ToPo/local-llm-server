@@ -51,6 +51,64 @@ def _write_cfg(tmp_path, body):
     return p
 
 
+def test_row_selection_copies_model_name(tmp_path, monkeypatch):
+    # 表の行を選ぶ（クリック/Enter）と、その行のモデル名がコピーされること。
+    from textual.widgets import DataTable
+    from local_llm_server import tui_app
+
+    gcfg = load_gateway_config(str(_write_cfg(tmp_path, "port = 8799\n")))
+    monkeypatch.setattr(tui_app, "server_status", lambda h, p: {"ready": True})
+    monkeypatch.setattr(tui_app, "gateway_admin_status", lambda h, p: None)
+    admin = {
+        "uptime": 1.0, "requests": 0,
+        "models": [{"model": "mlx-community/Foo-4bit", "backend": "mlx-vlm",
+                    "loaded": True, "inflight": 0, "requests": 0, "idle_for": 1.0}],
+        "available": [{"id": "unsloth/Bar-GGUF", "backend": "llama-cpp"}],
+    }
+
+    async def scenario():
+        app = tui_app.GatewayMonitor(gcfg)
+        copied = []
+        async with app.run_test() as pilot:
+            app._copy_model = lambda m: copied.append(m)
+            app._apply(admin)
+            await pilot.pause()
+            table = app.query_one("#models", DataTable)
+            assert table.row_count == 2
+            table.focus()
+            table.move_cursor(row=1)            # 2 行目 = unsloth/Bar-GGUF（未ロード候補）
+            table.action_select_cursor()        # Enter 相当
+            await pilot.pause()
+        assert copied == ["unsloth/Bar-GGUF"]
+
+    asyncio.run(scenario())
+
+
+def test_copy_model_uses_pbcopy_on_macos(tmp_path, monkeypatch):
+    from local_llm_server import tui_app
+
+    gcfg = load_gateway_config(str(_write_cfg(tmp_path, "port = 8799\n")))
+    monkeypatch.setattr(tui_app, "server_status", lambda h, p: {"ready": True})
+    monkeypatch.setattr(tui_app, "gateway_admin_status", lambda h, p: None)
+    monkeypatch.setattr(tui_app.sys, "platform", "darwin")
+    recorded = {}
+    monkeypatch.setattr(
+        tui_app.subprocess, "run",
+        lambda cmd, input=None, check=False: recorded.update(cmd=cmd, input=input),
+    )
+
+    async def scenario():
+        app = tui_app.GatewayMonitor(gcfg)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._copy_model("org/My-Model:Q4")
+            await pilot.pause()
+        assert recorded["cmd"] == ["pbcopy"]
+        assert recorded["input"] == b"org/My-Model:Q4"
+
+    asyncio.run(scenario())
+
+
 def test_log_screen_opens_and_closes(tmp_path, monkeypatch):
     # 外部ページャでなくアプリ内画面でログを出し、q / Esc でダッシュボードに戻れること。
     from textual.app import App
