@@ -14,7 +14,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import DataTable, Footer, Input, Static
+from textual.widgets import DataTable, Input, Static
 
 from .server import (
     find_pids_on_port,
@@ -92,7 +92,7 @@ class GatewayMonitor(App):
     DataTable { height: auto; background: #16161a; }
     DataTable > .datatable--header { color: #83838c; background: #16161a; text-style: none; }
     #cmd { border: round #3a3a40; margin: 1 1 0 1; background: #16161a; }
-    Footer { background: #1d1d22; }
+    #hints { background: #1d1d22; padding: 0 1; }
     """
 
     BINDINGS = [
@@ -119,7 +119,8 @@ class GatewayMonitor(App):
             yield DataTable(id="models", show_cursor=False, zebra_stripes=False)
             yield Static(id="policy")
         yield Input(placeholder="command — stop · restart · start · log · quit", id="cmd")
-        yield Footer()
+        # キーの凡例は固定表示にする（Footer はコマンド入力中に隠れてしまうため）。
+        yield Static(self._hints(), id="hints")
 
     def on_mount(self) -> None:
         table = self.query_one("#models", DataTable)
@@ -136,6 +137,18 @@ class GatewayMonitor(App):
         t.append("◆ ", style=_ACCENT)
         t.append("local-llm-server", style="bold")
         t.append("  · gateway monitor", style=_DIM)
+        return t
+
+    def _hints(self) -> Text:
+        """キー操作の凡例（フォーカスに依らず常に見える固定行。入力中も消えない）。"""
+        t = Text()
+        for i, (key, label) in enumerate(
+            (("s", "stop"), ("r", "restart"), ("g", "start"), ("l", "log"), ("q", "quit"))
+        ):
+            if i:
+                t.append("   ", style=_DIM)
+            t.append(f" {key} ", style=f"bold {_ACCENT}")
+            t.append(f" {label}", style=_DIM)
         return t
 
     # --- ポーリング（別スレッドで HTTP、結果は UI スレッドへ） ---

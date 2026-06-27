@@ -19,6 +19,38 @@ def test_read_log_tail(tmp_path, monkeypatch):
     assert tui.read_log_tail(123).startswith("(ログはまだ")
 
 
+def test_key_hints_stay_visible_while_typing_command(tmp_path, monkeypatch):
+    # コマンド入力中（Input にフォーカス）でも、stop/start 等のキー凡例が消えないこと。
+    from local_llm_server import tui_app
+
+    gcfg = load_gateway_config(str(_write_cfg(tmp_path, "port = 8799\n")))
+    monkeypatch.setattr(tui_app, "server_status", lambda h, p: {"ready": True})  # 自動起動させない
+    monkeypatch.setattr(tui_app, "gateway_admin_status", lambda h, p: None)
+
+    async def scenario():
+        app = tui_app.GatewayMonitor(gcfg)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            hints = app.query_one("#hints")
+            text = hints.render().plain
+            assert all(w in text for w in ("stop", "restart", "start", "log", "quit"))
+            # 入力欄にフォーカスして打鍵 → 凡例は表示されたまま
+            app.query_one("#cmd").focus()
+            await pilot.pause()
+            await pilot.press("s", "t", "o", "p")
+            await pilot.pause()
+            assert app.query_one("#cmd").value == "stop"
+            assert app.query_one("#hints").display is True
+
+    asyncio.run(scenario())
+
+
+def _write_cfg(tmp_path, body):
+    p = tmp_path / "gateway.toml"
+    p.write_text(body, encoding="utf-8")
+    return p
+
+
 def test_log_screen_opens_and_closes(tmp_path, monkeypatch):
     # 外部ページャでなくアプリ内画面でログを出し、q / Esc でダッシュボードに戻れること。
     from textual.app import App
