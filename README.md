@@ -12,9 +12,7 @@
 
 ## インストール
 
-[uv](https://docs.astral.sh/uv/) を使う。**このリポジトリをクローンして、ソースから動かすのが基本。**
-コマンドは OS を問わず `uv sync` だけ。推論バックエンドの **mlx は Apple Silicon (macOS arm64) のときだけ
-自動で入る**（他 OS / Intel Mac では入らない → llama.cpp を別途用意。末尾の注記）。
+[uv](https://docs.astral.sh/uv/) を使う。このリポジトリをクローンして、ソースから動かすのが基本。
 
 ```bash
 git clone https://github.com/ToPo-ToPo-ToPo/local-llm-server
@@ -33,8 +31,6 @@ uv sync
 
 - **コマンドとして入れる**: `uv tool install local-llm-server` → どこでも `local-llm-server` で起動。
 - **別プロジェクトの依存として入れる**: `gateway.toml` を置く新規フォルダで `uv init` → `uv add local-llm-server` → `uv run local-llm-server`。
-
-（mlx は Apple Silicon でのみ自動で入る。`[mlx]` の extra 指定は不要になった。）
 </details>
 
 ## 使い方
