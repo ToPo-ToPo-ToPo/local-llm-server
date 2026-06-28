@@ -17,7 +17,7 @@ from local_llm_server import (
 )
 
 
-def test_build_command_mlx():
+def test_build_command_mlx(stub_cache):
     cmd = build_command(ServerConfig("mlx", "model", port=8080))
     assert cmd[0] == "mlx_lm.server" and "--model" in cmd and "8080" in cmd
 
@@ -38,6 +38,15 @@ def hf_cache(tmp_path, monkeypatch):
     """HF_HUB_CACHE を隔離し、`make(repo, files)` で repo を用意できるようにする。"""
     monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path / "hub"))
     return lambda repo, files: _make_hf_cache(tmp_path, repo, files)
+
+
+@pytest.fixture
+def stub_cache(monkeypatch):
+    """mlx 系の事前 DL チェック（ensure_cached）を無効化し、コマンド構築だけを検証する。
+
+    ensure_cached 自体の挙動は test_ensure_cached_* で（実物のまま）検証する。
+    """
+    monkeypatch.setattr(srv, "ensure_cached", lambda repo, **_kw: repo)
 
 
 def test_build_command_llama_parallel_and_thinking(hf_cache):
@@ -146,12 +155,12 @@ def test_build_command_llama_no_mmproj_optout(hf_cache):
     assert "--mmproj" not in cmd and "--no-mmproj" in cmd
 
 
-def test_build_command_mlx_disable_thinking():
+def test_build_command_mlx_disable_thinking(stub_cache):
     cmd = build_command(ServerConfig("mlx", "m", disable_thinking=True))
     assert "--chat-template-args" in cmd
 
 
-def test_build_command_mlx_vlm():
+def test_build_command_mlx_vlm(stub_cache):
     cmd = build_command(ServerConfig("mlx-vlm", "vision-model", port=8080))
     # python -m mlx_vlm.server でモデル/ホスト/ポートを渡して起動する
     assert cmd[1:3] == ["-m", "mlx_vlm.server"]
@@ -160,7 +169,7 @@ def test_build_command_mlx_vlm():
     assert "--chat-template-args" not in cmd
 
 
-def test_build_command_mlx_vlm_mtp_drafter():
+def test_build_command_mlx_vlm_mtp_drafter(stub_cache):
     # Gemma 4 MTP: mlx-vlm に --draft-model を渡し、--draft-kind は mtp 固定。
     c = ServerConfig(
         "mlx-vlm", "mlx-community/gemma-4-E4B-it-qat-4bit",
@@ -179,13 +188,13 @@ def test_resolve_drafter_auto_qwen36():
     )
 
 
-def test_build_command_mlx_no_draft_support():
+def test_build_command_mlx_no_draft_support(stub_cache):
     # テキスト専用 mlx には MTP を渡さない（mlx-vlm のみ対応）。
     cmd = build_command(ServerConfig("mlx", "m", draft_model="d"))
     assert "--draft-model" not in cmd and "--draft-kind" not in cmd
 
 
-def test_build_command_no_draft_by_default():
+def test_build_command_no_draft_by_default(stub_cache):
     # ドラフター未指定なら draft 系フラグは出ない。
     assert "--draft-model" not in build_command(ServerConfig("mlx-vlm", "m"))
 
@@ -217,12 +226,48 @@ def test_resolve_drafter_auto_unknown_raises():
         resolve_drafter("some/unknown-model", "auto")
 
 
-def test_build_command_mlx_vlm_draft_auto():
+def test_build_command_mlx_vlm_draft_auto(stub_cache):
     # build_command でも "auto" が解決され、対応ドラフター＋mtp が付く。
     target = "mlx-community/gemma-4-12B-it-qat-4bit"
     cmd = build_command(ServerConfig("mlx-vlm", target, draft_model="auto"))
     assert cmd[cmd.index("--draft-model") + 1] == MTP_DRAFTERS[target]
     assert cmd[cmd.index("--draft-kind") + 1] == "mtp"
+
+
+# --- 事前 DL 必須（自動ダウンロード無効）の検証 ----------------------------
+
+def test_ensure_cached_ok_when_present(hf_cache):
+    # 重み（safetensors）が揃っていれば OK（スナップショットを返す）。
+    snap = hf_cache("org/mlx-model", ["config.json", "model.safetensors"])
+    assert srv.ensure_cached("org/mlx-model") == str(snap)
+
+
+def test_ensure_cached_errors_when_not_cached(hf_cache):
+    # キャッシュに無ければ案内付きでエラー（自動 DL しない）。
+    with pytest.raises(ValueError, match="hf download"):
+        srv.ensure_cached("org/not-cached")
+
+
+def test_ensure_cached_errors_on_incomplete(hf_cache, tmp_path):
+    # DL 途中（*.incomplete 残存）は「未取得」と同じ扱い（今回の不具合の主症状）。
+    hf_cache("org/mlx-model", ["config.json", "model.safetensors"])
+    blobs = tmp_path / "hub" / "models--org--mlx-model" / "blobs"
+    blobs.mkdir(parents=True, exist_ok=True)
+    (blobs / "abc123.incomplete").write_bytes(b"")
+    with pytest.raises(ValueError, match="hf download"):
+        srv.ensure_cached("org/mlx-model")
+
+
+def test_ensure_cached_rejects_bare_name(hf_cache):
+    # repo-id（org/repo）形式でないものは弾く。
+    with pytest.raises(ValueError):
+        srv.ensure_cached("bare-name")
+
+
+def test_build_command_mlx_requires_predownload(hf_cache):
+    # 配線確認: 未取得モデルでは build_command がそのまま起動せずエラーにする。
+    with pytest.raises(ValueError, match="hf download"):
+        build_command(ServerConfig("mlx-vlm", "org/uncached-model"))
 
 
 def test_mlx_vlm_in_backends_and_not_parallel():
@@ -543,10 +588,20 @@ def test_discover_cached_models(monkeypatch, tmp_path):
     _touch(str(root / "models--x--OnlyProj-GGUF/snapshots/a/mmproj.gguf"))
     # モデルでない repo（重みなし）→ 除外
     _touch(str(root / "models--y--JustReadme/snapshots/a/README.md"))
+    # Qwen3.6-27B-4bit の MTP ドラフター（揃っている）→ 一覧から除外しつつ本体は mtp="ready"
+    _config(str(root / "models--mlx-community--Qwen3.6-27B-MTP-4bit/snapshots/a/config.json"),
+            "qwen3", ["Qwen3ForCausalLM"])
+    _touch(str(root / "models--mlx-community--Qwen3.6-27B-MTP-4bit/snapshots/a/model.safetensors"))
+    # MTP 対応だがドラフター未取得の本体 → mtp="available"
+    _config(str(root / "models--mlx-community--gemma-4-E4B-it-qat-4bit/snapshots/a/config.json"),
+            "gemma3", ["Gemma3ForCausalLM"])
+    _touch(str(root / "models--mlx-community--gemma-4-E4B-it-qat-4bit/snapshots/a/model.safetensors"))
 
     monkeypatch.setattr(srv, "_hf_hub_cache", lambda: str(root))
     srv._DISCOVER_CACHE["t"] = -1e9  # キャッシュを無効化して再走査させる
-    found = {d["id"]: d["backend"] for d in srv.discover_cached_models(ttl=0)}
+    items = srv.discover_cached_models(ttl=0)
+    found = {d["id"]: d["backend"] for d in items}
+    mtp = {d["id"]: d["mtp"] for d in items}
 
     assert found["mlx-community/Qwen3.6-27B-4bit"] == "mlx-vlm"
     assert found["unsloth/Foo-GGUF"] == "llama-cpp"
@@ -555,3 +610,9 @@ def test_discover_cached_models(monkeypatch, tmp_path):
     assert "intfloat/e5-large" not in found     # 埋め込みは除外
     assert "x/OnlyProj-GGUF" not in found
     assert "y/JustReadme" not in found
+    # ドラフターは「使えるモデル」一覧に出さない
+    assert "mlx-community/Qwen3.6-27B-MTP-4bit" not in found
+    # MTP の利用可否: ドラフターが揃う本体は "ready"、未取得は "available"、非対応は None
+    assert mtp["mlx-community/Qwen3.6-27B-4bit"] == "ready"
+    assert mtp["mlx-community/gemma-4-E4B-it-qat-4bit"] == "available"
+    assert mtp["unsloth/Foo-GGUF"] is None

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import sys
 
-from .server import gateway_log_path, is_ready
+from .server import gateway_log_path, is_ready, mtp_status
 
 
 def merge_status(gcfg, admin: dict | None) -> dict:
@@ -24,12 +24,14 @@ def merge_status(gcfg, admin: dict | None) -> dict:
 
     def _row(model, backend, port, m):
         """ライブ状態 m（None=未ロード）から表示用の 1 行を作る。"""
+        # MTP（高速化）の利用可否は本体名から判定する（ドラフターがキャッシュ済みなら "ready"）。
+        mtp = mtp_status(model)
         if not m or not m.get("loaded"):
             return {
                 "model": model, "backend": backend, "port": port,
                 "state": "unloaded", "inflight": 0,
                 "requests": (m or {}).get("requests", 0), "idle_remaining": None,
-                "sessions": (m or {}).get("sessions", 0),
+                "sessions": (m or {}).get("sessions", 0), "mtp": mtp,
             }
         inflight = int(m.get("inflight", 0))
         idle_for = m.get("idle_for")
@@ -46,6 +48,7 @@ def merge_status(gcfg, admin: dict | None) -> dict:
             "state": state, "inflight": inflight,
             "requests": int(m.get("requests", 0)), "idle_remaining": remaining,
             "sessions": int(m.get("sessions", 0)),  # 在席エージェント数（0 で即アンロード対象）
+            "mtp": mtp,
         }
 
     rows = []

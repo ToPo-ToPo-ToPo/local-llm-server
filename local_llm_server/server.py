@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import glob
 import json
 import os
 import platform
@@ -236,8 +237,8 @@ class ServerConfig:
     # draft_model にドラフターの HF id / パス（例
     # mlx-community/gemma-4-E4B-it-qat-assistant-bf16）を指定すると、本体の出力を
     # 変えずに高速化する。"auto" にすると本体名から対応ドラフターを自動選択する
-    # （MTP_DRAFTERS の対応表）。指定時は本体＋ドラフターの2モデルを mlx-vlm が
-    # 初回に自動ダウンロードする。MTP は vision 対応の mlx-vlm バックエンドのみ対応。
+    # （MTP_DRAFTERS の対応表）。本体・ドラフターとも事前に `hf download` 済みである必要が
+    # ある（自動ダウンロードはしない）。MTP は vision 対応の mlx-vlm バックエンドのみ対応。
     draft_model: str | None = None
     extra_args: list[str] = field(default_factory=list)
 
@@ -293,6 +294,12 @@ MTP_DRAFTERS = {
     "ToPo-ToPo/gemma-4-E4B-it-qat-mlx-4bit": "google/gemma-4-E4B-it-assistant",
     "ToPo-ToPo/gemma-4-E2B-it-qat-mlx-4bit": "google/gemma-4-E2B-it-assistant",
 }
+
+
+# MTP ドラフター（speculative decoding 用の補助モデル）の repo-id 集合。これ自体は
+# 単体のチャットモデルとして使うものではないので、発見一覧（discover_cached_models）には
+# 「使えるモデル」として出さない。`org/repo:selector` 形式のドラフターは repo 部分で判定する。
+_DRAFTER_REPOS = frozenset(v.split(":", 1)[0] for v in MTP_DRAFTERS.values())
 
 
 def resolve_drafter(model: str, draft_model: str | None) -> str | None:
@@ -387,6 +394,78 @@ def resolve_gguf(model: str) -> str:
     return pool[0]
 
 
+def ensure_cached(repo: str, *, what: str = "モデル") -> str:
+    """mlx 系（mlx / mlx-vlm）の HF repo-id がローカルキャッシュに**完全に**存在するか検証する。
+
+    本サーバーは自動ダウンロードを行わない（事前に `hf download` 済みであることを要求する）。
+    起動前にここで存在を確認し、無ければ取得方法を案内して ValueError を送出する
+    （llama-cpp の resolve_gguf と同じ「事前 DL 必須」ポリシー）。返り値は確認したスナップショット
+    ディレクトリ（実ファイルパス指定時はそのパス）。
+
+    次のいずれも「未取得」とみなしてエラーにする:
+      - スナップショットが存在しない。
+      - ダウンロード途中の残骸（blobs/ 配下の *.incomplete）が残っている。
+      - 重み（*.safetensors）の実体がキャッシュに揃っていない。
+    """
+    spec = repo.strip()
+    # 実ファイル/ディレクトリパス指定（repo-id ではない）はそのパスの存在のみ確認する。
+    if spec.startswith(("/", "./", "../", "~")):
+        path = os.path.expanduser(spec)
+        if not os.path.exists(path):
+            raise ValueError(f"{what}のパスが見つかりません: {repo!r}")
+        return path
+    if spec.count("/") != 1 or not all(spec.split("/")):
+        raise ValueError(
+            f"{what}は HF repo-id（org/repo）で指定してください: {repo!r}"
+        )
+    org, name = spec.split("/", 1)
+    base = os.path.join(_hf_hub_cache(), f"models--{org}--{name}")
+    snap_root = os.path.join(base, "snapshots")
+    # ダウンロード途中の残骸があれば「未取得」と同じ扱い（今回の不具合＝DL 停滞の主症状）。
+    incomplete = glob.glob(os.path.join(base, "blobs", "*.incomplete"))
+    snaps = sorted(glob.glob(os.path.join(snap_root, "*"))) if os.path.isdir(snap_root) else []
+    if not snaps or incomplete:
+        raise ValueError(
+            f"{what} '{repo}' がローカルキャッシュにありません（自動ダウンロードは無効）。"
+            f" 先に取得してください: hf download {spec}"
+        )
+    # 重み（safetensors）の実体（シンボリックリンク先まで）が存在するか確認する。
+    weights = [
+        f
+        for s in snaps
+        for f in glob.glob(os.path.join(s, "*.safetensors"))
+        if os.path.exists(os.path.realpath(f))
+    ]
+    if not weights:
+        raise ValueError(
+            f"{what} '{repo}' の重み（*.safetensors）がキャッシュに揃っていません。"
+            f" 取得し直してください: hf download {spec}"
+        )
+    return os.path.dirname(weights[0])
+
+
+def mtp_status(model: str) -> str | None:
+    """model の MTP（Multi-Token Prediction による高速化）の利用可否を返す。
+
+    対応表（MTP_DRAFTERS）に本体が在るかと、対応ドラフターがローカルにキャッシュ済みかで判定する:
+
+    - "ready"     … 対応ドラフターがキャッシュ済み。そのまま MTP が効く（~2倍速）。
+    - "available" … MTP には対応するがドラフターが未取得。`hf download <drafter>` で有効化できる。
+    - None        … MTP 非対応（対応表に無い）。
+
+    一覧表示（discover_cached_models / TUI）から呼ぶ。ドラフターの有無確認に ensure_cached を
+    使う（自動 DL はしない方針と一貫）。
+    """
+    drafter = MTP_DRAFTERS.get(model)
+    if not drafter:
+        return None
+    try:
+        ensure_cached(drafter, what="ドラフター")
+        return "ready"
+    except ValueError:
+        return "available"
+
+
 _DISCOVER_CACHE: dict = {"t": -1e9, "v": []}
 
 # チャット/生成に使わない（埋め込み・STT・分類・エンコーダ）モデルタイプ。発見一覧から除く。
@@ -430,8 +509,9 @@ def discover_cached_models(ttl: float = 10.0) -> list[dict]:
     """HF キャッシュにある**実行可能なチャットモデル**を列挙する（発見用）。
 
     LM Studio / Ollama のように「いま手元で動かせる候補」をクライアントに見せるための一覧。
-    ロード済みかどうかに関わらず、ダウンロード済みモデルを `{"id", "backend"}` のリストで返す。
-    判定はヒューリスティック:
+    ロード済みかどうかに関わらず、ダウンロード済みモデルを `{"id", "backend", "mtp"}` のリストで
+    返す（`mtp` は "ready" / "available" / None＝mtp_status）。MTP ドラフター自体は単体で使う
+    モデルではないので一覧からは除外する（_DRAFTER_REPOS）。判定はヒューリスティック:
 
     - GGUF を含む repo → llama-cpp。本体（mmproj / MTP ヘッドを除く）が 1 つなら `org/repo`、
       複数あれば `org/repo:<ファイル名>` を量子化ごとに列挙（そのままロードできる形）。
@@ -453,6 +533,9 @@ def discover_cached_models(ttl: float = 10.0) -> list[dict]:
                 continue
             _, org, name = entry.split("--", 2)
             repo = f"{org}/{name}"
+            # MTP ドラフターは「使えるモデル」ではないので一覧に出さない。
+            if repo in _DRAFTER_REPOS:
+                continue
             snap_root = os.path.join(root, entry, "snapshots")
             if not os.path.isdir(snap_root):
                 continue
@@ -479,10 +562,12 @@ def discover_cached_models(ttl: float = 10.0) -> list[dict]:
                 backend = infer_backend(repo)  # mlx → mlx-vlm、それ以外は OS 既定
             else:
                 continue
+            # MTP（高速化）の利用可否を本体ごとに付与する（ドラフターが揃っていれば "ready"）。
+            mtp = mtp_status(repo)
             for c in cands:
                 if c not in seen:
                     seen.add(c)
-                    out.append({"id": c, "backend": backend})
+                    out.append({"id": c, "backend": backend, "mtp": mtp})
     _DISCOVER_CACHE["t"] = now
     _DISCOVER_CACHE["v"] = out
     return list(out)
@@ -563,6 +648,9 @@ def build_command(config: ServerConfig) -> list[str]:
       - llama-cpp : llama-server（--parallel で並列スロットを確保）
     """
     if config.backend == "mlx":
+        # 自動ダウンロードは行わない。事前に `hf download` 済みであることを起動前に確認する
+        # （未取得ならここで案内付き ValueError）。
+        ensure_cached(config.model)
         command = [
             "mlx_lm.server",
             "--model", config.model,
@@ -577,6 +665,8 @@ def build_command(config: ServerConfig) -> list[str]:
         # 概念はないため --parallel は渡さない。thinking はサーバー既定が OFF
         # （--enable-thinking を渡さなければ無効）であり、リクエスト毎の明示制御は
         # クライアントがトップレベル enable_thinking で行う（llm.py 参照）。
+        # 自動ダウンロードは行わない。本体は事前に `hf download` 済みであることを確認する。
+        ensure_cached(config.model)
         command = [
             sys.executable, "-m", "mlx_vlm.server",
             "--model", config.model,
@@ -585,10 +675,11 @@ def build_command(config: ServerConfig) -> list[str]:
         ]
         # Gemma 4 の MTP ドラフターによる speculative decoding。draft_kind は mtp に固定する
         # （他種別＝dflash / eagle3 は今回は対象外）。draft_model="auto" は本体名から
-        # 対応ドラフターを自動選択する。指定があれば本体とドラフターの両方を mlx-vlm が
-        # 初回に自動ダウンロードする。
+        # 対応ドラフターを自動選択する。本体・ドラフターとも事前 DL 必須（未取得なら案内付き
+        # エラーで起動を中止し、自動ダウンロードはしない）。
         drafter = resolve_drafter(config.model, config.draft_model)
         if drafter:
+            ensure_cached(drafter, what="ドラフター")
             command += ["--draft-model", drafter, "--draft-kind", "mtp"]
     elif config.backend == "llama-cpp":
         # model は HF repo-id（org/repo[:selector]）。DL 済みキャッシュから実 GGUF を解決する
@@ -741,10 +832,20 @@ class LocalServer:
             os.makedirs(os.path.dirname(self.log_path) or ".", exist_ok=True)
         try:
             self._log_file = open(self.log_path, "a", encoding="utf-8")
+            # 自動ダウンロードを完全に無効化する hard guard。バックエンド（mlx_lm / mlx_vlm /
+            # transformers / tokenizers / ドラフター）はキャッシュのみを参照し、未取得ファイルが
+            # あればその場でエラーになる（ネットワークへ取りに行かない＝DL 停滞も起きない）。
+            # build_command 側の ensure_cached 事前チェックと二重で「事前 DL 必須」を担保する。
+            env = {
+                **os.environ,
+                "HF_HUB_OFFLINE": "1",
+                "TRANSFORMERS_OFFLINE": "1",
+            }
             self._proc = subprocess.Popen(
                 build_command(self.config),
                 stdout=self._log_file,
                 stderr=subprocess.STDOUT,
+                env=env,
                 # 子を独立したプロセスグループにして、停止時に孫まで一括終了できるようにする
                 # （POSIX のみ。Windows では無視される）。stop() の killpg と対になる。
                 start_new_session=_POSIX,

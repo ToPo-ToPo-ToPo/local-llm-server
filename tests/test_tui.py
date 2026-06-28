@@ -191,6 +191,40 @@ def test_merge_lists_cached_available_models_unloaded(tmp_path):
     assert rows["mlx-community/Qwen3.6-27B-4bit"]["backend"] == "mlx-vlm"
 
 
+def test_merge_shows_mtp_status(tmp_path, monkeypatch):
+    # 行に MTP（高速化）の利用可否が乗る: ドラフター揃い="ready"、未取得="available"、非対応=None。
+    import json
+    from local_llm_server import server as srv
+
+    root = tmp_path / "hub"
+
+    def _mk(repo, files):
+        org, name = repo.split("/", 1)
+        d = root / f"models--{org}--{name}" / "snapshots" / "a"
+        d.mkdir(parents=True, exist_ok=True)
+        for f, data in files.items():
+            (d / f).write_bytes(data)
+
+    # Qwen3.6-27B-4bit のドラフターだけ用意（本体名は対応表に在る）→ "ready"
+    _mk("mlx-community/Qwen3.6-27B-MTP-4bit",
+        {"config.json": json.dumps({"model_type": "qwen3"}).encode(),
+         "model.safetensors": b"x"})
+    monkeypatch.setattr(srv, "_hf_hub_cache", lambda: str(root))
+
+    gcfg = _gcfg(tmp_path, _TWO_MODELS)
+    admin = {
+        "uptime": 1.0, "requests": 0, "models": [],
+        "available": [
+            {"id": "mlx-community/Qwen3.6-27B-4bit", "backend": "mlx-vlm"},   # ドラフター揃い
+            {"id": "mlx-community/gemma-4-E4B-it-qat-4bit", "backend": "mlx-vlm"},  # 未取得
+        ],
+    }
+    rows = {r["model"]: r for r in tui.merge_status(gcfg, admin)["models"]}
+    assert rows["mlx-community/Qwen3.6-27B-4bit"]["mtp"] == "ready"
+    assert rows["mlx-community/gemma-4-E4B-it-qat-4bit"]["mtp"] == "available"
+    assert rows["org/A"]["mtp"] is None  # 対応表に無い本体は MTP 非対応
+
+
 def test_merge_marks_unlisted_models_unloaded(tmp_path):
     gcfg = _gcfg(tmp_path, _TWO_MODELS)
     admin = {
