@@ -128,7 +128,7 @@ class GatewayMonitor(App):
     def on_mount(self) -> None:
         table = self.query_one("#models", DataTable)
         table.cursor_type = "none"  # 行ハイライトは出さない（選択色を「動作中」と誤認しないため）
-        table.add_columns("MODEL", "STATE", "INFLT", "AGENTS", "UNLOAD", "REQS")
+        table.add_columns("MODEL", "STATE", "MTP", "INFLT", "AGENTS", "UNLOAD", "REQS")
         # 起動時にゲートウェイを裏で常駐させる（既定起動＝「アプリを開く」感覚）。
         if server_status(self.host, self.port) is None:
             self.action_start()
@@ -196,13 +196,19 @@ class GatewayMonitor(App):
                 "busy": ("●", _GREEN), "idle": ("○", _AMBER), "unloaded": ("·", _DIM),
             }.get(r["state"], ("·", _DIM))
             state = Text.assemble((sym + " ", col), (r["state"], col))
+            # MTP（高速化）の利用可否。ready=緑●、available=淡色（要 hf download）、非対応=「—」。
+            mtp_sym, mtp_col, mtp_label = {
+                "ready": ("●", _GREEN, "ready"),
+                "available": ("○", _DIM, "avail"),
+            }.get(r.get("mtp"), ("—", _DIM, ""))
+            mtp_cell = Text.assemble((mtp_sym, mtp_col), (" " + mtp_label if mtp_label else "", mtp_col))
             inflt = Text(str(r["inflight"]), style="" if r["inflight"] else _DIM)
             # 在席エージェント数。>0 は緑（解放されない＝使用中）、0 は淡色（即アンロード対象）。
             sess_n = r.get("sessions", 0)
             agents = Text(str(sess_n), style=_GREEN if sess_n else _DIM)
             table.add_row(
                 Text(name, style="" if r["state"] != "unloaded" else _DIM),
-                state, inflt, agents,
+                state, mtp_cell, inflt, agents,
                 Text(_fmt_hms(r["idle_remaining"]), style=_DIM),
                 Text(f"{r['requests']:,}", style=_DIM),
             )
@@ -250,6 +256,10 @@ class GatewayMonitor(App):
         self.push_screen(LogScreen(self.port))
 
     def action_quit(self) -> None:
+        # q（終了）ではゲートウェイ・デーモンも停止する。ダッシュボードを閉じたら裏の常駐も
+        # 完全に終了させることで、次回 `uv run local-llm-server` 起動時に必ず最新コードで
+        # 立ち上がる（＝コード変更が反映される）。終了前に同期実行して確実に落とす。
+        self._kill_ports()
         self.exit()
 
     def on_click(self, event) -> None:
@@ -285,7 +295,7 @@ class GatewayMonitor(App):
         cmd = (event.value or "").strip().lower()
         event.input.value = ""
         if cmd in ("q", "quit", "exit"):
-            self.exit()
+            self.action_quit()  # キー `q` と同じく、デーモンも停止してから終了する
             return
         {
             "s": self.action_stop, "stop": self.action_stop,

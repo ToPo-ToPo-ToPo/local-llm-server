@@ -191,6 +191,40 @@ def test_merge_lists_cached_available_models_unloaded(tmp_path):
     assert rows["mlx-community/Qwen3.6-27B-4bit"]["backend"] == "mlx-vlm"
 
 
+def test_merge_shows_mtp_status(tmp_path, monkeypatch):
+    # 行に MTP（高速化）の利用可否が乗る: ドラフター揃い="ready"、未取得="available"、非対応=None。
+    import json
+    from local_llm_server import server as srv
+
+    root = tmp_path / "hub"
+
+    def _mk(repo, files):
+        org, name = repo.split("/", 1)
+        d = root / f"models--{org}--{name}" / "snapshots" / "a"
+        d.mkdir(parents=True, exist_ok=True)
+        for f, data in files.items():
+            (d / f).write_bytes(data)
+
+    # Qwen3.6-27B-4bit のドラフターだけ用意（本体名は対応表に在る）→ "ready"
+    _mk("mlx-community/Qwen3.6-27B-MTP-4bit",
+        {"config.json": json.dumps({"model_type": "qwen3"}).encode(),
+         "model.safetensors": b"x"})
+    monkeypatch.setattr(srv, "_hf_hub_cache", lambda: str(root))
+
+    gcfg = _gcfg(tmp_path, _TWO_MODELS)
+    admin = {
+        "uptime": 1.0, "requests": 0, "models": [],
+        "available": [
+            {"id": "mlx-community/Qwen3.6-27B-4bit", "backend": "mlx-vlm"},   # ドラフター揃い
+            {"id": "mlx-community/gemma-4-E4B-it-qat-4bit", "backend": "mlx-vlm"},  # 未取得
+        ],
+    }
+    rows = {r["model"]: r for r in tui.merge_status(gcfg, admin)["models"]}
+    assert rows["mlx-community/Qwen3.6-27B-4bit"]["mtp"] == "ready"
+    assert rows["mlx-community/gemma-4-E4B-it-qat-4bit"]["mtp"] == "available"
+    assert rows["org/A"]["mtp"] is None  # 対応表に無い本体は MTP 非対応
+
+
 def test_merge_marks_unlisted_models_unloaded(tmp_path):
     gcfg = _gcfg(tmp_path, _TWO_MODELS)
     admin = {
@@ -233,3 +267,40 @@ def test_fmt_hms():
     assert tui._fmt_hms(65) == "1:05"
     assert tui._fmt_hms(3725) == "1:02:05"
     assert tui._fmt_hms(0) == "0:00"
+
+
+def test_quit_stops_gateway_daemon(tmp_path, monkeypatch):
+    # q（終了）でゲートウェイ・デーモンも停止する（次回起動で最新コードが反映されるように）。
+    from local_llm_server import tui_app
+
+    gcfg = load_gateway_config(str(_write_cfg(tmp_path, "port = 8799\n")))
+    monkeypatch.setattr(tui_app, "server_status", lambda h, p: {"ready": True})  # 自動起動させない
+    monkeypatch.setattr(tui_app, "gateway_admin_status", lambda h, p: None)
+    killed = []
+
+    async def scenario():
+        app = tui_app.GatewayMonitor(gcfg)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            monkeypatch.setattr(app, "_kill_ports", lambda: killed.append(True))
+            monkeypatch.setattr(app, "exit", lambda *a, **k: None)  # 実際の終了は抑止
+            app.action_quit()
+            await pilot.pause()
+            # コマンド入力（"quit"）経路も同じく停止を通すこと
+            killed.clear()
+            app.on_input_submitted(_FakeSubmit("quit"))
+            await pilot.pause()
+
+    asyncio.run(scenario())
+    assert killed == [True]
+
+
+class _FakeSubmit:
+    """on_input_submitted に渡す最小のイベント代用（value と input だけ持つ）。"""
+    def __init__(self, value):
+        self.value = value
+        self.input = _FakeInput()
+
+
+class _FakeInput:
+    value = ""
