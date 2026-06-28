@@ -256,6 +256,10 @@ class GatewayMonitor(App):
         self.push_screen(LogScreen(self.port))
 
     def action_quit(self) -> None:
+        # q（終了）ではゲートウェイ・デーモンも停止する。ダッシュボードを閉じたら裏の常駐も
+        # 完全に終了させることで、次回 `uv run local-llm-server` 起動時に必ず最新コードで
+        # 立ち上がる（＝コード変更が反映される）。終了前に同期実行して確実に落とす。
+        self._kill_ports()
         self.exit()
 
     def on_click(self, event) -> None:
@@ -291,7 +295,7 @@ class GatewayMonitor(App):
         cmd = (event.value or "").strip().lower()
         event.input.value = ""
         if cmd in ("q", "quit", "exit"):
-            self.exit()
+            self.action_quit()  # キー `q` と同じく、デーモンも停止してから終了する
             return
         {
             "s": self.action_stop, "stop": self.action_stop,

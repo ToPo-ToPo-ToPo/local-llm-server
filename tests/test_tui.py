@@ -267,3 +267,40 @@ def test_fmt_hms():
     assert tui._fmt_hms(65) == "1:05"
     assert tui._fmt_hms(3725) == "1:02:05"
     assert tui._fmt_hms(0) == "0:00"
+
+
+def test_quit_stops_gateway_daemon(tmp_path, monkeypatch):
+    # q（終了）でゲートウェイ・デーモンも停止する（次回起動で最新コードが反映されるように）。
+    from local_llm_server import tui_app
+
+    gcfg = load_gateway_config(str(_write_cfg(tmp_path, "port = 8799\n")))
+    monkeypatch.setattr(tui_app, "server_status", lambda h, p: {"ready": True})  # 自動起動させない
+    monkeypatch.setattr(tui_app, "gateway_admin_status", lambda h, p: None)
+    killed = []
+
+    async def scenario():
+        app = tui_app.GatewayMonitor(gcfg)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            monkeypatch.setattr(app, "_kill_ports", lambda: killed.append(True))
+            monkeypatch.setattr(app, "exit", lambda *a, **k: None)  # 実際の終了は抑止
+            app.action_quit()
+            await pilot.pause()
+            # コマンド入力（"quit"）経路も同じく停止を通すこと
+            killed.clear()
+            app.on_input_submitted(_FakeSubmit("quit"))
+            await pilot.pause()
+
+    asyncio.run(scenario())
+    assert killed == [True]
+
+
+class _FakeSubmit:
+    """on_input_submitted に渡す最小のイベント代用（value と input だけ持つ）。"""
+    def __init__(self, value):
+        self.value = value
+        self.input = _FakeInput()
+
+
+class _FakeInput:
+    value = ""
