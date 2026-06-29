@@ -8,3 +8,6 @@ dist/
 .pytest_cache/
 .python-version
 .local-llm-server/
+
+# Claude Code のローカル個人設定（マシン固有・共有しない）
+.claude/settings.local.json
