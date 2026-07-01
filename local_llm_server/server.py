@@ -987,6 +987,36 @@ def daemon_log_path(port: int) -> str:
     return os.path.join(project_cache_dir(), f"server-{port}.log")
 
 
+def local_connect_host(bind_host: str) -> str:
+    """bind 用ホストから、同一マシンでの自己接続に使うホストを求める。
+
+    0.0.0.0 / :: / 空（ワイルドカード bind）は、そのアドレス宛の直接接続が不可搬なため
+    （特に macOS）ループバック 127.0.0.1 で叩く。特定 IP に bind したときはその IP をそのまま
+    使う。TUI/CLI の状態確認・ヘルスチェックなど「自分自身のゲートウェイ」への接続に使う。
+    """
+    if bind_host in ("0.0.0.0", "::", "", "*"):
+        return "127.0.0.1"
+    return bind_host
+
+
+def primary_lan_ip() -> str | None:
+    """このマシンの主要な LAN IP（外向きインターフェースのアドレス）。取得不能なら None。
+
+    実際には通信せず、UDP ソケットの接続先選択でルーティング表からローカル側 IP を得る
+    （リモートのクライアントが指す base_url を案内するために使う）。
+    """
+    import socket
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))  # 実送信はしない。ローカル側アドレスの決定だけ
+        return s.getsockname()[0]
+    except OSError:
+        return None
+    finally:
+        s.close()
+
+
 def server_status(host: str = "127.0.0.1", port: int = 8799) -> dict | None:
     """ポートで動いているローカルサーバーの状態をまとめて返す（`--status` 表示用）。
 

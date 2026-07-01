@@ -30,6 +30,8 @@ from .server import (
     find_pids_on_port,
     gateway_log_path,
     install_shutdown_handlers,
+    local_connect_host,
+    primary_lan_ip,
     server_status,
     start_gateway_background,
     stop_pid,
@@ -88,18 +90,24 @@ def _start_background(gcfg) -> int:
     ターミナルを占有せずに常駐させる（Ollama 流）。既に起動済みなら何もしない。
     起動して応答可能になれば 0、失敗/タイムアウトは 1。
     """
+    # bind 先が 0.0.0.0 等でも、自分自身への接続はループバックで行う（"0.0.0.0" 宛は不可搬）。
+    local_host = local_connect_host(gcfg.host)
     base_url = f"http://{gcfg.host}:{gcfg.port}/v1"
-    if server_status(gcfg.host, gcfg.port) is not None:
+    if server_status(local_host, gcfg.port) is not None:
         print(f"Gateway already running on port {gcfg.port} ({base_url}).", file=sys.stderr)
         return 0
     print(f"Starting gateway in the background on port {gcfg.port}...", file=sys.stderr)
     try:
-        pid = start_gateway_background(os.getcwd(), gcfg.host, gcfg.port)
+        pid = start_gateway_background(os.getcwd(), local_host, gcfg.port)
     except (RuntimeError, TimeoutError) as exc:
         print(f"Failed to start gateway: {exc}", file=sys.stderr)
         return 1
     print(f"Gateway started (pid {pid}).", file=sys.stderr)
     print(f"  public: {base_url}", file=sys.stderr)
+    if gcfg.host in ("0.0.0.0", "::", "", "*"):
+        lan = primary_lan_ip()
+        if lan:
+            print(f"  reachable from LAN: http://{lan}:{gcfg.port}/v1", file=sys.stderr)
     print(f"  log:    {gateway_log_path(gcfg.port)}", file=sys.stderr)
     print("Stop it with `local-llm-server --stop`.", file=sys.stderr)
     return 0
@@ -192,7 +200,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.stop:
         return _stop_servers(all_ports)
     if args.status:
-        return _status_servers(gcfg.host, [gcfg.port])
+        return _status_servers(local_connect_host(gcfg.host), [gcfg.port])
     if args.restart:
         _stop_servers(all_ports)  # 動いていなければ no-op
         return _start_background(gcfg)

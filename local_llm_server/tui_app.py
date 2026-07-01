@@ -23,6 +23,8 @@ from .server import (
     gateway_admin_status,
     gateway_log_path,
     gateway_set_max_resident,
+    local_connect_host,
+    primary_lan_ip,
     server_status,
     start_gateway_background,
     stop_pid,
@@ -111,9 +113,17 @@ class GatewayMonitor(App):
     def __init__(self, gcfg):
         super().__init__()
         self.gcfg = gcfg
-        self.host = gcfg.host
+        self.bind_host = gcfg.host                       # 公開 bind 先（表示用）
+        # 自分自身のゲートウェイへの接続はループバックで（bind が 0.0.0.0 等でも "0.0.0.0" 宛は不可搬）。
+        self.host = local_connect_host(gcfg.host)
         self.port = gcfg.port
         self.all_ports = [self.port] + [m.port for m in gcfg.models]
+        # ネットワーク公開（0.0.0.0 等）のとき、リモートのクライアントが指す LAN URL を1度だけ解決。
+        self.reachable_url = None
+        if gcfg.host in ("0.0.0.0", "::", "", "*"):
+            lan = primary_lan_ip()
+            if lan:
+                self.reachable_url = f"http://{lan}:{self.port}/v1"
         self.admin = None
         self.busy = ""
         self._row_models: list[str] = []  # 表の表示順モデル ID（行クリック→コピー用）
@@ -229,6 +239,9 @@ class GatewayMonitor(App):
             f"max_resident {view['max_resident'] if view['max_resident'] is not None else '∞'}"
             f"    idle {int(view['idle_timeout']) if view['idle_timeout'] else 'off'}s"
         )
+        # ネットワーク公開時は、リモートのクライアントが指す LAN URL を添える（クリックでコピー可）。
+        if self.reachable_url:
+            policy += f"    LAN {self.reachable_url}"
         if self.busy:
             policy += f"    · {self.busy.strip()}"
         self.query_one("#policy", Static).update(policy)

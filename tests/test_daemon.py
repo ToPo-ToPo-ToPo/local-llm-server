@@ -558,6 +558,16 @@ def test_replica_respects_llama_parallel_slots(monkeypatch):
     mgr.release(h4)
 
 
+def test_load_gateway_config_api_key(tmp_path):
+    # api_key を読み取る。省略や空文字は None（認証なし）。
+    base = '[[models]]\nmodel = "x"\nbackend = "mlx"\n'
+    assert gw.load_gateway_config(_write(tmp_path, base)).api_key is None
+    assert gw.load_gateway_config(
+        _write(tmp_path, 'api_key = "s3cret"\n' + base)).api_key == "s3cret"
+    assert gw.load_gateway_config(
+        _write(tmp_path, 'api_key = "  "\n' + base)).api_key is None  # 空白のみ→無効
+
+
 def test_load_gateway_config_load_timeout(tmp_path):
     base = '[[models]]\nmodel = "x"\nbackend = "mlx"\n'
     assert gw.load_gateway_config(_write(tmp_path, base)).load_timeout == 300.0  # 既定
@@ -615,25 +625,28 @@ def _make_upstream(name):
     return srv
 
 
-def _post(port, path, obj):
+def _post(port, path, obj, headers=None):
     conn = http.client.HTTPConnection("127.0.0.1", port)
-    conn.request("POST", path, json.dumps(obj), {"Content-Type": "application/json"})
+    hdrs = {"Content-Type": "application/json"}
+    if headers:
+        hdrs.update(headers)
+    conn.request("POST", path, json.dumps(obj), hdrs)
     resp = conn.getresponse()
     body = resp.read().decode("utf-8")
     conn.close()
     return resp.status, json.loads(body)
 
 
-def _get(port, path):
+def _get(port, path, headers=None):
     conn = http.client.HTTPConnection("127.0.0.1", port)
-    conn.request("GET", path)
+    conn.request("GET", path, headers=headers or {})
     resp = conn.getresponse()
     body = resp.read().decode("utf-8")
     conn.close()
     return resp.status, json.loads(body)
 
 
-def _start_gateway(monkeypatch):
+def _start_gateway(monkeypatch, api_key=None):
     # 上流は実フェイクサーバー。LocalServer は no-op（既に上流が動いている）に差し替える。
     up1 = _make_upstream("m1-upstream")
     up2 = _make_upstream("m2-upstream")
@@ -643,7 +656,7 @@ def _start_gateway(monkeypatch):
         ServerConfig(backend="mlx", model="m2", host="127.0.0.1", port=up2.server_address[1]),
     ]
     mgr = gw.ModelManager(configs)
-    server = gw.GatewayServer(("127.0.0.1", 0), mgr, catalog=["m1", "m2"])
+    server = gw.GatewayServer(("127.0.0.1", 0), mgr, catalog=["m1", "m2"], api_key=api_key)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server, mgr, (up1, up2)
 
@@ -684,6 +697,73 @@ def test_gateway_models_catalog(monkeypatch):
         assert status == 200
         ids = [m["id"] for m in obj["data"]]
         assert ids == ["m1", "m2"]
+    finally:
+        server.shutdown(); server.server_close(); mgr.shutdown()
+        for u in ups:
+            u.shutdown(); u.server_close()
+
+
+def test_local_connect_host():
+    # ワイルドカード bind は自己接続をループバックに寄せる。特定 IP はそのまま。
+    from local_llm_server.server import local_connect_host
+    assert local_connect_host("0.0.0.0") == "127.0.0.1"
+    assert local_connect_host("::") == "127.0.0.1"
+    assert local_connect_host("") == "127.0.0.1"
+    assert local_connect_host("192.168.1.5") == "192.168.1.5"
+    assert local_connect_host("127.0.0.1") == "127.0.0.1"
+
+
+def test_gateway_api_key_required_for_chat_and_models(monkeypatch):
+    # api_key 設定時、chat と /v1/models は Authorization: Bearer <key> が要る（無/不一致は 401）。
+    server, mgr, ups = _start_gateway(monkeypatch, api_key="secret")
+    try:
+        port = server.server_address[1]
+        chat = {"model": "m1", "messages": [{"role": "user", "content": "hi"}]}
+        # キー無し → 401
+        status, obj = _post(port, "/v1/chat/completions", chat)
+        assert status == 401 and "error" in obj
+        # 不一致 → 401
+        status, _ = _post(port, "/v1/chat/completions", chat,
+                          headers={"Authorization": "Bearer wrong"})
+        assert status == 401
+        # 正しいキー → 通る
+        status, obj = _post(port, "/v1/chat/completions", chat,
+                            headers={"Authorization": "Bearer secret"})
+        assert status == 200 and obj["backend"] == "m1-upstream"
+        # /v1/models もキーが要る
+        assert _get(port, "/v1/models")[0] == 401
+        status, obj = _get(port, "/v1/models", headers={"Authorization": "Bearer secret"})
+        assert status == 200
+    finally:
+        server.shutdown(); server.server_close(); mgr.shutdown()
+        for u in ups:
+            u.shutdown(); u.server_close()
+
+
+def test_gateway_admin_is_loopback_and_keyless(monkeypatch):
+    # api_key 設定時でも、/admin/status・/admin/config はローカル（=テストは 127.0.0.1）から
+    # キー無しで使える（ループバック限定・キーではなく接続元で保護）。
+    server, mgr, ups = _start_gateway(monkeypatch, api_key="secret")
+    try:
+        port = server.server_address[1]
+        status, obj = _get(port, "/admin/status")            # キー無しでも 200
+        assert status == 200 and obj["object"] == "gateway.status"
+        status, obj = _post(port, "/admin/config", {"max_resident": 2})
+        assert status == 200 and obj["max_resident"] == 2
+    finally:
+        server.shutdown(); server.server_close(); mgr.shutdown()
+        for u in ups:
+            u.shutdown(); u.server_close()
+
+
+def test_gateway_no_auth_when_key_unset(monkeypatch):
+    # api_key 未設定なら従来どおり認証なし（後方互換）。
+    server, mgr, ups = _start_gateway(monkeypatch)  # api_key=None
+    try:
+        port = server.server_address[1]
+        status, obj = _post(port, "/v1/chat/completions",
+                            {"model": "m1", "messages": []})
+        assert status == 200 and obj["backend"] == "m1-upstream"
     finally:
         server.shutdown(); server.server_close(); mgr.shutdown()
         for u in ups:

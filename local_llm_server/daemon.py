@@ -26,6 +26,7 @@ http://127.0.0.1:8799/v1）を 1 つだけ立て、受信した `/v1/chat/comple
 """
 from __future__ import annotations
 
+import hmac
 import json
 import sys
 import threading
@@ -46,6 +47,7 @@ from .server import (
     ignore_shutdown_signals,
     infer_backend,
     parallel_supported,
+    primary_lan_ip,
     resolve_drafter,
 )
 
@@ -826,12 +828,17 @@ class GatewayServer(ThreadingHTTPServer):
         idle_timeout: float | None = None,
         load_timeout: float | None = None,
         session_ttl: float | None = None,
+        api_key: str | None = None,
     ) -> None:
         super().__init__(addr, _GatewayHandler)
         self.manager = manager
         self.catalog = catalog            # /v1/models で返すモデル一覧
         self.default_model = default_model
         self.timeout_s = timeout_s        # None なら無制限（長時間生成に備える）
+        # ネットワーク公開時の API キー（None/空 で認証なし）。chat（/v1/*）と在席セッション
+        # （/admin/sessions/*）に Authorization: Bearer <key> を要求する。/admin/status と
+        # /admin/config はループバック限定（キーではなく接続元で制限）。
+        self.api_key = api_key
         # GET /admin/status（TUI 等の監視用）で返すゲートウェイ設定。運用ポリシーを
         # 添えることで、常駐モデルのライブ状態と一緒に「上限/退避方針」も読み取れる。
         self.max_resident = max_resident
@@ -848,12 +855,44 @@ class _GatewayHandler(BaseHTTPRequestHandler):
     def log_message(self, *_args) -> None:  # アクセスログは出さない
         pass
 
+    def _client_is_loopback(self) -> bool:
+        """接続元がループバック（同一マシン）か。"""
+        host = self.client_address[0]
+        return (
+            host in ("127.0.0.1", "::1", "::ffff:127.0.0.1") or host.startswith("127.")
+        )
+
+    def _require_loopback(self) -> bool:
+        """管理系（状態・設定）はローカルからのみ許可。非ループバックなら 403 を返して False。"""
+        if self._client_is_loopback():
+            return True
+        send_error(self, 403, "this endpoint is restricted to localhost")
+        return False
+
+    def _require_api_key(self) -> bool:
+        """api_key が設定されていれば Authorization: Bearer <key> を要求する。
+
+        未設定なら誰でも可（True）。設定済みでキーが無い/一致しなければ 401 を返して False。
+        比較は hmac.compare_digest（タイミング安全）。
+        """
+        key = getattr(self.server, "api_key", None)
+        if not key:
+            return True  # 認証なし運用
+        auth = self.headers.get("Authorization", "")
+        token = auth[7:].strip() if auth.startswith("Bearer ") else ""
+        if token and hmac.compare_digest(token, key):
+            return True
+        send_error(self, 401, "missing or invalid API key")
+        return False
+
     def do_GET(self) -> None:
         path = self.path.rstrip("/")
         srv = self.server  # type: ignore[assignment]
         # /v1/models は設定済みカタログを合成して返す（is_ready 判定・モデル取り違え
         # 警告に対応）。実モデルは起動していなくてもカタログとして列挙する。
         if path.endswith("/models"):
+            if not self._require_api_key():
+                return
             # 事前登録カタログ＋現在管理中（動的ロード分）を重複なく列挙する（標準どおり）。
             # DL 済みモデルの「発見一覧」は TUI 専用（/admin/status の available）に集約する。
             ids = list(dict.fromkeys(srv.catalog + srv.manager.model_ids))
@@ -866,6 +905,8 @@ class _GatewayHandler(BaseHTTPRequestHandler):
         # /admin/status は常駐モデルのライブ状態（loaded/inflight）＋運用ポリシーを返す。
         # TUI が CLI の --status より詳しい状態を出すための読み取り口。
         if path.endswith("/admin/status"):
+            if not self._require_loopback():
+                return
             host, port = srv.server_address[0], srv.server_address[1]
             models = srv.manager.status()
             data = {
@@ -899,8 +940,14 @@ class _GatewayHandler(BaseHTTPRequestHandler):
         # エージェント在席（セッション）管理エンドポイント。チャット転送とは別系統で、
         # 「使う人が居なくなったモデルを即アンロードする」ための登録/心拍/解除を受ける。
         path = self.path.rstrip("/")
+        # 管理系（設定変更）はローカルからのみ。
         if path.endswith("/admin/config"):
+            if not self._require_loopback():
+                return
             self._handle_config_update(srv, payload)
+            return
+        # 以降（在席セッション・chat 転送）はクライアント向け。API キーが設定されていれば要求する。
+        if not self._require_api_key():
             return
         if path.endswith("/admin/sessions/register"):
             self._handle_session_register(srv, payload)
@@ -941,6 +988,8 @@ class _GatewayHandler(BaseHTTPRequestHandler):
         path = self.path.rstrip("/")
         if not path.endswith("/admin/sessions"):
             send_error(self, 404, f"DELETE {self.path} is not supported by the gateway")
+            return
+        if not self._require_api_key():
             return
         length = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(length) if length else b""
@@ -1034,6 +1083,7 @@ class GatewayConfig:
     parallel: int | None = None        # 動的ロード時の並列スロット既定（llama-cpp のみ。他は無視）
     max_memory_fraction: float | None = None  # 常駐モデルの推定占有量の合計を総RAMのこの割合に制限（None で無効）
     internal_base_port: int = 9001     # 内部サーバーの割当開始ポート（動的モデルもこの続きから割り当て）
+    api_key: str | None = None         # ネットワーク公開時の API キー（None/空 で認証なし）。chat と在席セッションに要求
 
 
 def _resolve_model_draft(
@@ -1103,6 +1153,11 @@ def load_gateway_config(path: str) -> GatewayConfig:
     host = str(data.get("host", "127.0.0.1"))
     port = int(data.get("port", 8799))
     internal_base = int(data.get("internal_base_port", 9001))
+    # ネットワーク公開時の API キー（省略/空 で認証なし）。chat（/v1/*）と在席セッション
+    # （/admin/sessions/*）に Authorization: Bearer <key> を要求する。
+    api_key = data.get("api_key")
+    if api_key is not None:
+        api_key = str(api_key).strip() or None
     max_resident = data.get("max_resident")
     if max_resident is not None:
         max_resident = int(max_resident)
@@ -1206,6 +1261,7 @@ def load_gateway_config(path: str) -> GatewayConfig:
         draft_model=default_draft, parallel=default_parallel,
         max_memory_fraction=max_memory_fraction,
         internal_base_port=internal_base,
+        api_key=api_key,
     )
 
 
@@ -1232,10 +1288,27 @@ def run_gateway(cfg: GatewayConfig) -> int:
         idle_timeout=cfg.idle_timeout,
         load_timeout=cfg.load_timeout,
         session_ttl=cfg.session_ttl,
+        api_key=cfg.api_key,
     )
     public = f"http://{cfg.host}:{cfg.port}/v1"
+    exposed = cfg.host in ("0.0.0.0", "::", "", "*")
     print("Gateway ready (lazy multi-model):", file=sys.stderr)
     print(f"  public: {public}", file=sys.stderr)
+    # 全インターフェース公開時は、リモートのクライアントが指す LAN URL を案内する。
+    if exposed:
+        lan = primary_lan_ip()
+        if lan:
+            print(f"  reachable from LAN: http://{lan}:{cfg.port}/v1", file=sys.stderr)
+    # ネットワーク公開の認証状態。公開かつ未認証は目立つ警告を出す。
+    if cfg.api_key:
+        print("  auth: API key required (Authorization: Bearer <key>)", file=sys.stderr)
+    elif exposed:
+        print(
+            "  WARNING: bound to a network interface WITHOUT an api_key — anyone who can "
+            "reach this host:port can use the models. Set api_key in gateway.toml.",
+            file=sys.stderr,
+        )
+    print("  admin (/admin/status, /admin/config): localhost only", file=sys.stderr)
     for c in cfg.models:
         print(f"    {c.model}  ->  127.0.0.1:{c.port} ({c.backend})", file=sys.stderr)
     cap = "unlimited" if cfg.max_resident is None else (
