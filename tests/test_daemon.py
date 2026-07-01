@@ -435,6 +435,53 @@ def test_manager_waits_for_slot_then_loads(monkeypatch):
     assert st == {"m1": False, "m2": True}
 
 
+def test_set_max_resident_trims_idle_keeps_busy(monkeypatch):
+    # 実行中に max_resident を下げると、超過分をアイドルから LRU 退避する（busy は止めない）。
+    created = _patch_fake(monkeypatch)
+    mgr = gw.ModelManager(_configs(), max_resident=None)  # 起動時は無制限
+    _, h1 = mgr.acquire("m1")
+    mgr.release(h1)             # m1: アイドル
+    _, h2 = mgr.acquire("m2")   # m2: 処理中（release しない＝busy）
+    mgr.set_max_resident(1)     # 上限 1 に縮小 → 裏で trim
+    assert _wait_unloaded(mgr, "m1")          # アイドルの m1 は退避される
+    st = {s["model"]: s["loaded"] for s in mgr.status()}
+    assert st == {"m1": False, "m2": True}    # busy な m2 は残る（更新で止まらない）
+    by_model = {s.config.model: s for s in created}
+    assert by_model["m1"].stops == 1
+    assert by_model["m2"].stops == 0
+    assert mgr._max_resident == 1
+    mgr.release(h2)
+
+
+def test_set_max_resident_does_not_stop_busy_when_all_busy(monkeypatch):
+    # 全て処理中なら、上限を下げても 1 つも止めない（稼働中の生成を守る）。
+    created = _patch_fake(monkeypatch)
+    mgr = gw.ModelManager(_configs(), max_resident=None)
+    _, h1 = mgr.acquire("m1")   # busy
+    _, h2 = mgr.acquire("m2")   # busy
+    mgr.set_max_resident(1)
+    mgr._trim_to_limit()        # 直接呼んで決定的に検証（アイドルが無いので何も止まらない）
+    st = {s["model"]: s["loaded"] for s in mgr.status()}
+    assert st == {"m1": True, "m2": True}
+    assert all(s.stops == 0 for s in created)
+    mgr.release(h1)
+    mgr.release(h2)
+
+
+def test_set_max_resident_raise_allows_new_load_without_evict(monkeypatch):
+    # 上限を上げれば、退避せずに新しいモデルを追加常駐できる。
+    created = _patch_fake(monkeypatch)
+    mgr = gw.ModelManager(_configs(), max_resident=1)
+    _, h1 = mgr.acquire("m1")
+    mgr.release(h1)
+    mgr.set_max_resident(2)     # 枠を 2 に拡大
+    _, h2 = mgr.acquire("m2")   # m1 を退避せずロードできる
+    mgr.release(h2)
+    st = {s["model"]: s["loaded"] for s in mgr.status()}
+    assert st == {"m1": True, "m2": True}
+    assert all(s.stops == 0 for s in created)  # 退避は起きていない
+
+
 def test_load_gateway_config_load_timeout(tmp_path):
     base = '[[models]]\nmodel = "x"\nbackend = "mlx"\n'
     assert gw.load_gateway_config(_write(tmp_path, base)).load_timeout == 300.0  # 既定
@@ -572,6 +619,48 @@ def test_gateway_missing_model_returns_400(monkeypatch):
     try:
         port = server.server_address[1]
         status, obj = _post(port, "/v1/chat/completions", {"messages": []})
+        assert status == 400 and "error" in obj
+    finally:
+        server.shutdown(); server.server_close(); mgr.shutdown()
+        for u in ups:
+            u.shutdown(); u.server_close()
+
+
+def test_gateway_admin_config_updates_max_resident(monkeypatch):
+    # POST /admin/config で稼働中に max_resident を変更でき、/admin/status に即反映される。
+    server, mgr, ups = _start_gateway(monkeypatch)
+    try:
+        port = server.server_address[1]
+        _, st = _get(port, "/admin/status")
+        assert st["max_resident"] is None            # 起動時は無制限
+        status, obj = _post(port, "/admin/config", {"max_resident": 2})
+        assert status == 200 and obj["max_resident"] == 2
+        assert mgr._max_resident == 2
+        _, st = _get(port, "/admin/status")
+        assert st["max_resident"] == 2               # 表示にも反映
+        status, obj = _post(port, "/admin/config", {"max_resident": None})
+        assert status == 200 and obj["max_resident"] is None   # null → 無制限に戻す
+        assert mgr._max_resident is None
+    finally:
+        server.shutdown(); server.server_close(); mgr.shutdown()
+        for u in ups:
+            u.shutdown(); u.server_close()
+
+
+def test_gateway_admin_config_validates_input(monkeypatch):
+    # 0 / off は無制限扱い。負数・非数値・キー無しは 400。
+    server, mgr, ups = _start_gateway(monkeypatch)
+    try:
+        port = server.server_address[1]
+        status, obj = _post(port, "/admin/config", {"max_resident": 0})
+        assert status == 200 and obj["max_resident"] is None
+        status, obj = _post(port, "/admin/config", {"max_resident": "off"})
+        assert status == 200 and obj["max_resident"] is None
+        status, obj = _post(port, "/admin/config", {"max_resident": -3})
+        assert status == 400 and "error" in obj
+        status, obj = _post(port, "/admin/config", {"max_resident": "abc"})
+        assert status == 400 and "error" in obj
+        status, obj = _post(port, "/admin/config", {})
         assert status == 400 and "error" in obj
     finally:
         server.shutdown(); server.server_close(); mgr.shutdown()

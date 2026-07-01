@@ -262,6 +262,19 @@ def test_merge_no_admin_falls_back(tmp_path):
     assert all(r["state"] == "unloaded" for r in view["models"])
 
 
+def test_merge_prefers_live_max_resident(tmp_path):
+    # max_resident は実行中に変更できる。admin のライブ値があれば toml 値より優先する。
+    gcfg = _gcfg(tmp_path, "max_resident = 1\n" + _TWO_MODELS)
+    assert gcfg.max_resident == 1
+    admin = {"uptime": 1.0, "requests": 0, "models": [], "max_resident": 3}
+    assert tui.merge_status(gcfg, admin)["max_resident"] == 3   # ライブ値を優先
+    # admin が無制限（None）ならそれを尊重（toml の 1 に戻さない）。
+    admin["max_resident"] = None
+    assert tui.merge_status(gcfg, admin)["max_resident"] is None
+    # ゲートウェイ未応答（admin=None）なら toml の起動時値へフォールバック。
+    assert tui.merge_status(gcfg, None)["max_resident"] == 1
+
+
 def test_fmt_hms():
     assert tui._fmt_hms(None) == "—"
     assert tui._fmt_hms(65) == "1:05"

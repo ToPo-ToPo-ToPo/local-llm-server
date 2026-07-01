@@ -69,11 +69,15 @@ def merge_status(gcfg, admin: dict | None) -> dict:
             listed.add(mid)
             rows.append(_row(mid, d.get("backend", "?"), None, None))
     ready = bool(admin) or is_ready(f"http://{gcfg.host}:{gcfg.port}/v1")
+    # max_resident は実行中に変更できる（POST /admin/config）。ライブ値（admin）があれば
+    # それを優先し、無ければ gateway.toml の起動時値にフォールバックする。admin では None が
+    # 「無制限」を意味するので、キーが在ればその値（None 含む）をそのまま使う。
+    live_max = (admin or {}).get("max_resident", gcfg.max_resident) if admin else gcfg.max_resident
     return {
         "ready": ready,
         "uptime": (admin or {}).get("uptime"),
         "requests": (admin or {}).get("requests", sum(r["requests"] for r in rows)),
-        "max_resident": gcfg.max_resident,
+        "max_resident": live_max,
         "idle_timeout": idle_timeout,
         "models": rows,
     }

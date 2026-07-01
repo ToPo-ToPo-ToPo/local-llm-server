@@ -1031,6 +1031,33 @@ def gateway_admin_status(
     return data if isinstance(data, dict) else None
 
 
+def gateway_set_max_resident(
+    value: int | None,
+    host: str = "127.0.0.1",
+    port: int = 8799,
+    timeout: float = 5.0,
+) -> dict | None:
+    """稼働中のゲートウェイに POST /admin/config で max_resident を変更させる（TUI 操作用）。
+
+    value は 1 以上の整数、または None（無制限）。稼働中（busy）のモデルは止めず、超過分は
+    サーバー側でアイドルから順に非同期退避される（＝更新でリクエストが止まらない）。反映後の
+    値を含む応答 dict を返す。応答しない・エラー時は None（呼び出し側が失敗として扱う）。
+    """
+    url = f"http://{host}:{port}/admin/config"
+    body = json.dumps({"max_resident": value}).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=body, headers={"Content-Type": "application/json"}, method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            if resp.status != 200:
+                return None
+            data = json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
 def gateway_log_path(port: int) -> str:
     """バックグラウンド起動したゲートウェイ本体（公開ポート）の出力ログ保存先。
 

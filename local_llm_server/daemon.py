@@ -365,6 +365,53 @@ class ModelManager:
                     with self._state:
                         self._models.pop(victim_id, None)
 
+    def set_max_resident(self, value: int | None) -> None:
+        """常駐上限（max_resident）を実行中に変更する。処理中（busy）のモデルは止めない。
+
+        value は 1 以上の整数、または None（無制限）。上限を上げる／無制限にするときは、
+        枠が空くのを待って止まっていたロードを起こすだけ。下げるときは、超過している常駐
+        モデルをアイドルなものから LRU で **非同期に** 退避する（inflight>0 のモデルには
+        一切触れないので、生成中のリクエストは止まらない）。退避しきれなかった超過分は、
+        次の release/acquire もしくは idle_timeout で片付く。
+        """
+        with self._state:
+            self._max_resident = value
+            # 枠が広がった可能性 → _evict_if_needed で待っているロードを起こす。
+            self._state.notify_all()
+        if value is not None:
+            # 縮小時の超過分を裏で片付ける（busy は残すので HTTP 応答を待たせない）。
+            threading.Thread(target=self._trim_to_limit, daemon=True).start()
+
+    def _trim_to_limit(self) -> None:
+        """現在の max_resident を超える常駐モデルを、アイドルなものから LRU で退避する。
+
+        処理中（inflight>0）のモデルには一切触れない（＝更新で稼働中の生成を止めない）。
+        上限内に収まるか、退避できるアイドルモデルが尽きたら終わる。control を握って起動
+        （slow path）／idle 退避と直列化し、stop 自体（最長 ~10s）は state ロックの外で行う。
+        """
+        with self._control:
+            while True:
+                with self._state:
+                    limit = self._max_resident
+                    if limit is None:
+                        return
+                    resident = [m for m in self._models.values() if m.server is not None]
+                    if len(resident) <= limit:
+                        return
+                    idle = [m for m in resident if m.ready and m.inflight == 0]
+                    if not idle:
+                        return  # 残りは全て処理中 → 止めない（後で片付く）
+                    victim = min(idle, key=lambda m: m.last_used)
+                    victim_srv = victim.server
+                    victim_id = victim.config.model
+                    victim_dynamic = victim.dynamic
+                    victim.server = None
+                    victim.ready = False
+                victim_srv.stop()  # state ロックの外で（最長 ~10s）
+                if victim_dynamic:  # 動的モデルは登録ごと消す（表示から外す）
+                    with self._state:
+                        self._models.pop(victim_id, None)
+
     def evict_idle(self, timeout: float) -> int:
         """最終利用から `timeout` 秒を超えて使われていないモデルを停止する（idle TTL）。
 
@@ -655,6 +702,9 @@ class _GatewayHandler(BaseHTTPRequestHandler):
         # エージェント在席（セッション）管理エンドポイント。チャット転送とは別系統で、
         # 「使う人が居なくなったモデルを即アンロードする」ための登録/心拍/解除を受ける。
         path = self.path.rstrip("/")
+        if path.endswith("/admin/config"):
+            self._handle_config_update(srv, payload)
+            return
         if path.endswith("/admin/sessions/register"):
             self._handle_session_register(srv, payload)
             return
@@ -703,6 +753,38 @@ class _GatewayHandler(BaseHTTPRequestHandler):
             send_error(self, 400, "invalid JSON body")
             return
         self._handle_session_release(self.server, payload)  # type: ignore[arg-type]
+
+    def _handle_config_update(self, srv, payload: dict) -> None:
+        """POST /admin/config … 実行中の運用ポリシーを変更する（今は max_resident のみ）。
+
+        `{"max_resident": N}` で常駐上限を変更。N は 1 以上の整数、または null / 0 /
+        "off" / "unlimited" で無制限。稼働中（busy）のモデルは止めず、超過分はアイドルから
+        順に非同期退避する（set_max_resident 参照）。再起動すると gateway.toml の値に戻る。
+        """
+        if "max_resident" not in payload:
+            send_error(self, 400, "no 'max_resident' in the request")
+            return
+        raw = payload.get("max_resident")
+        if raw in (None, 0, "", "off", "none", "unlimited"):
+            value: int | None = None
+        else:
+            try:
+                value = int(raw)
+            except (TypeError, ValueError):
+                send_error(
+                    self, 400,
+                    "max_resident must be an integer >= 1 (or null/0/off for unlimited)",
+                )
+                return
+            if value < 1:
+                send_error(
+                    self, 400,
+                    "max_resident must be 1 or greater (or null/0/off for unlimited)",
+                )
+                return
+        srv.manager.set_max_resident(value)
+        srv.max_resident = value  # GET /admin/status の表示にも即反映する
+        send_json(self, 200, {"object": "gateway.config", "max_resident": value})
 
     def _handle_session_register(self, srv, payload: dict) -> None:
         agent_id = payload.get("agent_id")

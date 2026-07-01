@@ -22,6 +22,7 @@ from .server import (
     find_pids_on_port,
     gateway_admin_status,
     gateway_log_path,
+    gateway_set_max_resident,
     server_status,
     start_gateway_background,
     stop_pid,
@@ -87,20 +88,22 @@ class GatewayMonitor(App):
 
     CSS = """
     Screen { background: #16161a; }
-    #dash { border: round #3a3a40; padding: 0 1; height: auto; margin: 1 1 0 1; }
+    #dash { border: round #3a3a40; padding: 0 1; height: 1fr; margin: 1 1 0 1; }
     #title { padding: 0 0 1 0; }
     #status { padding: 0 0 1 0; }
     #policy { padding: 1 0 0 0; color: #83838c; }
     DataTable { height: auto; background: #16161a; }
     DataTable > .datatable--header { color: #83838c; background: #16161a; text-style: none; }
-    #cmd { border: round #3a3a40; margin: 1 1 0 1; background: #16161a; }
-    #hints { background: #1d1d22; padding: 0 1; }
+    /* コマンド欄は上・凡例は下に固定（dock）。中央の #dash が伸びても両者は隠れない。 */
+    #cmd { dock: top; border: round #3a3a40; margin: 1 1 0 1; background: #16161a; }
+    #hints { dock: bottom; background: #1d1d22; padding: 0 1; }
     """
 
     BINDINGS = [
         Binding("s", "stop", "stop"),
         Binding("r", "restart", "restart"),
         Binding("g", "start", "start"),
+        Binding("m", "prefill_max", "max"),
         Binding("l", "log", "log"),
         Binding("q", "quit", "quit"),
     ]
@@ -116,13 +119,18 @@ class GatewayMonitor(App):
         self._row_models: list[str] = []  # 表の表示順モデル ID（行クリック→コピー用）
 
     def compose(self) -> ComposeResult:
-        with Container(id="dash"):
+        # コマンド欄を最上部に固定する（dock: top）。モデル一覧が増えて #dash が縦に伸びても、
+        # 入力欄が画面外へ押し出されない。中央の一覧は #dash 内でスクロールする。
+        yield Input(
+            placeholder="command — stop · restart · start · max <n> · log · quit",
+            id="cmd",
+        )
+        with VerticalScroll(id="dash"):
             yield Static(self._title(), id="title")
             yield Static(id="status")
             yield DataTable(id="models", show_cursor=False, zebra_stripes=False)
             yield Static(id="policy")
-        yield Input(placeholder="command — stop · restart · start · log · quit", id="cmd")
-        # キーの凡例は固定表示にする（Footer はコマンド入力中に隠れてしまうため）。
+        # キーの凡例は最下部に固定する（Footer はコマンド入力中に隠れてしまうため）。
         yield Static(self._hints(), id="hints")
 
     def on_mount(self) -> None:
@@ -146,7 +154,8 @@ class GatewayMonitor(App):
         """キー操作の凡例（フォーカスに依らず常に見える固定行。入力中も消えない）。"""
         t = Text()
         for i, (key, label) in enumerate(
-            (("s", "stop"), ("r", "restart"), ("g", "start"), ("l", "log"), ("q", "quit"))
+            (("s", "stop"), ("r", "restart"), ("g", "start"),
+             ("m", "max"), ("l", "log"), ("q", "quit"))
         ):
             if i:
                 t.append("   ", style=_DIM)
@@ -255,6 +264,50 @@ class GatewayMonitor(App):
         # アプリ内のスクロール画面で表示する（q/Esc で戻る）。
         self.push_screen(LogScreen(self.port))
 
+    def action_prefill_max(self) -> None:
+        # `m` キー: コマンド欄に "max " を入れてフォーカスし、数値だけ打てば送信できるようにする。
+        inp = self.query_one("#cmd", Input)
+        inp.value = "max "
+        inp.focus()
+        inp.cursor_position = len(inp.value)
+
+    def _set_max_resident(self, arg: str) -> None:
+        """`max <n>` / `max off` を解釈して稼働中のゲートウェイに反映する（再起動不要・busy 継続）。
+
+        n は 1 以上の整数。off / none / unlimited / 0 / ∞ は無制限。稼働中のモデルは止めず、
+        超過分はサーバー側でアイドルから順に非同期退避される（→ POST /admin/config）。
+        """
+        arg = arg.strip().lower()
+        if arg in ("off", "none", "unlimited", "inf", "∞", "0"):
+            value: int | None = None
+        else:
+            try:
+                value = int(arg)
+            except ValueError:
+                self.notify(
+                    f"max_resident には数値か off を指定してください: '{arg}'",
+                    severity="error", timeout=4,
+                )
+                return
+            if value < 1:
+                self.notify(
+                    "max_resident は 1 以上、または off（無制限）です",
+                    severity="error", timeout=4,
+                )
+                return
+        label = "∞" if value is None else str(value)
+
+        def _apply() -> None:
+            res = gateway_set_max_resident(value, self.host, self.port)
+            msg, sev = (
+                (f"max_resident を {label} に変更しました", "information")
+                if res is not None
+                else ("max_resident の変更に失敗しました（ゲートウェイ未起動？）", "error")
+            )
+            self.call_from_thread(self.notify, msg, severity=sev, timeout=3)
+
+        self._run(f"max_resident → {label}…", _apply)
+
     def action_quit(self) -> None:
         # q（終了）ではゲートウェイ・デーモンも停止する。ダッシュボードを閉じたら裏の常駐も
         # 完全に終了させることで、次回 `uv run local-llm-server` 起動時に必ず最新コードで
@@ -292,10 +345,16 @@ class GatewayMonitor(App):
         )
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
-        cmd = (event.value or "").strip().lower()
+        raw = (event.value or "").strip()
         event.input.value = ""
+        cmd = raw.lower()
         if cmd in ("q", "quit", "exit"):
             self.action_quit()  # キー `q` と同じく、デーモンも停止してから終了する
+            return
+        # `max <n>` / `m <n>`: 引数を伴うので先頭トークンで分岐する（例: "max 2", "max off"）。
+        head, _, tail = raw.partition(" ")
+        if head.lower() in ("max", "m") and tail.strip():
+            self._set_max_resident(tail)
             return
         {
             "s": self.action_stop, "stop": self.action_stop,
