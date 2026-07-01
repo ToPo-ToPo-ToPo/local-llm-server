@@ -205,6 +205,9 @@ class GatewayMonitor(App):
                 "busy": ("●", _GREEN), "idle": ("○", _AMBER), "unloaded": ("·", _DIM),
             }.get(r["state"], ("·", _DIM))
             state = Text.assemble((sym + " ", col), (r["state"], col))
+            # 同一モデルが複数インスタンスで並列稼働しているときは「×N」を添える（並列度の目安）。
+            if r.get("instances", 0) > 1:
+                state.append(f" ×{r['instances']}", style=_ACCENT)
             # MTP（高速化）の利用可否。ready=緑●、available=淡色（要 hf download）、非対応=「—」。
             mtp_sym, mtp_col, mtp_label = {
                 "ready": ("●", _GREEN, "ready"),

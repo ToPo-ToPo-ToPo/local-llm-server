@@ -30,7 +30,7 @@ import json
 import sys
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .proxy import forward, send_error, send_json
@@ -79,17 +79,35 @@ class CapacityError(RuntimeError):
 
 
 @dataclass
-class _Model:
-    """ゲートウェイが管理する 1 モデルの状態。"""
+class _Instance:
+    """1 モデルの 1 起動インスタンス（独立プロセス・独立ポート）。
 
-    config: ServerConfig  # host/port は内部用に割当済み
+    同一モデルへリクエストが集中したとき、負荷ベースでこのインスタンスを複数起動して
+    並列化する（→ ModelManager.acquire）。各インスタンスは自前の inflight（処理中数）と
+    last_used（LRU 基準）を持ち、LRU 退避・idle 解放はインスタンス単位で行う。
+    """
+
+    config: ServerConfig  # このインスタンス専用の host/port（同一モデルでもポートは別）
     server: LocalServer | None = None
     ready: bool = False
-    inflight: int = 0  # 処理中リクエスト数（>0 の間は退避しない）
+    inflight: int = 0  # このインスタンスの処理中リクエスト数（>0 の間は退避しない）
     last_used: float = 0.0  # time.monotonic()。LRU の基準
-    requests: int = 0  # このモデルに振り分けた累計リクエスト数（表示用）
-    dynamic: bool = False  # 未登録モデルを動的登録したもの（アンロード時に登録ごと消す）
-    footprint: int | None = None  # 概算占有メモリ（バイト）のキャッシュ。0=見積もり不能
+
+
+@dataclass
+class _Model:
+    """1 model_id の共通設定と、その起動インスタンス群。
+
+    instances は現在起動中（ready）のインスタンス。0 個ならモデルは未ロード。負荷に応じて
+    max_resident とメモリの範囲で複製・退避され増減する。requests は表示用の累計で、
+    インスタンスが退避されても失われないようモデル側に持つ。
+    """
+
+    config: ServerConfig  # テンプレート（backend/parallel/draft 等）。単一運用時の既定ポートも保持
+    instances: list[_Instance] = field(default_factory=list)
+    requests: int = 0  # このモデルに振り分けた累計リクエスト数（表示用。退避で消えない）
+    dynamic: bool = False  # 未登録モデルを動的登録したもの（全インスタンス消滅時に登録ごと消す）
+    footprint: int | None = None  # 1 インスタンスの概算占有メモリ（バイト）。0=見積もり不能
 
 
 @dataclass
@@ -164,10 +182,18 @@ class ModelManager:
         # 即アンロードする判定に使う。_state ロック下で操作する。
         self._sessions: dict[str, _Session] = {}
         self._model_sessions: dict[str, set[str]] = {}
+        # 同一モデルの複製インスタンスを裏で起動中の model_id 集合（多重起動を防ぐ）。
+        self._spawning: set[str] = set()
 
     def _alloc_port_locked(self) -> int:
-        """動的モデルに内部ポートを割り当てる（state ロック保持下で呼ぶ）。"""
+        """内部ポートを1つ払い出す（state ロック保持下で呼ぶ）。
+
+        各モデルの既定ポート・起動中の全インスタンスのポート・公開ポートを避けて連番で割り当てる。
+        動的モデルの初回インスタンスにも、複製インスタンスにも使う。
+        """
         used = {m.config.port for m in self._models.values()}
+        for m in self._models.values():
+            used.update(i.config.port for i in m.instances)
         if self._public_port is not None:
             used.add(self._public_port)
         p = self._next_port
@@ -224,23 +250,81 @@ class ModelManager:
     def model_ids(self) -> list[str]:
         return list(self._models)
 
-    def acquire(self, model_id: str) -> tuple[tuple[str, int], _Model]:
-        """model_id のサーバーを（必要なら起動して）確保し、(内部アドレス, ハンドル) を返す。
+    def _capacity(self, config: ServerConfig) -> int:
+        """1 インスタンスが同時に捌けるリクエスト数。llama-cpp は parallel スロット、他は 1。
 
-        呼び出し側は転送後に必ず release(ハンドル) すること（inflight を戻すため）。
-        未登録モデルは、dynamic 有効なら ID からバックエンドを推論して動的にロードする
-        （無効なら KeyError）。起動失敗は RuntimeError/TimeoutError、空き枠が `load_timeout`
-        内に得られなければ CapacityError（→ 503）を投げる。
+        この本数に達したインスタンスを「満杯」とみなし、負荷ベースで複製インスタンスを増やす
+        判断に使う（mlx 系は 1 なので、2 本目の同時リクエストで複製が検討される。llama-cpp は
+        まずプロセス内の parallel スロットを使い切ってから複製する）。
         """
-        # 高速パス: 既にロード済みなら state ロックのみ。
+        if parallel_supported(config.backend) and config.parallel:
+            return int(config.parallel)
+        return 1
+
+    def _route_locked(self, inst: _Instance) -> tuple[str, int]:
+        """インスタンス inst にリクエストを1つ割り当てる（_state 保持下で呼ぶ）。"""
+        inst.inflight += 1
+        inst.last_used = time.monotonic()
+        return (inst.config.host, inst.config.port)
+
+    def _running_instances_locked(self) -> list[tuple[_Model, _Instance]]:
+        """起動中（server がある）の (model, instance) を全モデル横断で列挙（_state 保持下）。"""
+        return [
+            (m, i)
+            for m in self._models.values()
+            for i in m.instances
+            if i.server is not None
+        ]
+
+    def _port_in_use_locked(self, port: int) -> bool:
+        """port を現在いずれかの起動中インスタンスが使っているか（_state 保持下）。"""
+        return any(
+            i.config.port == port
+            for m in self._models.values()
+            for i in m.instances
+            if i.server is not None
+        )
+
+    def _make_instance_config_locked(self, mm: _Model) -> ServerConfig:
+        """mm の新規インスタンス用に、専用ポートを与えた ServerConfig を作る（_state 保持下）。
+
+        既定ポート（mm.config.port）が空いていれば単一運用の予測性のためそれを使い、既に別
+        インスタンスが使っていれば連番で新ポートを払い出す（複製インスタンス用）。
+        """
+        base = mm.config.port
+        port = base if not self._port_in_use_locked(base) else self._alloc_port_locked()
+        return replace(mm.config, port=port)
+
+    def acquire(self, model_id: str) -> tuple[tuple[str, int], _Instance]:
+        """model_id のインスタンスを（必要なら起動して）確保し、(内部アドレス, ハンドル) を返す。
+
+        呼び出し側は転送後に必ず release(ハンドル) すること（inflight を戻すため）。ready な
+        インスタンスが複数あれば**最も空いているもの**へ振り分ける。最も空いているものすら満杯
+        （inflight >= capacity）だった＝リクエストが競合しているときは、max_resident とメモリの
+        範囲で**バックグラウンドで複製インスタンスを1つ増やす**（現在のリクエストは待たせず、その
+        まま最少負荷のインスタンスへ転送する）。
+        未登録モデルは、dynamic 有効なら ID からバックエンドを推論して初回インスタンスを起動する
+        （無効なら KeyError）。起動失敗は RuntimeError/TimeoutError、初回起動の空き枠が
+        `load_timeout` 内に得られなければ CapacityError（→ 503）を投げる。
+        """
+        # 高速パス: ready なインスタンスがあれば、最も空いているものへ割り当てる（state のみ）。
+        spawn = False
         with self._state:
             mm = self._models.get(model_id)
-            if mm is not None and mm.ready and mm.server is not None:
-                mm.inflight += 1
+            ready = (
+                [i for i in mm.instances if i.ready and i.server is not None] if mm else []
+            )
+            if ready:
+                inst = min(ready, key=lambda i: i.inflight)
+                # 「最少負荷のインスタンスすら満杯」なら競合中 → 複製を検討（割当は前の値で判定）。
+                spawn = inst.inflight >= self._capacity(mm.config)
+                addr = self._route_locked(inst)
                 mm.requests += 1
-                mm.last_used = time.monotonic()
-                return (mm.config.host, mm.config.port), mm
-        # 低速パス: ロード（または動的登録）が要る。control で直列化する。
+        if ready:
+            if spawn:
+                self._maybe_spawn_replica_async(model_id)
+            return addr, inst
+        # 低速パス: ready インスタンスが1つも無い → 初回インスタンスを起動（control で直列化）。
         with self._control:
             with self._state:
                 mm = self._models.get(model_id)
@@ -248,39 +332,147 @@ class ModelManager:
                     if not self._dynamic:
                         raise KeyError(model_id)
                     mm = self._register_dynamic_locked(model_id)
-                elif mm.ready and mm.server is not None:  # 待つ間に他スレッドがロード済み
-                    mm.inflight += 1
-                    mm.requests += 1
-                    mm.last_used = time.monotonic()
-                    return (mm.config.host, mm.config.port), mm
+                else:
+                    ready = [i for i in mm.instances if i.ready and i.server is not None]
+                    if ready:  # 待つ間に他スレッドが用意した
+                        inst = min(ready, key=lambda i: i.inflight)
+                        addr = self._route_locked(inst)
+                        mm.requests += 1
+                        return addr, inst
             self._evict_if_needed(keep=model_id)
-            server = LocalServer(mm.config, log_path=daemon_log_path(mm.config.port))
+            with self._state:
+                cfg = self._make_instance_config_locked(mm)
+            inst = _Instance(config=cfg)
+            server = LocalServer(cfg, log_path=daemon_log_path(cfg.port))
             try:
                 server.start()
                 server.wait_until_ready()
             except (RuntimeError, TimeoutError, ValueError):
                 # ValueError は build_command の解決失敗（未キャッシュの repo-id 等）。
                 server.stop()
-                # 動的登録の起動失敗は登録ごと取り消す（誤った model 名を残さない）。
+                # 動的登録の初回起動失敗は、他に生きたインスタンスが無ければ登録ごと取り消す。
                 if mm.dynamic:
                     with self._state:
-                        self._models.pop(model_id, None)
+                        if not mm.instances:
+                            self._models.pop(model_id, None)
                 raise
             with self._state:
-                mm.server = server
-                mm.ready = True
-                mm.inflight += 1
+                inst.server = server
+                inst.ready = True
+                addr = self._route_locked(inst)
                 mm.requests += 1
-                mm.last_used = time.monotonic()
-            return (mm.config.host, mm.config.port), mm
+                mm.instances.append(inst)
+            return addr, inst
 
-    def release(self, mm: _Model) -> None:
+    def release(self, inst: _Instance) -> None:
         with self._state:
-            if mm.inflight > 0:
-                mm.inflight -= 1
-                if mm.inflight == 0:
+            if inst.inflight > 0:
+                inst.inflight -= 1
+                if inst.inflight == 0:
                     # 枠が空いた可能性。_evict_if_needed で待っているスレッドを起こす。
                     self._state.notify_all()
+
+    def _maybe_spawn_replica_async(self, model_id: str) -> None:
+        """満杯モデルの複製インスタンスを1つ、バックグラウンドで起動する（多重起動を防ぐ）。
+
+        既に同モデルの複製を起動中なら何もしない（1 モデルにつき同時 1 本だけウォームアップ）。
+        HTTP 応答を待たせないよう別スレッドで行う。
+        """
+        with self._state:
+            if model_id in self._spawning:
+                return
+            self._spawning.add(model_id)
+        threading.Thread(
+            target=self._spawn_replica, args=(model_id,), daemon=True
+        ).start()
+
+    def _spawn_replica(self, model_id: str) -> None:
+        """複製インスタンスを1つ起動する。枠が取れない/もう満杯でなければ黙って諦める。
+
+        現在のリクエストは既に別インスタンスへ流れているので、これは将来の負荷に備えた
+        best-effort なウォームアップ。枠確保は**非ブロッキング**（処理中のインスタンスは止めず、
+        退避できるアイドルが無ければ複製しない）。起動失敗も本流に影響させない。
+        """
+        try:
+            with self._control:
+                with self._state:
+                    mm = self._models.get(model_id)
+                    if mm is None:
+                        return
+                    ready = [i for i in mm.instances if i.ready and i.server is not None]
+                    cap = self._capacity(mm.config)
+                    # 起動判断の時点で空きができた／満杯でなくなっていたら複製不要。
+                    if not ready or any(i.inflight < cap for i in ready):
+                        return
+                if not self._make_room_for_replica(keep=model_id):
+                    return  # 上限・メモリで枠が取れない（アイドル退避もできない）→ 複製しない
+                with self._state:
+                    mm = self._models.get(model_id)
+                    if mm is None:
+                        return
+                    cfg = self._make_instance_config_locked(mm)
+                inst = _Instance(config=cfg)
+                server = LocalServer(cfg, log_path=daemon_log_path(cfg.port))
+                try:
+                    server.start()
+                    server.wait_until_ready()
+                except (RuntimeError, TimeoutError, ValueError):
+                    server.stop()
+                    return
+                with self._state:
+                    mm = self._models.get(model_id)
+                    if mm is None:  # 起動中にモデルが消えた → 起動物は止める
+                        threading.Thread(target=server.stop, daemon=True).start()
+                        return
+                    inst.server = server
+                    inst.ready = True
+                    inst.last_used = time.monotonic()
+                    mm.instances.append(inst)
+                    self._state.notify_all()
+        finally:
+            with self._state:
+                self._spawning.discard(model_id)
+
+    def _make_room_for_replica(self, keep: str) -> bool:
+        """複製用に枠を確保する（非ブロッキング）。確保できたら True（control 保持下で呼ぶ）。
+
+        上限・メモリに余裕があればそのまま True。超過していても、アイドルなインスタンス
+        （keep 以外・処理中でない）を LRU 退避して空けられれば True。処理中しか無く空けられない
+        なら False（複製を諦める＝busy は止めない）。_evict_if_needed と違い**待たない**。
+        """
+        budget = self._mem_budget()
+        if self._max_resident is None and budget is None:
+            return True
+        while True:
+            victim_srv = None
+            victim_model = None
+            with self._state:
+                running = self._running_instances_locked()
+                resident = len(running)
+                over_count = (
+                    self._max_resident is not None and resident >= self._max_resident
+                )
+                over_mem = False
+                if budget is not None:
+                    keep_mm = self._models.get(keep)
+                    need = self._footprint_locked(keep_mm) if keep_mm else 0
+                    used = sum(self._footprint_locked(m) for (m, _i) in running)
+                    over_mem = (used + need) > budget
+                if not over_count and not over_mem:
+                    return True
+                candidates = [
+                    (m, i) for (m, i) in running
+                    if i.ready and i.inflight == 0 and m.config.model != keep
+                ]
+                if not candidates:
+                    return False  # 退避できるアイドルが無い → 複製しない
+                victim_model, victim_inst = min(candidates, key=lambda mi: mi[1].last_used)
+                victim_srv = victim_inst.server
+                victim_model.instances.remove(victim_inst)
+            victim_srv.stop()  # state ロックの外で（最長 ~10s）
+            if victim_model.dynamic and not victim_model.instances:
+                with self._state:
+                    self._models.pop(victim_model.config.model, None)
 
     def _footprint_locked(self, mm: _Model) -> int:
         """モデルの概算占有メモリ（バイト）。一度計算したらキャッシュする。0=見積もり不能。"""
@@ -313,11 +505,10 @@ class ModelManager:
         )
         while True:
             victim_srv = None
-            victim_id = None
-            victim_dynamic = False
+            victim_model = None
             with self._state:
-                resident_models = [m for m in self._models.values() if m.server is not None]
-                resident = len(resident_models)
+                running = self._running_instances_locked()
+                resident = len(running)
                 over_count = (
                     self._max_resident is not None and resident >= self._max_resident
                 )
@@ -325,23 +516,20 @@ class ModelManager:
                 if budget is not None:
                     keep_mm = self._models.get(keep)
                     need = self._footprint_locked(keep_mm) if keep_mm else 0
-                    used = sum(self._footprint_locked(m) for m in resident_models)
+                    used = sum(self._footprint_locked(m) for (m, _i) in running)
                     over_mem = (used + need) > budget
                 if not over_count and not over_mem:
                     return
                 candidates = [
-                    m for m in resident_models
-                    if m.ready and m.inflight == 0 and m.config.model != keep
+                    (m, i) for (m, i) in running
+                    if i.ready and i.inflight == 0 and m.config.model != keep
                 ]
                 if candidates:
-                    victim = min(candidates, key=lambda m: m.last_used)
-                    victim_srv = victim.server
-                    victim_id = victim.config.model
-                    victim_dynamic = victim.dynamic
-                    victim.server = None
-                    victim.ready = False
+                    victim_model, victim_inst = min(candidates, key=lambda mi: mi[1].last_used)
+                    victim_srv = victim_inst.server
+                    victim_model.instances.remove(victim_inst)
                 elif over_mem and resident == 0:
-                    # 退避できる常駐モデルが無く、keep 単体で予算超過 → 待っても無駄。
+                    # 退避できる常駐インスタンスが無く、keep 単体で予算超過 → 待っても無駄。
                     raise CapacityError(
                         f"model '{keep}' needs ~{need / 1e9:.1f}GB but the memory budget is "
                         f"{budget / 1e9:.1f}GB (max_memory_fraction={self._mem_fraction:g} of "
@@ -352,7 +540,7 @@ class ModelManager:
                     remaining = None if deadline is None else deadline - time.monotonic()
                     if remaining is not None and remaining <= 0:
                         why = "memory budget exceeded" if over_mem else (
-                            f"all {self._max_resident} model slot(s) busy"
+                            f"all {self._max_resident} instance slot(s) busy"
                         )
                         raise CapacityError(
                             f"{why}; could not free room within {self._load_timeout:g}s"
@@ -361,9 +549,9 @@ class ModelManager:
                     continue  # 起きたら再判定
             if victim_srv is not None:
                 victim_srv.stop()  # state ロックの外で（最長 ~10s）。停止後にループ再確認。
-                if victim_dynamic:  # 動的モデルは登録ごと消す（表示から外す）
+                if victim_model.dynamic and not victim_model.instances:  # 空なら登録ごと消す
                     with self._state:
-                        self._models.pop(victim_id, None)
+                        self._models.pop(victim_model.config.model, None)
 
     def set_max_resident(self, value: int | None) -> None:
         """常駐上限（max_resident）を実行中に変更する。処理中（busy）のモデルは止めない。
@@ -395,22 +583,19 @@ class ModelManager:
                     limit = self._max_resident
                     if limit is None:
                         return
-                    resident = [m for m in self._models.values() if m.server is not None]
-                    if len(resident) <= limit:
+                    running = self._running_instances_locked()
+                    if len(running) <= limit:
                         return
-                    idle = [m for m in resident if m.ready and m.inflight == 0]
+                    idle = [(m, i) for (m, i) in running if i.ready and i.inflight == 0]
                     if not idle:
                         return  # 残りは全て処理中 → 止めない（後で片付く）
-                    victim = min(idle, key=lambda m: m.last_used)
-                    victim_srv = victim.server
-                    victim_id = victim.config.model
-                    victim_dynamic = victim.dynamic
-                    victim.server = None
-                    victim.ready = False
+                    victim_model, victim_inst = min(idle, key=lambda mi: mi[1].last_used)
+                    victim_srv = victim_inst.server
+                    victim_model.instances.remove(victim_inst)
                 victim_srv.stop()  # state ロックの外で（最長 ~10s）
-                if victim_dynamic:  # 動的モデルは登録ごと消す（表示から外す）
+                if victim_model.dynamic and not victim_model.instances:  # 空なら登録ごと消す
                     with self._state:
-                        self._models.pop(victim_id, None)
+                        self._models.pop(victim_model.config.model, None)
 
     def evict_idle(self, timeout: float) -> int:
         """最終利用から `timeout` 秒を超えて使われていないモデルを停止する（idle TTL）。
@@ -426,18 +611,19 @@ class ModelManager:
             with self._state:
                 victims = []
                 for m in self._models.values():
-                    if (
-                        m.server is not None and m.ready and m.inflight == 0
-                        and (now - m.last_used) > timeout
-                    ):
-                        victims.append((m.server, m.config.model, m.dynamic))
-                        m.server = None
-                        m.ready = False
-            for srv, mid, dyn in victims:
+                    for i in list(m.instances):
+                        if (
+                            i.server is not None and i.ready and i.inflight == 0
+                            and (now - i.last_used) > timeout
+                        ):
+                            victims.append((m, i.server))
+                            m.instances.remove(i)
+            for _m, srv in victims:
                 srv.stop()  # state ロックの外で（最長 ~10s かかるため）
-                if dyn:  # 動的モデルは登録ごと消す（表示から外す）
-                    with self._state:
-                        self._models.pop(mid, None)
+            with self._state:
+                for m, _srv in victims:  # 全インスタンスが消えた動的モデルは登録ごと消す
+                    if m.dynamic and not m.instances:
+                        self._models.pop(m.config.model, None)
         return len(victims)
 
     # --- エージェント在席（セッション）管理 -----------------------------------
@@ -523,19 +709,23 @@ class ModelManager:
         with self._control:
             with self._state:
                 mm = self._models.get(model_id)
-                if mm is None or mm.server is None or mm.inflight > 0:
+                if mm is None or not mm.instances:
                     return False
+                if any(i.inflight > 0 for i in mm.instances):
+                    return False  # まだ処理中のインスタンスがある → 残す
                 if self._model_sessions.get(model_id):
                     return False  # 解放手前で誰かが再登録した → 残す
-                srv = mm.server
+                victims = [i.server for i in mm.instances if i.server is not None]
+                mm.instances.clear()  # このモデルの全インスタンスを解放する
                 dyn = mm.dynamic
-                mm.server = None
-                mm.ready = False
-            srv.stop()  # state ロックの外で（最長 ~10s）
-            if dyn:  # 動的モデルは登録ごと消す（表示から外す）
+            for srv in victims:
+                srv.stop()  # state ロックの外で（最長 ~10s）
+            if dyn:  # 全インスタンスを落とした動的モデルは登録ごと消す（表示から外す）
                 with self._state:
-                    self._models.pop(model_id, None)
-        return True
+                    mm2 = self._models.get(model_id)
+                    if mm2 is not None and not mm2.instances and not self._model_sessions.get(model_id):
+                        self._models.pop(model_id, None)
+        return bool(victims)
 
     def reap_sessions(self, ttl: float) -> int:
         """ハートビートが ttl 秒途絶えた在席を掃除する（異常終了したエージェント対策）。
@@ -576,16 +766,23 @@ class ModelManager:
         with self._state:
             out = []
             for m in self._models.values():
-                loaded = m.server is not None and m.ready
+                ready = [i for i in m.instances if i.server is not None and i.ready]
+                loaded = bool(ready)
+                inflight = sum(i.inflight for i in ready)
                 # アイドル経過は「ロード済みかつ処理中でない」ときだけ意味がある
-                # （idle_timeout までの残り表示に使う）。それ以外は None。
-                idle_for = round(now - m.last_used, 1) if (loaded and m.inflight == 0) else None
+                # （idle_timeout までの残り表示に使う）。最後に使ったインスタンス基準。それ以外は None。
+                idle_for = (
+                    round(now - max(i.last_used for i in ready), 1)
+                    if (loaded and inflight == 0) else None
+                )
                 out.append({
                     "model": m.config.model,
                     "backend": m.config.backend,
-                    "port": m.config.port,
+                    "port": ready[0].config.port if ready else m.config.port,
                     "loaded": loaded,
-                    "inflight": m.inflight,
+                    # 起動中インスタンス数（負荷ベースの複製で >1 になる。並列度の目安）。
+                    "instances": len(ready),
+                    "inflight": inflight,
                     "requests": m.requests,
                     "idle_for": idle_for,
                     # このモデルに在席宣言しているエージェント数（0 で即アンロード対象）。
@@ -594,17 +791,17 @@ class ModelManager:
             return out
 
     def shutdown(self) -> None:
-        """全モデルサーバーを並列に停止する（ゲートウェイ終了時）。
+        """全モデルサーバー（全インスタンス）を並列に停止する（ゲートウェイ終了時）。
 
         並列にするのは、外部 `--stop`（SIGTERM→10s→SIGKILL）の猶予内に収めるため。
         """
         with self._state:
             servers = []
             for m in self._models.values():
-                if m.server is not None:
-                    servers.append(m.server)
-                    m.server = None
-                    m.ready = False
+                for i in m.instances:
+                    if i.server is not None:
+                        servers.append(i.server)
+                m.instances.clear()
         threads = [threading.Thread(target=s.stop) for s in servers]
         for t in threads:
             t.start()

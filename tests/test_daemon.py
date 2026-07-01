@@ -142,13 +142,16 @@ class _StubServer:
 
 
 def _resident(mgr, model, gb, *, inflight=0, last_used=0.0):
-    """ロード済みモデルを 1 つ手で常駐させる（占有量 gb GB をキャッシュ済みにする）。"""
+    """ロード済みモデルを 1 つ手で常駐させる（占有量 gb GB をキャッシュ済みにする）。
+
+    1 モデル=複数インスタンス構成なので、単一インスタンスを持つ _Model を組み立てる。
+    """
     srv = _StubServer()
-    m = gw._Model(
-        config=ServerConfig(backend="mlx-vlm", model=model, port=9000),
-        server=srv, ready=True, inflight=inflight, last_used=last_used,
-        footprint=int(gb * 1e9),
+    cfg = ServerConfig(backend="mlx-vlm", model=model, port=9000)
+    inst = gw._Instance(
+        config=cfg, server=srv, ready=True, inflight=inflight, last_used=last_used,
     )
+    m = gw._Model(config=cfg, instances=[inst], footprint=int(gb * 1e9))
     mgr._models[model] = m
     return m
 
@@ -166,11 +169,13 @@ def test_memory_guard_evicts_idle_to_fit():
     mgr = gw.ModelManager([], dynamic=True, max_memory_fraction=0.66)
     mgr._mem_total = int(100e9)  # 決定的にするため総RAMを固定
     idle = _resident(mgr, "old/idle", gb=50)
+    idle_inst = idle.instances[0]
     keep = mgr._register_dynamic_locked("new/Big-GGUF:Q4")
     keep.footprint = int(30e9)
     mgr._evict_if_needed(keep="new/Big-GGUF:Q4")
-    # idle は退避された（server が外れ、FakeServer.stop が呼ばれた）。非動的なので _models には残る。
-    assert idle.server is None and not idle.ready
+    # idle は退避された（インスタンスが外れ、StubServer.stop が呼ばれた）。非動的なので _models には残る。
+    assert idle_inst.server.stopped is True
+    assert idle.instances == []
     assert mgr._models["old/idle"] is idle
 
 
@@ -366,7 +371,7 @@ def test_manager_evict_idle_stops_unused(monkeypatch):
     _, h1 = mgr.acquire("m1")
     mgr.release(h1)
     # m1 の last_used を十分過去にする（idle 判定させる）。
-    mgr._models["m1"].last_used = time.monotonic() - 100
+    mgr._models["m1"].instances[0].last_used = time.monotonic() - 100
     freed = mgr.evict_idle(timeout=10)
     assert freed == 1
     by_model = {s.config.model: s for s in created}
@@ -383,7 +388,7 @@ def test_manager_evict_idle_keeps_recent_and_inflight(monkeypatch):
     mgr.release(h1)
     # m2: 古いが処理中（inflight>0）→ 残す
     _, h2 = mgr.acquire("m2")
-    mgr._models["m2"].last_used = time.monotonic() - 100
+    mgr._models["m2"].instances[0].last_used = time.monotonic() - 100
     assert mgr.evict_idle(timeout=10) == 0
     st = {s["model"]: s["loaded"] for s in mgr.status()}
     assert st == {"m1": True, "m2": True}
@@ -480,6 +485,77 @@ def test_set_max_resident_raise_allows_new_load_without_evict(monkeypatch):
     st = {s["model"]: s["loaded"] for s in mgr.status()}
     assert st == {"m1": True, "m2": True}
     assert all(s.stops == 0 for s in created)  # 退避は起きていない
+
+
+def _wait_instances(mgr, model, n, timeout=2.0):
+    """指定モデルの ready インスタンス数が n 以上になるまで待つ（複製の非同期起動用）。"""
+    import time
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        mm = mgr._models.get(model)
+        if mm and sum(1 for i in mm.instances if i.ready and i.server is not None) >= n:
+            return True
+        time.sleep(0.01)
+    return False
+
+
+def test_no_replica_for_sequential_requests(monkeypatch):
+    # 逐次リクエスト（常に release で inflight 0 に戻る）は満杯にならず、複製しない。
+    created = _patch_fake(monkeypatch)
+    mgr = gw.ModelManager(_configs(), max_resident=3)
+    for _ in range(3):
+        _, h = mgr.acquire("m1")
+        mgr.release(h)
+    import time
+    time.sleep(0.1)  # 複製スレッドが走る猶予（走らないはず）
+    assert len(mgr._models["m1"].instances) == 1
+    assert sum(1 for _ in created) == 1
+
+
+def test_replica_spawns_on_concurrent_load(monkeypatch):
+    # 同一モデルに同時リクエストが集中して満杯になると、複製インスタンスが起動して並列化する。
+    created = _patch_fake(monkeypatch)
+    mgr = gw.ModelManager(_configs(), max_resident=2)  # mlx: capacity=1
+    _, h1 = mgr.acquire("m1")   # inst1 へ（inflight=1、満杯）
+    _, h2 = mgr.acquire("m1")   # 満杯のまま2本目 → 複製起動をトリガ（今は inst1 へ）
+    assert _wait_instances(mgr, "m1", 2)          # 裏で inst2 が起動する
+    _, h3 = mgr.acquire("m1")   # 3本目は空いた inst2 へ（負荷分散）
+    insts = mgr._models["m1"].instances
+    assert len(insts) == 2
+    assert sorted(i.inflight for i in insts) == [1, 2]  # inst1=2, inst2=1
+    assert sum(1 for _ in created) == 2            # プロセスが 2 つ起動している
+    mgr.release(h1); mgr.release(h2); mgr.release(h3)
+
+
+def test_replica_capped_by_max_resident(monkeypatch):
+    # 上限に達していてアイドルも無ければ、満杯でも複製しない（busy は止めない）。
+    created = _patch_fake(monkeypatch)
+    mgr = gw.ModelManager(_configs(), max_resident=1)
+    _, h1 = mgr.acquire("m1")
+    _, h2 = mgr.acquire("m1")   # 満杯だが上限 1・退避できるアイドル無し → 複製不可
+    import time
+    time.sleep(0.2)  # 複製スレッドが走る猶予
+    assert len(mgr._models["m1"].instances) == 1
+    assert sum(1 for _ in created) == 1
+    mgr.release(h1); mgr.release(h2)
+
+
+def test_replica_respects_llama_parallel_slots(monkeypatch):
+    # llama-cpp は 1 プロセス内の parallel スロットを使い切ってから複製する（メモリ効率優先）。
+    created = _patch_fake(monkeypatch)
+    cfgs = [ServerConfig(backend="llama-cpp", model="L", host="127.0.0.1",
+                         port=9001, parallel=3)]
+    mgr = gw.ModelManager(cfgs, max_resident=2)
+    hs = [mgr.acquire("L")[1] for _ in range(3)]  # 3 本は inst1 の parallel スロット内
+    import time
+    time.sleep(0.15)
+    assert len(mgr._models["L"].instances) == 1   # まだ複製しない
+    h4 = mgr.acquire("L")[1]                       # 4 本目で満杯 → 複製
+    assert _wait_instances(mgr, "L", 2)
+    assert sum(1 for _ in created) == 2
+    for h in hs:
+        mgr.release(h)
+    mgr.release(h4)
 
 
 def test_load_gateway_config_load_timeout(tmp_path):

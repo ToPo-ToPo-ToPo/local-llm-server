@@ -29,7 +29,7 @@ def merge_status(gcfg, admin: dict | None) -> dict:
         if not m or not m.get("loaded"):
             return {
                 "model": model, "backend": backend, "port": port,
-                "state": "unloaded", "inflight": 0,
+                "state": "unloaded", "inflight": 0, "instances": 0,
                 "requests": (m or {}).get("requests", 0), "idle_remaining": None,
                 "sessions": (m or {}).get("sessions", 0), "mtp": mtp,
             }
@@ -46,6 +46,8 @@ def merge_status(gcfg, admin: dict | None) -> dict:
         return {
             "model": model, "backend": backend, "port": port,
             "state": state, "inflight": inflight,
+            # 起動中インスタンス数（負荷ベースの複製で >1 になる。並列度の目安）。
+            "instances": int(m.get("instances", 1)),
             "requests": int(m.get("requests", 0)), "idle_remaining": remaining,
             "sessions": int(m.get("sessions", 0)),  # 在席エージェント数（0 で即アンロード対象）
             "mtp": mtp,
