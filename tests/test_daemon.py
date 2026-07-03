@@ -937,3 +937,174 @@ def test_gateway_session_endpoints(monkeypatch):
         server.shutdown(); server.server_close(); mgr.shutdown()
         for u in ups:
             u.shutdown(); u.server_close()
+
+
+# --- 今回の修正の回帰テスト ---------------------------------------------------
+
+def test_load_gateway_config_request_and_start_timeout(tmp_path):
+    base = '[[models]]\nmodel = "x"\nbackend = "mlx"\n'
+    cfg = gw.load_gateway_config(_write(tmp_path, base))
+    assert cfg.request_timeout is None      # 既定: 無制限（長時間生成を妨げない）
+    assert cfg.start_timeout == 120.0       # 既定: 120 秒
+    cfg = gw.load_gateway_config(
+        _write(tmp_path, "request_timeout = 600\nstart_timeout = 300\n" + base))
+    assert cfg.request_timeout == 600.0
+    assert cfg.start_timeout == 300.0
+    # 0 は「無効（無制限）」
+    assert gw.load_gateway_config(
+        _write(tmp_path, "request_timeout = 0\n" + base)).request_timeout is None
+    with pytest.raises(ValueError, match="start_timeout"):
+        gw.load_gateway_config(_write(tmp_path, "start_timeout = 0\n" + base))
+
+
+def test_load_gateway_config_rejects_unsupported_wildcards(tmp_path):
+    # ゲートウェイは IPv4 で bind する。"::" / "*" は bind 時の分かりにくい OSError ではなく
+    # 設定読み込みで明確に断る。
+    base = '[[models]]\nmodel = "x"\nbackend = "mlx"\n'
+    for host in ("::", "*"):
+        with pytest.raises(ValueError, match="not supported"):
+            gw.load_gateway_config(_write(tmp_path, f'host = "{host}"\n' + base))
+    # "0.0.0.0" は従来どおり許可
+    assert gw.load_gateway_config(
+        _write(tmp_path, 'host = "0.0.0.0"\n' + base)).host == "0.0.0.0"
+
+
+def test_no_replica_when_no_limits_configured(monkeypatch):
+    # max_resident もメモリ上限も無い構成では複製しない（重みのコピーが際限なく増えて
+    # OOM する事故を防ぐ。並列化を使うにはどちらかで範囲を決める）。
+    created = _patch_fake(monkeypatch)
+    mgr = gw.ModelManager(_configs(), max_resident=None)  # 上限なし
+    _, h1 = mgr.acquire("m1")
+    _, h2 = mgr.acquire("m1")   # 満杯（mlx: capacity=1）だが上限が無い → 複製しない
+    import time
+    time.sleep(0.2)  # 複製スレッドが走る猶予（走らないはず）
+    assert len(mgr._models["m1"].instances) == 1
+    assert sum(1 for _ in created) == 1
+    mgr.release(h1); mgr.release(h2)
+
+
+def test_shutdown_stops_server_that_is_still_starting(monkeypatch):
+    # ロード中（wait_until_ready の途中）に shutdown しても、起動しかけのモデルサーバーを
+    # 取り逃さず止める（孤児プロセス化してメモリ・ポートを掴み続けない）。
+    import time
+
+    started_loading = threading.Event()
+    release_load = threading.Event()
+    created = []
+
+    class _SlowServer(_FakeServer):
+        def __init__(self, config, log_path=None):
+            super().__init__(config, log_path)
+            created.append(self)
+
+        def wait_until_ready(self, *a, **k):
+            started_loading.set()
+            release_load.wait(timeout=5)
+
+    monkeypatch.setattr(gw, "LocalServer", _SlowServer)
+    mgr = gw.ModelManager(_configs())
+    errors = []
+
+    def _load():
+        try:
+            mgr.acquire("m1")
+        except RuntimeError as exc:  # shutting down は正当な失敗
+            errors.append(exc)
+
+    t = threading.Thread(target=_load)
+    t.start()
+    assert started_loading.wait(timeout=5)  # ロード（wait_until_ready）中
+    mgr.shutdown()                          # ← この時点で instances は空だが _starting にいる
+    release_load.set()
+    t.join(timeout=5)
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline and created[0].stops == 0:
+        time.sleep(0.01)
+    assert created[0].stops >= 1            # 起動途中のサーバーも止まっている
+    assert errors                            # ロード側は「shutting down」で中断される
+    # shutdown 後の新規ロードは拒否される
+    with pytest.raises(RuntimeError):
+        mgr.acquire("m2")
+
+
+def test_gateway_non_ascii_bearer_token_returns_401(monkeypatch):
+    # 非 ASCII のトークンでも 500（TypeError）にならず、きれいに 401 を返す。
+    server, mgr, ups = _start_gateway(monkeypatch, api_key="secret")
+    try:
+        port = server.server_address[1]
+        status, obj = _get(port, "/v1/models",
+                           headers={"Authorization": "Bearer café"})
+        assert status == 401 and "error" in obj
+    finally:
+        server.shutdown(); server.server_close(); mgr.shutdown()
+        for u in ups:
+            u.shutdown(); u.server_close()
+
+
+def test_gateway_rejects_non_dict_json_body(monkeypatch):
+    # [1] や "x" のような dict 以外の JSON は 500（AttributeError）ではなく 400。
+    server, mgr, ups = _start_gateway(monkeypatch)
+    try:
+        port = server.server_address[1]
+        status, obj = _post(port, "/v1/chat/completions", [1])
+        assert status == 400 and "error" in obj
+        # model が文字列でないのも 400
+        status, obj = _post(port, "/v1/chat/completions", {"model": ["m1"]})
+        assert status == 400 and "error" in obj
+    finally:
+        server.shutdown(); server.server_close(); mgr.shutdown()
+        for u in ups:
+            u.shutdown(); u.server_close()
+
+
+def test_gateway_routes_with_query_string(monkeypatch):
+    # クエリ付きでもルーティングが壊れない（GET /v1/models?limit=10 → 200）。
+    server, mgr, ups = _start_gateway(monkeypatch)
+    try:
+        port = server.server_address[1]
+        status, obj = _get(port, "/v1/models?limit=10")
+        assert status == 200
+        assert [m["id"] for m in obj["data"]] == ["m1", "m2"]
+    finally:
+        server.shutdown(); server.server_close(); mgr.shutdown()
+        for u in ups:
+            u.shutdown(); u.server_close()
+
+
+def test_gateway_invalid_content_length_returns_400(monkeypatch):
+    # Content-Length が数値でない/負でも 500 にならず 400 を返す。
+    server, mgr, ups = _start_gateway(monkeypatch)
+    try:
+        port = server.server_address[1]
+        for bad in ("abc", "-5"):
+            conn = http.client.HTTPConnection("127.0.0.1", port)
+            conn.putrequest("POST", "/v1/chat/completions")
+            conn.putheader("Content-Type", "application/json")
+            conn.putheader("Content-Length", bad)
+            conn.endheaders()
+            resp = conn.getresponse()
+            assert resp.status == 400
+            conn.close()
+    finally:
+        server.shutdown(); server.server_close(); mgr.shutdown()
+        for u in ups:
+            u.shutdown(); u.server_close()
+
+
+def test_gateway_oversized_content_length_returns_413(monkeypatch):
+    # 巨大 Content-Length の申告は本文を読み込まず 413 で断る（メモリ DoS 防止）。
+    server, mgr, ups = _start_gateway(monkeypatch)
+    try:
+        port = server.server_address[1]
+        conn = http.client.HTTPConnection("127.0.0.1", port)
+        conn.putrequest("POST", "/v1/chat/completions")
+        conn.putheader("Content-Type", "application/json")
+        conn.putheader("Content-Length", str(10 * 1024 * 1024 * 1024))  # 10GB を申告
+        conn.endheaders()
+        resp = conn.getresponse()
+        assert resp.status == 413
+        conn.close()
+    finally:
+        server.shutdown(); server.server_close(); mgr.shutdown()
+        for u in ups:
+            u.shutdown(); u.server_close()

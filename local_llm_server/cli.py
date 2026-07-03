@@ -31,6 +31,7 @@ from .server import (
     gateway_log_path,
     install_shutdown_handlers,
     local_connect_host,
+    pid_looks_like_ours,
     primary_lan_ip,
     server_status,
     start_gateway_background,
@@ -73,6 +74,15 @@ def _stop_servers(ports: list[int]) -> int:
     for port in ports:
         pids = find_pids_on_port(port)
         for pid in pids:
+            # ポート番号だけで殺すと、たまたま同じポートを使う無関係なプロセス
+            # （別プロジェクトの開発サーバー等）を巻き添えにするので、コマンドラインで確認する。
+            if not pid_looks_like_ours(pid):
+                print(
+                    f"Port {port}: pid {pid} does not look like a local-llm-server "
+                    "process; leaving it alone.",
+                    file=sys.stderr,
+                )
+                continue
             print(f"Stopping server on port {port} (pid {pid})...", file=sys.stderr)
             if stop_pid(pid):
                 stopped = True
@@ -146,8 +156,9 @@ def main(argv: list[str] | None = None) -> int:
             "Run the local LLM gateway defined by ./gateway.toml in the current directory "
             "(model catalog). Host, port, models and MTP are all configured in that file. Clients "
             "connect to the public port and select a model via `model`; the client never starts a "
-            "server. Run in the foreground (default), or operate it from the terminal with "
-            "--start / --stop / --status / --restart."
+            "server. With no arguments an interactive terminal opens the TUI dashboard (which "
+            "keeps the gateway resident in the background); use --headless to run the gateway in "
+            "the foreground, or operate it with --start / --stop / --status / --restart."
         ),
     )
     parser.add_argument(

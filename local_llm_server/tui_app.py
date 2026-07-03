@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import threading
 
 from rich.text import Text
 from textual import work
@@ -23,7 +24,9 @@ from .server import (
     gateway_admin_status,
     gateway_log_path,
     gateway_set_max_resident,
+    is_ready,
     local_connect_host,
+    pid_looks_like_ours,
     primary_lan_ip,
     server_status,
     start_gateway_background,
@@ -110,6 +113,11 @@ class GatewayMonitor(App):
         Binding("q", "quit", "quit"),
     ]
 
+    # 起動時にコマンド入力欄へ自動フォーカスしない。フォーカスされた Input は印字キーを
+    # 消費するため、上の単キーショートカット（s/r/g/m/l/q）が一切効かなくなってしまう。
+    # コマンドを打つときは入力欄をクリック（または m キーでプリフィル）する。
+    AUTO_FOCUS = None
+
     def __init__(self, gcfg):
         super().__init__()
         self.gcfg = gcfg
@@ -125,6 +133,7 @@ class GatewayMonitor(App):
             if lan:
                 self.reachable_url = f"http://{lan}:{self.port}/v1"
         self.admin = None
+        self._gw_ready = False  # ポーリングワーカーが判定した稼働状態（UI スレッドで HTTP しない）
         self.busy = ""
         self._row_models: list[str] = []  # 表の表示順モデル ID（行クリック→コピー用）
 
@@ -178,14 +187,18 @@ class GatewayMonitor(App):
     @work(thread=True, exclusive=True, group="poll")
     def poll(self) -> None:
         admin = gateway_admin_status(self.host, self.port)
-        self.call_from_thread(self._apply, admin)
+        # /admin/status が取れなくても、応答だけはある（起動直後等）ならフォールバックで確認。
+        # HTTP はすべてこのワーカースレッドで行う（UI スレッドを固めない）。
+        ready = admin is not None or is_ready(f"http://{self.host}:{self.port}/v1")
+        self.call_from_thread(self._apply, admin, ready)
 
-    def _apply(self, admin) -> None:
+    def _apply(self, admin, ready: bool | None = None) -> None:
         self.admin = admin
+        self._gw_ready = bool(admin) if ready is None else ready
         self._render()
 
     def _render(self) -> None:
-        view = merge_status(self.gcfg, self.admin)
+        view = merge_status(self.gcfg, self.admin, ready=self._gw_ready)
 
         st = Text()
         if self.busy:
@@ -253,15 +266,30 @@ class GatewayMonitor(App):
         self.call_from_thread(self._render)
         try:
             fn()
+        except (RuntimeError, TimeoutError, OSError) as exc:
+            # 起動失敗（ポート占有・タイムアウト等）はアプリを落とさず通知する
+            # （@work のワーカー例外は既定でアプリ全体をクラッシュさせるため必ず捕まえる）。
+            self.call_from_thread(
+                self.notify, f"{label.strip('…')} に失敗しました: {exc}",
+                severity="error", timeout=8,
+            )
         finally:
             self.busy = ""
             admin = gateway_admin_status(self.host, self.port)
-            self.call_from_thread(self._apply, admin)
+            ready = admin is not None or is_ready(f"http://{self.host}:{self.port}/v1")
+            self.call_from_thread(self._apply, admin, ready)
 
     def _kill_ports(self) -> None:
-        for p in self.all_ports:
-            for pid in find_pids_on_port(p):
-                stop_pid(pid)
+        # このパッケージ由来に見えるプロセスだけ止める（同じポート番号をたまたま使っている
+        # 無関係なプロセスを巻き添えにしない）。stop_pid は 1 件あたり最長 ~10s 待つので、
+        # 並列に止めて合計時間を抑える（q 終了時は同期実行のため体感に直結する）。
+        pids = {pid for p in self.all_ports for pid in find_pids_on_port(p)}
+        pids = [pid for pid in pids if pid_looks_like_ours(pid)]
+        threads = [threading.Thread(target=stop_pid, args=(pid,)) for pid in pids]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
 
     def action_start(self) -> None:
         self._run("starting…", lambda: start_gateway_background(os.getcwd(), self.host, self.port))
@@ -372,9 +400,14 @@ class GatewayMonitor(App):
         if head.lower() in ("max", "m") and tail.strip():
             self._set_max_resident(tail)
             return
-        {
+        handler = {
             "s": self.action_stop, "stop": self.action_stop,
             "r": self.action_restart, "restart": self.action_restart,
             "g": self.action_start, "start": self.action_start,
             "l": self.action_log, "log": self.action_log,
-        }.get(cmd, lambda: None)()
+        }.get(cmd)
+        if handler is None:
+            if raw:  # 空 Enter は無視。タイプミス等は黙殺せず知らせる
+                self.notify(f"不明なコマンドです: '{raw}'", severity="warning", timeout=4)
+            return
+        handler()

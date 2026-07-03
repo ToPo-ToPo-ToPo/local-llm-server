@@ -164,6 +164,28 @@ def _find_pids_netstat(port: int) -> list[int]:
     return pids
 
 
+# このパッケージが起動するプロセスのコマンドラインに現れる目印。--stop / TUI の終了処理が
+# 「ポートを LISTEN しているだけの無関係なプロセス」を巻き添えにしないための判定に使う。
+_OUR_CMD_MARKERS = (
+    "local_llm_server", "local-llm-server", "llama-server", "mlx_lm", "mlx_vlm",
+)
+
+
+def pid_looks_like_ours(pid: int) -> bool:
+    """PID がこのパッケージ由来（ゲートウェイ / モデルサーバー）のプロセスに見えるか。
+
+    ポート番号だけを頼りに stop すると、たまたま同じポートで動いている別プロジェクトの
+    サーバーを殺してしまう。コマンドラインに目印が含まれるものだけ「ours」と判定する。
+    判定不能（プロセス消滅・権限なし・psutil 不在）は False（手を出さない）。
+    """
+    try:
+        import psutil
+        cmd = " ".join(psutil.Process(pid).cmdline())
+    except Exception:  # noqa: BLE001 - 判定できないものは殺さない側に倒す
+        return False
+    return any(m in cmd for m in _OUR_CMD_MARKERS)
+
+
 def stop_pid(pid: int, timeout: float = 10.0) -> bool:
     """PID（とその子/プロセスグループ）を停止する（macOS / Linux / Windows）。
 
@@ -726,10 +748,17 @@ def build_command(config: ServerConfig) -> list[str]:
 
 
 def is_ready(base_url: str, timeout: float = 1.0) -> bool:
-    """OpenAI互換サーバーが応答可能かを判定する。"""
+    """OpenAI互換サーバーが応答可能かを判定する。
+
+    401/403 も「起動して応答している」と判定する（api_key を設定したゲートウェイは
+    /v1/models にキーを要求するため。ここで False にすると --start / --status / TUI の
+    自己ヘルスチェックが、正常起動したゲートウェイを「応答なし」と誤判定してしまう）。
+    """
     try:
         with urllib.request.urlopen(f"{base_url}/models", timeout=timeout) as resp:
             return resp.status == 200
+    except urllib.error.HTTPError as exc:
+        return exc.code in (401, 403)  # 認証は要求されたが、サーバー自体は稼働中
     except (urllib.error.URLError, OSError):
         return False
 
@@ -1114,8 +1143,18 @@ def start_gateway_background(
     """
     base_url = f"http://{host}:{port}/v1"
     existing = find_pids_on_port(port)
-    if is_ready(base_url) or existing:
+    if is_ready(base_url):
         return existing[0] if existing else 0
+    if existing:
+        # ポートは埋まっているのに応答しない。うちのプロセス（起動途中など）なら既存扱い、
+        # 無関係なプロセスなら「起動済み」と偽らず明示エラーにする（黙って成功を返すと
+        # ゲートウェイが一度も立たないまま全リクエストが失敗し続ける）。
+        if any(pid_looks_like_ours(p) for p in existing):
+            return existing[0]
+        raise RuntimeError(
+            f"port {port} is in use by an unrelated process (pid {existing}) that does not "
+            f"respond as a gateway; stop it or change `port` in gateway.toml"
+        )
 
     log_path = gateway_log_path(port)
     os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)

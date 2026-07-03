@@ -616,3 +616,40 @@ def test_discover_cached_models(monkeypatch, tmp_path):
     assert mtp["mlx-community/Qwen3.6-27B-4bit"] == "ready"
     assert mtp["mlx-community/gemma-4-E4B-it-qat-4bit"] == "available"
     assert mtp["unsloth/Foo-GGUF"] is None
+
+
+# --- is_ready: 認証ゲート越しのヘルスチェック --------------------------------
+
+def test_is_ready_treats_auth_gated_as_up():
+    """api_key 付きゲートウェイ（/v1/models が 401）も「稼働中」と判定する。
+
+    ここで False になると、--start / --status / TUI の自己ヘルスチェックが
+    正常起動したゲートウェイを「応答なし」と誤判定してしまう（回帰防止）。
+    """
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class _AuthGated(BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = b'{"error": "missing or invalid API key"}'
+            self.send_response(401)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_a):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _AuthGated)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        assert srv.is_ready(f"http://127.0.0.1:{server.server_address[1]}/v1") is True
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_is_ready_false_when_down():
+    # 誰も LISTEN していないポートは従来どおり False。
+    assert srv.is_ready("http://127.0.0.1:9/v1", timeout=0.3) is False

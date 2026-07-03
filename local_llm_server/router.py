@@ -54,7 +54,14 @@ class _RouterHandler(BaseHTTPRequestHandler):
         self._proxy(self.server.text_addr, body=b"")  # type: ignore[attr-defined]
 
     def do_POST(self) -> None:
-        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            self._error(400, "invalid Content-Length header")
+            return
+        if length < 0:
+            self._error(400, "invalid Content-Length header")
+            return
         body = self.rfile.read(length) if length else b""
         target = self._select_target(body)
         self._proxy(target, body)
@@ -95,7 +102,9 @@ class _RouterHandler(BaseHTTPRequestHandler):
                 self.send_header("Content-Type", ctype)
             self.end_headers()
             while True:
-                chunk = resp.read(8192)
+                # read1: ソケットに届いた分だけ即返す（read(8192) は 8192 バイト溜まる
+                # までブロックし、SSE のトークン逐次配信が全バッファリングされてしまう）。
+                chunk = resp.read1(8192)
                 if not chunk:
                     break
                 self.wfile.write(chunk)
