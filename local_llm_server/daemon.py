@@ -26,11 +26,13 @@ http://127.0.0.1:8799/v1）を 1 つだけ立て、受信した `/v1/chat/comple
 """
 from __future__ import annotations
 
+import hmac
 import json
 import sys
 import threading
 import time
-from dataclasses import dataclass, field
+import urllib.parse
+from dataclasses import dataclass, field, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .proxy import forward, send_error, send_json
@@ -46,6 +48,7 @@ from .server import (
     ignore_shutdown_signals,
     infer_backend,
     parallel_supported,
+    primary_lan_ip,
     resolve_drafter,
 )
 
@@ -79,17 +82,35 @@ class CapacityError(RuntimeError):
 
 
 @dataclass
-class _Model:
-    """ゲートウェイが管理する 1 モデルの状態。"""
+class _Instance:
+    """1 モデルの 1 起動インスタンス（独立プロセス・独立ポート）。
 
-    config: ServerConfig  # host/port は内部用に割当済み
+    同一モデルへリクエストが集中したとき、負荷ベースでこのインスタンスを複数起動して
+    並列化する（→ ModelManager.acquire）。各インスタンスは自前の inflight（処理中数）と
+    last_used（LRU 基準）を持ち、LRU 退避・idle 解放はインスタンス単位で行う。
+    """
+
+    config: ServerConfig  # このインスタンス専用の host/port（同一モデルでもポートは別）
     server: LocalServer | None = None
     ready: bool = False
-    inflight: int = 0  # 処理中リクエスト数（>0 の間は退避しない）
+    inflight: int = 0  # このインスタンスの処理中リクエスト数（>0 の間は退避しない）
     last_used: float = 0.0  # time.monotonic()。LRU の基準
-    requests: int = 0  # このモデルに振り分けた累計リクエスト数（表示用）
-    dynamic: bool = False  # 未登録モデルを動的登録したもの（アンロード時に登録ごと消す）
-    footprint: int | None = None  # 概算占有メモリ（バイト）のキャッシュ。0=見積もり不能
+
+
+@dataclass
+class _Model:
+    """1 model_id の共通設定と、その起動インスタンス群。
+
+    instances は現在起動中（ready）のインスタンス。0 個ならモデルは未ロード。負荷に応じて
+    max_resident とメモリの範囲で複製・退避され増減する。requests は表示用の累計で、
+    インスタンスが退避されても失われないようモデル側に持つ。
+    """
+
+    config: ServerConfig  # テンプレート（backend/parallel/draft 等）。単一運用時の既定ポートも保持
+    instances: list[_Instance] = field(default_factory=list)
+    requests: int = 0  # このモデルに振り分けた累計リクエスト数（表示用。退避で消えない）
+    dynamic: bool = False  # 未登録モデルを動的登録したもの（全インスタンス消滅時に登録ごと消す）
+    footprint: int | None = None  # 1 インスタンスの概算占有メモリ（バイト）。0=見積もり不能
 
 
 @dataclass
@@ -124,6 +145,7 @@ class ModelManager:
         max_resident: int | None = None,
         load_timeout: float | None = None,
         *,
+        start_timeout: float = 120.0,
         dynamic: bool = False,
         default_disable_thinking: bool = False,
         default_draft: str | None = None,
@@ -135,6 +157,7 @@ class ModelManager:
         self._models: dict[str, _Model] = {c.model: _Model(config=c) for c in configs}
         self._max_resident = max_resident
         self._load_timeout = load_timeout   # 枠が空くのを待つ最大秒数（None で無期限）
+        self._start_timeout = start_timeout  # 1 インスタンスの起動完了（ready）を待つ最大秒数
         self._started = time.monotonic()    # 起動経過時間（uptime 表示用）の基準
         # 未登録モデルの動的ロード（IDからバックエンド推論。ロード時に表示へ追加・アンロードで消す）。
         self._dynamic = dynamic
@@ -164,10 +187,23 @@ class ModelManager:
         # 即アンロードする判定に使う。_state ロック下で操作する。
         self._sessions: dict[str, _Session] = {}
         self._model_sessions: dict[str, set[str]] = {}
+        # 同一モデルの複製インスタンスを裏で起動中の model_id 集合（多重起動を防ぐ）。
+        self._spawning: set[str] = set()
+        # shutdown 済みフラグと、起動処理中（start〜instances 登録前）のサーバー集合。
+        # shutdown はこの集合も止めることで、「ロード中に Ctrl+C → 起動しかけの巨大モデルが
+        # 孤児プロセスとしてメモリとポートを掴んだまま残る」のを防ぐ。_state ロック下で操作する。
+        self._closing = False
+        self._starting: set[LocalServer] = set()
 
     def _alloc_port_locked(self) -> int:
-        """動的モデルに内部ポートを割り当てる（state ロック保持下で呼ぶ）。"""
+        """内部ポートを1つ払い出す（state ロック保持下で呼ぶ）。
+
+        各モデルの既定ポート・起動中の全インスタンスのポート・公開ポートを避けて連番で割り当てる。
+        動的モデルの初回インスタンスにも、複製インスタンスにも使う。
+        """
         used = {m.config.port for m in self._models.values()}
+        for m in self._models.values():
+            used.update(i.config.port for i in m.instances)
         if self._public_port is not None:
             used.add(self._public_port)
         p = self._next_port
@@ -224,63 +260,261 @@ class ModelManager:
     def model_ids(self) -> list[str]:
         return list(self._models)
 
-    def acquire(self, model_id: str) -> tuple[tuple[str, int], _Model]:
-        """model_id のサーバーを（必要なら起動して）確保し、(内部アドレス, ハンドル) を返す。
+    def _capacity(self, config: ServerConfig) -> int:
+        """1 インスタンスが同時に捌けるリクエスト数。llama-cpp は parallel スロット、他は 1。
 
-        呼び出し側は転送後に必ず release(ハンドル) すること（inflight を戻すため）。
-        未登録モデルは、dynamic 有効なら ID からバックエンドを推論して動的にロードする
-        （無効なら KeyError）。起動失敗は RuntimeError/TimeoutError、空き枠が `load_timeout`
-        内に得られなければ CapacityError（→ 503）を投げる。
+        この本数に達したインスタンスを「満杯」とみなし、負荷ベースで複製インスタンスを増やす
+        判断に使う（mlx 系は 1 なので、2 本目の同時リクエストで複製が検討される。llama-cpp は
+        まずプロセス内の parallel スロットを使い切ってから複製する）。
         """
-        # 高速パス: 既にロード済みなら state ロックのみ。
+        if parallel_supported(config.backend) and config.parallel:
+            return int(config.parallel)
+        return 1
+
+    def _route_locked(self, inst: _Instance) -> tuple[str, int]:
+        """インスタンス inst にリクエストを1つ割り当てる（_state 保持下で呼ぶ）。"""
+        inst.inflight += 1
+        inst.last_used = time.monotonic()
+        return (inst.config.host, inst.config.port)
+
+    def _running_instances_locked(self) -> list[tuple[_Model, _Instance]]:
+        """起動中（server がある）の (model, instance) を全モデル横断で列挙（_state 保持下）。"""
+        return [
+            (m, i)
+            for m in self._models.values()
+            for i in m.instances
+            if i.server is not None
+        ]
+
+    def _port_in_use_locked(self, port: int) -> bool:
+        """port を現在いずれかの起動中インスタンスが使っているか（_state 保持下）。"""
+        return any(
+            i.config.port == port
+            for m in self._models.values()
+            for i in m.instances
+            if i.server is not None
+        )
+
+    def _make_instance_config_locked(self, mm: _Model) -> ServerConfig:
+        """mm の新規インスタンス用に、専用ポートを与えた ServerConfig を作る（_state 保持下）。
+
+        既定ポート（mm.config.port）が空いていれば単一運用の予測性のためそれを使い、既に別
+        インスタンスが使っていれば連番で新ポートを払い出す（複製インスタンス用）。
+        """
+        base = mm.config.port
+        port = base if not self._port_in_use_locked(base) else self._alloc_port_locked()
+        return replace(mm.config, port=port)
+
+    def acquire(self, model_id: str) -> tuple[tuple[str, int], _Instance]:
+        """model_id のインスタンスを（必要なら起動して）確保し、(内部アドレス, ハンドル) を返す。
+
+        呼び出し側は転送後に必ず release(ハンドル) すること（inflight を戻すため）。ready な
+        インスタンスが複数あれば**最も空いているもの**へ振り分ける。最も空いているものすら満杯
+        （inflight >= capacity）だった＝リクエストが競合しているときは、max_resident とメモリの
+        範囲で**バックグラウンドで複製インスタンスを1つ増やす**（現在のリクエストは待たせず、その
+        まま最少負荷のインスタンスへ転送する）。
+        未登録モデルは、dynamic 有効なら ID からバックエンドを推論して初回インスタンスを起動する
+        （無効なら KeyError）。起動失敗は RuntimeError/TimeoutError、初回起動の空き枠が
+        `load_timeout` 内に得られなければ CapacityError（→ 503）を投げる。
+        """
+        # 高速パス: ready なインスタンスがあれば、最も空いているものへ割り当てる（state のみ）。
+        spawn = False
         with self._state:
             mm = self._models.get(model_id)
-            if mm is not None and mm.ready and mm.server is not None:
-                mm.inflight += 1
+            ready = (
+                [i for i in mm.instances if i.ready and i.server is not None] if mm else []
+            )
+            if ready:
+                inst = min(ready, key=lambda i: i.inflight)
+                # 「最少負荷のインスタンスすら満杯」なら競合中 → 複製を検討（割当は前の値で判定）。
+                spawn = inst.inflight >= self._capacity(mm.config)
+                addr = self._route_locked(inst)
                 mm.requests += 1
-                mm.last_used = time.monotonic()
-                return (mm.config.host, mm.config.port), mm
-        # 低速パス: ロード（または動的登録）が要る。control で直列化する。
+        if ready:
+            if spawn:
+                self._maybe_spawn_replica_async(model_id)
+            return addr, inst
+        # 低速パス: ready インスタンスが1つも無い → 初回インスタンスを起動（control で直列化）。
         with self._control:
             with self._state:
+                if self._closing:
+                    raise RuntimeError("gateway is shutting down")
                 mm = self._models.get(model_id)
                 if mm is None:
                     if not self._dynamic:
                         raise KeyError(model_id)
                     mm = self._register_dynamic_locked(model_id)
-                elif mm.ready and mm.server is not None:  # 待つ間に他スレッドがロード済み
-                    mm.inflight += 1
-                    mm.requests += 1
-                    mm.last_used = time.monotonic()
-                    return (mm.config.host, mm.config.port), mm
-            self._evict_if_needed(keep=model_id)
-            server = LocalServer(mm.config, log_path=daemon_log_path(mm.config.port))
+                else:
+                    ready = [i for i in mm.instances if i.ready and i.server is not None]
+                    if ready:  # 待つ間に他スレッドが用意した
+                        inst = min(ready, key=lambda i: i.inflight)
+                        addr = self._route_locked(inst)
+                        mm.requests += 1
+                        return addr, inst
+            try:
+                self._evict_if_needed(keep=model_id)
+            except Exception:
+                # 枠・メモリ不足（CapacityError 等）で起動を諦めたとき、動的登録だけが
+                # 幽霊としてカタログに残らないよう取り消す（起動失敗パスと同じ扱い）。
+                if mm.dynamic:
+                    with self._state:
+                        if not mm.instances:
+                            self._models.pop(model_id, None)
+                raise
+            with self._state:
+                cfg = self._make_instance_config_locked(mm)
+            inst = _Instance(config=cfg)
+            server = LocalServer(cfg, log_path=daemon_log_path(cfg.port))
+            with self._state:
+                if self._closing:
+                    raise RuntimeError("gateway is shutting down")
+                self._starting.add(server)  # shutdown が起動途中のサーバーも止められるように
             try:
                 server.start()
-                server.wait_until_ready()
+                server.wait_until_ready(timeout=self._start_timeout)
             except (RuntimeError, TimeoutError, ValueError):
                 # ValueError は build_command の解決失敗（未キャッシュの repo-id 等）。
                 server.stop()
-                # 動的登録の起動失敗は登録ごと取り消す（誤った model 名を残さない）。
+                with self._state:
+                    self._starting.discard(server)
+                # 動的登録の初回起動失敗は、他に生きたインスタンスが無ければ登録ごと取り消す。
                 if mm.dynamic:
                     with self._state:
-                        self._models.pop(model_id, None)
+                        if not mm.instances:
+                            self._models.pop(model_id, None)
                 raise
             with self._state:
-                mm.server = server
-                mm.ready = True
-                mm.inflight += 1
+                self._starting.discard(server)
+                if self._closing:  # 起動完了と同時に shutdown が走った → 登録せず止める
+                    threading.Thread(target=server.stop, daemon=True).start()
+                    raise RuntimeError("gateway is shutting down")
+                inst.server = server
+                inst.ready = True
+                addr = self._route_locked(inst)
                 mm.requests += 1
-                mm.last_used = time.monotonic()
-            return (mm.config.host, mm.config.port), mm
+                mm.instances.append(inst)
+            return addr, inst
 
-    def release(self, mm: _Model) -> None:
+    def release(self, inst: _Instance) -> None:
         with self._state:
-            if mm.inflight > 0:
-                mm.inflight -= 1
-                if mm.inflight == 0:
+            if inst.inflight > 0:
+                inst.inflight -= 1
+                if inst.inflight == 0:
                     # 枠が空いた可能性。_evict_if_needed で待っているスレッドを起こす。
                     self._state.notify_all()
+
+    def _maybe_spawn_replica_async(self, model_id: str) -> None:
+        """満杯モデルの複製インスタンスを1つ、バックグラウンドで起動する（多重起動を防ぐ）。
+
+        既に同モデルの複製を起動中なら何もしない（1 モデルにつき同時 1 本だけウォームアップ）。
+        HTTP 応答を待たせないよう別スレッドで行う。
+        """
+        with self._state:
+            if model_id in self._spawning:
+                return
+            self._spawning.add(model_id)
+        threading.Thread(
+            target=self._spawn_replica, args=(model_id,), daemon=True
+        ).start()
+
+    def _spawn_replica(self, model_id: str) -> None:
+        """複製インスタンスを1つ起動する。枠が取れない/もう満杯でなければ黙って諦める。
+
+        現在のリクエストは既に別インスタンスへ流れているので、これは将来の負荷に備えた
+        best-effort なウォームアップ。枠確保は**非ブロッキング**（処理中のインスタンスは止めず、
+        退避できるアイドルが無ければ複製しない）。起動失敗も本流に影響させない。
+        """
+        try:
+            with self._control:
+                with self._state:
+                    mm = self._models.get(model_id)
+                    if mm is None:
+                        return
+                    ready = [i for i in mm.instances if i.ready and i.server is not None]
+                    cap = self._capacity(mm.config)
+                    # 起動判断の時点で空きができた／満杯でなくなっていたら複製不要。
+                    if not ready or any(i.inflight < cap for i in ready):
+                        return
+                if not self._make_room_for_replica(keep=model_id):
+                    return  # 上限・メモリで枠が取れない（アイドル退避もできない）→ 複製しない
+                with self._state:
+                    mm = self._models.get(model_id)
+                    if mm is None or self._closing:
+                        return
+                    cfg = self._make_instance_config_locked(mm)
+                inst = _Instance(config=cfg)
+                server = LocalServer(cfg, log_path=daemon_log_path(cfg.port))
+                with self._state:
+                    if self._closing:
+                        return
+                    self._starting.add(server)  # shutdown が起動途中の複製も止められるように
+                try:
+                    server.start()
+                    server.wait_until_ready(timeout=self._start_timeout)
+                except (RuntimeError, TimeoutError, ValueError):
+                    server.stop()
+                    with self._state:
+                        self._starting.discard(server)
+                    return
+                with self._state:
+                    self._starting.discard(server)
+                    mm = self._models.get(model_id)
+                    if mm is None or self._closing:  # 起動中にモデルが消えた/終了中 → 止める
+                        threading.Thread(target=server.stop, daemon=True).start()
+                        return
+                    inst.server = server
+                    inst.ready = True
+                    inst.last_used = time.monotonic()
+                    mm.instances.append(inst)
+                    self._state.notify_all()
+        finally:
+            with self._state:
+                self._spawning.discard(model_id)
+
+    def _make_room_for_replica(self, keep: str) -> bool:
+        """複製用に枠を確保する（非ブロッキング）。確保できたら True（control 保持下で呼ぶ）。
+
+        上限・メモリに余裕があればそのまま True。超過していても、アイドルなインスタンス
+        （keep 以外・処理中でない）を LRU 退避して空けられれば True。処理中しか無く空けられない
+        なら False（複製を諦める＝busy は止めない）。_evict_if_needed と違い**待たない**。
+
+        max_resident もメモリ上限（max_memory_fraction）も無い構成では**複製しない**（False）。
+        際限なく重みのコピーが増えて OOM する事故を防ぐため、負荷ベースの並列化を使うには
+        どちらかで総量の範囲を決めることを要求する。
+        """
+        budget = self._mem_budget()
+        if self._max_resident is None and budget is None:
+            return False
+        while True:
+            victim_srv = None
+            victim_model = None
+            with self._state:
+                running = self._running_instances_locked()
+                resident = len(running)
+                over_count = (
+                    self._max_resident is not None and resident >= self._max_resident
+                )
+                over_mem = False
+                if budget is not None:
+                    keep_mm = self._models.get(keep)
+                    need = self._footprint_locked(keep_mm) if keep_mm else 0
+                    used = sum(self._footprint_locked(m) for (m, _i) in running)
+                    over_mem = (used + need) > budget
+                if not over_count and not over_mem:
+                    return True
+                candidates = [
+                    (m, i) for (m, i) in running
+                    if i.ready and i.inflight == 0 and m.config.model != keep
+                ]
+                if not candidates:
+                    return False  # 退避できるアイドルが無い → 複製しない
+                victim_model, victim_inst = min(candidates, key=lambda mi: mi[1].last_used)
+                victim_srv = victim_inst.server
+                victim_model.instances.remove(victim_inst)
+            victim_srv.stop()  # state ロックの外で（最長 ~10s）
+            if victim_model.dynamic and not victim_model.instances:
+                with self._state:
+                    self._models.pop(victim_model.config.model, None)
 
     def _footprint_locked(self, mm: _Model) -> int:
         """モデルの概算占有メモリ（バイト）。一度計算したらキャッシュする。0=見積もり不能。"""
@@ -313,11 +547,12 @@ class ModelManager:
         )
         while True:
             victim_srv = None
-            victim_id = None
-            victim_dynamic = False
+            victim_model = None
             with self._state:
-                resident_models = [m for m in self._models.values() if m.server is not None]
-                resident = len(resident_models)
+                if self._closing:
+                    raise CapacityError("gateway is shutting down")
+                running = self._running_instances_locked()
+                resident = len(running)
                 over_count = (
                     self._max_resident is not None and resident >= self._max_resident
                 )
@@ -325,23 +560,20 @@ class ModelManager:
                 if budget is not None:
                     keep_mm = self._models.get(keep)
                     need = self._footprint_locked(keep_mm) if keep_mm else 0
-                    used = sum(self._footprint_locked(m) for m in resident_models)
+                    used = sum(self._footprint_locked(m) for (m, _i) in running)
                     over_mem = (used + need) > budget
                 if not over_count and not over_mem:
                     return
                 candidates = [
-                    m for m in resident_models
-                    if m.ready and m.inflight == 0 and m.config.model != keep
+                    (m, i) for (m, i) in running
+                    if i.ready and i.inflight == 0 and m.config.model != keep
                 ]
                 if candidates:
-                    victim = min(candidates, key=lambda m: m.last_used)
-                    victim_srv = victim.server
-                    victim_id = victim.config.model
-                    victim_dynamic = victim.dynamic
-                    victim.server = None
-                    victim.ready = False
+                    victim_model, victim_inst = min(candidates, key=lambda mi: mi[1].last_used)
+                    victim_srv = victim_inst.server
+                    victim_model.instances.remove(victim_inst)
                 elif over_mem and resident == 0:
-                    # 退避できる常駐モデルが無く、keep 単体で予算超過 → 待っても無駄。
+                    # 退避できる常駐インスタンスが無く、keep 単体で予算超過 → 待っても無駄。
                     raise CapacityError(
                         f"model '{keep}' needs ~{need / 1e9:.1f}GB but the memory budget is "
                         f"{budget / 1e9:.1f}GB (max_memory_fraction={self._mem_fraction:g} of "
@@ -352,7 +584,7 @@ class ModelManager:
                     remaining = None if deadline is None else deadline - time.monotonic()
                     if remaining is not None and remaining <= 0:
                         why = "memory budget exceeded" if over_mem else (
-                            f"all {self._max_resident} model slot(s) busy"
+                            f"all {self._max_resident} instance slot(s) busy"
                         )
                         raise CapacityError(
                             f"{why}; could not free room within {self._load_timeout:g}s"
@@ -361,9 +593,53 @@ class ModelManager:
                     continue  # 起きたら再判定
             if victim_srv is not None:
                 victim_srv.stop()  # state ロックの外で（最長 ~10s）。停止後にループ再確認。
-                if victim_dynamic:  # 動的モデルは登録ごと消す（表示から外す）
+                if victim_model.dynamic and not victim_model.instances:  # 空なら登録ごと消す
                     with self._state:
-                        self._models.pop(victim_id, None)
+                        self._models.pop(victim_model.config.model, None)
+
+    def set_max_resident(self, value: int | None) -> None:
+        """常駐上限（max_resident）を実行中に変更する。処理中（busy）のモデルは止めない。
+
+        value は 1 以上の整数、または None（無制限）。上限を上げる／無制限にするときは、
+        枠が空くのを待って止まっていたロードを起こすだけ。下げるときは、超過している常駐
+        モデルをアイドルなものから LRU で **非同期に** 退避する（inflight>0 のモデルには
+        一切触れないので、生成中のリクエストは止まらない）。退避しきれなかった超過分は、
+        次の release/acquire もしくは idle_timeout で片付く。
+        """
+        with self._state:
+            self._max_resident = value
+            # 枠が広がった可能性 → _evict_if_needed で待っているロードを起こす。
+            self._state.notify_all()
+        if value is not None:
+            # 縮小時の超過分を裏で片付ける（busy は残すので HTTP 応答を待たせない）。
+            threading.Thread(target=self._trim_to_limit, daemon=True).start()
+
+    def _trim_to_limit(self) -> None:
+        """現在の max_resident を超える常駐モデルを、アイドルなものから LRU で退避する。
+
+        処理中（inflight>0）のモデルには一切触れない（＝更新で稼働中の生成を止めない）。
+        上限内に収まるか、退避できるアイドルモデルが尽きたら終わる。control を握って起動
+        （slow path）／idle 退避と直列化し、stop 自体（最長 ~10s）は state ロックの外で行う。
+        """
+        with self._control:
+            while True:
+                with self._state:
+                    limit = self._max_resident
+                    if limit is None:
+                        return
+                    running = self._running_instances_locked()
+                    if len(running) <= limit:
+                        return
+                    idle = [(m, i) for (m, i) in running if i.ready and i.inflight == 0]
+                    if not idle:
+                        return  # 残りは全て処理中 → 止めない（後で片付く）
+                    victim_model, victim_inst = min(idle, key=lambda mi: mi[1].last_used)
+                    victim_srv = victim_inst.server
+                    victim_model.instances.remove(victim_inst)
+                victim_srv.stop()  # state ロックの外で（最長 ~10s）
+                if victim_model.dynamic and not victim_model.instances:  # 空なら登録ごと消す
+                    with self._state:
+                        self._models.pop(victim_model.config.model, None)
 
     def evict_idle(self, timeout: float) -> int:
         """最終利用から `timeout` 秒を超えて使われていないモデルを停止する（idle TTL）。
@@ -379,18 +655,19 @@ class ModelManager:
             with self._state:
                 victims = []
                 for m in self._models.values():
-                    if (
-                        m.server is not None and m.ready and m.inflight == 0
-                        and (now - m.last_used) > timeout
-                    ):
-                        victims.append((m.server, m.config.model, m.dynamic))
-                        m.server = None
-                        m.ready = False
-            for srv, mid, dyn in victims:
+                    for i in list(m.instances):
+                        if (
+                            i.server is not None and i.ready and i.inflight == 0
+                            and (now - i.last_used) > timeout
+                        ):
+                            victims.append((m, i.server))
+                            m.instances.remove(i)
+            for _m, srv in victims:
                 srv.stop()  # state ロックの外で（最長 ~10s かかるため）
-                if dyn:  # 動的モデルは登録ごと消す（表示から外す）
-                    with self._state:
-                        self._models.pop(mid, None)
+            with self._state:
+                for m, _srv in victims:  # 全インスタンスが消えた動的モデルは登録ごと消す
+                    if m.dynamic and not m.instances:
+                        self._models.pop(m.config.model, None)
         return len(victims)
 
     # --- エージェント在席（セッション）管理 -----------------------------------
@@ -476,19 +753,23 @@ class ModelManager:
         with self._control:
             with self._state:
                 mm = self._models.get(model_id)
-                if mm is None or mm.server is None or mm.inflight > 0:
+                if mm is None or not mm.instances:
                     return False
+                if any(i.inflight > 0 for i in mm.instances):
+                    return False  # まだ処理中のインスタンスがある → 残す
                 if self._model_sessions.get(model_id):
                     return False  # 解放手前で誰かが再登録した → 残す
-                srv = mm.server
+                victims = [i.server for i in mm.instances if i.server is not None]
+                mm.instances.clear()  # このモデルの全インスタンスを解放する
                 dyn = mm.dynamic
-                mm.server = None
-                mm.ready = False
-            srv.stop()  # state ロックの外で（最長 ~10s）
-            if dyn:  # 動的モデルは登録ごと消す（表示から外す）
+            for srv in victims:
+                srv.stop()  # state ロックの外で（最長 ~10s）
+            if dyn:  # 全インスタンスを落とした動的モデルは登録ごと消す（表示から外す）
                 with self._state:
-                    self._models.pop(model_id, None)
-        return True
+                    mm2 = self._models.get(model_id)
+                    if mm2 is not None and not mm2.instances and not self._model_sessions.get(model_id):
+                        self._models.pop(model_id, None)
+        return bool(victims)
 
     def reap_sessions(self, ttl: float) -> int:
         """ハートビートが ttl 秒途絶えた在席を掃除する（異常終了したエージェント対策）。
@@ -529,16 +810,23 @@ class ModelManager:
         with self._state:
             out = []
             for m in self._models.values():
-                loaded = m.server is not None and m.ready
+                ready = [i for i in m.instances if i.server is not None and i.ready]
+                loaded = bool(ready)
+                inflight = sum(i.inflight for i in ready)
                 # アイドル経過は「ロード済みかつ処理中でない」ときだけ意味がある
-                # （idle_timeout までの残り表示に使う）。それ以外は None。
-                idle_for = round(now - m.last_used, 1) if (loaded and m.inflight == 0) else None
+                # （idle_timeout までの残り表示に使う）。最後に使ったインスタンス基準。それ以外は None。
+                idle_for = (
+                    round(now - max(i.last_used for i in ready), 1)
+                    if (loaded and inflight == 0) else None
+                )
                 out.append({
                     "model": m.config.model,
                     "backend": m.config.backend,
-                    "port": m.config.port,
+                    "port": ready[0].config.port if ready else m.config.port,
                     "loaded": loaded,
-                    "inflight": m.inflight,
+                    # 起動中インスタンス数（負荷ベースの複製で >1 になる。並列度の目安）。
+                    "instances": len(ready),
+                    "inflight": inflight,
                     "requests": m.requests,
                     "idle_for": idle_for,
                     # このモデルに在席宣言しているエージェント数（0 で即アンロード対象）。
@@ -547,17 +835,22 @@ class ModelManager:
             return out
 
     def shutdown(self) -> None:
-        """全モデルサーバーを並列に停止する（ゲートウェイ終了時）。
+        """全モデルサーバー（全インスタンス）を並列に停止する（ゲートウェイ終了時）。
 
         並列にするのは、外部 `--stop`（SIGTERM→10s→SIGKILL）の猶予内に収めるため。
+        起動途中（_starting）のサーバーも止める（ロード中の Ctrl+C で巨大モデルの
+        プロセスが孤児として残らないように）。以降の起動は _closing で拒否する。
         """
         with self._state:
-            servers = []
+            self._closing = True
+            servers = list(self._starting)
             for m in self._models.values():
-                if m.server is not None:
-                    servers.append(m.server)
-                    m.server = None
-                    m.ready = False
+                for i in m.instances:
+                    if i.server is not None:
+                        servers.append(i.server)
+                m.instances.clear()
+            # _evict_if_needed で枠待ちしているロードを起こす（closing を見て中断させる）。
+            self._state.notify_all()
         threads = [threading.Thread(target=s.stop) for s in servers]
         for t in threads:
             t.start()
@@ -582,12 +875,17 @@ class GatewayServer(ThreadingHTTPServer):
         idle_timeout: float | None = None,
         load_timeout: float | None = None,
         session_ttl: float | None = None,
+        api_key: str | None = None,
     ) -> None:
         super().__init__(addr, _GatewayHandler)
         self.manager = manager
         self.catalog = catalog            # /v1/models で返すモデル一覧
         self.default_model = default_model
         self.timeout_s = timeout_s        # None なら無制限（長時間生成に備える）
+        # ネットワーク公開時の API キー（None/空 で認証なし）。chat（/v1/*）と在席セッション
+        # （/admin/sessions/*）に Authorization: Bearer <key> を要求する。/admin/status と
+        # /admin/config はループバック限定（キーではなく接続元で制限）。
+        self.api_key = api_key
         # GET /admin/status（TUI 等の監視用）で返すゲートウェイ設定。運用ポリシーを
         # 添えることで、常駐モデルのライブ状態と一緒に「上限/退避方針」も読み取れる。
         self.max_resident = max_resident
@@ -596,20 +894,93 @@ class GatewayServer(ThreadingHTTPServer):
         self.session_ttl = session_ttl
 
 
+# 受け付けるリクエストボディの上限（バイト）。vision の base64 画像を見込んでも十分大きく、
+# かつ「巨大 Content-Length を申告してメモリを食い潰す」DoS は防ぐ。
+_MAX_BODY_BYTES = 100 * 1024 * 1024
+
+
 class _GatewayHandler(BaseHTTPRequestHandler):
     server_version = "local-llm-gateway"
     # HTTP/1.0: 応答ボディは接続クローズ区切り（router と同じ）。
     protocol_version = "HTTP/1.0"
+    # リクエスト受信（ヘッダ・ボディ）のソケットタイムアウト。ネットワーク公開時に
+    # 「ヘッダを送り切らない接続」がハンドラスレッドを永久に塞がないようにする（Slowloris 対策）。
+    # 応答の書き出しは生成中ほぼブロックしないので、長時間生成の妨げにはならない。
+    timeout = 60
 
     def log_message(self, *_args) -> None:  # アクセスログは出さない
         pass
 
+    def _route_path(self) -> str:
+        """ルーティング用のパス（クエリ文字列を除き、末尾の '/' を落とす）。
+
+        `GET /v1/models?limit=10` のようにクエリが付いても正しくマッチさせる
+        （上流への転送には self.path をそのまま使う）。
+        """
+        return urllib.parse.urlsplit(self.path).path.rstrip("/")
+
+    def _read_body(self) -> bytes | None:
+        """Content-Length を検証して本文を読む。不正・過大は応答を返して None。"""
+        raw = self.headers.get("Content-Length") or "0"
+        try:
+            length = int(raw)
+        except ValueError:
+            send_error(self, 400, "invalid Content-Length header")
+            return None
+        if length < 0:
+            send_error(self, 400, "invalid Content-Length header")
+            return None
+        if length > _MAX_BODY_BYTES:
+            send_error(self, 413, f"request body too large (> {_MAX_BODY_BYTES} bytes)")
+            return None
+        return self.rfile.read(length) if length else b""
+
+    def _client_is_loopback(self) -> bool:
+        """接続元が同一マシン（ループバック、または bind 先そのもの）か。
+
+        特定 IP に bind した場合（host = "192.168.x.y"）、同一マシンの TUI/CLI も
+        その IP 経由で接続し、接続元アドレスは bind 先と同じになる（TCP のハンドシェイクを
+        通るため他マシンからは名乗れない）。それも「同一マシン」と扱わないと、管理系
+        エンドポイントが自分の TUI からも 403 になってしまう。
+        """
+        host = self.client_address[0]
+        if host in ("127.0.0.1", "::1", "::ffff:127.0.0.1") or host.startswith("127."):
+            return True
+        bind_host = self.server.server_address[0]
+        return bind_host not in ("0.0.0.0", "::", "") and host == bind_host
+
+    def _require_loopback(self) -> bool:
+        """管理系（状態・設定）はローカルからのみ許可。非ループバックなら 403 を返して False。"""
+        if self._client_is_loopback():
+            return True
+        send_error(self, 403, "this endpoint is restricted to localhost")
+        return False
+
+    def _require_api_key(self) -> bool:
+        """api_key が設定されていれば Authorization: Bearer <key> を要求する。
+
+        未設定なら誰でも可（True）。設定済みでキーが無い/一致しなければ 401 を返して False。
+        比較は hmac.compare_digest（タイミング安全）。
+        """
+        key = getattr(self.server, "api_key", None)
+        if not key:
+            return True  # 認証なし運用
+        auth = self.headers.get("Authorization", "")
+        token = auth[7:].strip() if auth.startswith("Bearer ") else ""
+        # bytes で比較する（str の compare_digest は非 ASCII で TypeError → 500 になる）。
+        if token and hmac.compare_digest(token.encode("utf-8"), key.encode("utf-8")):
+            return True
+        send_error(self, 401, "missing or invalid API key")
+        return False
+
     def do_GET(self) -> None:
-        path = self.path.rstrip("/")
+        path = self._route_path()
         srv = self.server  # type: ignore[assignment]
         # /v1/models は設定済みカタログを合成して返す（is_ready 判定・モデル取り違え
         # 警告に対応）。実モデルは起動していなくてもカタログとして列挙する。
         if path.endswith("/models"):
+            if not self._require_api_key():
+                return
             # 事前登録カタログ＋現在管理中（動的ロード分）を重複なく列挙する（標準どおり）。
             # DL 済みモデルの「発見一覧」は TUI 専用（/admin/status の available）に集約する。
             ids = list(dict.fromkeys(srv.catalog + srv.manager.model_ids))
@@ -622,6 +993,8 @@ class _GatewayHandler(BaseHTTPRequestHandler):
         # /admin/status は常駐モデルのライブ状態（loaded/inflight）＋運用ポリシーを返す。
         # TUI が CLI の --status より詳しい状態を出すための読み取り口。
         if path.endswith("/admin/status"):
+            if not self._require_loopback():
+                return
             host, port = srv.server_address[0], srv.server_address[1]
             models = srv.manager.status()
             data = {
@@ -644,17 +1017,33 @@ class _GatewayHandler(BaseHTTPRequestHandler):
         send_error(self, 404, f"GET {self.path} is not supported by the gateway")
 
     def do_POST(self) -> None:
-        length = int(self.headers.get("Content-Length") or 0)
-        body = self.rfile.read(length) if length else b""
         srv = self.server  # type: ignore[assignment]
+        path = self._route_path()
+        # 認可はボディを読む前に判定する（未認証のリモートに巨大ボディを読み込まされない）。
+        # 管理系（設定変更）はローカルからのみ。以降（在席セッション・chat 転送）は
+        # クライアント向けで、API キーが設定されていれば要求する。
+        if path.endswith("/admin/config"):
+            if not self._require_loopback():
+                return
+        elif not self._require_api_key():
+            return
+        body = self._read_body()
+        if body is None:
+            return
         try:
             payload = json.loads(body or b"{}")
         except (json.JSONDecodeError, ValueError):
             send_error(self, 400, "invalid JSON body")
             return
+        if not isinstance(payload, dict):
+            # [1] や "x" など dict 以外の JSON は .get で落ちる前に弾く（400 を返す）。
+            send_error(self, 400, "JSON body must be an object")
+            return
         # エージェント在席（セッション）管理エンドポイント。チャット転送とは別系統で、
         # 「使う人が居なくなったモデルを即アンロードする」ための登録/心拍/解除を受ける。
-        path = self.path.rstrip("/")
+        if path.endswith("/admin/config"):
+            self._handle_config_update(srv, payload)
+            return
         if path.endswith("/admin/sessions/register"):
             self._handle_session_register(srv, payload)
             return
@@ -667,6 +1056,14 @@ class _GatewayHandler(BaseHTTPRequestHandler):
         model = payload.get("model") or srv.default_model
         if not model:
             send_error(self, 400, "no 'model' in the request and no default_model is configured")
+            return
+        if not isinstance(model, str):
+            send_error(self, 400, "'model' must be a string")
+            return
+        # 動的ロードはローカルの任意パスも受け付ける（開発向け）。リモートのクライアントには
+        # 許さない（ファイルシステムの探索・存在確認オラクルにさせない）。
+        if model.startswith(("/", ".", "~", "\\")) and not self._client_is_loopback():
+            send_error(self, 400, "path-like model ids are not allowed from remote clients")
             return
         try:
             addr, handle = srv.manager.acquire(model)
@@ -691,18 +1088,56 @@ class _GatewayHandler(BaseHTTPRequestHandler):
 
     def do_DELETE(self) -> None:
         """DELETE /admin/sessions … エージェント停止時の解除（POST .../release と等価）。"""
-        path = self.path.rstrip("/")
+        path = self._route_path()
         if not path.endswith("/admin/sessions"):
             send_error(self, 404, f"DELETE {self.path} is not supported by the gateway")
             return
-        length = int(self.headers.get("Content-Length") or 0)
-        body = self.rfile.read(length) if length else b""
+        if not self._require_api_key():  # 認可はボディを読む前に判定する
+            return
+        body = self._read_body()
+        if body is None:
+            return
         try:
             payload = json.loads(body or b"{}")
         except (json.JSONDecodeError, ValueError):
             send_error(self, 400, "invalid JSON body")
             return
+        if not isinstance(payload, dict):
+            send_error(self, 400, "JSON body must be an object")
+            return
         self._handle_session_release(self.server, payload)  # type: ignore[arg-type]
+
+    def _handle_config_update(self, srv, payload: dict) -> None:
+        """POST /admin/config … 実行中の運用ポリシーを変更する（今は max_resident のみ）。
+
+        `{"max_resident": N}` で常駐上限を変更。N は 1 以上の整数、または null / 0 /
+        "off" / "unlimited" で無制限。稼働中（busy）のモデルは止めず、超過分はアイドルから
+        順に非同期退避する（set_max_resident 参照）。再起動すると gateway.toml の値に戻る。
+        """
+        if "max_resident" not in payload:
+            send_error(self, 400, "no 'max_resident' in the request")
+            return
+        raw = payload.get("max_resident")
+        if raw in (None, 0, "", "off", "none", "unlimited"):
+            value: int | None = None
+        else:
+            try:
+                value = int(raw)
+            except (TypeError, ValueError):
+                send_error(
+                    self, 400,
+                    "max_resident must be an integer >= 1 (or null/0/off for unlimited)",
+                )
+                return
+            if value < 1:
+                send_error(
+                    self, 400,
+                    "max_resident must be 1 or greater (or null/0/off for unlimited)",
+                )
+                return
+        srv.manager.set_max_resident(value)
+        srv.max_resident = value  # GET /admin/status の表示にも即反映する
+        send_json(self, 200, {"object": "gateway.config", "max_resident": value})
 
     def _handle_session_register(self, srv, payload: dict) -> None:
         agent_id = payload.get("agent_id")
@@ -748,6 +1183,9 @@ class GatewayConfig:
     models: list[ServerConfig] = field(default_factory=list)
     idle_timeout: float | None = 1200.0  # 秒。これだけ使われないモデルを自動アンロード（既定 1200=20分。None/0 で無効）
     load_timeout: float = 300.0        # 秒。全枠処理中のとき、空くのを待つ最大時間（超過で 503）
+    start_timeout: float = 120.0       # 秒。モデルサーバー1つの起動完了（ready）を待つ最大時間（巨大モデルは延ばす）
+    request_timeout: float | None = None  # 秒。上流との通信が無応答のとき打ち切る（None で無制限）。ハングした
+                                       # モデルサーバーが inflight を握ったまま枠を塞ぎ続けるのを防ぐ保険
     session_ttl: float | None = 90.0   # 秒。在席エージェントのハートビートがこれだけ途絶えたら無人扱いで掃除（既定 90。None/0 で無効）
     dynamic: bool = True               # 未登録モデルを ID 推論で動的ロードする（false で事前登録のみ）
     disable_thinking: bool = False     # 動的ロード時の既定（思考抑制）。事前登録は各 [[models]] が優先
@@ -755,6 +1193,7 @@ class GatewayConfig:
     parallel: int | None = None        # 動的ロード時の並列スロット既定（llama-cpp のみ。他は無視）
     max_memory_fraction: float | None = None  # 常駐モデルの推定占有量の合計を総RAMのこの割合に制限（None で無効）
     internal_base_port: int = 9001     # 内部サーバーの割当開始ポート（動的モデルもこの続きから割り当て）
+    api_key: str | None = None         # ネットワーク公開時の API キー（None/空 で認証なし）。chat と在席セッションに要求
 
 
 def _resolve_model_draft(
@@ -822,8 +1261,20 @@ def load_gateway_config(path: str) -> GatewayConfig:
         data = tomllib.load(fh)
 
     host = str(data.get("host", "127.0.0.1"))
+    # ゲートウェイは AF_INET（IPv4）で bind する。"::" / "*" は bind 時に分かりにくい
+    # OSError で落ちるので、設定読み込みの時点で明確に断る。
+    if host in ("::", "*"):
+        raise ValueError(
+            f'host = "{host}" is not supported; use "0.0.0.0" to listen on all '
+            "IPv4 interfaces (or a specific IPv4 address)"
+        )
     port = int(data.get("port", 8799))
     internal_base = int(data.get("internal_base_port", 9001))
+    # ネットワーク公開時の API キー（省略/空 で認証なし）。chat（/v1/*）と在席セッション
+    # （/admin/sessions/*）に Authorization: Bearer <key> を要求する。
+    api_key = data.get("api_key")
+    if api_key is not None:
+        api_key = str(api_key).strip() or None
     max_resident = data.get("max_resident")
     if max_resident is not None:
         max_resident = int(max_resident)
@@ -842,6 +1293,21 @@ def load_gateway_config(path: str) -> GatewayConfig:
     load_timeout = float(data.get("load_timeout", 300.0))
     if load_timeout < 1:
         raise ValueError("load_timeout must be 1 or greater")
+    # モデルサーバー1つの起動完了（ready）を待つ最大秒数。巨大モデル・コールドディスクでは
+    # 120 秒を超えることがあるので設定可能にする。
+    start_timeout = float(data.get("start_timeout", 120.0))
+    if start_timeout < 1:
+        raise ValueError("start_timeout must be 1 or greater")
+    # 上流モデルサーバーとの通信タイムアウト（ソケット単位の無応答秒数）。省略/0 で無制限。
+    # ハングしたサーバーが inflight を握り続けて枠を塞ぐ事故の保険（トークンが流れている限り
+    # 切れないので、ストリーミングの長時間生成は妨げない）。
+    request_timeout = data.get("request_timeout")
+    if request_timeout is not None:
+        request_timeout = float(request_timeout)
+        if request_timeout < 0:
+            raise ValueError("request_timeout must be 0 or greater (0 disables)")
+        if request_timeout == 0:
+            request_timeout = None
     # 在席エージェントのハートビート猶予秒数。途絶でそのエージェントを無人扱いし、モデルが
     # 無人になれば即アンロード（明示 release を呼べずに落ちたエージェントの保険）。0 で無効。
     session_ttl = data.get("session_ttl", 90)
@@ -922,11 +1388,14 @@ def load_gateway_config(path: str) -> GatewayConfig:
 
     return GatewayConfig(
         host, port, max_resident, default_model, configs, idle_timeout, load_timeout,
+        start_timeout=start_timeout,
+        request_timeout=request_timeout,
         session_ttl=session_ttl,
         dynamic=dynamic, disable_thinking=dyn_disable_thinking,
         draft_model=default_draft, parallel=default_parallel,
         max_memory_fraction=max_memory_fraction,
         internal_base_port=internal_base,
+        api_key=api_key,
     )
 
 
@@ -939,6 +1408,7 @@ def run_gateway(cfg: GatewayConfig) -> int:
     """
     manager = ModelManager(
         cfg.models, max_resident=cfg.max_resident, load_timeout=cfg.load_timeout,
+        start_timeout=cfg.start_timeout,
         dynamic=cfg.dynamic, default_disable_thinking=cfg.disable_thinking,
         default_draft=cfg.draft_model, default_parallel=cfg.parallel,
         max_memory_fraction=cfg.max_memory_fraction,
@@ -949,14 +1419,34 @@ def run_gateway(cfg: GatewayConfig) -> int:
         manager,
         catalog=[c.model for c in cfg.models],
         default_model=cfg.default_model,
+        timeout_s=cfg.request_timeout,
         max_resident=cfg.max_resident,
         idle_timeout=cfg.idle_timeout,
         load_timeout=cfg.load_timeout,
         session_ttl=cfg.session_ttl,
+        api_key=cfg.api_key,
     )
     public = f"http://{cfg.host}:{cfg.port}/v1"
+    wildcard = cfg.host in ("0.0.0.0", "")
+    # ループバック以外へ bind したら「公開」扱い（特定 LAN IP への bind も外から届く）。
+    exposed = wildcard or cfg.host not in ("127.0.0.1", "localhost", "::1")
     print("Gateway ready (lazy multi-model):", file=sys.stderr)
     print(f"  public: {public}", file=sys.stderr)
+    # 全インターフェース公開時は、リモートのクライアントが指す LAN URL を案内する。
+    if wildcard:
+        lan = primary_lan_ip()
+        if lan:
+            print(f"  reachable from LAN: http://{lan}:{cfg.port}/v1", file=sys.stderr)
+    # ネットワーク公開の認証状態。公開かつ未認証は目立つ警告を出す。
+    if cfg.api_key:
+        print("  auth: API key required (Authorization: Bearer <key>)", file=sys.stderr)
+    elif exposed:
+        print(
+            "  WARNING: bound to a network interface WITHOUT an api_key — anyone who can "
+            "reach this host:port can use the models. Set api_key in gateway.toml.",
+            file=sys.stderr,
+        )
+    print("  admin (/admin/status, /admin/config): localhost only", file=sys.stderr)
     for c in cfg.models:
         print(f"    {c.model}  ->  127.0.0.1:{c.port} ({c.backend})", file=sys.stderr)
     cap = "unlimited" if cfg.max_resident is None else (

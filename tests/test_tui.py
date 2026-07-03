@@ -26,6 +26,7 @@ def test_key_hints_stay_visible_while_typing_command(tmp_path, monkeypatch):
     gcfg = load_gateway_config(str(_write_cfg(tmp_path, "port = 8799\n")))
     monkeypatch.setattr(tui_app, "server_status", lambda h, p: {"ready": True})  # 自動起動させない
     monkeypatch.setattr(tui_app, "gateway_admin_status", lambda h, p: None)
+    monkeypatch.setattr(tui_app, "is_ready", lambda url, **k: False)  # 実 HTTP を叩かない
 
     async def scenario():
         app = tui_app.GatewayMonitor(gcfg)
@@ -58,7 +59,9 @@ def test_row_click_copies_model_name(tmp_path, monkeypatch):
 
     gcfg = load_gateway_config(str(_write_cfg(tmp_path, "port = 8799\n")))
     monkeypatch.setattr(tui_app, "server_status", lambda h, p: {"ready": True})
-    monkeypatch.setattr(tui_app, "gateway_admin_status", lambda h, p: None)
+    # ポーリングが表を消さないよう常に同じ admin を返す（is_ready の実 HTTP も叩かせない）。
+    monkeypatch.setattr(tui_app, "gateway_admin_status", lambda h, p: admin)
+    monkeypatch.setattr(tui_app, "is_ready", lambda url, **k: True)
     admin = {
         "uptime": 1.0, "requests": 0,
         "models": [{"model": "mlx-community/Foo-4bit", "backend": "mlx-vlm",
@@ -91,6 +94,7 @@ def test_copy_model_uses_pbcopy_on_macos(tmp_path, monkeypatch):
     gcfg = load_gateway_config(str(_write_cfg(tmp_path, "port = 8799\n")))
     monkeypatch.setattr(tui_app, "server_status", lambda h, p: {"ready": True})
     monkeypatch.setattr(tui_app, "gateway_admin_status", lambda h, p: None)
+    monkeypatch.setattr(tui_app, "is_ready", lambda url, **k: False)  # 実 HTTP を叩かない
     monkeypatch.setattr(tui_app.sys, "platform", "darwin")
     recorded = {}
     monkeypatch.setattr(
@@ -262,6 +266,19 @@ def test_merge_no_admin_falls_back(tmp_path):
     assert all(r["state"] == "unloaded" for r in view["models"])
 
 
+def test_merge_prefers_live_max_resident(tmp_path):
+    # max_resident は実行中に変更できる。admin のライブ値があれば toml 値より優先する。
+    gcfg = _gcfg(tmp_path, "max_resident = 1\n" + _TWO_MODELS)
+    assert gcfg.max_resident == 1
+    admin = {"uptime": 1.0, "requests": 0, "models": [], "max_resident": 3}
+    assert tui.merge_status(gcfg, admin)["max_resident"] == 3   # ライブ値を優先
+    # admin が無制限（None）ならそれを尊重（toml の 1 に戻さない）。
+    admin["max_resident"] = None
+    assert tui.merge_status(gcfg, admin)["max_resident"] is None
+    # ゲートウェイ未応答（admin=None）なら toml の起動時値へフォールバック。
+    assert tui.merge_status(gcfg, None)["max_resident"] == 1
+
+
 def test_fmt_hms():
     assert tui._fmt_hms(None) == "—"
     assert tui._fmt_hms(65) == "1:05"
@@ -276,6 +293,7 @@ def test_quit_stops_gateway_daemon(tmp_path, monkeypatch):
     gcfg = load_gateway_config(str(_write_cfg(tmp_path, "port = 8799\n")))
     monkeypatch.setattr(tui_app, "server_status", lambda h, p: {"ready": True})  # 自動起動させない
     monkeypatch.setattr(tui_app, "gateway_admin_status", lambda h, p: None)
+    monkeypatch.setattr(tui_app, "is_ready", lambda url, **k: False)  # 実 HTTP を叩かない
     killed = []
 
     async def scenario():
@@ -304,3 +322,14 @@ class _FakeSubmit:
 
 class _FakeInput:
     value = ""
+
+
+def test_merge_status_ready_is_passed_in_not_probed(tmp_path):
+    # ready はポーリング側（ワーカースレッド）が判定して渡す。merge_status 自身は
+    # HTTP を叩かない純粋関数のまま（UI スレッドを固めない）。省略時は admin の有無。
+    gcfg = _gcfg(tmp_path, _TWO_MODELS)
+    admin = {"uptime": 1.0, "requests": 0, "models": []}
+    assert tui.merge_status(gcfg, admin)["ready"] is True          # admin あり → 稼働中
+    assert tui.merge_status(gcfg, None)["ready"] is False          # admin なし → 停止扱い
+    assert tui.merge_status(gcfg, None, ready=True)["ready"] is True   # 明示指定を優先
+    assert tui.merge_status(gcfg, admin, ready=False)["ready"] is False

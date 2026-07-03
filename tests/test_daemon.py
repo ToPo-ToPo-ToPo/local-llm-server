@@ -142,13 +142,16 @@ class _StubServer:
 
 
 def _resident(mgr, model, gb, *, inflight=0, last_used=0.0):
-    """ロード済みモデルを 1 つ手で常駐させる（占有量 gb GB をキャッシュ済みにする）。"""
+    """ロード済みモデルを 1 つ手で常駐させる（占有量 gb GB をキャッシュ済みにする）。
+
+    1 モデル=複数インスタンス構成なので、単一インスタンスを持つ _Model を組み立てる。
+    """
     srv = _StubServer()
-    m = gw._Model(
-        config=ServerConfig(backend="mlx-vlm", model=model, port=9000),
-        server=srv, ready=True, inflight=inflight, last_used=last_used,
-        footprint=int(gb * 1e9),
+    cfg = ServerConfig(backend="mlx-vlm", model=model, port=9000)
+    inst = gw._Instance(
+        config=cfg, server=srv, ready=True, inflight=inflight, last_used=last_used,
     )
+    m = gw._Model(config=cfg, instances=[inst], footprint=int(gb * 1e9))
     mgr._models[model] = m
     return m
 
@@ -166,11 +169,13 @@ def test_memory_guard_evicts_idle_to_fit():
     mgr = gw.ModelManager([], dynamic=True, max_memory_fraction=0.66)
     mgr._mem_total = int(100e9)  # 決定的にするため総RAMを固定
     idle = _resident(mgr, "old/idle", gb=50)
+    idle_inst = idle.instances[0]
     keep = mgr._register_dynamic_locked("new/Big-GGUF:Q4")
     keep.footprint = int(30e9)
     mgr._evict_if_needed(keep="new/Big-GGUF:Q4")
-    # idle は退避された（server が外れ、FakeServer.stop が呼ばれた）。非動的なので _models には残る。
-    assert idle.server is None and not idle.ready
+    # idle は退避された（インスタンスが外れ、StubServer.stop が呼ばれた）。非動的なので _models には残る。
+    assert idle_inst.server.stopped is True
+    assert idle.instances == []
     assert mgr._models["old/idle"] is idle
 
 
@@ -366,7 +371,7 @@ def test_manager_evict_idle_stops_unused(monkeypatch):
     _, h1 = mgr.acquire("m1")
     mgr.release(h1)
     # m1 の last_used を十分過去にする（idle 判定させる）。
-    mgr._models["m1"].last_used = time.monotonic() - 100
+    mgr._models["m1"].instances[0].last_used = time.monotonic() - 100
     freed = mgr.evict_idle(timeout=10)
     assert freed == 1
     by_model = {s.config.model: s for s in created}
@@ -383,7 +388,7 @@ def test_manager_evict_idle_keeps_recent_and_inflight(monkeypatch):
     mgr.release(h1)
     # m2: 古いが処理中（inflight>0）→ 残す
     _, h2 = mgr.acquire("m2")
-    mgr._models["m2"].last_used = time.monotonic() - 100
+    mgr._models["m2"].instances[0].last_used = time.monotonic() - 100
     assert mgr.evict_idle(timeout=10) == 0
     st = {s["model"]: s["loaded"] for s in mgr.status()}
     assert st == {"m1": True, "m2": True}
@@ -433,6 +438,134 @@ def test_manager_waits_for_slot_then_loads(monkeypatch):
     assert by_model["m1"].stops == 1           # m1 は退避された
     st = {s["model"]: s["loaded"] for s in mgr.status()}
     assert st == {"m1": False, "m2": True}
+
+
+def test_set_max_resident_trims_idle_keeps_busy(monkeypatch):
+    # 実行中に max_resident を下げると、超過分をアイドルから LRU 退避する（busy は止めない）。
+    created = _patch_fake(monkeypatch)
+    mgr = gw.ModelManager(_configs(), max_resident=None)  # 起動時は無制限
+    _, h1 = mgr.acquire("m1")
+    mgr.release(h1)             # m1: アイドル
+    _, h2 = mgr.acquire("m2")   # m2: 処理中（release しない＝busy）
+    mgr.set_max_resident(1)     # 上限 1 に縮小 → 裏で trim
+    assert _wait_unloaded(mgr, "m1")          # アイドルの m1 は退避される
+    st = {s["model"]: s["loaded"] for s in mgr.status()}
+    assert st == {"m1": False, "m2": True}    # busy な m2 は残る（更新で止まらない）
+    by_model = {s.config.model: s for s in created}
+    assert by_model["m1"].stops == 1
+    assert by_model["m2"].stops == 0
+    assert mgr._max_resident == 1
+    mgr.release(h2)
+
+
+def test_set_max_resident_does_not_stop_busy_when_all_busy(monkeypatch):
+    # 全て処理中なら、上限を下げても 1 つも止めない（稼働中の生成を守る）。
+    created = _patch_fake(monkeypatch)
+    mgr = gw.ModelManager(_configs(), max_resident=None)
+    _, h1 = mgr.acquire("m1")   # busy
+    _, h2 = mgr.acquire("m2")   # busy
+    mgr.set_max_resident(1)
+    mgr._trim_to_limit()        # 直接呼んで決定的に検証（アイドルが無いので何も止まらない）
+    st = {s["model"]: s["loaded"] for s in mgr.status()}
+    assert st == {"m1": True, "m2": True}
+    assert all(s.stops == 0 for s in created)
+    mgr.release(h1)
+    mgr.release(h2)
+
+
+def test_set_max_resident_raise_allows_new_load_without_evict(monkeypatch):
+    # 上限を上げれば、退避せずに新しいモデルを追加常駐できる。
+    created = _patch_fake(monkeypatch)
+    mgr = gw.ModelManager(_configs(), max_resident=1)
+    _, h1 = mgr.acquire("m1")
+    mgr.release(h1)
+    mgr.set_max_resident(2)     # 枠を 2 に拡大
+    _, h2 = mgr.acquire("m2")   # m1 を退避せずロードできる
+    mgr.release(h2)
+    st = {s["model"]: s["loaded"] for s in mgr.status()}
+    assert st == {"m1": True, "m2": True}
+    assert all(s.stops == 0 for s in created)  # 退避は起きていない
+
+
+def _wait_instances(mgr, model, n, timeout=2.0):
+    """指定モデルの ready インスタンス数が n 以上になるまで待つ（複製の非同期起動用）。"""
+    import time
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        mm = mgr._models.get(model)
+        if mm and sum(1 for i in mm.instances if i.ready and i.server is not None) >= n:
+            return True
+        time.sleep(0.01)
+    return False
+
+
+def test_no_replica_for_sequential_requests(monkeypatch):
+    # 逐次リクエスト（常に release で inflight 0 に戻る）は満杯にならず、複製しない。
+    created = _patch_fake(monkeypatch)
+    mgr = gw.ModelManager(_configs(), max_resident=3)
+    for _ in range(3):
+        _, h = mgr.acquire("m1")
+        mgr.release(h)
+    import time
+    time.sleep(0.1)  # 複製スレッドが走る猶予（走らないはず）
+    assert len(mgr._models["m1"].instances) == 1
+    assert sum(1 for _ in created) == 1
+
+
+def test_replica_spawns_on_concurrent_load(monkeypatch):
+    # 同一モデルに同時リクエストが集中して満杯になると、複製インスタンスが起動して並列化する。
+    created = _patch_fake(monkeypatch)
+    mgr = gw.ModelManager(_configs(), max_resident=2)  # mlx: capacity=1
+    _, h1 = mgr.acquire("m1")   # inst1 へ（inflight=1、満杯）
+    _, h2 = mgr.acquire("m1")   # 満杯のまま2本目 → 複製起動をトリガ（今は inst1 へ）
+    assert _wait_instances(mgr, "m1", 2)          # 裏で inst2 が起動する
+    _, h3 = mgr.acquire("m1")   # 3本目は空いた inst2 へ（負荷分散）
+    insts = mgr._models["m1"].instances
+    assert len(insts) == 2
+    assert sorted(i.inflight for i in insts) == [1, 2]  # inst1=2, inst2=1
+    assert sum(1 for _ in created) == 2            # プロセスが 2 つ起動している
+    mgr.release(h1); mgr.release(h2); mgr.release(h3)
+
+
+def test_replica_capped_by_max_resident(monkeypatch):
+    # 上限に達していてアイドルも無ければ、満杯でも複製しない（busy は止めない）。
+    created = _patch_fake(monkeypatch)
+    mgr = gw.ModelManager(_configs(), max_resident=1)
+    _, h1 = mgr.acquire("m1")
+    _, h2 = mgr.acquire("m1")   # 満杯だが上限 1・退避できるアイドル無し → 複製不可
+    import time
+    time.sleep(0.2)  # 複製スレッドが走る猶予
+    assert len(mgr._models["m1"].instances) == 1
+    assert sum(1 for _ in created) == 1
+    mgr.release(h1); mgr.release(h2)
+
+
+def test_replica_respects_llama_parallel_slots(monkeypatch):
+    # llama-cpp は 1 プロセス内の parallel スロットを使い切ってから複製する（メモリ効率優先）。
+    created = _patch_fake(monkeypatch)
+    cfgs = [ServerConfig(backend="llama-cpp", model="L", host="127.0.0.1",
+                         port=9001, parallel=3)]
+    mgr = gw.ModelManager(cfgs, max_resident=2)
+    hs = [mgr.acquire("L")[1] for _ in range(3)]  # 3 本は inst1 の parallel スロット内
+    import time
+    time.sleep(0.15)
+    assert len(mgr._models["L"].instances) == 1   # まだ複製しない
+    h4 = mgr.acquire("L")[1]                       # 4 本目で満杯 → 複製
+    assert _wait_instances(mgr, "L", 2)
+    assert sum(1 for _ in created) == 2
+    for h in hs:
+        mgr.release(h)
+    mgr.release(h4)
+
+
+def test_load_gateway_config_api_key(tmp_path):
+    # api_key を読み取る。省略や空文字は None（認証なし）。
+    base = '[[models]]\nmodel = "x"\nbackend = "mlx"\n'
+    assert gw.load_gateway_config(_write(tmp_path, base)).api_key is None
+    assert gw.load_gateway_config(
+        _write(tmp_path, 'api_key = "s3cret"\n' + base)).api_key == "s3cret"
+    assert gw.load_gateway_config(
+        _write(tmp_path, 'api_key = "  "\n' + base)).api_key is None  # 空白のみ→無効
 
 
 def test_load_gateway_config_load_timeout(tmp_path):
@@ -492,25 +625,28 @@ def _make_upstream(name):
     return srv
 
 
-def _post(port, path, obj):
+def _post(port, path, obj, headers=None):
     conn = http.client.HTTPConnection("127.0.0.1", port)
-    conn.request("POST", path, json.dumps(obj), {"Content-Type": "application/json"})
+    hdrs = {"Content-Type": "application/json"}
+    if headers:
+        hdrs.update(headers)
+    conn.request("POST", path, json.dumps(obj), hdrs)
     resp = conn.getresponse()
     body = resp.read().decode("utf-8")
     conn.close()
     return resp.status, json.loads(body)
 
 
-def _get(port, path):
+def _get(port, path, headers=None):
     conn = http.client.HTTPConnection("127.0.0.1", port)
-    conn.request("GET", path)
+    conn.request("GET", path, headers=headers or {})
     resp = conn.getresponse()
     body = resp.read().decode("utf-8")
     conn.close()
     return resp.status, json.loads(body)
 
 
-def _start_gateway(monkeypatch):
+def _start_gateway(monkeypatch, api_key=None):
     # 上流は実フェイクサーバー。LocalServer は no-op（既に上流が動いている）に差し替える。
     up1 = _make_upstream("m1-upstream")
     up2 = _make_upstream("m2-upstream")
@@ -520,7 +656,7 @@ def _start_gateway(monkeypatch):
         ServerConfig(backend="mlx", model="m2", host="127.0.0.1", port=up2.server_address[1]),
     ]
     mgr = gw.ModelManager(configs)
-    server = gw.GatewayServer(("127.0.0.1", 0), mgr, catalog=["m1", "m2"])
+    server = gw.GatewayServer(("127.0.0.1", 0), mgr, catalog=["m1", "m2"], api_key=api_key)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server, mgr, (up1, up2)
 
@@ -567,11 +703,120 @@ def test_gateway_models_catalog(monkeypatch):
             u.shutdown(); u.server_close()
 
 
+def test_local_connect_host():
+    # ワイルドカード bind は自己接続をループバックに寄せる。特定 IP はそのまま。
+    from local_llm_server.server import local_connect_host
+    assert local_connect_host("0.0.0.0") == "127.0.0.1"
+    assert local_connect_host("::") == "127.0.0.1"
+    assert local_connect_host("") == "127.0.0.1"
+    assert local_connect_host("192.168.1.5") == "192.168.1.5"
+    assert local_connect_host("127.0.0.1") == "127.0.0.1"
+
+
+def test_gateway_api_key_required_for_chat_and_models(monkeypatch):
+    # api_key 設定時、chat と /v1/models は Authorization: Bearer <key> が要る（無/不一致は 401）。
+    server, mgr, ups = _start_gateway(monkeypatch, api_key="secret")
+    try:
+        port = server.server_address[1]
+        chat = {"model": "m1", "messages": [{"role": "user", "content": "hi"}]}
+        # キー無し → 401
+        status, obj = _post(port, "/v1/chat/completions", chat)
+        assert status == 401 and "error" in obj
+        # 不一致 → 401
+        status, _ = _post(port, "/v1/chat/completions", chat,
+                          headers={"Authorization": "Bearer wrong"})
+        assert status == 401
+        # 正しいキー → 通る
+        status, obj = _post(port, "/v1/chat/completions", chat,
+                            headers={"Authorization": "Bearer secret"})
+        assert status == 200 and obj["backend"] == "m1-upstream"
+        # /v1/models もキーが要る
+        assert _get(port, "/v1/models")[0] == 401
+        status, obj = _get(port, "/v1/models", headers={"Authorization": "Bearer secret"})
+        assert status == 200
+    finally:
+        server.shutdown(); server.server_close(); mgr.shutdown()
+        for u in ups:
+            u.shutdown(); u.server_close()
+
+
+def test_gateway_admin_is_loopback_and_keyless(monkeypatch):
+    # api_key 設定時でも、/admin/status・/admin/config はローカル（=テストは 127.0.0.1）から
+    # キー無しで使える（ループバック限定・キーではなく接続元で保護）。
+    server, mgr, ups = _start_gateway(monkeypatch, api_key="secret")
+    try:
+        port = server.server_address[1]
+        status, obj = _get(port, "/admin/status")            # キー無しでも 200
+        assert status == 200 and obj["object"] == "gateway.status"
+        status, obj = _post(port, "/admin/config", {"max_resident": 2})
+        assert status == 200 and obj["max_resident"] == 2
+    finally:
+        server.shutdown(); server.server_close(); mgr.shutdown()
+        for u in ups:
+            u.shutdown(); u.server_close()
+
+
+def test_gateway_no_auth_when_key_unset(monkeypatch):
+    # api_key 未設定なら従来どおり認証なし（後方互換）。
+    server, mgr, ups = _start_gateway(monkeypatch)  # api_key=None
+    try:
+        port = server.server_address[1]
+        status, obj = _post(port, "/v1/chat/completions",
+                            {"model": "m1", "messages": []})
+        assert status == 200 and obj["backend"] == "m1-upstream"
+    finally:
+        server.shutdown(); server.server_close(); mgr.shutdown()
+        for u in ups:
+            u.shutdown(); u.server_close()
+
+
 def test_gateway_missing_model_returns_400(monkeypatch):
     server, mgr, ups = _start_gateway(monkeypatch)
     try:
         port = server.server_address[1]
         status, obj = _post(port, "/v1/chat/completions", {"messages": []})
+        assert status == 400 and "error" in obj
+    finally:
+        server.shutdown(); server.server_close(); mgr.shutdown()
+        for u in ups:
+            u.shutdown(); u.server_close()
+
+
+def test_gateway_admin_config_updates_max_resident(monkeypatch):
+    # POST /admin/config で稼働中に max_resident を変更でき、/admin/status に即反映される。
+    server, mgr, ups = _start_gateway(monkeypatch)
+    try:
+        port = server.server_address[1]
+        _, st = _get(port, "/admin/status")
+        assert st["max_resident"] is None            # 起動時は無制限
+        status, obj = _post(port, "/admin/config", {"max_resident": 2})
+        assert status == 200 and obj["max_resident"] == 2
+        assert mgr._max_resident == 2
+        _, st = _get(port, "/admin/status")
+        assert st["max_resident"] == 2               # 表示にも反映
+        status, obj = _post(port, "/admin/config", {"max_resident": None})
+        assert status == 200 and obj["max_resident"] is None   # null → 無制限に戻す
+        assert mgr._max_resident is None
+    finally:
+        server.shutdown(); server.server_close(); mgr.shutdown()
+        for u in ups:
+            u.shutdown(); u.server_close()
+
+
+def test_gateway_admin_config_validates_input(monkeypatch):
+    # 0 / off は無制限扱い。負数・非数値・キー無しは 400。
+    server, mgr, ups = _start_gateway(monkeypatch)
+    try:
+        port = server.server_address[1]
+        status, obj = _post(port, "/admin/config", {"max_resident": 0})
+        assert status == 200 and obj["max_resident"] is None
+        status, obj = _post(port, "/admin/config", {"max_resident": "off"})
+        assert status == 200 and obj["max_resident"] is None
+        status, obj = _post(port, "/admin/config", {"max_resident": -3})
+        assert status == 400 and "error" in obj
+        status, obj = _post(port, "/admin/config", {"max_resident": "abc"})
+        assert status == 400 and "error" in obj
+        status, obj = _post(port, "/admin/config", {})
         assert status == 400 and "error" in obj
     finally:
         server.shutdown(); server.server_close(); mgr.shutdown()
@@ -688,6 +933,177 @@ def test_gateway_session_endpoints(monkeypatch):
         assert {m["model"]: m["sessions"] for m in st["models"]}["m1"] == 1
         assert _post(port, "/admin/sessions/release", {"agent_id": "A"})[0] == 200
         assert _wait_unloaded(mgr, "m1")
+    finally:
+        server.shutdown(); server.server_close(); mgr.shutdown()
+        for u in ups:
+            u.shutdown(); u.server_close()
+
+
+# --- 今回の修正の回帰テスト ---------------------------------------------------
+
+def test_load_gateway_config_request_and_start_timeout(tmp_path):
+    base = '[[models]]\nmodel = "x"\nbackend = "mlx"\n'
+    cfg = gw.load_gateway_config(_write(tmp_path, base))
+    assert cfg.request_timeout is None      # 既定: 無制限（長時間生成を妨げない）
+    assert cfg.start_timeout == 120.0       # 既定: 120 秒
+    cfg = gw.load_gateway_config(
+        _write(tmp_path, "request_timeout = 600\nstart_timeout = 300\n" + base))
+    assert cfg.request_timeout == 600.0
+    assert cfg.start_timeout == 300.0
+    # 0 は「無効（無制限）」
+    assert gw.load_gateway_config(
+        _write(tmp_path, "request_timeout = 0\n" + base)).request_timeout is None
+    with pytest.raises(ValueError, match="start_timeout"):
+        gw.load_gateway_config(_write(tmp_path, "start_timeout = 0\n" + base))
+
+
+def test_load_gateway_config_rejects_unsupported_wildcards(tmp_path):
+    # ゲートウェイは IPv4 で bind する。"::" / "*" は bind 時の分かりにくい OSError ではなく
+    # 設定読み込みで明確に断る。
+    base = '[[models]]\nmodel = "x"\nbackend = "mlx"\n'
+    for host in ("::", "*"):
+        with pytest.raises(ValueError, match="not supported"):
+            gw.load_gateway_config(_write(tmp_path, f'host = "{host}"\n' + base))
+    # "0.0.0.0" は従来どおり許可
+    assert gw.load_gateway_config(
+        _write(tmp_path, 'host = "0.0.0.0"\n' + base)).host == "0.0.0.0"
+
+
+def test_no_replica_when_no_limits_configured(monkeypatch):
+    # max_resident もメモリ上限も無い構成では複製しない（重みのコピーが際限なく増えて
+    # OOM する事故を防ぐ。並列化を使うにはどちらかで範囲を決める）。
+    created = _patch_fake(monkeypatch)
+    mgr = gw.ModelManager(_configs(), max_resident=None)  # 上限なし
+    _, h1 = mgr.acquire("m1")
+    _, h2 = mgr.acquire("m1")   # 満杯（mlx: capacity=1）だが上限が無い → 複製しない
+    import time
+    time.sleep(0.2)  # 複製スレッドが走る猶予（走らないはず）
+    assert len(mgr._models["m1"].instances) == 1
+    assert sum(1 for _ in created) == 1
+    mgr.release(h1); mgr.release(h2)
+
+
+def test_shutdown_stops_server_that_is_still_starting(monkeypatch):
+    # ロード中（wait_until_ready の途中）に shutdown しても、起動しかけのモデルサーバーを
+    # 取り逃さず止める（孤児プロセス化してメモリ・ポートを掴み続けない）。
+    import time
+
+    started_loading = threading.Event()
+    release_load = threading.Event()
+    created = []
+
+    class _SlowServer(_FakeServer):
+        def __init__(self, config, log_path=None):
+            super().__init__(config, log_path)
+            created.append(self)
+
+        def wait_until_ready(self, *a, **k):
+            started_loading.set()
+            release_load.wait(timeout=5)
+
+    monkeypatch.setattr(gw, "LocalServer", _SlowServer)
+    mgr = gw.ModelManager(_configs())
+    errors = []
+
+    def _load():
+        try:
+            mgr.acquire("m1")
+        except RuntimeError as exc:  # shutting down は正当な失敗
+            errors.append(exc)
+
+    t = threading.Thread(target=_load)
+    t.start()
+    assert started_loading.wait(timeout=5)  # ロード（wait_until_ready）中
+    mgr.shutdown()                          # ← この時点で instances は空だが _starting にいる
+    release_load.set()
+    t.join(timeout=5)
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline and created[0].stops == 0:
+        time.sleep(0.01)
+    assert created[0].stops >= 1            # 起動途中のサーバーも止まっている
+    assert errors                            # ロード側は「shutting down」で中断される
+    # shutdown 後の新規ロードは拒否される
+    with pytest.raises(RuntimeError):
+        mgr.acquire("m2")
+
+
+def test_gateway_non_ascii_bearer_token_returns_401(monkeypatch):
+    # 非 ASCII のトークンでも 500（TypeError）にならず、きれいに 401 を返す。
+    server, mgr, ups = _start_gateway(monkeypatch, api_key="secret")
+    try:
+        port = server.server_address[1]
+        status, obj = _get(port, "/v1/models",
+                           headers={"Authorization": "Bearer café"})
+        assert status == 401 and "error" in obj
+    finally:
+        server.shutdown(); server.server_close(); mgr.shutdown()
+        for u in ups:
+            u.shutdown(); u.server_close()
+
+
+def test_gateway_rejects_non_dict_json_body(monkeypatch):
+    # [1] や "x" のような dict 以外の JSON は 500（AttributeError）ではなく 400。
+    server, mgr, ups = _start_gateway(monkeypatch)
+    try:
+        port = server.server_address[1]
+        status, obj = _post(port, "/v1/chat/completions", [1])
+        assert status == 400 and "error" in obj
+        # model が文字列でないのも 400
+        status, obj = _post(port, "/v1/chat/completions", {"model": ["m1"]})
+        assert status == 400 and "error" in obj
+    finally:
+        server.shutdown(); server.server_close(); mgr.shutdown()
+        for u in ups:
+            u.shutdown(); u.server_close()
+
+
+def test_gateway_routes_with_query_string(monkeypatch):
+    # クエリ付きでもルーティングが壊れない（GET /v1/models?limit=10 → 200）。
+    server, mgr, ups = _start_gateway(monkeypatch)
+    try:
+        port = server.server_address[1]
+        status, obj = _get(port, "/v1/models?limit=10")
+        assert status == 200
+        assert [m["id"] for m in obj["data"]] == ["m1", "m2"]
+    finally:
+        server.shutdown(); server.server_close(); mgr.shutdown()
+        for u in ups:
+            u.shutdown(); u.server_close()
+
+
+def test_gateway_invalid_content_length_returns_400(monkeypatch):
+    # Content-Length が数値でない/負でも 500 にならず 400 を返す。
+    server, mgr, ups = _start_gateway(monkeypatch)
+    try:
+        port = server.server_address[1]
+        for bad in ("abc", "-5"):
+            conn = http.client.HTTPConnection("127.0.0.1", port)
+            conn.putrequest("POST", "/v1/chat/completions")
+            conn.putheader("Content-Type", "application/json")
+            conn.putheader("Content-Length", bad)
+            conn.endheaders()
+            resp = conn.getresponse()
+            assert resp.status == 400
+            conn.close()
+    finally:
+        server.shutdown(); server.server_close(); mgr.shutdown()
+        for u in ups:
+            u.shutdown(); u.server_close()
+
+
+def test_gateway_oversized_content_length_returns_413(monkeypatch):
+    # 巨大 Content-Length の申告は本文を読み込まず 413 で断る（メモリ DoS 防止）。
+    server, mgr, ups = _start_gateway(monkeypatch)
+    try:
+        port = server.server_address[1]
+        conn = http.client.HTTPConnection("127.0.0.1", port)
+        conn.putrequest("POST", "/v1/chat/completions")
+        conn.putheader("Content-Type", "application/json")
+        conn.putheader("Content-Length", str(10 * 1024 * 1024 * 1024))  # 10GB を申告
+        conn.endheaders()
+        resp = conn.getresponse()
+        assert resp.status == 413
+        conn.close()
     finally:
         server.shutdown(); server.server_close(); mgr.shutdown()
         for u in ups:

@@ -73,11 +73,23 @@ def test_status_dispatches(in_gateway_dir, monkeypatch):
 def test_stop_dispatches(in_gateway_dir, monkeypatch):
     stopped = []
     monkeypatch.setattr(cli, "find_pids_on_port", lambda port: [1000 + port])
+    # --stop はコマンドラインで「うちのプロセス」か確認してから止める（無関係を巻き添えにしない）。
+    monkeypatch.setattr(cli, "pid_looks_like_ours", lambda pid: True)
     monkeypatch.setattr(cli, "stop_pid", lambda pid, **_: stopped.append(pid) or True)
     monkeypatch.setattr(cli, "run_gateway", lambda cfg: pytest.fail("must not start"))
     assert cli.main(["--stop"]) == 0
     # 公開ポート＋内部モデルポートの両方を止めにいく
     assert stopped  # 1つ以上停止した
+
+
+def test_stop_skips_unrelated_processes(in_gateway_dir, monkeypatch):
+    # ポートを LISTEN していても、うちのプロセスに見えなければ止めない。
+    monkeypatch.setattr(cli, "find_pids_on_port", lambda port: [1000 + port])
+    monkeypatch.setattr(cli, "pid_looks_like_ours", lambda pid: False)
+    monkeypatch.setattr(cli, "stop_pid",
+                        lambda pid, **_: pytest.fail("must not kill unrelated processes"))
+    monkeypatch.setattr(cli, "run_gateway", lambda cfg: pytest.fail("must not start"))
+    assert cli.main(["--stop"]) == 1  # 止めたものは無い
 
 
 def test_start_dispatches_background(in_gateway_dir, monkeypatch):

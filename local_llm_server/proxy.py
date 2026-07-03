@@ -38,7 +38,9 @@ def forward(handler: Any, addr: tuple[str, int], body: bytes, timeout_s: float |
             handler.send_header("Content-Type", ctype)
         handler.end_headers()
         while True:
-            chunk = resp.read(8192)
+            # read1: ソケットに届いた分だけ即返す（read(8192) は 8192 バイト溜まるまで
+            # ブロックするため、SSE のトークン逐次配信が全バッファリングされてしまう）。
+            chunk = resp.read1(8192)
             if not chunk:
                 break
             handler.wfile.write(chunk)

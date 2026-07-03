@@ -143,7 +143,7 @@ def test_admin_status_reports_live_model_state():
     """/admin/status が常駐状態（loaded/inflight）＋運用方針を返す。"""
     import threading
 
-    from local_llm_server.daemon import GatewayServer, ModelManager
+    from local_llm_server.daemon import GatewayServer, ModelManager, _Instance
     from local_llm_server.server import ServerConfig, gateway_admin_status
 
     cfgs = [
@@ -153,9 +153,9 @@ def test_admin_status_reports_live_model_state():
     mgr = ModelManager(cfgs, max_resident=1, load_timeout=300)
     # org/A をロード済み・処理中 2 件に見立てる（実サーバーは起動しない）。
     a = mgr._models["org/A"]
-    a.server = object()
-    a.ready = True
-    a.inflight = 2
+    a.instances.append(
+        _Instance(config=a.config, server=object(), ready=True, inflight=2)
+    )
     srv = GatewayServer(
         ("127.0.0.1", 0), mgr, catalog=["org/A", "org/B"],
         default_model=None, max_resident=1, idle_timeout=1200, load_timeout=300,

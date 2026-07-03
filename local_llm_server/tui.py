@@ -9,10 +9,10 @@ from __future__ import annotations
 
 import sys
 
-from .server import gateway_log_path, is_ready, mtp_status
+from .server import gateway_log_path, mtp_status
 
 
-def merge_status(gcfg, admin: dict | None) -> dict:
+def merge_status(gcfg, admin: dict | None, ready: bool | None = None) -> dict:
     """gateway.toml のカタログと `/admin/status` のライブ状態を1つのビューに統合する（純粋関数）。
 
     カタログの全モデルを並べ（未起動も「unloaded」で見せる）、起動中のものはライブ状態
@@ -29,7 +29,7 @@ def merge_status(gcfg, admin: dict | None) -> dict:
         if not m or not m.get("loaded"):
             return {
                 "model": model, "backend": backend, "port": port,
-                "state": "unloaded", "inflight": 0,
+                "state": "unloaded", "inflight": 0, "instances": 0,
                 "requests": (m or {}).get("requests", 0), "idle_remaining": None,
                 "sessions": (m or {}).get("sessions", 0), "mtp": mtp,
             }
@@ -46,6 +46,8 @@ def merge_status(gcfg, admin: dict | None) -> dict:
         return {
             "model": model, "backend": backend, "port": port,
             "state": state, "inflight": inflight,
+            # 起動中インスタンス数（負荷ベースの複製で >1 になる。並列度の目安）。
+            "instances": int(m.get("instances", 1)),
             "requests": int(m.get("requests", 0)), "idle_remaining": remaining,
             "sessions": int(m.get("sessions", 0)),  # 在席エージェント数（0 で即アンロード対象）
             "mtp": mtp,
@@ -68,12 +70,20 @@ def merge_status(gcfg, admin: dict | None) -> dict:
         if mid and mid not in listed:
             listed.add(mid)
             rows.append(_row(mid, d.get("backend", "?"), None, None))
-    ready = bool(admin) or is_ready(f"http://{gcfg.host}:{gcfg.port}/v1")
+    # ready は呼び出し側（ポーリングのワーカースレッド）が判定して渡す。ここで HTTP を
+    # 叩くと UI スレッドが固まる（_render は毎秒呼ばれる）ため、純粋関数のまま保つ。
+    # 省略時は「/admin/status が取れた＝稼働中」で判定する。
+    if ready is None:
+        ready = bool(admin)
+    # max_resident は実行中に変更できる（POST /admin/config）。ライブ値（admin）があれば
+    # それを優先し、無ければ gateway.toml の起動時値にフォールバックする。admin では None が
+    # 「無制限」を意味するので、キーが在ればその値（None 含む）をそのまま使う。
+    live_max = (admin or {}).get("max_resident", gcfg.max_resident) if admin else gcfg.max_resident
     return {
         "ready": ready,
         "uptime": (admin or {}).get("uptime"),
         "requests": (admin or {}).get("requests", sum(r["requests"] for r in rows)),
-        "max_resident": gcfg.max_resident,
+        "max_resident": live_max,
         "idle_timeout": idle_timeout,
         "models": rows,
     }
@@ -89,20 +99,27 @@ def _fmt_hms(seconds) -> str:
     return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
 
 
-def read_log_tail(port: int, max_lines: int = 1000) -> str:
+def read_log_tail(port: int, max_lines: int = 1000, max_bytes: int = 512 * 1024) -> str:
     """ゲートウェイログの末尾（最大 max_lines 行）を返す（TUI 内のログ画面で表示用）。
 
     外部ページャ（less 等）には頼らず、textual アプリ内のスクロール画面に出すための純データ。
-    ログがまだ無い／空のときは案内文を返す。
+    ログはローテーションされず肥大化しうるので、末尾 max_bytes だけ読む（全読みすると
+    巨大ログで UI スレッドが固まる）。ログがまだ無い／空のときは案内文を返す。
     """
     path = gateway_log_path(port)
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as fh:
-            lines = fh.readlines()
+        with open(path, "rb") as fh:
+            fh.seek(0, 2)  # 末尾へ
+            size = fh.tell()
+            fh.seek(max(0, size - max_bytes))
+            data = fh.read()
     except OSError:
         return f"(ログはまだありません: {path})"
-    if not lines:
+    if not data:
         return f"(ログは空です: {path})"
+    lines = data.decode("utf-8", errors="replace").splitlines(keepends=True)
+    if size > max_bytes and lines:
+        lines = lines[1:]  # 途中から読んだ先頭の欠け行は捨てる
     return "".join(lines[-max_lines:])
 
 

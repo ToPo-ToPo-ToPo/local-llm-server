@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import threading
 
 from rich.text import Text
 from textual import work
@@ -22,6 +23,11 @@ from .server import (
     find_pids_on_port,
     gateway_admin_status,
     gateway_log_path,
+    gateway_set_max_resident,
+    is_ready,
+    local_connect_host,
+    pid_looks_like_ours,
+    primary_lan_ip,
     server_status,
     start_gateway_background,
     stop_pid,
@@ -87,42 +93,63 @@ class GatewayMonitor(App):
 
     CSS = """
     Screen { background: #16161a; }
-    #dash { border: round #3a3a40; padding: 0 1; height: auto; margin: 1 1 0 1; }
+    #dash { border: round #3a3a40; padding: 0 1; height: 1fr; margin: 1 1 0 1; }
     #title { padding: 0 0 1 0; }
     #status { padding: 0 0 1 0; }
     #policy { padding: 1 0 0 0; color: #83838c; }
     DataTable { height: auto; background: #16161a; }
     DataTable > .datatable--header { color: #83838c; background: #16161a; text-style: none; }
-    #cmd { border: round #3a3a40; margin: 1 1 0 1; background: #16161a; }
-    #hints { background: #1d1d22; padding: 0 1; }
+    /* コマンド欄は上・凡例は下に固定（dock）。中央の #dash が伸びても両者は隠れない。 */
+    #cmd { dock: top; border: round #3a3a40; margin: 1 1 0 1; background: #16161a; }
+    #hints { dock: bottom; background: #1d1d22; padding: 0 1; }
     """
 
     BINDINGS = [
         Binding("s", "stop", "stop"),
         Binding("r", "restart", "restart"),
         Binding("g", "start", "start"),
+        Binding("m", "prefill_max", "max"),
         Binding("l", "log", "log"),
         Binding("q", "quit", "quit"),
     ]
 
+    # 起動時にコマンド入力欄へ自動フォーカスしない。フォーカスされた Input は印字キーを
+    # 消費するため、上の単キーショートカット（s/r/g/m/l/q）が一切効かなくなってしまう。
+    # コマンドを打つときは入力欄をクリック（または m キーでプリフィル）する。
+    AUTO_FOCUS = None
+
     def __init__(self, gcfg):
         super().__init__()
         self.gcfg = gcfg
-        self.host = gcfg.host
+        self.bind_host = gcfg.host                       # 公開 bind 先（表示用）
+        # 自分自身のゲートウェイへの接続はループバックで（bind が 0.0.0.0 等でも "0.0.0.0" 宛は不可搬）。
+        self.host = local_connect_host(gcfg.host)
         self.port = gcfg.port
         self.all_ports = [self.port] + [m.port for m in gcfg.models]
+        # ネットワーク公開（0.0.0.0 等）のとき、リモートのクライアントが指す LAN URL を1度だけ解決。
+        self.reachable_url = None
+        if gcfg.host in ("0.0.0.0", "::", "", "*"):
+            lan = primary_lan_ip()
+            if lan:
+                self.reachable_url = f"http://{lan}:{self.port}/v1"
         self.admin = None
+        self._gw_ready = False  # ポーリングワーカーが判定した稼働状態（UI スレッドで HTTP しない）
         self.busy = ""
         self._row_models: list[str] = []  # 表の表示順モデル ID（行クリック→コピー用）
 
     def compose(self) -> ComposeResult:
-        with Container(id="dash"):
+        # コマンド欄を最上部に固定する（dock: top）。モデル一覧が増えて #dash が縦に伸びても、
+        # 入力欄が画面外へ押し出されない。中央の一覧は #dash 内でスクロールする。
+        yield Input(
+            placeholder="command — stop · restart · start · max <n> · log · quit",
+            id="cmd",
+        )
+        with VerticalScroll(id="dash"):
             yield Static(self._title(), id="title")
             yield Static(id="status")
             yield DataTable(id="models", show_cursor=False, zebra_stripes=False)
             yield Static(id="policy")
-        yield Input(placeholder="command — stop · restart · start · log · quit", id="cmd")
-        # キーの凡例は固定表示にする（Footer はコマンド入力中に隠れてしまうため）。
+        # キーの凡例は最下部に固定する（Footer はコマンド入力中に隠れてしまうため）。
         yield Static(self._hints(), id="hints")
 
     def on_mount(self) -> None:
@@ -146,7 +173,8 @@ class GatewayMonitor(App):
         """キー操作の凡例（フォーカスに依らず常に見える固定行。入力中も消えない）。"""
         t = Text()
         for i, (key, label) in enumerate(
-            (("s", "stop"), ("r", "restart"), ("g", "start"), ("l", "log"), ("q", "quit"))
+            (("s", "stop"), ("r", "restart"), ("g", "start"),
+             ("m", "max"), ("l", "log"), ("q", "quit"))
         ):
             if i:
                 t.append("   ", style=_DIM)
@@ -159,14 +187,18 @@ class GatewayMonitor(App):
     @work(thread=True, exclusive=True, group="poll")
     def poll(self) -> None:
         admin = gateway_admin_status(self.host, self.port)
-        self.call_from_thread(self._apply, admin)
+        # /admin/status が取れなくても、応答だけはある（起動直後等）ならフォールバックで確認。
+        # HTTP はすべてこのワーカースレッドで行う（UI スレッドを固めない）。
+        ready = admin is not None or is_ready(f"http://{self.host}:{self.port}/v1")
+        self.call_from_thread(self._apply, admin, ready)
 
-    def _apply(self, admin) -> None:
+    def _apply(self, admin, ready: bool | None = None) -> None:
         self.admin = admin
+        self._gw_ready = bool(admin) if ready is None else ready
         self._render()
 
     def _render(self) -> None:
-        view = merge_status(self.gcfg, self.admin)
+        view = merge_status(self.gcfg, self.admin, ready=self._gw_ready)
 
         st = Text()
         if self.busy:
@@ -196,6 +228,9 @@ class GatewayMonitor(App):
                 "busy": ("●", _GREEN), "idle": ("○", _AMBER), "unloaded": ("·", _DIM),
             }.get(r["state"], ("·", _DIM))
             state = Text.assemble((sym + " ", col), (r["state"], col))
+            # 同一モデルが複数インスタンスで並列稼働しているときは「×N」を添える（並列度の目安）。
+            if r.get("instances", 0) > 1:
+                state.append(f" ×{r['instances']}", style=_ACCENT)
             # MTP（高速化）の利用可否。ready=緑●、available=淡色（要 hf download）、非対応=「—」。
             mtp_sym, mtp_col, mtp_label = {
                 "ready": ("●", _GREEN, "ready"),
@@ -217,6 +252,9 @@ class GatewayMonitor(App):
             f"max_resident {view['max_resident'] if view['max_resident'] is not None else '∞'}"
             f"    idle {int(view['idle_timeout']) if view['idle_timeout'] else 'off'}s"
         )
+        # ネットワーク公開時は、リモートのクライアントが指す LAN URL を添える（クリックでコピー可）。
+        if self.reachable_url:
+            policy += f"    LAN {self.reachable_url}"
         if self.busy:
             policy += f"    · {self.busy.strip()}"
         self.query_one("#policy", Static).update(policy)
@@ -228,15 +266,30 @@ class GatewayMonitor(App):
         self.call_from_thread(self._render)
         try:
             fn()
+        except (RuntimeError, TimeoutError, OSError) as exc:
+            # 起動失敗（ポート占有・タイムアウト等）はアプリを落とさず通知する
+            # （@work のワーカー例外は既定でアプリ全体をクラッシュさせるため必ず捕まえる）。
+            self.call_from_thread(
+                self.notify, f"{label.strip('…')} に失敗しました: {exc}",
+                severity="error", timeout=8,
+            )
         finally:
             self.busy = ""
             admin = gateway_admin_status(self.host, self.port)
-            self.call_from_thread(self._apply, admin)
+            ready = admin is not None or is_ready(f"http://{self.host}:{self.port}/v1")
+            self.call_from_thread(self._apply, admin, ready)
 
     def _kill_ports(self) -> None:
-        for p in self.all_ports:
-            for pid in find_pids_on_port(p):
-                stop_pid(pid)
+        # このパッケージ由来に見えるプロセスだけ止める（同じポート番号をたまたま使っている
+        # 無関係なプロセスを巻き添えにしない）。stop_pid は 1 件あたり最長 ~10s 待つので、
+        # 並列に止めて合計時間を抑える（q 終了時は同期実行のため体感に直結する）。
+        pids = {pid for p in self.all_ports for pid in find_pids_on_port(p)}
+        pids = [pid for pid in pids if pid_looks_like_ours(pid)]
+        threads = [threading.Thread(target=stop_pid, args=(pid,)) for pid in pids]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
 
     def action_start(self) -> None:
         self._run("starting…", lambda: start_gateway_background(os.getcwd(), self.host, self.port))
@@ -254,6 +307,50 @@ class GatewayMonitor(App):
         # 外部ページャを suspend で開くと表示が壊れ戻り方も分かりにくいので、
         # アプリ内のスクロール画面で表示する（q/Esc で戻る）。
         self.push_screen(LogScreen(self.port))
+
+    def action_prefill_max(self) -> None:
+        # `m` キー: コマンド欄に "max " を入れてフォーカスし、数値だけ打てば送信できるようにする。
+        inp = self.query_one("#cmd", Input)
+        inp.value = "max "
+        inp.focus()
+        inp.cursor_position = len(inp.value)
+
+    def _set_max_resident(self, arg: str) -> None:
+        """`max <n>` / `max off` を解釈して稼働中のゲートウェイに反映する（再起動不要・busy 継続）。
+
+        n は 1 以上の整数。off / none / unlimited / 0 / ∞ は無制限。稼働中のモデルは止めず、
+        超過分はサーバー側でアイドルから順に非同期退避される（→ POST /admin/config）。
+        """
+        arg = arg.strip().lower()
+        if arg in ("off", "none", "unlimited", "inf", "∞", "0"):
+            value: int | None = None
+        else:
+            try:
+                value = int(arg)
+            except ValueError:
+                self.notify(
+                    f"max_resident には数値か off を指定してください: '{arg}'",
+                    severity="error", timeout=4,
+                )
+                return
+            if value < 1:
+                self.notify(
+                    "max_resident は 1 以上、または off（無制限）です",
+                    severity="error", timeout=4,
+                )
+                return
+        label = "∞" if value is None else str(value)
+
+        def _apply() -> None:
+            res = gateway_set_max_resident(value, self.host, self.port)
+            msg, sev = (
+                (f"max_resident を {label} に変更しました", "information")
+                if res is not None
+                else ("max_resident の変更に失敗しました（ゲートウェイ未起動？）", "error")
+            )
+            self.call_from_thread(self.notify, msg, severity=sev, timeout=3)
+
+        self._run(f"max_resident → {label}…", _apply)
 
     def action_quit(self) -> None:
         # q（終了）ではゲートウェイ・デーモンも停止する。ダッシュボードを閉じたら裏の常駐も
@@ -292,14 +389,25 @@ class GatewayMonitor(App):
         )
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
-        cmd = (event.value or "").strip().lower()
+        raw = (event.value or "").strip()
         event.input.value = ""
+        cmd = raw.lower()
         if cmd in ("q", "quit", "exit"):
             self.action_quit()  # キー `q` と同じく、デーモンも停止してから終了する
             return
-        {
+        # `max <n>` / `m <n>`: 引数を伴うので先頭トークンで分岐する（例: "max 2", "max off"）。
+        head, _, tail = raw.partition(" ")
+        if head.lower() in ("max", "m") and tail.strip():
+            self._set_max_resident(tail)
+            return
+        handler = {
             "s": self.action_stop, "stop": self.action_stop,
             "r": self.action_restart, "restart": self.action_restart,
             "g": self.action_start, "start": self.action_start,
             "l": self.action_log, "log": self.action_log,
-        }.get(cmd, lambda: None)()
+        }.get(cmd)
+        if handler is None:
+            if raw:  # 空 Enter は無視。タイプミス等は黙殺せず知らせる
+                self.notify(f"不明なコマンドです: '{raw}'", severity="warning", timeout=4)
+            return
+        handler()
