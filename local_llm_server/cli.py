@@ -123,6 +123,56 @@ def _start_background(gcfg) -> int:
     return 0
 
 
+def mtp_report(model: str | None) -> tuple[str, int]:
+    """使う予定のモデルに必要な MTP ドラフターを、ダウンロード前に調べて文面にする。
+
+    CLI の `--check-mtp` と TUI の `mtp` コマンドが共有する本体。対応表（MTP_DRAFTERS）の
+    辞書引きとローカルキャッシュ確認だけで、モデルのダウンロードは一切しない
+    （`resolve_drafter` / `mtp_status` と同じく非破壊）。gateway.toml も見ないので、
+    どのディレクトリからでも実行できる。model を省略（None/空）すると対応表を全件、
+    取得状況つきで並べる。
+
+    戻り値: (表示テキスト, 終了コード)。指定モデルが MTP 非対応なら 1、
+    それ以外（ready / available / 一覧表示）は 0。
+    """
+    from .server import MTP_DRAFTERS, mtp_status
+
+    def _describe(target: str) -> str:
+        drafter = MTP_DRAFTERS[target]
+        # mtp_status は "ready"（ドラフター取得済み）/ "available"（未取得）を返す。DL はしない。
+        if mtp_status(target) == "ready":
+            return (
+                f"{target}\n"
+                f"    drafter: {drafter}  [ready — 取得済み。そのまま MTP が効く]"
+            )
+        return (
+            f"{target}\n"
+            f"    drafter: {drafter}  [available — 未取得]\n"
+            f"    hf download {drafter}"
+        )
+
+    if not model:
+        lines = ['MTP 対応モデル（mlx-vlm・draft_model="auto" で自動解決）:']
+        lines.extend(f"  {_describe(target)}" for target in sorted(MTP_DRAFTERS))
+        return "\n".join(lines), 0
+
+    if model not in MTP_DRAFTERS:
+        return (
+            f"{model}: MTP 非対応（対応表に無い）。使うなら gateway.toml の draft_model に "
+            "ドラフターの HF id を明示してください。対応モデル一覧は引数なしの "
+            "`--check-mtp`（TUI では `mtp`）で表示。",
+            1,
+        )
+    return _describe(model), 0
+
+
+def _check_mtp(model: str | None) -> int:
+    """`--check-mtp` 用の入口。結果はパイプで拾えるよう stdout に出す。"""
+    text, code = mtp_report(model)
+    print(text)
+    return code
+
+
 def _status_servers(host: str, ports: list[int]) -> int:
     """指定ポートで動いているゲートウェイの状態を表示する（--status 用）。
 
@@ -191,7 +241,21 @@ def main(argv: list[str] | None = None) -> int:
         help="Run the gateway in the foreground without the TUI dashboard (for pipes, CI, or "
         "background launch). A non-interactive terminal selects this automatically.",
     )
+    parser.add_argument(
+        "--check-mtp",
+        metavar="MODEL",
+        nargs="?",
+        const="",  # フラグはあるが値なし → 対応表を全件表示
+        default=None,  # フラグ自体が無い
+        help="Show which MTP drafter a model needs (and whether it is already downloaded) without "
+        "downloading anything, then exit. Give a model id to check one; omit it to list every "
+        "supported model. Does not read gateway.toml, so it works from any directory.",
+    )
     args = parser.parse_args(argv)
+
+    # --check-mtp: gateway.toml も HF ダウンロードも要らない純粋な参照。設定ロードより前に処理する。
+    if args.check_mtp is not None:
+        return _check_mtp(args.check_mtp)
 
     config_path = _resolve_config()
     if config_path is None:

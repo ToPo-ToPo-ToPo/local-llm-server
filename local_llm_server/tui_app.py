@@ -11,6 +11,7 @@ import subprocess
 import sys
 import threading
 
+from rich.style import Style
 from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
@@ -39,6 +40,25 @@ _AMBER = "#e0b46a"
 _RED = "#d8645f"
 _ACCENT = "#d8a45f"
 _DIM = "#83838c"
+
+
+def _clipboard_copy(app, text: str) -> bool:
+    """テキストをクリップボードへ。macOS は pbcopy、他は端末の OSC52（textual）。
+
+    ダッシュボードの行クリック（モデル名）と MTP 画面のパスクリックで共用する。
+    成功したら True。
+    """
+    if sys.platform == "darwin":
+        try:
+            subprocess.run(["pbcopy"], input=text.encode(), check=True)
+            return True
+        except Exception:  # noqa: BLE001 - pbcopy 不在等は OSC52 にフォールバック
+            pass
+    try:
+        app.copy_to_clipboard(text)  # 端末の OSC52 経由（対応端末のみ）
+        return True
+    except Exception:  # noqa: BLE001
+        return False
 
 
 class LogScreen(ModalScreen):
@@ -82,6 +102,95 @@ class LogScreen(ModalScreen):
         # レイアウト確定後に末尾までスクロール（最新行を見せる）。
         self.call_after_refresh(
             self.query_one("#logbody", VerticalScroll).scroll_end, animate=False
+        )
+
+    def action_close(self) -> None:
+        self.dismiss()
+
+
+class MtpScreen(ModalScreen):
+    """MTP ドラフターの要否・取得状況をアプリ内のスクロール画面で表示する（`mtp [model]`）。
+
+    表示内容は CLI の `--check-mtp` と同じ（cli.mtp_report を共有）。ダウンロードはしない。
+    `q` / `Esc` でダッシュボードに戻る。`r` で再読込（`hf download` 後に ready へ変わったか
+    その場で確認できる）。
+    """
+
+    CSS = """
+    MtpScreen { align: center middle; }
+    #mtpbox { width: 92%; height: 90%; border: round #3a3a40; background: #16161a; padding: 0 1; }
+    #mtphead { padding: 0 0 1 0; color: #83838c; }
+    #mtpbody { height: 1fr; background: #16161a; }
+    """
+
+    BINDINGS = [
+        Binding("escape", "close", "back"),
+        Binding("q", "close", "back"),
+        Binding("r", "reload", "reload"),
+    ]
+
+    def __init__(self, model: str | None):
+        super().__init__()
+        self._model = model  # None = 対応表を全件表示
+
+    def compose(self) -> ComposeResult:
+        with Container(id="mtpbox"):
+            head = Text()
+            head.append("mtp ", style="bold")
+            head.append(self._model or "（対応モデル一覧）", style=_DIM)
+            head.append("    (q / Esc で戻る · r 更新 · パスをクリックでコピー)", style=_ACCENT)
+            yield Static(head, id="mtphead")
+            with VerticalScroll(id="mtpbody"):
+                yield Static(id="mtptext")
+
+    def on_mount(self) -> None:
+        self.action_reload()
+
+    def action_reload(self) -> None:
+        # 辞書引き＋ローカルキャッシュ確認だけの軽い処理（HTTP/DL なし）なので UI スレッドでよい
+        # （read_log_tail と同じ扱い）。
+        from .cli import mtp_report
+
+        text, _code = mtp_report(self._model)
+        self.query_one("#mtptext", Static).update(self._linkify(text))
+
+    def _linkify(self, report: str) -> Text:
+        """レポート中のドラフター HF id と `hf download` 行を、クリックでコピー可能にする。
+
+        文面そのものは CLI（cli.mtp_report）と共通のまま、行フォーマットを頼りに該当スパンへ
+        @click メタ（→ action_copy_path）を貼る。ドラフター id はそのまま、`hf download` 行は
+        コマンドごとコピーして端末に貼れるようにする。HF id / コマンドに引用符は現れないので
+        アクション引数のクォート衝突はない。
+        """
+
+        def _link(txt: str) -> Style:
+            return Style(color=_ACCENT, underline=True, meta={"@click": f"screen.copy_path('{txt}')"})
+
+        out = Text()
+        for i, line in enumerate(report.splitlines()):
+            if i:
+                out.append("\n")
+            stripped = line.strip()
+            head, sep, rest = line.partition("drafter: ")
+            if sep and rest:
+                # "    drafter: <id>  [ready …]" — id は直後の 2 連スペースまで。
+                drafter, sep2, tail = rest.partition("  ")
+                out.append(head + sep)
+                out.append(drafter, style=_link(drafter))
+                out.append(sep2 + tail, style=_DIM)
+            elif stripped.startswith("hf download "):
+                # ダウンロードコマンドは行ごとコピー（そのまま端末へ貼れる）。
+                out.append(line[: len(line) - len(stripped)])
+                out.append(stripped, style=_link(stripped))
+            else:
+                out.append(line)
+        return out
+
+    def action_copy_path(self, path: str) -> None:
+        copied = _clipboard_copy(self.app, path)
+        self.app.notify(
+            f"copied: {path}" if copied else f"クリップボードにコピーできませんでした: {path}",
+            timeout=3,
         )
 
     def action_close(self) -> None:
@@ -141,7 +250,7 @@ class GatewayMonitor(App):
         # コマンド欄を最上部に固定する（dock: top）。モデル一覧が増えて #dash が縦に伸びても、
         # 入力欄が画面外へ押し出されない。中央の一覧は #dash 内でスクロールする。
         yield Input(
-            placeholder="command — stop · restart · start · max <n> · log · quit",
+            placeholder="command — stop · restart · start · max <n> · mtp [model] · log · quit",
             id="cmd",
         )
         with VerticalScroll(id="dash"):
@@ -369,20 +478,7 @@ class GatewayMonitor(App):
             self._copy_model(self._row_models[row])
 
     def _copy_model(self, model: str) -> None:
-        """モデル名をクリップボードへ。macOS は pbcopy、他は端末の OSC52（textual）。"""
-        copied = False
-        if sys.platform == "darwin":
-            try:
-                subprocess.run(["pbcopy"], input=model.encode(), check=True)
-                copied = True
-            except Exception:  # noqa: BLE001 - pbcopy 不在等は OSC52 にフォールバック
-                copied = False
-        if not copied:
-            try:
-                self.copy_to_clipboard(model)  # 端末の OSC52 経由（対応端末のみ）
-                copied = True
-            except Exception:  # noqa: BLE001
-                copied = False
+        copied = _clipboard_copy(self, model)
         self.notify(
             f"copied: {model}" if copied else f"クリップボードにコピーできませんでした: {model}",
             timeout=3,
@@ -399,6 +495,11 @@ class GatewayMonitor(App):
         head, _, tail = raw.partition(" ")
         if head.lower() in ("max", "m") and tail.strip():
             self._set_max_resident(tail)
+            return
+        # `mtp [model]`: 必要な MTP ドラフターと取得状況を表示する（CLI の --check-mtp と同じ）。
+        # モデル ID は大文字小文字を区別するので raw から取る（cmd に落とさない）。
+        if head.lower() == "mtp":
+            self.push_screen(MtpScreen(tail.strip() or None))
             return
         handler = {
             "s": self.action_stop, "stop": self.action_stop,
