@@ -512,6 +512,24 @@ def test_no_replica_for_sequential_requests(monkeypatch):
     assert sum(1 for _ in created) == 1
 
 
+def test_no_replica_for_release_race(monkeypatch):
+    # 逐次クライアントのフェーズ境界レース: ストリーミングのクライアントは [DONE] を
+    # 受けた直後に次のリクエストを送るため、前リクエストのゲートウェイ側 release より
+    # 数 ms 早く次が届き「満杯」に見えて複製がトリガーされ得る。猶予後の再確認で
+    # 競合が持続していなければ (前リクエストが解放済みなら) 複製しないこと。
+    import time
+    monkeypatch.setattr(gw, "_REPLICA_GRACE_S", 0.2)  # テスト高速化
+    created = _patch_fake(monkeypatch)
+    mgr = gw.ModelManager(_configs(), max_resident=2)
+    _, h1 = mgr.acquire("m1")     # 生成中 (inflight=1, 満杯)
+    _, h2 = mgr.acquire("m1")     # release の直前に次ターンが到着 → 複製トリガー
+    mgr.release(h1)               # 数 ms 後に前リクエストが解放される (レース解消)
+    assert not _wait_instances(mgr, "m1", 2, timeout=0.8)  # 猶予後も複製されない
+    assert len(mgr._models["m1"].instances) == 1
+    assert sum(1 for _ in created) == 1
+    mgr.release(h2)
+
+
 def test_replica_spawns_on_concurrent_load(monkeypatch):
     # 同一モデルに同時リクエストが集中して満杯になると、複製インスタンスが起動して並列化する。
     created = _patch_fake(monkeypatch)

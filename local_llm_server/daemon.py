@@ -52,6 +52,12 @@ from .server import (
     resolve_drafter,
 )
 
+# 複製インスタンス起動前の猶予秒数。ストリーミングのクライアントは [DONE] を受けた
+# 直後に次のリクエストを送るが、ゲートウェイ側の inflight 解放は転送スレッドが上流の
+# 終端を読み切る数 ms 後になる。この隙間に届いた**逐次**リクエストが「満杯」に見えて
+# 複製が誤発動しないよう、猶予を置いてから持続的な競合かを再確認する。
+_REPLICA_GRACE_S = 1.0
+
 # MTP（speculative decoding）が効くバックエンド。draft_model は mlx-vlm のみ build_command が
 # 反映する（他は無視）。ゲートウェイはこれを使って継承・検証する。
 _MTP_BACKEND = "mlx-vlm"
@@ -425,6 +431,10 @@ class ModelManager:
         退避できるアイドルが無ければ複製しない）。起動失敗も本流に影響させない。
         """
         try:
+            # 逐次クライアントのフェーズ境界レース（[DONE] 受信〜release の数 ms 差）に
+            # よる誤発動を除外する猶予（_REPLICA_GRACE_S 参照）。この間 _spawning に
+            # 登録済みなので同モデルの再トリガーは重複しない
+            time.sleep(_REPLICA_GRACE_S)
             with self._control:
                 with self._state:
                     mm = self._models.get(model_id)
@@ -432,8 +442,11 @@ class ModelManager:
                         return
                     ready = [i for i in mm.instances if i.ready and i.server is not None]
                     cap = self._capacity(mm.config)
-                    # 起動判断の時点で空きができた／満杯でなくなっていたら複製不要。
-                    if not ready or any(i.inflight < cap for i in ready):
+                    # 猶予後も「全インスタンスに容量+1 以上積まれている」＝複数リクエスト
+                    # が実際に同時へ載っている場合のみ複製する。単なる処理中 (inflight==cap)
+                    # はトリガー時のレース痕跡と区別できないため複製しない（真の並行負荷では
+                    # 追い越したリクエストも同じインスタンスへ載るので inflight が cap を超える）
+                    if not ready or min(i.inflight for i in ready) <= cap:
                         return
                 if not self._make_room_for_replica(keep=model_id):
                     return  # 上限・メモリで枠が取れない（アイドル退避もできない）→ 複製しない
