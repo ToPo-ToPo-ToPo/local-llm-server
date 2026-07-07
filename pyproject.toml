@@ -1,6 +1,6 @@
 [project]
 name = "local-llm-server"
-version = "0.20.0"
+version = "0.20.1"
 description = "ローカルLLM（mlx / mlx-vlm / llama.cpp）を OpenAI 互換 API で束ねるマルチモデルゲートウェイ（サーバー）。gateway.toml のカタログを 1 ポートで配信し、model で振り分け・遅延起動・LRU 退避・MTP 高速化（Ollama 流の共有デーモン）。接続用クライアントは別パッケージ local-llm-client。"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -29,7 +29,9 @@ dependencies = [
     "psutil>=5.9",
     # mlx 系バックエンド（テキスト/vision/STT）。Apple Silicon でのみ解決・インストールされる。
     "mlx-lm>=0.31.3 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
-    "mlx-vlm>=0.6.3 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    # mlx-vlm 0.6.4 は Qwen3.6 で変換・推論とも壊れる（garble）ため 0.6.4 未満に固定。
+    # 直ったら上限を上げる（上げた直後は Qwen3.6 で 1+1 の sanity check を必ず行う）。
+    "mlx-vlm>=0.6.3,<0.6.4 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
     "transformers<5.13",
 ]
 
