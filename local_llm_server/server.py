@@ -12,7 +12,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 
 # 起動可能なバックエンド一覧は同梱の constants から取得（OpenAI互換APIの公開値）。
 from .constants import BACKENDS, project_cache_dir  # noqa: F401
@@ -164,7 +164,7 @@ def _find_pids_netstat(port: int) -> list[int]:
     return pids
 
 
-# このパッケージが起動するプロセスのコマンドラインに現れる目印。--stop / TUI の終了処理が
+# このパッケージが起動するプロセスのコマンドラインに現れる目印。TUI の停止/終了処理が
 # 「ポートを LISTEN しているだけの無関係なプロセス」を巻き添えにしないための判定に使う。
 _OUR_CMD_MARKERS = (
     "local_llm_server", "local-llm-server", "llama-server", "mlx_lm", "mlx_vlm",
@@ -751,8 +751,8 @@ def is_ready(base_url: str, timeout: float = 1.0) -> bool:
     """OpenAI互換サーバーが応答可能かを判定する。
 
     401/403 も「起動して応答している」と判定する（api_key を設定したゲートウェイは
-    /v1/models にキーを要求するため。ここで False にすると --start / --status / TUI の
-    自己ヘルスチェックが、正常起動したゲートウェイを「応答なし」と誤判定してしまう）。
+    /v1/models にキーを要求するため。ここで False にすると TUI の自己ヘルスチェック
+    （起動判定・常駐ポーリング）が、正常起動したゲートウェイを「応答なし」と誤判定してしまう）。
     """
     try:
         with urllib.request.urlopen(f"{base_url}/models", timeout=timeout) as resp:
@@ -914,71 +914,36 @@ class LocalServer:
             raise RuntimeError("server not started")
         return self._proc.wait()
 
-    def stop(self) -> None:
+    def stop(self, grace: float = 10.0) -> None:
+        """モデルサーバー（とプロセスグループ）を止める。
+
+        grace > 0 は graceful: プロセスグループ全体へ SIGTERM を送り、grace 秒だけ自発終了を
+        待ってから SIGKILL でとどめを刺す（LRU 退避など、単体を丁寧に止めたいとき用）。
+        grace <= 0 は最初から SIGKILL する。ゲートウェイの全体終了時はこれを使う —— どうせ
+        全プロセスを畳むので graceful は不要で、mlx/Metal の終了時クリーンアップ（数秒かかる
+        ことがある）を待たずカーネルに即回収させた方が、TUI の quit が目に見えて速くなる。
+        """
         if self._proc is None:
             self._close_log()
             return
         proc = self._proc
-        # graceful: プロセスグループ全体へ SIGTERM を送って 10 秒待つ
-        _signal_process_tree(proc, kill=False)
-        try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            # 終わらなければグループ全体へ SIGKILL で強制終了
-            _signal_process_tree(proc, kill=True)
+        if grace <= 0:
+            _signal_process_tree(proc, kill=True)  # 即 SIGKILL（全体終了・graceful 不要）
+        else:
+            _signal_process_tree(proc, kill=False)  # SIGTERM を送って grace 秒待つ
             try:
-                proc.wait(timeout=5)
+                proc.wait(timeout=grace)
             except subprocess.TimeoutExpired:
-                pass
+                # 終わらなければグループ全体へ SIGKILL で強制終了
+                _signal_process_tree(proc, kill=True)
+        try:
+            proc.wait(timeout=5)  # SIGKILL 後の回収を見届ける（ゾンビを残さない）
+        except subprocess.TimeoutExpired:
+            pass
         self._proc = None
         self._close_log()
 
     def __enter__(self) -> "LocalServer":
-        self.start()
-        self.wait_until_ready()
-        return self
-
-    def __exit__(self, *exc: object) -> None:
-        self.stop()
-
-
-def build_pool_configs(base: ServerConfig, instances: int) -> list[ServerConfig]:
-    """base を起点に、連番ポート（port, port+1, ...）の設定を instances 個作る。"""
-    return [replace(base, port=base.port + i) for i in range(instances)]
-
-
-class ServerPool:
-    """複数のローカルLLMサーバーをまとめて起動・管理する。
-
-    mlx のように1プロセスが逐次処理のバックエンドで並列性を得る用途を想定。
-    各インスタンスは別ポートで起動し、それぞれモデルを個別にロードする
-    （= 重みのメモリはインスタンス数分かかる）。
-    """
-
-    def __init__(self, configs: list[ServerConfig]) -> None:
-        self._servers = [LocalServer(c) for c in configs]
-
-    @property
-    def base_urls(self) -> list[str]:
-        return [server.base_url for server in self._servers]
-
-    def start(self) -> None:
-        for server in self._servers:
-            server.start()
-
-    def wait_until_ready(self, timeout: float = 120.0) -> None:
-        for server in self._servers:
-            server.wait_until_ready(timeout=timeout)
-
-    def wait(self) -> None:
-        for server in self._servers:
-            server.wait()
-
-    def stop(self) -> None:
-        for server in self._servers:
-            server.stop()
-
-    def __enter__(self) -> "ServerPool":
         self.start()
         self.wait_until_ready()
         return self
@@ -992,7 +957,7 @@ def ignore_shutdown_signals() -> None:
     """SIGTERM / SIGHUP / SIGINT を一旦無視（SIG_IGN）にする。
 
     後始末（配下のサーバー停止など）の最中に再度シグナルが届いても中断されないよう、
-    クリーンアップ開始時に呼ぶ。`--stop` の killpg や端末クローズで複数シグナルが連続して
+    クリーンアップ開始時に呼ぶ。停止時の killpg や端末クローズで複数シグナルが連続して
     届いても、停止処理を最後までやり切って孫プロセスを残さないための保険。
     install_shutdown_handlers() の対（同じくメインスレッドからのみ有効）。
     """
@@ -1009,7 +974,7 @@ def ignore_shutdown_signals() -> None:
 def daemon_log_path(port: int) -> str:
     """ゲートウェイが起動するモデルサーバーのログ保存先（ポート別の固定パス）。
 
-    `--status` から参照できるよう、ランダムな tempfile ではなくポートで決まる固定パスにする。
+    TUI やログ表示から参照できるよう、ランダムな tempfile ではなくポートで決まる固定パスにする。
     プロジェクト内（`./.local-llm-server/`、カレントディレクトリ相対）に置き、ホーム等の外部には
     書かない。同じポートのサーバーは同じログに追記する。
     """
@@ -1047,7 +1012,7 @@ def primary_lan_ip() -> str | None:
 
 
 def server_status(host: str = "127.0.0.1", port: int = 8799) -> dict | None:
-    """ポートで動いているローカルサーバーの状態をまとめて返す（`--status` 表示用）。
+    """ポートで動いているローカルサーバーの状態をまとめて返す（TUI の状態表示用）。
 
     応答もせず LISTEN しているプロセスも無ければ None。応答可否・PID 一覧・提供モデル・
     ログパス（存在すれば）を1つの dict にまとめる。PID は POSIX で lsof が使えるときのみ
@@ -1121,7 +1086,7 @@ def gateway_log_path(port: int) -> str:
     """バックグラウンド起動したゲートウェイ本体（公開ポート）の出力ログ保存先。
 
     モデルサーバーの daemon_log_path（server-<port>.log）と別に、ゲートウェイ自身の
-    起動ログを gateway-<port>.log に逃がす（`--status` / TUI から参照できる固定パス）。
+    起動ログを gateway-<port>.log に逃がす（TUI のログ表示から参照できる固定パス）。
     """
     return os.path.join(project_cache_dir(), f"gateway-{port}.log")
 
@@ -1136,7 +1101,7 @@ def start_gateway_background(
     """ゲートウェイをデタッチした別プロセスで常駐起動し、応答可能になるまで待つ。
 
     ターミナルを占有しない常駐起動（Ollama 流）。cwd の ./gateway.toml を読む
-    フォアグラウンド版（`python -m local_llm_server.cli`）を、新セッション（POSIX）/
+    ヘッドレスワーカー（`python -m local_llm_server` = __main__）を、新セッション（POSIX）/
     DETACHED_PROCESS（Windows）で起動して端末・親から切り離し、出力は gateway_log_path に
     逃がす。応答可能になったら PID を返す。既に起動済みなら何もせず既存 PID（不明なら 0）を返す。
     起動失敗は RuntimeError、時間内に応答しなければ TimeoutError。
@@ -1173,9 +1138,10 @@ def start_gateway_background(
     else:
         popen_kwargs["start_new_session"] = True  # setsid: 端末/親から独立
     try:
-        # --headless 必須: 裏起動は出力をログへ逃がす非 TTY なので TUI を出さずゲートウェイ本体を回す。
+        # ヘッドレスワーカー（__main__）を起動。裏起動は出力をログへ逃がす非 TTY なので
+        # TUI を出さずゲートウェイ本体だけを回す。
         proc = subprocess.Popen(
-            [sys.executable, "-m", "local_llm_server.cli", "--headless"], **popen_kwargs
+            [sys.executable, "-m", "local_llm_server"], **popen_kwargs
         )
     finally:
         log_file.close()  # fd は子へ複製済み。親側は閉じてよい

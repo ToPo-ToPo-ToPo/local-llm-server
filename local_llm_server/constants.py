@@ -19,13 +19,6 @@ DEFAULT_VISION_MODEL = DEFAULT_MODEL
 BACKENDS = ("mlx", "mlx-vlm", "llama-cpp")
 
 
-def _env_bool(name: str, default: bool) -> bool:
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    return value.strip().lower() in ("1", "true", "yes", "on")
-
-
 def project_cache_dir() -> str:
     """プロジェクト内（カレントディレクトリ）のキャッシュ/ログ用ディレクトリ `./.local-llm-server`。
 

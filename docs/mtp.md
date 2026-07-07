@@ -45,15 +45,16 @@ draft_model = "google/gemma-4-31B-it-assistant"  # サイズ固有・mlx-vlm で
   落とさず MTP なしにフォールバックするが、`[[models]]` に `draft_model="auto"` を明示した場合は
   「明示したのに引けない」ので起動時エラーにする（設定ミスを早く気付けるように）。
 
-## ドラフターの事前確認（`--check-mtp` / TUI `mtp`）
+## ドラフターの事前確認（TUI `mtp`）
 
 **ダウンロードする前に**、そのモデルの MTP にどのドラフターが必要か・もう取得済みかを確認できる。
-対応表の辞書引きとローカルキャッシュ確認だけで、**モデルの DL は一切しない**。gateway.toml も
-読まないので、どのディレクトリからでも実行できる。
+対応表の辞書引きとローカルキャッシュ確認だけで、**モデルの DL は一切しない**。
 
-```bash
-uv run local-llm-server --check-mtp 'ToPo-ToPo/Qwen3.6-27B-mlx-4bit'   # 1 モデルを確認
-uv run local-llm-server --check-mtp                                    # 対応モデルを全件一覧
+TUI ダッシュボードの入力欄に `mtp [model]` と打つと、画面内に表示される。
+
+```
+mtp ToPo-ToPo/gemma-4-31b-it-mlx-4bit
+mtp                                    # 対応モデルを全件一覧（model 省略）
 ```
 
 ```
@@ -64,11 +65,10 @@ ToPo-ToPo/gemma-4-31b-it-mlx-4bit
 
 - `[ready]` はドラフター取得済み（そのまま MTP が効く）、`[available]` は未取得（そのまま貼れる
   `hf download` コマンドを添えて表示）。
-- 対応表に無いモデルは「MTP 非対応」と表示して終了コード 1 を返す（使うなら `draft_model` に
-  ドラフターの HF id を明示する）。ready / available / 一覧は 0。結果は stdout に出るので
-  `--check-mtp MODEL | grep 'hf download'` のようにパイプでも拾える。
-- TUI では入力欄に `mtp [model]` と打つと同じ内容が画面内に出る。ドラフターのパスと
-  `hf download` コマンドは**クリックでコピー**でき、そのまま端末に貼ってダウンロードできる。
+- 対応表に無いモデルは「MTP 非対応」と表示する（使うなら `draft_model` に
+  ドラフターの HF id を明示する）。
+- ドラフターのパスと `hf download` コマンドは**クリックでコピー**でき、そのまま端末に貼って
+  ダウンロードできる。
 
 ## 対応モデル（`MTP_DRAFTERS`）
 
@@ -82,5 +82,5 @@ ToPo-ToPo/gemma-4-31b-it-mlx-4bit
   `mlx-vlm >= 0.6.3` が必要。ドラフターはサイズ間で互換性が無い（31B / 26B-A4B / E4B / E2B で別）。
   `google/...` は gated（Gemma ライセンス）なので、自動DLには同意済みの HF トークンが要る場合がある。
 
-一覧は `--check-mtp`（引数なし）か `from local_llm_server import MTP_DRAFTERS` で参照、解決は
+一覧は TUI の `mtp`（引数なし）か `from local_llm_server import MTP_DRAFTERS` で参照、解決は
 `resolve_drafter(model, "auto")` で行う。未収録モデルは `draft_model` に HF id を明示する。

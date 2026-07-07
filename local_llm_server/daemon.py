@@ -246,8 +246,7 @@ class ModelManager:
 
         - 既定（`_default_draft` が None）では mlx-vlm のみ `"auto"` を試みる。本体名が対応表
           `MTP_DRAFTERS` にあればそのドラフターを返し、無ければ静かに None（MTP なし）にする。
-          動的ロードを未対応モデルで失敗させないための graceful な解決（gateway.py の
-          `ensure_server` と同じ方針）。
+          動的ロードを未対応モデルで失敗させないための graceful な解決。
         - `_default_draft` を明示していればそれを尊重する（`"off"`/`"none"`/`""` で無効化、
           HF id で明示指定）。
         - llama.cpp の MTP は埋め込みヘッドの有無を repo-id から確実に判定できず、未対応 GGUF に
@@ -850,9 +849,12 @@ class ModelManager:
     def shutdown(self) -> None:
         """全モデルサーバー（全インスタンス）を並列に停止する（ゲートウェイ終了時）。
 
-        並列にするのは、外部 `--stop`（SIGTERM→10s→SIGKILL）の猶予内に収めるため。
-        起動途中（_starting）のサーバーも止める（ロード中の Ctrl+C で巨大モデルの
-        プロセスが孤児として残らないように）。以降の起動は _closing で拒否する。
+        全体を畳むので graceful は不要 —— `grace=0` で各モデルを即 SIGKILL する。SIGTERM で
+        待つと mlx/Metal の終了時クリーンアップに数秒かかり、それが TUI の quit 待ち時間として
+        表面化するため。カーネルがメモリを回収するので即 kill でも取りこぼしはない。並列に
+        するのは、外部からの停止（stop_pid の猶予）内に確実に収めるため。起動途中（_starting）の
+        サーバーも止める（ロード中の Ctrl+C で巨大モデルのプロセスが孤児として残らないように）。
+        以降の起動は _closing で拒否する。
         """
         with self._state:
             self._closing = True
@@ -864,7 +866,7 @@ class ModelManager:
                 m.instances.clear()
             # _evict_if_needed で枠待ちしているロードを起こす（closing を見て中断させる）。
             self._state.notify_all()
-        threads = [threading.Thread(target=s.stop) for s in servers]
+        threads = [threading.Thread(target=s.stop, kwargs={"grace": 0.0}) for s in servers]
         for t in threads:
             t.start()
         for t in threads:
@@ -1004,7 +1006,7 @@ class _GatewayHandler(BaseHTTPRequestHandler):
             send_json(self, 200, data)
             return
         # /admin/status は常駐モデルのライブ状態（loaded/inflight）＋運用ポリシーを返す。
-        # TUI が CLI の --status より詳しい状態を出すための読み取り口。
+        # TUI が詳しい状態（server_status より細かいライブ状態）を出すための読み取り口。
         if path.endswith("/admin/status"):
             if not self._require_loopback():
                 return
@@ -1417,7 +1419,7 @@ def run_gateway(cfg: GatewayConfig) -> int:
 
     終了時に配下のモデルサーバーを全て停止する。SIGTERM/SIGHUP を
     KeyboardInterrupt に変換する install_shutdown_handlers() が呼ばれていれば、
-    `kill` や `--stop`、端末クローズでも下の finally を通って後始末する。
+    `kill` や TUI からの停止、端末クローズでも下の finally を通って後始末する。
     """
     manager = ModelManager(
         cfg.models, max_resident=cfg.max_resident, load_timeout=cfg.load_timeout,
@@ -1523,7 +1525,7 @@ def run_gateway(cfg: GatewayConfig) -> int:
     except KeyboardInterrupt:
         pass
     finally:
-        # 後始末中に再度シグナル（--stop の killpg 等で連続して届く）が来ても中断されず、
+        # 後始末中に再度シグナル（停止時の killpg 等で連続して届く）が来ても中断されず、
         # 配下のモデルサーバーを必ず止め切るため、まず以降のシグナルを無視にする。
         ignore_shutdown_signals()
         stop_reaper.set()
