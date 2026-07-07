@@ -137,7 +137,7 @@ class _StubServer:
     def __init__(self):
         self.stopped = False
 
-    def stop(self):
+    def stop(self, grace: float | None = None):
         self.stopped = True
 
 
@@ -285,6 +285,7 @@ class _FakeServer:
         self.config = config
         self.starts = 0
         self.stops = 0
+        self.last_grace = None  # 直近 stop() に渡された grace（全体終了は 0）
 
     def start(self):
         self.starts += 1
@@ -292,8 +293,9 @@ class _FakeServer:
     def wait_until_ready(self, *a, **k):
         pass
 
-    def stop(self):
+    def stop(self, grace: float = 10.0):
         self.stops += 1
+        self.last_grace = grace
 
 
 def _patch_fake(monkeypatch):
@@ -615,6 +617,8 @@ def test_manager_shutdown_stops_all(monkeypatch):
     mgr.release(mgr.acquire("m2")[1])
     mgr.shutdown()
     assert all(s.stops == 1 for s in created)
+    # 全体終了は graceful を待たず即 SIGKILL（grace=0）で畳む（quit を速くするため）。
+    assert all(s.last_grace == 0.0 for s in created)
     assert all(not s["loaded"] for s in mgr.status())
 
 

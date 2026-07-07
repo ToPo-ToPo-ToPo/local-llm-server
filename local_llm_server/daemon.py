@@ -849,9 +849,12 @@ class ModelManager:
     def shutdown(self) -> None:
         """全モデルサーバー（全インスタンス）を並列に停止する（ゲートウェイ終了時）。
 
-        並列にするのは、外部からの停止（stop_pid: SIGTERM→10s→SIGKILL）の猶予内に収めるため。
-        起動途中（_starting）のサーバーも止める（ロード中の Ctrl+C で巨大モデルの
-        プロセスが孤児として残らないように）。以降の起動は _closing で拒否する。
+        全体を畳むので graceful は不要 —— `grace=0` で各モデルを即 SIGKILL する。SIGTERM で
+        待つと mlx/Metal の終了時クリーンアップに数秒かかり、それが TUI の quit 待ち時間として
+        表面化するため。カーネルがメモリを回収するので即 kill でも取りこぼしはない。並列に
+        するのは、外部からの停止（stop_pid の猶予）内に確実に収めるため。起動途中（_starting）の
+        サーバーも止める（ロード中の Ctrl+C で巨大モデルのプロセスが孤児として残らないように）。
+        以降の起動は _closing で拒否する。
         """
         with self._state:
             self._closing = True
@@ -863,7 +866,7 @@ class ModelManager:
                 m.instances.clear()
             # _evict_if_needed で枠待ちしているロードを起こす（closing を見て中断させる）。
             self._state.notify_all()
-        threads = [threading.Thread(target=s.stop) for s in servers]
+        threads = [threading.Thread(target=s.stop, kwargs={"grace": 0.0}) for s in servers]
         for t in threads:
             t.start()
         for t in threads:

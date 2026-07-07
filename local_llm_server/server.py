@@ -914,22 +914,32 @@ class LocalServer:
             raise RuntimeError("server not started")
         return self._proc.wait()
 
-    def stop(self) -> None:
+    def stop(self, grace: float = 10.0) -> None:
+        """モデルサーバー（とプロセスグループ）を止める。
+
+        grace > 0 は graceful: プロセスグループ全体へ SIGTERM を送り、grace 秒だけ自発終了を
+        待ってから SIGKILL でとどめを刺す（LRU 退避など、単体を丁寧に止めたいとき用）。
+        grace <= 0 は最初から SIGKILL する。ゲートウェイの全体終了時はこれを使う —— どうせ
+        全プロセスを畳むので graceful は不要で、mlx/Metal の終了時クリーンアップ（数秒かかる
+        ことがある）を待たずカーネルに即回収させた方が、TUI の quit が目に見えて速くなる。
+        """
         if self._proc is None:
             self._close_log()
             return
         proc = self._proc
-        # graceful: プロセスグループ全体へ SIGTERM を送って 10 秒待つ
-        _signal_process_tree(proc, kill=False)
-        try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            # 終わらなければグループ全体へ SIGKILL で強制終了
-            _signal_process_tree(proc, kill=True)
+        if grace <= 0:
+            _signal_process_tree(proc, kill=True)  # 即 SIGKILL（全体終了・graceful 不要）
+        else:
+            _signal_process_tree(proc, kill=False)  # SIGTERM を送って grace 秒待つ
             try:
-                proc.wait(timeout=5)
+                proc.wait(timeout=grace)
             except subprocess.TimeoutExpired:
-                pass
+                # 終わらなければグループ全体へ SIGKILL で強制終了
+                _signal_process_tree(proc, kill=True)
+        try:
+            proc.wait(timeout=5)  # SIGKILL 後の回収を見届ける（ゾンビを残さない）
+        except subprocess.TimeoutExpired:
+            pass
         self._proc = None
         self._close_log()
 

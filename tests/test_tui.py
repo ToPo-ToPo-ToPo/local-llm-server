@@ -288,6 +288,7 @@ def test_fmt_hms():
 
 def test_quit_stops_gateway_daemon(tmp_path, monkeypatch):
     # q（終了）でゲートウェイ・デーモンも停止する（次回起動で最新コードが反映されるように）。
+    # 停止は UI スレッドを固めないよう別スレッド（@work）で走り、完了後に exit する。
     from local_llm_server import tui_app
 
     gcfg = load_gateway_config(str(_write_cfg(tmp_path, "port = 8799\n")))
@@ -295,22 +296,29 @@ def test_quit_stops_gateway_daemon(tmp_path, monkeypatch):
     monkeypatch.setattr(tui_app, "gateway_admin_status", lambda h, p: None)
     monkeypatch.setattr(tui_app, "is_ready", lambda url, **k: False)  # 実 HTTP を叩かない
     killed = []
+    exited = []
 
     async def scenario():
         app = tui_app.GatewayMonitor(gcfg)
         async with app.run_test() as pilot:
             await pilot.pause()
             monkeypatch.setattr(app, "_kill_ports", lambda: killed.append(True))
-            monkeypatch.setattr(app, "exit", lambda *a, **k: None)  # 実際の終了は抑止
+            monkeypatch.setattr(app, "exit", lambda *a, **k: exited.append(True))
             app.action_quit()
+            await app.workers.wait_for_complete()  # 停止ワーカーの完了を待つ
             await pilot.pause()
+            # 停止中は "closing…" を表示して UI が固まって見えないようにする。
+            assert app.busy == "closing…"
+            assert "closing" in app.query_one("#status").render().plain
             # コマンド入力（"quit"）経路も同じく停止を通すこと
-            killed.clear()
             app.on_input_submitted(_FakeSubmit("quit"))
+            await app.workers.wait_for_complete()
             await pilot.pause()
 
     asyncio.run(scenario())
-    assert killed == [True]
+    # 両経路（キー q・入力 "quit"）とも停止と終了を通す。
+    assert killed == [True, True]
+    assert exited == [True, True]
 
 
 class _FakeSubmit:

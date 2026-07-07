@@ -463,10 +463,20 @@ class GatewayMonitor(App):
 
     def action_quit(self) -> None:
         # q（終了）ではゲートウェイ・デーモンも停止する。ダッシュボードを閉じたら裏の常駐も
-        # 完全に終了させることで、次回 `uv run gw` 起動時に必ず最新コードで
-        # 立ち上がる（＝コード変更が反映される）。終了前に同期実行して確実に落とす。
-        self._kill_ports()
-        self.exit()
+        # 完全に終了させることで、次回 `uv run gw` 起動時に必ず最新コードで立ち上がる。
+        # 停止はロード済みモデルの解放待ちで時間がかかるため、UI スレッドで同期実行すると
+        # 画面が固まる。別スレッドに逃がして "closing…" を出し、完了したら終了する。
+        self._quit_worker()
+
+    @work(thread=True, group="quit")
+    def _quit_worker(self) -> None:
+        self.busy = "closing…"
+        self.call_from_thread(self._render)
+        try:
+            self._kill_ports()
+        finally:
+            # 停止が終わってから閉じる（ポートが解放され、次回起動が旧プロセスに相乗りしない）。
+            self.call_from_thread(self.exit)
 
     def on_click(self, event) -> None:
         # 表の行をクリックしたら、その行のモデル名をコピーする（行ハイライトは出さない）。
