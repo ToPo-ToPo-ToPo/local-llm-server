@@ -7,9 +7,63 @@ textual を遅延 import する起動口だけを持つ（merge_status 等は端
 """
 from __future__ import annotations
 
+import os
 import sys
+import tomllib
 
-from .server import gateway_log_path, mtp_status
+from .daemon import load_gateway_config
+from .server import MTP_DRAFTERS, gateway_log_path, mtp_status
+
+
+def resolve_config() -> str | None:
+    """使う gateway.toml を決める。**カレントディレクトリの `./gateway.toml` のみ**。
+
+    存在すればそのパス、無ければ None（呼び出し側がエラーにする）。場所は CWD 固定で、
+    位置引数やホーム等の外部は見ない（「gateway.toml は CWD に置く」という 1 ルール）。
+    """
+    path = os.path.join(os.getcwd(), "gateway.toml")
+    return path if os.path.isfile(path) else None
+
+
+def mtp_report(model: str | None) -> tuple[str, int]:
+    """使う予定のモデルに必要な MTP ドラフターを、ダウンロード前に調べて文面にする。
+
+    TUI の `mtp` コマンド（MtpScreen）が使う本体。対応表（MTP_DRAFTERS）の辞書引きと
+    ローカルキャッシュ確認だけで、モデルのダウンロードは一切しない（`mtp_status` と同じく
+    非破壊）。gateway.toml も見ないので、どのディレクトリからでも実行できる。model を省略
+    （None/空）すると対応表を全件、取得状況つきで並べる。
+
+    戻り値: (表示テキスト, 終了コード)。指定モデルが MTP 非対応なら 1、
+    それ以外（ready / available / 一覧表示）は 0。
+    """
+
+    def _describe(target: str) -> str:
+        drafter = MTP_DRAFTERS[target]
+        # mtp_status は "ready"（ドラフター取得済み）/ "available"（未取得）を返す。DL はしない。
+        if mtp_status(target) == "ready":
+            return (
+                f"{target}\n"
+                f"    drafter: {drafter}  [ready — 取得済み。そのまま MTP が効く]"
+            )
+        return (
+            f"{target}\n"
+            f"    drafter: {drafter}  [available — 未取得]\n"
+            f"    hf download {drafter}"
+        )
+
+    if not model:
+        lines = ['MTP 対応モデル（mlx-vlm・draft_model="auto" で自動解決）:']
+        lines.extend(f"  {_describe(target)}" for target in sorted(MTP_DRAFTERS))
+        return "\n".join(lines), 0
+
+    if model not in MTP_DRAFTERS:
+        return (
+            f"{model}: MTP 非対応（対応表に無い）。使うなら gateway.toml の draft_model に "
+            "ドラフターの HF id を明示してください。対応モデル一覧は引数なしの "
+            "`mtp` コマンドで表示。",
+            1,
+        )
+    return _describe(model), 0
 
 
 def merge_status(gcfg, admin: dict | None, ready: bool | None = None) -> dict:
@@ -124,10 +178,7 @@ def read_log_tail(port: int, max_lines: int = 1000, max_bytes: int = 512 * 1024)
 
 
 def run_tui(gcfg) -> int:
-    """TUI を起動する。textual は重いので遅延 import（headless では読み込まない）。
-
-    textual 未導入なら ImportError を素通しし、呼び出し側（cli）が headless 実行へ落とす。
-    """
+    """TUI を起動する。textual は重いので遅延 import（headless ワーカーでは読み込まない）。"""
     from .tui_app import GatewayMonitor
 
     GatewayMonitor(gcfg).run()
@@ -135,15 +186,26 @@ def run_tui(gcfg) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """`python -m local_llm_server.tui` 用の薄い入口（通常は CLI 既定から呼ばれる）。"""
-    from .cli import _resolve_config
-    from .daemon import load_gateway_config
+    """`gw` コマンド: カレントディレクトリの `./gateway.toml` で TUI ダッシュボードを起動する。
 
-    config_path = _resolve_config()
+    引数は取らない（停止/再起動/起動・max 変更・MTP 確認・ログ表示は、すべて TUI 内の
+    単キー `s/r/g/m/l/q` と入力欄コマンドで行う → tui_app.py）。ダッシュボードはゲートウェイ
+    本体を裏で常駐させる（`python -m local_llm_server` = __main__ を別プロセスで起動）。
+    """
+    config_path = resolve_config()
     if config_path is None:
-        print("./gateway.toml not found in the current directory.", file=sys.stderr)
+        print(
+            "./gateway.toml not found in the current directory. Create one here "
+            "(see the gateway.toml example in the repo), then run again from that directory.",
+            file=sys.stderr,
+        )
         return 2
-    return run_tui(load_gateway_config(config_path))
+    try:
+        gcfg = load_gateway_config(config_path)
+    except (OSError, ValueError, tomllib.TOMLDecodeError) as exc:
+        print(f"Failed to load ./gateway.toml: {exc}", file=sys.stderr)
+        return 2
+    return run_tui(gcfg)
 
 
 if __name__ == "__main__":

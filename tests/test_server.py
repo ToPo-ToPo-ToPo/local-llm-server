@@ -623,7 +623,7 @@ def test_discover_cached_models(monkeypatch, tmp_path):
 def test_is_ready_treats_auth_gated_as_up():
     """api_key 付きゲートウェイ（/v1/models が 401）も「稼働中」と判定する。
 
-    ここで False になると、--start / --status / TUI の自己ヘルスチェックが
+    ここで False になると、TUI の自己ヘルスチェック（起動判定・常駐ポーリング）が
     正常起動したゲートウェイを「応答なし」と誤判定してしまう（回帰防止）。
     """
     import threading

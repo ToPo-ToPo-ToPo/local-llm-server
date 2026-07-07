@@ -1,7 +1,6 @@
 """テキスト LLM と vision VLM を内部で振り分けるルーティングプロキシ。
 
-`local-llm-server --backend router` で起動する。1 つの OpenAI 互換
-エンドポイント（例 http://127.0.0.1:8080/v1）を公開し、受信した
+1 つの OpenAI 互換エンドポイント（例 http://127.0.0.1:8080/v1）を公開し、受信した
 `/v1/chat/completions` の `messages` を検査して:
 
   - 画像など非テキストのコンテンツパートを含む → vision バックエンド(VLM)

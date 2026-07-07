@@ -2,7 +2,8 @@
 
 このパッケージは**ゲートウェイ・サーバー専用**。サポートするコマンドは 1 つ:
 
-  - `local-llm-server`      … ./gateway.toml のゲートウェイを起動（cli:main）
+  - `gw`      … ./gateway.toml のゲートウェイを TUI ダッシュボードで起動（tui:main）。
+              裏で常駐するゲートウェイ本体は `python -m local_llm_server`（__main__）。
 
 **クライアント（接続する側）は別パッケージ `local-llm-client`** に切り出した。エージェントは
 そちらの `LLMClient` / `connect` を使う（または素の `openai` SDK で base_url を指す）。本パッケージは
@@ -66,7 +67,7 @@ from .gateway import (
 # 公開 API は「ゲートウェイの運用」だけに絞る（サーバー専用パッケージ）。クライアント
 # （LLMClient / connect）は別パッケージ local-llm-client へ移動した。
 __all__ = [
-    "run_gateway",        # gateway.toml のゲートウェイを起動（cli:main が呼ぶ本体）
+    "run_gateway",        # gateway.toml のゲートウェイを起動（__main__ が呼ぶ本体）
     "load_gateway_config",  # ./gateway.toml の読み込み
     "GatewayConfig",      # 読み込んだゲートウェイ設定
     "server_status",      # 稼働状態（応答可否・pid・モデル・ログ）

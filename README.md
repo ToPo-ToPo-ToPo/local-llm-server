@@ -21,7 +21,7 @@ cd local-llm-server          # クローンしたフォルダの中で実行（u
 uv sync
 ```
 
-以降このフォルダで `gateway.toml` を編集し、`uv run local-llm-server` で起動する（→ [使い方](#使い方)）。
+以降このフォルダで `gateway.toml` を編集し、`uv run gw` で起動する（→ [使い方](#使い方)）。
 
 > **他 OS（Linux / Windows / Intel Mac）＝ llama.cpp**: `uv sync` は mlx を入れずに済むので、追加で
 > `llama-server` をインストールして PATH に通すだけ（OS 別手順は [docs/llama-cpp.md](docs/llama-cpp.md)）。
@@ -30,8 +30,8 @@ uv sync
 <details>
 <summary>クローンせず PyPI の公開パッケージを使う場合（任意）</summary>
 
-- **コマンドとして入れる**: `uv tool install local-llm-server` → どこでも `local-llm-server` で起動。
-- **別プロジェクトの依存として入れる**: `gateway.toml` を置く新規フォルダで `uv init` → `uv add local-llm-server` → `uv run local-llm-server`。
+- **コマンドとして入れる**: `uv tool install local-llm-server` → どこでも `gw` で起動。
+- **別プロジェクトの依存として入れる**: `gateway.toml` を置く新規フォルダで `uv init` → `uv add local-llm-server` → `uv run gw`。
 </details>
 
 ## 使い方
@@ -55,7 +55,7 @@ max_resident = 1            # 同時常駐モデル数の上限（超過は LRU 
 TUI ダッシュボードが開き、使えるモデル・ロード状況・処理中数が一目で分かる。
 
 ```bash
-uv run local-llm-server
+uv run gw
 ```
 
 ### 3. このサーバーとの接続　（使用先で実施）

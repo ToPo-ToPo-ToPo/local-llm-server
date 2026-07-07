@@ -111,7 +111,7 @@ class LogScreen(ModalScreen):
 class MtpScreen(ModalScreen):
     """MTP ドラフターの要否・取得状況をアプリ内のスクロール画面で表示する（`mtp [model]`）。
 
-    表示内容は CLI の `--check-mtp` と同じ（cli.mtp_report を共有）。ダウンロードはしない。
+    表示内容は tui.mtp_report が組み立てる（ダウンロードはしない）。
     `q` / `Esc` でダッシュボードに戻る。`r` で再読込（`hf download` 後に ready へ変わったか
     その場で確認できる）。
     """
@@ -149,7 +149,7 @@ class MtpScreen(ModalScreen):
     def action_reload(self) -> None:
         # 辞書引き＋ローカルキャッシュ確認だけの軽い処理（HTTP/DL なし）なので UI スレッドでよい
         # （read_log_tail と同じ扱い）。
-        from .cli import mtp_report
+        from .tui import mtp_report
 
         text, _code = mtp_report(self._model)
         self.query_one("#mtptext", Static).update(self._linkify(text))
@@ -463,7 +463,7 @@ class GatewayMonitor(App):
 
     def action_quit(self) -> None:
         # q（終了）ではゲートウェイ・デーモンも停止する。ダッシュボードを閉じたら裏の常駐も
-        # 完全に終了させることで、次回 `uv run local-llm-server` 起動時に必ず最新コードで
+        # 完全に終了させることで、次回 `uv run gw` 起動時に必ず最新コードで
         # 立ち上がる（＝コード変更が反映される）。終了前に同期実行して確実に落とす。
         self._kill_ports()
         self.exit()
@@ -496,7 +496,7 @@ class GatewayMonitor(App):
         if head.lower() in ("max", "m") and tail.strip():
             self._set_max_resident(tail)
             return
-        # `mtp [model]`: 必要な MTP ドラフターと取得状況を表示する（CLI の --check-mtp と同じ）。
+        # `mtp [model]`: 必要な MTP ドラフターと取得状況を表示する（tui.mtp_report）。
         # モデル ID は大文字小文字を区別するので raw から取る（cmd に落とさない）。
         if head.lower() == "mtp":
             self.push_screen(MtpScreen(tail.strip() or None))

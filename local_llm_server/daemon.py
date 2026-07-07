@@ -850,7 +850,7 @@ class ModelManager:
     def shutdown(self) -> None:
         """全モデルサーバー（全インスタンス）を並列に停止する（ゲートウェイ終了時）。
 
-        並列にするのは、外部 `--stop`（SIGTERM→10s→SIGKILL）の猶予内に収めるため。
+        並列にするのは、外部からの停止（stop_pid: SIGTERM→10s→SIGKILL）の猶予内に収めるため。
         起動途中（_starting）のサーバーも止める（ロード中の Ctrl+C で巨大モデルの
         プロセスが孤児として残らないように）。以降の起動は _closing で拒否する。
         """
@@ -1004,7 +1004,7 @@ class _GatewayHandler(BaseHTTPRequestHandler):
             send_json(self, 200, data)
             return
         # /admin/status は常駐モデルのライブ状態（loaded/inflight）＋運用ポリシーを返す。
-        # TUI が CLI の --status より詳しい状態を出すための読み取り口。
+        # TUI が詳しい状態（server_status より細かいライブ状態）を出すための読み取り口。
         if path.endswith("/admin/status"):
             if not self._require_loopback():
                 return
@@ -1417,7 +1417,7 @@ def run_gateway(cfg: GatewayConfig) -> int:
 
     終了時に配下のモデルサーバーを全て停止する。SIGTERM/SIGHUP を
     KeyboardInterrupt に変換する install_shutdown_handlers() が呼ばれていれば、
-    `kill` や `--stop`、端末クローズでも下の finally を通って後始末する。
+    `kill` や TUI からの停止、端末クローズでも下の finally を通って後始末する。
     """
     manager = ModelManager(
         cfg.models, max_resident=cfg.max_resident, load_timeout=cfg.load_timeout,
@@ -1523,7 +1523,7 @@ def run_gateway(cfg: GatewayConfig) -> int:
     except KeyboardInterrupt:
         pass
     finally:
-        # 後始末中に再度シグナル（--stop の killpg 等で連続して届く）が来ても中断されず、
+        # 後始末中に再度シグナル（停止時の killpg 等で連続して届く）が来ても中断されず、
         # 配下のモデルサーバーを必ず止め切るため、まず以降のシグナルを無視にする。
         ignore_shutdown_signals()
         stop_reaper.set()
