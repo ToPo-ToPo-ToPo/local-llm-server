@@ -246,8 +246,7 @@ class ModelManager:
 
         - 既定（`_default_draft` が None）では mlx-vlm のみ `"auto"` を試みる。本体名が対応表
           `MTP_DRAFTERS` にあればそのドラフターを返し、無ければ静かに None（MTP なし）にする。
-          動的ロードを未対応モデルで失敗させないための graceful な解決（gateway.py の
-          `ensure_server` と同じ方針）。
+          動的ロードを未対応モデルで失敗させないための graceful な解決。
         - `_default_draft` を明示していればそれを尊重する（`"off"`/`"none"`/`""` で無効化、
           HF id で明示指定）。
         - llama.cpp の MTP は埋め込みヘッドの有無を repo-id から確実に判定できず、未対応 GGUF に

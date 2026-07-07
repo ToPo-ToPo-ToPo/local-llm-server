@@ -758,6 +758,54 @@ def test_gateway_api_key_required_for_chat_and_models(monkeypatch):
             u.shutdown(); u.server_close()
 
 
+def test_admin_status_reports_live_model_state():
+    """/admin/status が常駐状態（loaded/inflight）＋運用方針を返す。"""
+    from local_llm_server.server import gateway_admin_status
+
+    cfgs = [
+        ServerConfig(backend="mlx-vlm", model="org/A", host="127.0.0.1", port=9001),
+        ServerConfig(backend="mlx", model="org/B", host="127.0.0.1", port=9002),
+    ]
+    mgr = gw.ModelManager(cfgs, max_resident=1, load_timeout=300)
+    # org/A をロード済み・処理中 2 件に見立てる（実サーバーは起動しない）。
+    a = mgr._models["org/A"]
+    a.instances.append(
+        gw._Instance(config=a.config, server=object(), ready=True, inflight=2)
+    )
+    srv = gw.GatewayServer(
+        ("127.0.0.1", 0), mgr, catalog=["org/A", "org/B"],
+        default_model=None, max_resident=1, idle_timeout=1200, load_timeout=300,
+    )
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        data = gateway_admin_status("127.0.0.1", port)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+    assert data is not None
+    assert data["object"] == "gateway.status"
+    assert data["max_resident"] == 1
+    assert data["idle_timeout"] == 1200
+    assert data["uptime"] >= 0                 # 起動経過（秒）
+    assert data["requests"] == 0               # acquire を通していないので 0
+    by_model = {m["model"]: m for m in data["models"]}
+    assert by_model["org/A"]["loaded"] is True
+    assert by_model["org/A"]["inflight"] == 2
+    assert by_model["org/A"]["requests"] == 0
+    assert "idle_for" in by_model["org/A"]     # 処理中なので None
+    assert by_model["org/B"]["loaded"] is False
+
+
+def test_gateway_admin_status_none_when_down():
+    """応答が無ければ None（TUI は server_status にフォールバックできる）。"""
+    from local_llm_server.server import gateway_admin_status
+
+    # 使われていないであろうポート。urlopen が失敗して None。
+    assert gateway_admin_status("127.0.0.1", 6, timeout=0.5) is None
+
+
 def test_gateway_admin_is_loopback_and_keyless(monkeypatch):
     # api_key 設定時でも、/admin/status・/admin/config はローカル（=テストは 127.0.0.1）から
     # キー無しで使える（ループバック限定・キーではなく接続元で保護）。

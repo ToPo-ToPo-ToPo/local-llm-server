@@ -7,9 +7,7 @@ from local_llm_server import (
     BACKENDS,
     MTP_DRAFTERS,
     ServerConfig,
-    ServerPool,
     build_command,
-    build_pool_configs,
     default_backend,
     parallel_supported,
     parse_host_port,
@@ -294,47 +292,6 @@ def test_parse_host_port():
     assert parse_host_port("http://127.0.0.1:8081/v1") == ("127.0.0.1", 8081)
 
 
-def test_build_pool_configs():
-    base = ServerConfig("mlx", "m", port=8080)
-    cfgs = build_pool_configs(base, 3)
-    assert [c.port for c in cfgs] == [8080, 8081, 8082]
-    assert base.port == 8080  # 元は不変
-
-
-def test_server_pool_order(monkeypatch):
-    events = []
-
-    class FakeLocal:
-        def __init__(self, cfg):
-            self.cfg = cfg
-
-        @property
-        def base_url(self):
-            return self.cfg.base_url
-
-        def start(self):
-            events.append(("start", self.cfg.port))
-
-        def wait_until_ready(self, timeout=120.0):
-            events.append(("ready", self.cfg.port))
-
-        def stop(self):
-            events.append(("stop", self.cfg.port))
-
-    # ServerPool 等は実装モジュール local_llm_server.server 内の名前を参照するため、
-    # パッケージ再エクスポート名ではなく実装モジュール側を差し替える。
-    monkeypatch.setattr("local_llm_server.server.LocalServer", FakeLocal)
-    pool = ServerPool(build_pool_configs(ServerConfig("mlx", "m", port=8080), 2))
-    pool.start()
-    pool.wait_until_ready()
-    pool.stop()
-    assert events == [
-        ("start", 8080), ("start", 8081),
-        ("ready", 8080), ("ready", 8081),
-        ("stop", 8080), ("stop", 8081),
-    ]
-
-
 def test_local_server_redirects_output_to_log(monkeypatch, tmp_path):
     # 自動起動サーバーの出力は端末に流さず、ログファイルへ逃がす（対話画面を汚さない）。
     import io
@@ -455,33 +412,8 @@ def test_models_match():
     assert models_match(None, "x") and models_match("x", None)  # 不明なら一致扱い（警告しない）
 
 
-def test_running_model_parses_v1_models(monkeypatch):
-    import io
-    import local_llm_server.server as srv
-
-    class _Resp:
-        def __init__(self, body):
-            self._b = body.encode("utf-8")
-        def read(self):
-            return self._b
-        def __enter__(self):
-            return self
-        def __exit__(self, *a):
-            return False
-
-    monkeypatch.setattr(
-        srv.urllib.request, "urlopen",
-        lambda url, timeout=5.0: _Resp('{"data": [{"id": "mlx-community/Qwen3.6-27B-4bit"}]}'),
-    )
-    assert srv.running_model("http://x/v1") == "mlx-community/Qwen3.6-27B-4bit"
-
-    def _boom(url, timeout=5.0):
-        raise OSError("down")
-    monkeypatch.setattr(srv.urllib.request, "urlopen", _boom)
-    assert srv.running_model("http://x/v1") is None  # 取得失敗は None
-
-
 class _Resp:
+    """urlopen の戻り値スタブ（/v1/models の JSON を返す context manager）。"""
     def __init__(self, body):
         self._b = body.encode("utf-8")
     def read(self):
@@ -497,6 +429,18 @@ def _patch_models(monkeypatch, body):
     monkeypatch.setattr(
         srv.urllib.request, "urlopen", lambda url, timeout=5.0: _Resp(body)
     )
+
+
+def test_running_model_parses_v1_models(monkeypatch):
+    import local_llm_server.server as srv
+
+    _patch_models(monkeypatch, '{"data": [{"id": "mlx-community/Qwen3.6-27B-4bit"}]}')
+    assert srv.running_model("http://x/v1") == "mlx-community/Qwen3.6-27B-4bit"
+
+    def _boom(url, timeout=5.0):
+        raise OSError("down")
+    monkeypatch.setattr(srv.urllib.request, "urlopen", _boom)
+    assert srv.running_model("http://x/v1") is None  # 取得失敗は None
 
 
 def test_list_models_returns_all_ids(monkeypatch):

@@ -12,7 +12,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 
 # 起動可能なバックエンド一覧は同梱の constants から取得（OpenAI互換APIの公開値）。
 from .constants import BACKENDS, project_cache_dir  # noqa: F401
@@ -934,51 +934,6 @@ class LocalServer:
         self._close_log()
 
     def __enter__(self) -> "LocalServer":
-        self.start()
-        self.wait_until_ready()
-        return self
-
-    def __exit__(self, *exc: object) -> None:
-        self.stop()
-
-
-def build_pool_configs(base: ServerConfig, instances: int) -> list[ServerConfig]:
-    """base を起点に、連番ポート（port, port+1, ...）の設定を instances 個作る。"""
-    return [replace(base, port=base.port + i) for i in range(instances)]
-
-
-class ServerPool:
-    """複数のローカルLLMサーバーをまとめて起動・管理する。
-
-    mlx のように1プロセスが逐次処理のバックエンドで並列性を得る用途を想定。
-    各インスタンスは別ポートで起動し、それぞれモデルを個別にロードする
-    （= 重みのメモリはインスタンス数分かかる）。
-    """
-
-    def __init__(self, configs: list[ServerConfig]) -> None:
-        self._servers = [LocalServer(c) for c in configs]
-
-    @property
-    def base_urls(self) -> list[str]:
-        return [server.base_url for server in self._servers]
-
-    def start(self) -> None:
-        for server in self._servers:
-            server.start()
-
-    def wait_until_ready(self, timeout: float = 120.0) -> None:
-        for server in self._servers:
-            server.wait_until_ready(timeout=timeout)
-
-    def wait(self) -> None:
-        for server in self._servers:
-            server.wait()
-
-    def stop(self) -> None:
-        for server in self._servers:
-            server.stop()
-
-    def __enter__(self) -> "ServerPool":
         self.start()
         self.wait_until_ready()
         return self
