@@ -13,7 +13,9 @@ llama-server）と同じく「単一モデルの OpenAI 互換サーバ」とし
   - POST /v1/audio/transcriptions   … 文字起こし（task=transcribe）
   - POST /v1/audio/translations     … 英訳（task=translate）
 
-音声デコードに ffmpeg CLI（PATH 上）が要る（mlx_whisper.load_audio の仕様）。
+音声デコードに ffmpeg が要る（mlx_whisper.load_audio が subprocess で "ffmpeg" を呼ぶ）。
+システム PATH に ffmpeg があればそれを使い、無ければ pip 同梱の imageio-ffmpeg のバイナリを
+"ffmpeg" として PATH に足す（`_ensure_ffmpeg_on_path`）＝brew/apt 無しで uv だけで完結する。
 モデルの重みは事前に `hf download` 済みであること（ゲートウェイが HF_HUB_OFFLINE=1 で
 起動するため、未取得ならロード時にエラーになる）。
 """
@@ -200,6 +202,50 @@ class _Server(ThreadingHTTPServer):
         self.lock = threading.Lock()  # mlx 呼び出しの直列化用
 
 
+def _ensure_ffmpeg_on_path() -> None:
+    """`ffmpeg` を PATH 上に確保する（mlx_whisper.load_audio が subprocess で "ffmpeg" を呼ぶ）。
+
+    優先順位:
+      1. システムに ffmpeg があればそれを使う（何もしない＝ユーザーの ffmpeg を尊重）。
+      2. 無ければ pip 同梱の imageio-ffmpeg のバイナリを "ffmpeg" という名前で見せて PATH に
+         足す（brew/apt を使わず uv だけで完結させる）。
+      3. どちらも無ければ何もしない（実リクエスト時に load_audio が分かりやすく失敗する）。
+    """
+    import shutil
+
+    if shutil.which("ffmpeg"):
+        return
+    try:
+        import imageio_ffmpeg
+
+        exe = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception as exc:  # noqa: BLE001 - 未導入/取得失敗。STT リクエスト時に表面化する
+        print(
+            f"[stt_server] ffmpeg が見つかりません（システム PATH にも imageio-ffmpeg にも無い）: {exc}",
+            file=sys.stderr, flush=True,
+        )
+        return
+    name = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
+    shim_dir = os.path.join(tempfile.gettempdir(), "local-llm-server-ffmpeg")
+    link = os.path.join(shim_dir, name)
+    try:
+        os.makedirs(shim_dir, exist_ok=True)
+        # imageio 更新でバイナリ名が変わった等で壊れた symlink が残っていたら作り直す。
+        if os.path.islink(link) and not os.path.exists(link):
+            os.unlink(link)
+        if not os.path.exists(link):
+            try:
+                os.symlink(exe, link)
+            except (OSError, NotImplementedError):
+                shutil.copy2(exe, link)  # symlink 不可（Windows 等）はコピーで代替
+                os.chmod(link, 0o755)
+    except OSError as exc:
+        print(f"[stt_server] 同梱 ffmpeg の配置に失敗: {exc}", file=sys.stderr, flush=True)
+        return
+    os.environ["PATH"] = shim_dir + os.pathsep + os.environ.get("PATH", "")
+    print(f"[stt_server] 同梱 ffmpeg を使用（imageio-ffmpeg）: {exe}", file=sys.stderr, flush=True)
+
+
 def _warm(model: str) -> None:
     """バックグラウンドでモデルを事前ロードする（初回リクエストの待ち時間を減らす）。
 
@@ -219,6 +265,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8080)
     args = parser.parse_args(argv)
+
+    # ffmpeg を確保してから受付を始める（無ければ同梱 imageio-ffmpeg を PATH に足す）。
+    # os.environ["PATH"] はプロセス共通なので、以降のハンドラスレッドの subprocess にも効く。
+    _ensure_ffmpeg_on_path()
 
     server = _Server((args.host, args.port), args.model)
     threading.Thread(target=_warm, args=(args.model,), daemon=True).start()

@@ -1,6 +1,6 @@
 [project]
 name = "local-llm-server"
-version = "0.22.0"
+version = "0.23.0"
 description = "ローカルLLM（mlx / mlx-vlm / llama.cpp）を OpenAI 互換 API で束ねるマルチモデルゲートウェイ（サーバー）。gateway.toml のカタログを 1 ポートで配信し、model で振り分け・遅延起動・LRU 退避・MTP 高速化（Ollama 流の共有デーモン）。接続用クライアントは別パッケージ local-llm-client。"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -34,8 +34,12 @@ dependencies = [
     "mlx-vlm>=0.6.3,<0.6.4 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
     "transformers<5.13",
     # STT（音声→テキスト）バックエンド。backend="whisper" が同梱の stt_server 経由で使う。
-    # 音声デコードに ffmpeg CLI（PATH 上）が要る。Apple Silicon でのみ解決・インストールされる。
+    # Apple Silicon でのみ解決・インストールされる。
     "mlx-whisper>=0.4.3 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    # STT の音声デコード用 ffmpeg を pip 同梱バイナリで供給する（brew/apt を使わず uv だけで
+    # 完結）。stt_server が、システム PATH に ffmpeg が無ければこの同梱 ffmpeg を "ffmpeg" として
+    # 見せる。STT が動く Apple Silicon でのみ入れる（他OSは STT 非対応なので不要）。
+    "imageio-ffmpeg>=0.4.9 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
 ]
 
 [dependency-groups]
