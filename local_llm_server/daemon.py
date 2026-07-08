@@ -1247,6 +1247,7 @@ class GatewayConfig:
     max_memory_fraction: float | None = None  # 常駐モデルの推定占有量の合計を総RAMのこの割合に制限（None で無効）
     internal_base_port: int = 9001     # 内部サーバーの割当開始ポート（動的モデルもこの続きから割り当て）
     api_key: str | None = None         # ネットワーク公開時の API キー（None/空 で認証なし）。chat と在席セッションに要求
+    auto_update: bool = True           # TUI が PyPI 新版を検知したら git pull で自動追従する（既定 true。false で無効）
 
 
 def _resolve_model_draft(
@@ -1370,6 +1371,8 @@ def load_gateway_config(path: str) -> GatewayConfig:
             raise ValueError("session_ttl must be 0 or greater (0 disables)")
         if session_ttl == 0:
             session_ttl = None
+    # TUI が PyPI 新版を検知したら git pull で自動追従するか（既定 true。false で無効）。
+    auto_update = bool(data.get("auto_update", True))
     # 未登録モデルを ID 推論で動的ロードするか（既定 true）。false なら事前登録のみ（旧挙動）。
     dynamic = bool(data.get("dynamic", True))
     # 動的ロード時の既定 disable_thinking（事前登録の [[models]] は各自の値が優先）。
@@ -1449,6 +1452,7 @@ def load_gateway_config(path: str) -> GatewayConfig:
         max_memory_fraction=max_memory_fraction,
         internal_base_port=internal_base,
         api_key=api_key,
+        auto_update=auto_update,
     )
 
 

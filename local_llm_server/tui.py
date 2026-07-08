@@ -178,10 +178,20 @@ def read_log_tail(port: int, max_lines: int = 1000, max_bytes: int = 512 * 1024)
 
 
 def run_tui(gcfg) -> int:
-    """TUI を起動する。textual は重いので遅延 import（headless ワーカーでは読み込まない）。"""
+    """TUI を起動する。textual は重いので遅延 import（headless ワーカーでは読み込まない）。
+
+    自動更新（PyPI 新版を git pull で追従）が適用されると、アプリは
+    `restart_after_exit` を立てて終了する。その場合は新コードで TUI を再 exec する
+    （textual の run() を抜けて端末を復帰させてから exec するので画面が乱れない）。
+    """
     from .tui_app import GatewayMonitor
 
-    GatewayMonitor(gcfg).run()
+    app = GatewayMonitor(gcfg)
+    app.run()
+    if getattr(app, "restart_after_exit", False):
+        from . import update
+
+        update.reexec_tui()  # 戻らない（現プロセスを新 TUI で置き換える）
     return 0
 
 

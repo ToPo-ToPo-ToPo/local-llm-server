@@ -48,6 +48,10 @@ def test_key_hints_stay_visible_while_typing_command(tmp_path, monkeypatch):
 
 def _write_cfg(tmp_path, body):
     p = tmp_path / "gateway.toml"
+    # TUI テストは既定で自動更新を切る（起動時の PyPI HTTP / git を走らせず hermetic に保つ）。
+    # 更新機能自体のテストは明示的に auto_update を書いて上書きする。
+    if "auto_update" not in body:
+        body = "auto_update = false\n" + body
     p.write_text(body, encoding="utf-8")
     return p
 
@@ -110,6 +114,72 @@ def test_copy_model_uses_pbcopy_on_macos(tmp_path, monkeypatch):
             await pilot.pause()
         assert recorded["cmd"] == ["pbcopy"]
         assert recorded["input"] == b"org/My-Model:Q4"
+
+    asyncio.run(scenario())
+
+
+def test_auto_update_applies_when_idle(tmp_path, monkeypatch):
+    # auto_update=true で新版を検知し、ゲートウェイがアイドルなら自動適用→再起動フラグが立つ。
+    from local_llm_server import tui_app, update
+
+    gcfg = load_gateway_config(str(_write_cfg(tmp_path, "auto_update = true\nport = 8799\n")))
+    monkeypatch.setattr(tui_app, "server_status", lambda h, p: {"ready": True})  # 自動起動させない
+    monkeypatch.setattr(tui_app, "gateway_admin_status", lambda h, p: None)      # admin なし=アイドル
+    monkeypatch.setattr(tui_app, "is_ready", lambda url, **k: False)
+    # 新版あり・適用可能を返すようチェックを固定。
+    st = update.UpdateStatus(current="0.21.0", latest="0.22.0", available=True,
+                             can_apply=True, reason="ok")
+    monkeypatch.setattr(tui_app.update, "check", lambda timeout=3.0: st)
+    applied = {}
+
+    def _fake_apply(*a, **k):
+        applied["called"] = True
+        return True, "done"
+
+    monkeypatch.setattr(tui_app.update, "apply_update", _fake_apply)
+
+    async def scenario():
+        app = tui_app.GatewayMonitor(gcfg)
+        app._kill_ports = lambda: None  # 実プロセスは触らない
+        async with app.run_test() as pilot:
+            for _ in range(10):
+                await pilot.pause()
+                if app.restart_after_exit:
+                    break
+        assert applied.get("called") is True
+        assert app.restart_after_exit is True
+
+    asyncio.run(scenario())
+
+
+def test_auto_update_holds_when_dirty(tmp_path, monkeypatch):
+    # ローカル変更ありは適用せず、バナー表示のみ（can_apply=False）。
+    from local_llm_server import tui_app, update
+
+    gcfg = load_gateway_config(str(_write_cfg(tmp_path, "auto_update = true\nport = 8799\n")))
+    monkeypatch.setattr(tui_app, "server_status", lambda h, p: {"ready": True})
+    monkeypatch.setattr(tui_app, "gateway_admin_status", lambda h, p: None)
+    monkeypatch.setattr(tui_app, "is_ready", lambda url, **k: False)
+    st = update.UpdateStatus(current="0.21.0", latest="0.22.0", available=True,
+                             can_apply=False, reason="dirty")
+    monkeypatch.setattr(tui_app.update, "check", lambda timeout=3.0: st)
+    applied = {}
+
+    def _fake_apply(*a, **k):
+        applied["called"] = True
+        return True, "x"
+
+    monkeypatch.setattr(tui_app.update, "apply_update", _fake_apply)
+
+    async def scenario():
+        app = tui_app.GatewayMonitor(gcfg)
+        app._kill_ports = lambda: None
+        async with app.run_test() as pilot:
+            for _ in range(6):
+                await pilot.pause()
+        assert applied.get("called") is None       # 汚れているので適用しない
+        assert app.restart_after_exit is False
+        assert app._update is not None and app._update.reason == "dirty"
 
     asyncio.run(scenario())
 

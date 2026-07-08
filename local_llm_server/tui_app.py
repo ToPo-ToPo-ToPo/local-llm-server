@@ -33,6 +33,7 @@ from .server import (
     start_gateway_background,
     stop_pid,
 )
+from . import update
 from .tui import _fmt_hms, merge_status, read_log_tail
 
 _GREEN = "#7fc99a"
@@ -40,6 +41,18 @@ _AMBER = "#e0b46a"
 _RED = "#d8645f"
 _ACCENT = "#d8a45f"
 _DIM = "#83838c"
+
+# PyPI 新版のポーリング間隔（秒）。起動直後に 1 回、以降はこの間隔で確認する。
+# 頻繁に叩く必要はない（公開は稀）ので長め。
+_UPDATE_CHECK_INTERVAL = 1800.0  # 30 分
+
+# can_apply=False の理由 → バナー用の短い和文。
+_UPDATE_REASONS = {
+    "dirty": "ローカル変更あり・保留",
+    "no-upstream": "追跡ブランチ無し・保留",
+    "not-a-git-clone": "git 運用外",
+    "offline": "確認できず",
+}
 
 
 def _clipboard_copy(app, text: str) -> bool:
@@ -219,6 +232,7 @@ class GatewayMonitor(App):
         Binding("g", "start", "start"),
         Binding("m", "prefill_max", "max"),
         Binding("l", "log", "log"),
+        Binding("u", "update", "update"),
         Binding("q", "quit", "quit"),
     ]
 
@@ -245,12 +259,17 @@ class GatewayMonitor(App):
         self._gw_ready = False  # ポーリングワーカーが判定した稼働状態（UI スレッドで HTTP しない）
         self.busy = ""
         self._row_models: list[str] = []  # 表の表示順モデル ID（行クリック→コピー用）
+        # --- 自動更新（PyPI 新版を git pull で追従） ---
+        self._update = None            # update.UpdateStatus（新版検知時のみ）
+        self._update_applying = False  # 適用中（多重起動を防ぐ）
+        self._update_done = False      # 適用完了→再起動待ち
+        self.restart_after_exit = False  # run_tui が見て、新コードで TUI を再 exec する合図
 
     def compose(self) -> ComposeResult:
         # コマンド欄を最上部に固定する（dock: top）。モデル一覧が増えて #dash が縦に伸びても、
         # 入力欄が画面外へ押し出されない。中央の一覧は #dash 内でスクロールする。
         yield Input(
-            placeholder="command — stop · restart · start · max <n> · mtp [model] · log · quit",
+            placeholder="command — stop · restart · start · max <n> · mtp [model] · log · update · quit",
             id="cmd",
         )
         with VerticalScroll(id="dash"):
@@ -270,6 +289,10 @@ class GatewayMonitor(App):
             self.action_start()
         self.set_interval(1.0, self.poll)
         self.poll()
+        # PyPI 新版の検知（起動直後に 1 回＋定期）。auto_update 無効なら一切走らせない。
+        if getattr(self.gcfg, "auto_update", True):
+            self.set_interval(_UPDATE_CHECK_INTERVAL, self.check_update)
+            self.check_update()
 
     def _title(self) -> Text:
         t = Text()
@@ -283,7 +306,7 @@ class GatewayMonitor(App):
         t = Text()
         for i, (key, label) in enumerate(
             (("s", "stop"), ("r", "restart"), ("g", "start"),
-             ("m", "max"), ("l", "log"), ("q", "quit"))
+             ("m", "max"), ("l", "log"), ("u", "update"), ("q", "quit"))
         ):
             if i:
                 t.append("   ", style=_DIM)
@@ -305,6 +328,8 @@ class GatewayMonitor(App):
         self.admin = admin
         self._gw_ready = bool(admin) if ready is None else ready
         self._render()
+        # ゲートウェイがアイドルに戻った瞬間に、保留中の更新があれば適用する。
+        self._maybe_apply_update()
 
     def _render(self) -> None:
         view = merge_status(self.gcfg, self.admin, ready=self._gw_ready)
@@ -320,6 +345,18 @@ class GatewayMonitor(App):
             f"    :{self.port}    up {_fmt_hms(view['uptime'])}    {view['requests']:,} reqs",
             style=_DIM,
         )
+        # 自動更新バナー: 適用できる場合は「適用予定/適用中」、保留（ローカル変更等）は理由つき。
+        up = self._update
+        if up is not None and up.available:
+            if self._update_applying:
+                st.append(f"    ⬆ {up.latest} に更新中…", style=_ACCENT)
+            elif up.can_apply:
+                st.append(f"    ⬆ {up.latest} に自動更新（アイドル時）", style=_ACCENT)
+            else:
+                st.append(
+                    f"    ⬆ {up.latest} 利用可（{_UPDATE_REASONS.get(up.reason, up.reason)}・u で適用）",
+                    style=_AMBER,
+                )
         self.query_one("#status", Static).update(st)
 
         table = self.query_one("#models", DataTable)
@@ -416,6 +453,87 @@ class GatewayMonitor(App):
         # 外部ページャを suspend で開くと表示が壊れ戻り方も分かりにくいので、
         # アプリ内のスクロール画面で表示する（q/Esc で戻る）。
         self.push_screen(LogScreen(self.port))
+
+    # --- 自動更新（PyPI 新版を git pull で追従）------------------------------
+    @work(thread=True, exclusive=True, group="update-check")
+    def check_update(self) -> None:
+        """PyPI 最新版を調べる（別スレッド。HTTP と git はここで行う）。"""
+        st = update.check(timeout=3.0)
+        self.call_from_thread(self._on_update_status, st)
+
+    def _on_update_status(self, st) -> None:
+        # 新版があるときだけ保持する（無ければバナーを消す）。適用済み待ちのときは触らない。
+        if self._update_done:
+            return
+        self._update = st if st.available else None
+        self._render()
+        self._maybe_apply_update()
+
+    def _gateway_idle(self) -> bool:
+        """再起動して安全か（処理中リクエストも在席エージェントも無い）。
+
+        ゲートウェイ未起動（admin なし）も「安全」とみなす。実行中の推論/文字起こしや、
+        在席中のエージェントがある間は再起動を避け、空いた瞬間に適用する。
+        """
+        admin = self.admin
+        if not admin:
+            return True
+        models = admin.get("models", [])
+        inflight = sum(int(m.get("inflight", 0)) for m in models)
+        sessions = sum(int(m.get("sessions", 0)) for m in models)
+        return inflight == 0 and sessions == 0
+
+    def _maybe_apply_update(self) -> None:
+        """保留中の更新を、条件が揃っていれば自動適用する（アイドル時のみ）。"""
+        st = self._update
+        if st is None or not st.available or not st.can_apply:
+            return
+        if self._update_applying or self._update_done:
+            return
+        if not self._gateway_idle():
+            return  # 処理中/在席あり → 完了を待つ（次のポーリングで再判定）
+        self._update_applying = True
+        self._render()
+        self._apply_update_worker()
+
+    def action_update(self) -> None:
+        """`u` キー: 手動で更新を適用する（アイドルを待たず、その場で試みる）。"""
+        st = self._update
+        if st is None or not st.available:
+            self.notify("最新です（更新はありません）", timeout=3)
+            return
+        if not st.can_apply:
+            self.notify(
+                f"自動更新できません: {_UPDATE_REASONS.get(st.reason, st.reason)}",
+                severity="warning", timeout=8,
+            )
+            return
+        if self._update_applying or self._update_done:
+            return
+        self._update_applying = True
+        self._render()
+        self._apply_update_worker()
+
+    @work(thread=True, group="update-apply")
+    def _apply_update_worker(self) -> None:
+        """git pull（＋uv sync）で更新し、成功したら新コードで TUI を再起動する。"""
+        self.busy = "updating…"
+        self.call_from_thread(self._render)
+        ok, msg = update.apply_update()
+        if ok:
+            # 旧ゲートウェイを止めてから抜ける（再 exec した新 TUI が新コードで起動し直す）。
+            self._kill_ports()
+            self._update_done = True
+            self.restart_after_exit = True
+            self.call_from_thread(self.exit)
+            return
+        # 失敗（作業ツリーが汚れた・ff 不可・pull 失敗）: 落とさず通知し、手動 u で再試行できる。
+        self._update_applying = False
+        self.busy = ""
+        self.call_from_thread(
+            self.notify, f"自動更新を見送りました: {msg}", severity="warning", timeout=10
+        )
+        self.call_from_thread(self._render)
 
     def action_prefill_max(self) -> None:
         # `m` キー: コマンド欄に "max " を入れてフォーカスし、数値だけ打てば送信できるようにする。
@@ -516,6 +634,7 @@ class GatewayMonitor(App):
             "r": self.action_restart, "restart": self.action_restart,
             "g": self.action_start, "start": self.action_start,
             "l": self.action_log, "log": self.action_log,
+            "u": self.action_update, "update": self.action_update,
         }.get(cmd)
         if handler is None:
             if raw:  # 空 Enter は無視。タイプミス等は黙殺せず知らせる
