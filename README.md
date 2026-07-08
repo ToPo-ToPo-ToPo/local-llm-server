@@ -1,9 +1,10 @@
 # local-llm-server
 
-ローカルLLM（**mlx** / **mlx-vlm** / **llama.cpp**）を束ねる**マルチモデルゲートウェイ**。
-1 プロセス起動するだけで、1 つの公開ポートに複数モデルを配信する。
+ローカルLLM（**mlx** / **mlx-vlm** / **llama.cpp**）と音声認識（**whisper** / STT）を束ねる
+**マルチモデルゲートウェイ**。1 プロセス起動するだけで、1 つの公開ポートに複数モデルを配信する。
 
 - **モデルの事前登録は不要**。クライアントが指定した `model` をその場でロードする。画像入力（mmproj 自動検出）も mlx-vlm の MTP も設定なしで効く。
+- **音声認識（STT）も同じポートで**。`/v1/audio/transcriptions` に音声を投げれば mlx-whisper が遅延起動して文字起こしする。エージェント側に mlx 依存は要らない（→ [音声認識（STT / whisper）](docs/gateway.md#音声認識stt--whisper)）。
 - 1 つの公開ポートで複数モデルを配信し、リクエストの `model` で振り分ける。
 - **TUI ダッシュボードが使えるモデルを自動一覧**。どれを指定すればよいか一目で分かる。
 - モデルは**初回リクエスト時に遅延起動**、`max_resident`（数）/ `max_memory_fraction`（メモリ量）超過で LRU 退避、`idle_timeout` で自動アンロード。

@@ -54,14 +54,16 @@ backend = "mlx-vlm"
 | `disable_thinking` | `false` | 動的ロード時の既定。事前登録モデルは各 `[[models]]` の値が優先 |
 
 `[[models]]` は 1 モデル 1 エントリ。`model`（HuggingFace ID）と `backend`（`mlx` / `mlx-vlm` /
-`llama-cpp`）が必須。各エントリで `draft_model` を上書きできる。`dynamic = true` なら `[[models]]` は
-省略可（全て動的ロード）。
+`llama-cpp` / `whisper`）が必須。各エントリで `draft_model` を上書きできる。`dynamic = true` なら
+`[[models]]` は省略可（全て動的ロード）。`whisper` は音声→テキスト（STT）バックエンド
+（→ [音声認識（STT / whisper）](#音声認識stt--whisper)）。
 
 ## 振る舞い
 
 - **遅延起動**: 各モデルは**初回リクエスト時に起動**し、2 回目以降は常駐して即応答する。
 - **動的ロード（`dynamic = true`）**: `[[models]]` に無いモデルもリクエストされた時点で起動・管理する。
-  バックエンドは ID から推論（`gguf`→llama-cpp、`mlx`→mlx-vlm、他→OS 既定。→ [docs/llama-cpp.md](llama-cpp.md)）。
+  バックエンドは ID から推論（`whisper`/`parakeet`→whisper、`gguf`→llama-cpp、`mlx`→mlx-vlm、
+  他→OS 既定。→ [docs/llama-cpp.md](llama-cpp.md)）。
   ロードされると一覧（`/v1/models`・ダッシュボード）に現れ、アンロードされると消える。すでにロード済みの
   モデルが再指定されたら**相乗り**（共有）する。**画像入力（mmproj 自動検出）と mlx-vlm の MTP（対応表に
   在る本体は `draft_model="auto"` を自動適用）は動的ロードでも効く**。一方 `parallel` や llama.cpp の MTP
@@ -72,9 +74,10 @@ backend = "mlx-vlm"
   → [同一モデルを並列化する（複数インスタンス）](#同一モデルを並列化する複数インスタンス)
 - **モデル発見（ダウンロード済みの一覧）**: **TUI ダッシュボード**が、ロード中のモデルに加えて
   **HF キャッシュにある DL 済みのチャットモデル**を未ロード候補として並べる（`ollama list` 風に
-  「いま手元で動かせるモデル」が一目で分かる）。判定はヒューリスティック（GGUF 本体、または
-  `*ForCausalLM`/`*ForConditionalGeneration` の mlx/重み repo）で、埋め込み・STT・分類などの非チャット
-  モデルは除外する。`/v1/models`（API）は標準どおり「登録済み＋ロード中」だけを返す。
+  「いま手元で動かせるモデル」が一目で分かる）。判定はヒューリスティック（GGUF 本体、
+  `*ForCausalLM`/`*ForConditionalGeneration` の mlx/重み repo、または whisper 系の STT repo）で、
+  埋め込み・分類などの非チャット・非STT モデルは除外する。`/v1/models`（API）は標準どおり
+  「登録済み＋ロード中」だけを返す。
 - **LRU 退避**: 常駐数が `max_resident` を超えると、最も使われていないモデルから停止する。
   全枠が処理中なら空くまで待つ（OOM 回避。`load_timeout` で打ち切り→ 503）。
 - **`max_resident` の実行中変更**: 再起動せず稼働中に上限を変えられる（→ [max_resident をライブで変える](#max_resident-をライブで変える)）。
@@ -89,6 +92,39 @@ backend = "mlx-vlm"
   リクエストの `model` で振り分けられる（クライアントはサーバーを起動しない）。
 
 MTP（speculative decoding）による高速化は [mtp.md](mtp.md) を参照。
+
+## 音声認識（STT / whisper）
+
+`backend = "whisper"` で mlx-whisper を **OpenAI 互換の STT サーバ**として束ねる。チャット/画像の
+モデルとまったく同じく、初回リクエストで遅延起動し、LRU 退避・idle アンロード・在席即時解放・
+`max_resident` のメモリ会計がそのまま効く。**狙いはエージェント側から mlx 依存を剥がすこと** ——
+各エージェントは mlx-whisper を持たず、ゲートウェイの 1 ポートに音声を POST するだけでよい
+（mlx-whisper のバージョンはこのサーバ 1 箇所で管理する）。
+
+- **公開エンドポイント**（`model` は他と同じくリクエストで指定。動的ロードなら事前登録不要）:
+  - `POST /v1/audio/transcriptions` … 文字起こし
+  - `POST /v1/audio/translations` … 英訳
+  いずれも OpenAI 仕様どおり **`multipart/form-data`**（`file` に音声、`model` にモデル ID）。
+  `language` / `prompt` / `temperature` / `response_format`（`json`・`text`・`verbose_json`・
+  `srt`・`vtt`）に対応する。
+- **モデル ID**: whisper 系の mlx repo（例 `mlx-community/whisper-large-v3-turbo`、
+  `mlx-community/whisper-large-v3-mlx`、`kaiinui/kotoba-whisper-v2.0-mlx`）。ID に `whisper` /
+  `parakeet` を含めば動的ロードで自動的に whisper バックエンドへ振り分けられる。
+- **要件**: 音声デコードに **ffmpeg CLI**（PATH 上）が要る（`brew install ffmpeg`）。本体重みは他の
+  mlx 同様に事前 DL 必須（`hf download <repo>`。ゲートウェイは `HF_HUB_OFFLINE=1` で起動するため、
+  未取得だとロード時にエラー）。
+
+```bash
+# 例: 文字起こし（クライアントは公開ポートに音声を投げるだけ。mlx 依存は不要）
+curl http://127.0.0.1:8799/v1/audio/transcriptions \
+  -F "model=mlx-community/whisper-large-v3-turbo" \
+  -F "language=ja" \
+  -F "file=@input.wav"
+# → {"text": "..."}
+```
+
+OpenAI SDK からもそのまま使える（`client.audio.transcriptions.create(model=..., file=...)`）。
+`base_url` を公開ポートに向けるだけで、振り分け・遅延起動・アンロードはゲートウェイが行う。
 
 ## 同一モデルを並列化する（複数インスタンス）
 

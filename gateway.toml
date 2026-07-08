@@ -86,3 +86,10 @@ dynamic = true
 # parallel = 4
 # disable_thinking = true
 # draft_model = "unsloth/gemma-4-26B-A4B-it-qat-GGUF:F16-MTP"
+#
+# 音声認識（STT）。mlx-whisper を OpenAI 互換の /v1/audio/transcriptions として束ねる。
+# ID に whisper/parakeet を含めば動的ロードで自動判定されるので、通常この事前登録も不要。
+# 音声デコードに ffmpeg CLI が要る（→ docs/gateway.md「音声認識（STT / whisper）」）:
+# [[models]]
+# model = "mlx-community/whisper-large-v3-turbo"
+# backend = "whisper"

@@ -16,7 +16,8 @@ DEFAULT_VISION_MODEL = DEFAULT_MODEL
 
 # 起動可能なローカルLLMサーバーのバックエンド一覧。
 # server/ が実装し、agent/ は agent.toml の backend 検証に使う（共有値）。
-BACKENDS = ("mlx", "mlx-vlm", "llama-cpp")
+# whisper は音声→テキスト（STT）。他はテキスト/画像の生成系。
+BACKENDS = ("mlx", "mlx-vlm", "llama-cpp", "whisper")
 
 
 def project_cache_dir() -> str:

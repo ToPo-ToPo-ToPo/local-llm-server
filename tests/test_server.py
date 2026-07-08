@@ -262,6 +262,27 @@ def test_ensure_cached_rejects_bare_name(hf_cache):
         srv.ensure_cached("bare-name")
 
 
+def test_ensure_cached_accepts_npz_weights(hf_cache):
+    # whisper 系の mlx リポジトリは *.npz で重みを持つものがある。
+    snap = hf_cache("mlx-community/whisper-tiny", ["config.json", "weights.npz"])
+    assert srv.ensure_cached("mlx-community/whisper-tiny") == str(snap)
+
+
+def test_infer_backend_whisper_before_mlx():
+    # whisper 系は id に "mlx" を含むが、STT（whisper）に振り分ける。
+    assert srv.infer_backend("mlx-community/whisper-large-v3-mlx") == "whisper"
+    assert srv.infer_backend("mlx-community/parakeet-tdt-0.6b") == "whisper"
+    # 通常の mlx チャットモデルは従来どおり mlx-vlm。
+    assert srv.infer_backend("ToPo-ToPo/Qwen3.6-27B-mlx-4bit") == "mlx-vlm"
+
+
+def test_build_command_whisper(stub_cache):
+    cmd = build_command(ServerConfig("whisper", "mlx-community/whisper-tiny", port=9300))
+    assert cmd[1:3] == ["-m", "local_llm_server.stt_server"]
+    assert "--model" in cmd and "mlx-community/whisper-tiny" in cmd
+    assert "9300" in cmd
+
+
 def test_build_command_mlx_requires_predownload(hf_cache):
     # 配線確認: 未取得モデルでは build_command がそのまま起動せずエラーにする。
     with pytest.raises(ValueError, match="hf download"):

@@ -33,6 +33,9 @@ dependencies = [
     # 直ったら上限を上げる（上げた直後は Qwen3.6 で 1+1 の sanity check を必ず行う）。
     "mlx-vlm>=0.6.3,<0.6.4 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
     "transformers<5.13",
+    # STT（音声→テキスト）バックエンド。backend="whisper" が同梱の stt_server 経由で使う。
+    # 音声デコードに ffmpeg CLI（PATH 上）が要る。Apple Silicon でのみ解決・インストールされる。
+    "mlx-whisper>=0.4.3 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
 ]
 
 [dependency-groups]

@@ -35,14 +35,23 @@ def default_backend() -> str:
 DEFAULT_BACKEND = default_backend()
 
 
+# STT（音声→テキスト）モデルの id 判定に使う語。whisper 系は id に "mlx" を含む
+# （例 mlx-community/whisper-large-v3-mlx）ため、mlx-vlm 判定より先に見る必要がある。
+_STT_HINTS = ("whisper", "parakeet")
+
+
 def infer_backend(model: str) -> str:
     """登録の無いモデル ID からバックエンドを推論する（動的ロード用）。
 
+    - STT（id に 'whisper'/'parakeet' を含む）→ whisper（音声→テキスト）
     - GGUF（id に 'gguf' を含む）→ llama-cpp
     - mlx（id に 'mlx' を含む。例 `mlx-community/...`・`*-MLX-*`）→ mlx-vlm（vision 兼テキスト）
     - それ以外 → OS 既定（Apple Silicon: mlx-vlm / 他: llama-cpp）
     """
     low = model.lower()
+    # whisper 系は "...-mlx" を含むので、mlx-vlm より先に STT へ振り分ける。
+    if any(h in low for h in _STT_HINTS):
+        return "whisper"
     if "gguf" in low:
         return "llama-cpp"
     if "mlx" in low:
@@ -451,16 +460,18 @@ def ensure_cached(repo: str, *, what: str = "モデル") -> str:
             f"{what} '{repo}' がローカルキャッシュにありません（自動ダウンロードは無効）。"
             f" 先に取得してください: hf download {spec}"
         )
-    # 重み（safetensors）の実体（シンボリックリンク先まで）が存在するか確認する。
+    # 重み（safetensors / npz）の実体（シンボリックリンク先まで）が存在するか確認する。
+    # whisper 系の mlx リポジトリは *.npz で重みを持つものがあるため両方を許容する。
     weights = [
         f
         for s in snaps
-        for f in glob.glob(os.path.join(s, "*.safetensors"))
+        for pattern in ("*.safetensors", "*.npz")
+        for f in glob.glob(os.path.join(s, pattern))
         if os.path.exists(os.path.realpath(f))
     ]
     if not weights:
         raise ValueError(
-            f"{what} '{repo}' の重み（*.safetensors）がキャッシュに揃っていません。"
+            f"{what} '{repo}' の重み（*.safetensors / *.npz）がキャッシュに揃っていません。"
             f" 取得し直してください: hf download {spec}"
         )
     return os.path.dirname(weights[0])
@@ -578,10 +589,12 @@ def discover_cached_models(ttl: float = 10.0) -> list[dict]:
             elif (
                 "config.json" in files
                 and any(f.endswith((".safetensors", ".npz")) for f in files)
-                and _is_generative_repo(snap_root)
+                # 生成系（チャット）または STT（whisper）を対象にする。埋め込み・分類器などの
+                # 非チャット・非STT モデルは除外する（_is_generative_repo）。
+                and (_is_generative_repo(snap_root) or infer_backend(repo) == "whisper")
             ):
                 cands = [repo]
-                backend = infer_backend(repo)  # mlx → mlx-vlm、それ以外は OS 既定
+                backend = infer_backend(repo)  # whisper → STT、mlx → mlx-vlm、他は OS 既定
             else:
                 continue
             # MTP（高速化）の利用可否を本体ごとに付与する（ドラフターが揃っていれば "ready"）。
@@ -740,6 +753,17 @@ def build_command(config: ServerConfig) -> list[str]:
                 command += ["-md", draft_path]
                 if "mtp" in os.path.basename(draft_path).lower():
                     command += ["--spec-type", "draft-mtp"]
+    elif config.backend == "whisper":
+        # mlx-whisper を OpenAI 互換の STT サーバ（1 モデル 1 プロセス）として起動する。
+        # 専用サーバは同梱の local_llm_server.stt_server（標準ライブラリのみ）。
+        # 本体は事前 DL 必須（未取得なら案内付き ValueError）。音声デコードに ffmpeg CLI が要る。
+        ensure_cached(config.model)
+        command = [
+            sys.executable, "-m", "local_llm_server.stt_server",
+            "--model", config.model,
+            "--host", config.host,
+            "--port", str(config.port),
+        ]
     else:
         raise ValueError(
             f"unknown backend: {config.backend!r} (choose from {BACKENDS})"

@@ -35,6 +35,7 @@ import urllib.parse
 from dataclasses import dataclass, field, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from . import multipart
 from .proxy import forward, send_error, send_json
 from .server import (
     BACKENDS,
@@ -1045,6 +1046,11 @@ class _GatewayHandler(BaseHTTPRequestHandler):
         body = self._read_body()
         if body is None:
             return
+        # 音声（STT）は OpenAI 仕様で multipart/form-data。本文は JSON ではないので、
+        # multipart（または query）から model を取り出して振り分ける（chat と別処理）。
+        if path.endswith(("/audio/transcriptions", "/audio/translations")):
+            self._handle_audio(srv, body)
+            return
         try:
             payload = json.loads(body or b"{}")
         except (json.JSONDecodeError, ValueError):
@@ -1072,6 +1078,38 @@ class _GatewayHandler(BaseHTTPRequestHandler):
         if not model:
             send_error(self, 400, "no 'model' in the request and no default_model is configured")
             return
+        self._acquire_and_forward(srv, model, body)
+
+    def _handle_audio(self, srv, body: bytes) -> None:
+        """STT（/v1/audio/transcriptions・/translations）を振り分ける。
+
+        chat と違い body は multipart/form-data。model はフォームフィールドから拾う
+        （OpenAI クライアントはここに載せる）。取れなければ query の ?model=、最後に
+        default_model にフォールバックする。振り分け後は chat と同じ acquire→forward。
+        """
+        ctype = self.headers.get("Content-Type", "")
+        model = None
+        if "multipart/form-data" in ctype.lower():
+            model = multipart.field(body, ctype, "model")
+        if not model:
+            q = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            vals = q.get("model")
+            model = vals[0] if vals else None
+        model = model or srv.default_model
+        if not model:
+            send_error(
+                self, 400,
+                "no 'model' field in the audio request and no default_model is configured",
+            )
+            return
+        self._acquire_and_forward(srv, model, body)
+
+    def _acquire_and_forward(self, srv, model, body: bytes) -> None:
+        """model を acquire し、現在のリクエストを担当インスタンスへ中継する。
+
+        chat（JSON）と STT（multipart）の共通処理。model 検証・容量/起動エラーの
+        HTTP 変換・在席解放（release）をここに集約する。
+        """
         if not isinstance(model, str):
             send_error(self, 400, "'model' must be a string")
             return
