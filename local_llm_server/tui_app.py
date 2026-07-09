@@ -210,6 +210,102 @@ class MtpScreen(ModalScreen):
         self.dismiss()
 
 
+# --- 起動スプラッシュ（Claude Code CLI 風のロゴ画面）--------------------------------
+# 5x5 の固定升目フォント。文字ごとに幅が変わる本物の figlet と違い、全グリフが同じ
+# 升目なので文字間のズレが起きない（手打ちの ASCII アートで一番事故りやすい部分）。
+_GLYPH_H = 5
+_GLYPH_W = 5
+_LETTERS: dict[str, list[str]] = {
+    "L": ["█    ", "█    ", "█    ", "█    ", "█████"],
+    "O": [" ███ ", "█   █", "█   █", "█   █", " ███ "],
+    "C": [" ████", "█    ", "█    ", "█    ", " ████"],
+    "A": [" ███ ", "█   █", "█████", "█   █", "█   █"],
+    "-": ["     ", "     ", "█████", "     ", "     "],
+    "M": ["█   █", "██ ██", "█ █ █", "█   █", "█   █"],
+    "S": [" ████", "█    ", " ███ ", "    █", "████ "],
+    "E": ["█████", "█    ", "████ ", "█    ", "█████"],
+    "R": ["████ ", "█   █", "████ ", "█  █ ", "█   █"],
+    "V": ["█   █", "█   █", "█   █", " █ █ ", "  █  "],
+}
+
+
+def _big_word(word: str, gap: int = 1) -> list[str]:
+    """word の各文字を _LETTERS の升目でつなげ、5 行のアスキーアートにする。"""
+    glyphs = [_LETTERS[ch] for ch in word]
+    return [(" " * gap).join(g[row] for g in glyphs) for row in range(_GLYPH_H)]
+
+
+def ascii_logo_big() -> str:
+    """'LOCAL-LLM' と 'SERVER' を升目フォントで積んだ大きいロゴ（幅 53 桁）。"""
+    top = _big_word("LOCAL-LLM")
+    bottom = _big_word("SERVER")
+    width = len(top[0])
+    bottom = [line.center(width) for line in bottom]
+    return "\n".join([*top, "", *bottom])
+
+
+def ascii_logo_small() -> str:
+    """幅の狭い端末向けの 1 行フォールバック（大きいロゴが収まらないとき）。"""
+    return "LOCAL-LLM-SERVER"
+
+
+# 大きいロゴが収まる最小の端末サイズ。満たさなければ小さいフォールバックを出す。
+_BIG_LOGO_MIN_WIDTH = 60
+_BIG_LOGO_MIN_HEIGHT = 18
+# 自動で閉じるまでの秒数（キー入力があれば即閉じる）。テストはこの秒数を短く差し替える。
+SPLASH_AUTO_DISMISS_SECONDS = 1.6
+
+
+class SplashScreen(ModalScreen):
+    """起動直後に一瞬だけ出すロゴ画面（Claude Code CLI 風）。
+
+    裏のダッシュボードは通常どおり起動処理（ゲートウェイ起動・ポーリング開始）を進めて
+    おり、このスプラッシュは見た目だけの演出——キー入力、または一定時間で自動的に閉じて
+    ダッシュボードに移る（起動そのものを遅らせない）。
+    """
+
+    CSS = """
+    SplashScreen { align: center middle; background: #16161a; }
+    #splash { width: auto; height: auto; }
+    #splash_art { color: #d8a45f; text-style: bold; width: auto; }
+    #splash_sub { text-align: center; padding: 1 0 0 0; }
+    #splash_hint { color: #83838c; text-align: center; padding: 1 0 0 0; }
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._done = False
+
+    def compose(self) -> ComposeResult:
+        size = self.app.size
+        big_enough = (
+            size.width >= _BIG_LOGO_MIN_WIDTH and size.height >= _BIG_LOGO_MIN_HEIGHT
+        )
+        art = ascii_logo_big() if big_enough else ascii_logo_small()
+        with Container(id="splash"):
+            yield Static(art, id="splash_art")
+            yield Static(id="splash_sub")
+            yield Static("press any key to continue", id="splash_hint")
+
+    def on_mount(self) -> None:
+        sub = Text()
+        sub.append("gateway monitor", style=_DIM)
+        ver = update.installed_version()
+        if ver:
+            sub.append(f"  ·  v{ver}", style=_ACCENT)
+        self.query_one("#splash_sub", Static).update(sub)
+        self.set_timer(SPLASH_AUTO_DISMISS_SECONDS, self._dismiss_once)
+
+    def on_key(self, _event) -> None:
+        self._dismiss_once()
+
+    def _dismiss_once(self) -> None:
+        # タイマーとキー入力の両方から呼ばれ得るため、二重 dismiss を防ぐ。
+        if not self._done:
+            self._done = True
+            self.dismiss()
+
+
 class GatewayMonitor(App):
     """ゲートウェイ常駐モニタ。1 秒ごとに /admin/status をポーリングして自動更新する。"""
 
@@ -241,9 +337,12 @@ class GatewayMonitor(App):
     # コマンドを打つときは入力欄をクリック（または m キーでプリフィル）する。
     AUTO_FOCUS = None
 
-    def __init__(self, gcfg):
+    def __init__(self, gcfg, *, show_splash: bool | None = None):
         super().__init__()
         self.gcfg = gcfg
+        # None = 自動（headless=テスト実行時は出さない、実端末では出す）。テストが明示的に
+        # True/False を渡してスプラッシュ自体の挙動も検証できるようにする。
+        self._show_splash = show_splash
         self.bind_host = gcfg.host                       # 公開 bind 先（表示用）
         # 自分自身のゲートウェイへの接続はループバックで（bind が 0.0.0.0 等でも "0.0.0.0" 宛は不可搬）。
         self.host = local_connect_host(gcfg.host)
@@ -293,6 +392,13 @@ class GatewayMonitor(App):
         if getattr(self.gcfg, "auto_update", True):
             self.set_interval(_UPDATE_CHECK_INTERVAL, self.check_update)
             self.check_update()
+        # 起動ロゴ（見た目だけ。裏のゲートウェイ起動・ポーリングは上ですでに始まっている）。
+        # 既定は「実端末では出す・pytest の run_test（headless）では出さない」の自動判定。
+        want_splash = self._show_splash
+        if want_splash is None:
+            want_splash = not self.is_headless
+        if want_splash:
+            self.push_screen(SplashScreen())
 
     def _title(self) -> Text:
         # 製品名＋自分のバージョンを Claude Code CLI 風に出す。自動更新でソースが入れ替わるため、
