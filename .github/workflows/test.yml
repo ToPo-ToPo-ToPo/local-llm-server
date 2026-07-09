@@ -43,4 +43,6 @@ jobs:
         run: uv sync --dev
 
       - name: Pytest
-        run: uv run pytest -q
+        # -v は 1 テスト 1 行で結果を出す（GitHub のログ取得が -q の進捗バー末尾を
+        # 取りこぼす問題を避け、失敗テストを確実にログへ残すため）。
+        run: uv run pytest -v --tb=short
