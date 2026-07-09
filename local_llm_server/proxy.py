@@ -16,6 +16,9 @@ def forward(handler: Any, addr: tuple[str, int], body: bytes, timeout_s: float |
 
     上流応答（ストリーミング含む）をそのままクライアントへ書き戻す。上流へ到達
     できなければ 502 を返す。クライアント切断（Broken pipe）は黙って無視する。
+    `timeout_s`（gateway.toml の request_timeout）を渡すとソケットの無応答上限になり、
+    上流が沈黙したまま `timeout_s` 秒を超えたら中継を打ち切る（枠を握り続けさせない保険）。
+    トークンが届く限りタイムアウトは都度リセットされるので長時間生成は妨げない。
     """
     host, port = addr
     headers = {"Content-Type": handler.headers.get("Content-Type", "application/json")}
@@ -47,6 +50,11 @@ def forward(handler: Any, addr: tuple[str, int], body: bytes, timeout_s: float |
             handler.wfile.flush()
     except (BrokenPipeError, ConnectionResetError):
         pass  # クライアント切断
+    except TimeoutError:
+        # 上流（MLXサーバ）が timeout_s 秒沈黙した（ソケット無応答）。既に応答ヘッダは
+        # 送出済みなのでエラー本文は返せない。中継を打ち切って conn.close()（下）で上流へ
+        # 切断を伝え、呼び出し側の release で inflight 枠を解放させる。
+        pass
     finally:
         conn.close()
 

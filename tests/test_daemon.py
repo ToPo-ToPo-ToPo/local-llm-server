@@ -1014,11 +1014,11 @@ def test_gateway_session_endpoints(monkeypatch):
 def test_load_gateway_config_request_and_start_timeout(tmp_path):
     base = '[[models]]\nmodel = "x"\nbackend = "mlx"\n'
     cfg = gw.load_gateway_config(_write(tmp_path, base))
-    assert cfg.request_timeout is None      # 既定: 無制限（長時間生成を妨げない）
+    assert cfg.request_timeout == 600.0     # 既定: 600 秒（沈黙した上流が枠を握り続けるのを防ぐ保険）
     assert cfg.start_timeout == 120.0       # 既定: 120 秒
     cfg = gw.load_gateway_config(
-        _write(tmp_path, "request_timeout = 600\nstart_timeout = 300\n" + base))
-    assert cfg.request_timeout == 600.0
+        _write(tmp_path, "request_timeout = 900\nstart_timeout = 300\n" + base))
+    assert cfg.request_timeout == 900.0
     assert cfg.start_timeout == 300.0
     # 0 は「無効（無制限）」
     assert gw.load_gateway_config(

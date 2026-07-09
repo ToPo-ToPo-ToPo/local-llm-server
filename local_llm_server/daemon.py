@@ -1237,8 +1237,9 @@ class GatewayConfig:
     idle_timeout: float | None = 1200.0  # 秒。これだけ使われないモデルを自動アンロード（既定 1200=20分。None/0 で無効）
     load_timeout: float = 300.0        # 秒。全枠処理中のとき、空くのを待つ最大時間（超過で 503）
     start_timeout: float = 120.0       # 秒。モデルサーバー1つの起動完了（ready）を待つ最大時間（巨大モデルは延ばす）
-    request_timeout: float | None = None  # 秒。上流との通信が無応答のとき打ち切る（None で無制限）。ハングした
-                                       # モデルサーバーが inflight を握ったまま枠を塞ぎ続けるのを防ぐ保険
+    request_timeout: float | None = 600.0  # 秒。上流との通信が無応答のとき打ち切る（0 で無制限）。ハングした／
+                                       # 沈黙した上流が inflight を握ったまま枠を塞ぎ続けるのを防ぐ保険。トークンが
+                                       # 流れている限り切れないので、長時間ストリーミング生成は妨げない（既定 600=10分）
     session_ttl: float | None = 90.0   # 秒。在席エージェントのハートビートがこれだけ途絶えたら無人扱いで掃除（既定 90。None/0 で無効）
     dynamic: bool = True               # 未登録モデルを ID 推論で動的ロードする（false で事前登録のみ）
     disable_thinking: bool = False     # 動的ロード時の既定（思考抑制）。事前登録は各 [[models]] が優先
@@ -1352,10 +1353,10 @@ def load_gateway_config(path: str) -> GatewayConfig:
     start_timeout = float(data.get("start_timeout", 120.0))
     if start_timeout < 1:
         raise ValueError("start_timeout must be 1 or greater")
-    # 上流モデルサーバーとの通信タイムアウト（ソケット単位の無応答秒数）。省略/0 で無制限。
-    # ハングしたサーバーが inflight を握り続けて枠を塞ぐ事故の保険（トークンが流れている限り
-    # 切れないので、ストリーミングの長時間生成は妨げない）。
-    request_timeout = data.get("request_timeout")
+    # 上流モデルサーバーとの通信タイムアウト（ソケット単位の無応答秒数）。省略時 600（=10分）、0 で無制限。
+    # ハングした／沈黙したサーバーが inflight を握り続けて枠を塞ぐ事故の保険（トークンが流れている
+    # 限り切れないので、ストリーミングの長時間生成は妨げない）。正当な長時間生成を切らないよう高め。
+    request_timeout = data.get("request_timeout", 600.0)
     if request_timeout is not None:
         request_timeout = float(request_timeout)
         if request_timeout < 0:
