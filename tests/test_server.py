@@ -618,3 +618,31 @@ def test_is_ready_treats_auth_gated_as_up():
 def test_is_ready_false_when_down():
     # 誰も LISTEN していないポートは従来どおり False。
     assert srv.is_ready("http://127.0.0.1:9/v1", timeout=0.3) is False
+
+
+def test_start_gateway_background_marks_launcher_env(tmp_path, monkeypatch):
+    # TUI の裏起動（この関数経由）で立つゲートウェイには launcher=tui マークが付き、
+    # /admin/status で「TUI が立てたのか、誰かが直接ヘッドレスで立てたのか」を区別できる。
+    calls = {}
+    ready = iter([False, True])  # Popen 前は未起動 → 起動後 ready
+    monkeypatch.setattr(srv, "is_ready", lambda url, **k: next(ready))
+    monkeypatch.setattr(srv, "find_pids_on_port", lambda port: [])
+    monkeypatch.setattr(srv, "gateway_log_path", lambda port: str(tmp_path / "gw.log"))
+
+    class _Proc:
+        pid = 4242
+
+        def poll(self):
+            return None
+
+    def _fake_popen(cmd, **kwargs):
+        calls["cmd"] = cmd
+        calls["kwargs"] = kwargs
+        return _Proc()
+
+    monkeypatch.setattr(srv.subprocess, "Popen", _fake_popen)
+    pid = srv.start_gateway_background(str(tmp_path), "127.0.0.1", 18799, start_timeout=5)
+    assert pid == 4242
+    env = calls["kwargs"]["env"]
+    assert env["LOCAL_LLM_GW_LAUNCHER"] == "tui"
+    assert "PATH" in env  # os.environ を引き継いだ上でマークを足している

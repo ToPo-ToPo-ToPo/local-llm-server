@@ -995,6 +995,14 @@ class GatewayServer(ThreadingHTTPServer):
         self.idle_timeout = idle_timeout
         self.load_timeout = load_timeout
         self.session_ttl = session_ttl
+        # 起動元情報（provenance）。「いつ・どこから・どの経路で立ったゲートウェイか」を
+        # /admin/status で見えるようにする——コーディングエージェント等が裏でヘッドレス起動
+        # した場合でも、TUI attach や curl 一発で出所を特定できる。経路は TUI の裏起動
+        # （start_gateway_background）が環境変数でマークし、無印は "headless"（直接起動）。
+        self.pid = os.getpid()
+        self.started_at = time.strftime("%Y-%m-%d %H:%M:%S")
+        self.start_cwd = os.getcwd()
+        self.launcher = os.environ.get("LOCAL_LLM_GW_LAUNCHER", "headless")
 
 
 # 受け付けるリクエストボディの上限（バイト）。vision の base64 画像を見込んでも十分大きく、
@@ -1112,6 +1120,12 @@ class _GatewayHandler(BaseHTTPRequestHandler):
                 "vision_model": srv.vision_model,
                 "uptime": round(srv.manager.uptime(), 1),
                 "requests": sum(m.get("requests", 0) for m in models),
+                # 起動元情報: いつ・どこから・どの経路（tui の裏起動 / headless 直接起動）で
+                # 立ったゲートウェイかを示す。出所不明のサーバーの特定用。
+                "pid": srv.pid,
+                "started_at": srv.started_at,
+                "cwd": srv.start_cwd,
+                "launcher": srv.launcher,
                 "models": models,
                 # キャッシュにある DL 済みモデル（TUI が未ロード候補として一覧する）。
                 "available": discover_cached_models(),

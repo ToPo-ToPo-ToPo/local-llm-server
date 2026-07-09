@@ -432,3 +432,33 @@ def test_title_falls_back_to_dev_when_version_unknown(tmp_path, monkeypatch):
     monkeypatch.setattr(tui_app.update, "installed_version", lambda: None)
     title = tui_app.GatewayMonitor(gcfg)._title().plain
     assert "local-llm-server" in title and "(dev)" in title
+
+
+def test_policy_line_shows_provenance(tmp_path, monkeypatch):
+    # ポリシー行に起動元情報（いつ・どの経路・pid・どこから）が出る。裏でヘッドレス起動された
+    # ゲートウェイに attach しても、TUI を開くだけで出所が分かる。
+    from local_llm_server import tui_app
+
+    gcfg = load_gateway_config(str(_write_cfg(tmp_path, "port = 8799\n")))
+    admin = {
+        "uptime": 5.0, "requests": 0, "models": [], "available": [],
+        "max_resident": 2, "idle_timeout": 1200,
+        "started_at": "2026-07-09 12:00:00", "launcher": "headless",
+        "pid": 4242, "cwd": "/somewhere/else",
+    }
+    monkeypatch.setattr(tui_app, "server_status", lambda h, p: {"ready": True})
+    monkeypatch.setattr(tui_app, "gateway_admin_status", lambda h, p: admin)
+    monkeypatch.setattr(tui_app, "is_ready", lambda url, **k: True)
+
+    async def scenario():
+        app = tui_app.GatewayMonitor(gcfg)
+        async with app.run_test(size=(120, 30)) as pilot:
+            app._apply(admin)
+            await pilot.pause()
+            text = str(app.query_one("#policy").render())
+            assert "started 2026-07-09 12:00:00" in text
+            assert "headless" in text          # 起動経路
+            assert "pid 4242" in text
+            assert "/somewhere/else" in text   # 起動 cwd（= どの gateway.toml か）
+
+    asyncio.run(scenario())

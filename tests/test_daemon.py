@@ -1525,3 +1525,33 @@ def test_watch_config_file_applies_on_save(tmp_path):
     finally:
         stop.set(); t.join(timeout=2)
         server.server_close(); mgr.shutdown()
+
+
+# --- 起動元情報（provenance: いつ・どこから・どの経路で立ったか） -------------------
+# 裏でヘッドレス起動されたゲートウェイでも、/admin/status 一発で出所を特定できるようにする。
+
+def test_admin_status_includes_provenance(tmp_path, monkeypatch):
+    monkeypatch.setenv("LOCAL_LLM_GW_LAUNCHER", "tui")  # TUI の裏起動が付けるマーク
+    cfg = gw.load_gateway_config(_write(tmp_path, "port = 8799\n"))
+    server, mgr = _live_server(cfg)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        st, obj = _get(server.server_address[1], "/admin/status")
+        assert st == 200
+        assert obj["pid"] == os.getpid()
+        assert obj["launcher"] == "tui"
+        assert obj["cwd"] == os.getcwd()
+        assert obj["started_at"]  # "YYYY-MM-DD HH:MM:SS"
+    finally:
+        server.shutdown(); server.server_close(); mgr.shutdown()
+
+
+def test_launcher_defaults_to_headless(tmp_path, monkeypatch):
+    # マーク無し（直接の python -m local_llm_server や run_gateway 直呼び）は headless 扱い。
+    monkeypatch.delenv("LOCAL_LLM_GW_LAUNCHER", raising=False)
+    cfg = gw.load_gateway_config(_write(tmp_path, "port = 8799\n"))
+    server, mgr = _live_server(cfg)
+    try:
+        assert server.launcher == "headless"
+    finally:
+        server.server_close(); mgr.shutdown()

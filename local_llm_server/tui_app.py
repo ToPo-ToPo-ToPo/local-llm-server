@@ -407,6 +407,18 @@ class GatewayMonitor(App):
             policy += f"    LAN {self.reachable_url}"
         if self.busy:
             policy += f"    · {self.busy.strip()}"
+        # 起動元情報: いつ・どこから・どの経路（tui/headless）で立ったゲートウェイに attach して
+        # いるかを常時表示する。裏でヘッドレス起動されたサーバーでも出所が一目で分かる。
+        admin = self.admin or {}
+        if admin.get("started_at"):
+            cwd = admin.get("cwd", "")
+            home = os.path.expanduser("~")
+            if cwd.startswith(home):
+                cwd = "~" + cwd[len(home):]
+            policy += (
+                f"\nstarted {admin['started_at']} · {admin.get('launcher', '?')}"
+                f" · pid {admin.get('pid', '?')} · {cwd}"
+            )
         self.query_one("#policy", Static).update(policy)
 
     # --- 操作（別スレッドで実行して UI を固めない） ---
