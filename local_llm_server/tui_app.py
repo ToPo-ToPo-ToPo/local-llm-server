@@ -295,9 +295,13 @@ class GatewayMonitor(App):
             self.check_update()
 
     def _title(self) -> Text:
+        # 製品名＋自分のバージョンを Claude Code CLI 風に出す。自動更新でソースが入れ替わるため、
+        # 「今どの版が動いているか」を一目で分かるようにする（version は importlib.metadata から）。
+        ver = update.installed_version()
         t = Text()
         t.append("◆ ", style=_ACCENT)
         t.append("local-llm-server", style="bold")
+        t.append(f"  v{ver}" if ver else "  (dev)", style=_ACCENT)
         t.append("  · gateway monitor", style=_DIM)
         return t
 

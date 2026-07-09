@@ -411,3 +411,24 @@ def test_merge_status_ready_is_passed_in_not_probed(tmp_path):
     assert tui.merge_status(gcfg, None)["ready"] is False          # admin なし → 停止扱い
     assert tui.merge_status(gcfg, None, ready=True)["ready"] is True   # 明示指定を優先
     assert tui.merge_status(gcfg, admin, ready=False)["ready"] is False
+
+
+def test_title_shows_name_and_version(tmp_path, monkeypatch):
+    # TUI タイトルに製品名と稼働中バージョンを出す（自動更新でどの版が動くか分かるように）。
+    from local_llm_server import tui_app
+
+    gcfg = load_gateway_config(str(_write_cfg(tmp_path, "port = 8799\n")))
+    monkeypatch.setattr(tui_app.update, "installed_version", lambda: "9.9.9")
+    title = tui_app.GatewayMonitor(gcfg)._title().plain
+    assert "local-llm-server" in title      # 名前
+    assert "v9.9.9" in title                 # バージョン
+
+
+def test_title_falls_back_to_dev_when_version_unknown(tmp_path, monkeypatch):
+    # ソース実行等で版が取れないときは (dev) 表示にして落ちない。
+    from local_llm_server import tui_app
+
+    gcfg = load_gateway_config(str(_write_cfg(tmp_path, "port = 8799\n")))
+    monkeypatch.setattr(tui_app.update, "installed_version", lambda: None)
+    title = tui_app.GatewayMonitor(gcfg)._title().plain
+    assert "local-llm-server" in title and "(dev)" in title
