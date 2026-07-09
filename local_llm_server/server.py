@@ -1038,6 +1038,118 @@ def daemon_log_path(port: int) -> str:
     return os.path.join(project_cache_dir(), f"server-{port}.log")
 
 
+class GatewayAlreadyRunning(RuntimeError):
+    """このマシンで既にゲートウェイが起動している（単一起動ガードが二重起動を拒否）。
+
+    保持者の PID（読めれば）とロックファイルのパスを添える。呼び出し側はこれを捕まえて
+    「既に起動済み」を明示エラーとして返す（黙って 2 個目を立てて乱立させない）。
+    """
+
+    def __init__(self, pid: int | None, path: str) -> None:
+        self.pid = pid
+        self.path = path
+        who = f"pid {pid}" if pid else "unknown pid"
+        super().__init__(
+            f"a local-llm-server gateway is already running on this machine ({who}); "
+            f"stop it before starting another (single-instance lock: {path})"
+        )
+
+
+def gateway_lock_path() -> str:
+    """マシン内で 1 つだけゲートウェイを許すロックファイルのパス（cwd 非依存の固定パス）。
+
+    モデルサーバーのログ（`project_cache_dir()` = cwd 相対）と違い、**どのディレクトリから
+    起動しても同じ 1 個**のロックを見るよう、temp ディレクトリ配下の固定名にする。これで
+    「別ディレクトリから（開発ツール等が）勝手に 2 個目を起動する」ケースも 1 本に束ねられる。
+    ポートに依存しないので、port を変えても二重には立たない（＝マシンにつき 1 ゲートウェイ）。
+    """
+    return os.path.join(tempfile.gettempdir(), "local-llm-server-gateway.lock")
+
+
+def _read_lock_pid(path: str) -> int | None:
+    """ロックファイルに保持者が書き込んだ PID を読む（読めなければ None）。"""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return int(fh.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+class GatewayLock:
+    """ゲートウェイの単一起動を保証する OS レベルの排他ロック（flock / msvcrt）。
+
+    プロセス生存中だけ握る advisory ロック。プロセスが（クラッシュ・SIGKILL 含め）終われば
+    OS が自動解放するので、古い PID ファイルが残っても stale ロックにはならない（＝手動の
+    生存判定が要らない）。`acquire()` は取得できなければ `GatewayAlreadyRunning` を投げる。
+    """
+
+    def __init__(self, path: str | None = None) -> None:
+        self._path = path or gateway_lock_path()
+        self._fd: int | None = None
+
+    def acquire(self) -> "GatewayLock":
+        os.makedirs(os.path.dirname(self._path) or ".", exist_ok=True)
+        fd = os.open(self._path, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            _flock_exclusive_nb(fd)
+        except OSError as exc:  # 既に他プロセスが握っている（EWOULDBLOCK 等）
+            pid = _read_lock_pid(self._path)
+            os.close(fd)
+            raise GatewayAlreadyRunning(pid, self._path) from exc
+        # 取得できた → 自分の PID を記録（失敗した取得者がこれを読んで相手を示す）。
+        try:
+            os.ftruncate(fd, 0)
+            os.write(fd, f"{os.getpid()}\n".encode())
+        except OSError:
+            pass  # PID 記録は best-effort（ロック自体は取れている）
+        self._fd = fd
+        return self
+
+    def release(self) -> None:
+        """ロックを解放する（プロセス終了時にも OS が自動解放するが明示的に返す）。
+
+        ファイル自体は消さない（消すと「解放→別プロセスが再作成」の隙に取り違えが起きる）。
+        残った PID は次の取得失敗時にしか読まれず、その時は必ず生きた保持者が上書き済み。
+        """
+        if self._fd is not None:
+            fd, self._fd = self._fd, None
+            try:
+                _flock_unlock(fd)
+            except OSError:
+                pass
+            finally:
+                os.close(fd)
+
+    def __enter__(self) -> "GatewayLock":
+        return self.acquire()
+
+    def __exit__(self, *_exc) -> None:
+        self.release()
+
+
+# --- プラットフォーム別のファイルロック実装 -----------------------------------
+# POSIX は fcntl.flock、Windows は msvcrt.locking を使う。どちらも「他プロセスが
+# 握っていれば即エラー（非ブロッキング）」で、プロセス終了時に OS が自動解放する。
+if os.name == "nt":  # pragma: no cover - Windows 専用パス
+    import msvcrt
+
+    def _flock_exclusive_nb(fd: int) -> None:
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+
+    def _flock_unlock(fd: int) -> None:
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+else:
+    import fcntl
+
+    def _flock_exclusive_nb(fd: int) -> None:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def _flock_unlock(fd: int) -> None:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+
+
 def local_connect_host(bind_host: str) -> str:
     """bind 用ホストから、同一マシンでの自己接続に使うホストを求める。
 

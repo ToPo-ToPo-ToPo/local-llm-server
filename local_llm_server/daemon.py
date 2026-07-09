@@ -41,6 +41,8 @@ from .server import (
     BACKENDS,
     DEFAULT_BACKEND,
     MTP_DRAFTERS,
+    GatewayAlreadyRunning,
+    GatewayLock,
     LocalServer,
     ServerConfig,
     daemon_log_path,
@@ -1516,7 +1518,25 @@ def run_gateway(cfg: GatewayConfig) -> int:
     終了時に配下のモデルサーバーを全て停止する。SIGTERM/SIGHUP を
     KeyboardInterrupt に変換する install_shutdown_handlers() が呼ばれていれば、
     `kill` や TUI からの停止、端末クローズでも下の finally を通って後始末する。
+
+    起動時にマシン単位の単一起動ロック（GatewayLock）を取る。既に別のゲートウェイが
+    起動していれば、2 個目を立てずに明示エラー（戻り値 3）で終わる。これで開発ツール等が
+    別ディレクトリから勝手に起動してもゲートウェイが乱立しない（1 マシン 1 ゲートウェイ）。
     """
+    # 単一起動ガード: サーバー本体（ポート bind やモデル起動）に入る前に取る。
+    try:
+        lock = GatewayLock().acquire()
+    except GatewayAlreadyRunning as exc:
+        print(f"Refusing to start: {exc}", file=sys.stderr)
+        return 3
+    try:
+        return _run_gateway_locked(cfg)
+    finally:
+        lock.release()
+
+
+def _run_gateway_locked(cfg: GatewayConfig) -> int:
+    """単一起動ロック取得済みで実際にゲートウェイを回す本体（run_gateway が呼ぶ）。"""
     manager = ModelManager(
         cfg.models, max_resident=cfg.max_resident, load_timeout=cfg.load_timeout,
         start_timeout=cfg.start_timeout,
