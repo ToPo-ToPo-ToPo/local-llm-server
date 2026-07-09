@@ -109,6 +109,15 @@ backend = "mlx-vlm"
   リクエストだけ**を（元の `model` に関わらず）そのモデルへ流す。テキストは元モデルのまま。
   現行 `mlx_vlm` では一部の vision モデル（Qwen3.6-27B 等の qwen3_5 系）が画像入力で壊れて
   いるため、画像だけを「画像が確実に動くモデル」（gemma-4 系など）へ逃がすのに使う。→ [mtp.md](mtp.md#画像入力vision)
+- **設定のホットリロード**: `gateway.toml` を**保存した瞬間**にポリシー設定を無停止で反映する
+  （プロセスは動かしたまま。~1 秒以内）。反映されるのは `vision_model`・`default_model`・
+  `max_resident`・`request_timeout`・`idle_timeout`・`session_ttl`・`load_timeout`・`api_key`
+  と動的ロードの既定（`draft_model`・`parallel`・`disable_thinking`・`max_memory_fraction`・
+  `dynamic`・`start_timeout`）。動的ロード既定は**次回ロードから**有効。一方 `host`・`port`・
+  `internal_base_port`・`[[models]]` はソケット bind 済み等で稼働中に変えられないため、変更を
+  検知しても**適用せず「要再起動」をログ警告**する（サーバーは旧値のまま動き続ける）。編集途中の
+  不正な TOML は無視して現行設定を維持する。反映内容は標準エラー（TUI のログ画面）に出る。
+  → [ホットリロードの反映範囲](#ホットリロードの反映範囲)
 
 MTP（speculative decoding）による高速化は [mtp.md](mtp.md) を参照。
 
@@ -213,6 +222,27 @@ OpenAI SDK からもそのまま使える（`client.audio.transcriptions.create(
 |---|---|---|---|
 | 上限変更 | `POST /admin/config` | `{"max_resident": 2}` | 常駐上限を 2 に。busy は止めず超過アイドルを非同期退避 |
 | 無制限化 | `POST /admin/config` | `{"max_resident": null}` | 上限撤廃（メモリが許す限り常駐）|
+
+（`POST /admin/config` / TUI の `max` は**実行中だけの一時変更**。恒久的に変えるなら次節のとおり
+`gateway.toml` を編集する —— 保存すれば同じく無停止で反映され、そちらが永続値になる。）
+
+## ホットリロードの反映範囲
+
+サーバーを**起動しっぱなしのまま**、`gateway.toml` を編集・保存するだけで設定を反映する。ゲートウェイは
+ファイルの更新時刻を ~1 秒周期で監視し、保存を検知したら読み直して**無停止で適用**する（反映内容は
+標準エラー＝ TUI のログ画面に出る）。運用中にモデルを落とさず方針だけ変えられる。
+
+| 種別 | 対象 | 反映 |
+|---|---|---|
+| **即時反映（ポリシー）** | `vision_model`, `default_model`, `max_resident`, `request_timeout`, `idle_timeout`, `session_ttl`, `load_timeout`, `api_key` | 保存した瞬間に有効 |
+| **次回ロードから（動的既定）** | `draft_model`, `parallel`, `disable_thinking`, `max_memory_fraction`, `dynamic`, `start_timeout` | 既にロード済みのモデルは次にロードし直すまで旧設定のまま |
+| **要再起動（構造）** | `host`, `port`, `internal_base_port`, `[[models]]` | 稼働中は変えられない（ソケット bind 済み・内部ポート割当は起動時固定）。変更を検知しても**適用せず「要再起動」をログ警告**し、旧値のまま動き続ける |
+
+- `max_resident` の即時反映は `POST /admin/config` と同じ挙動（**busy は止めず、超過アイドルのみ非同期
+  LRU 退避**。→ [max_resident をライブで変える](#max_resident-をライブで変える)）。
+- **編集途中の壊れた TOML は無視**して現行設定を維持する（保存の瞬間に構文エラーがあってもサーバーは
+  落ちない）。直後に有効な内容を保存すれば、また反映される。
+- 構造設定（`host`/`port` 等）を本当に変えたいときだけ、TUI の `r`（再起動）またはプロセス再起動を行う。
 
 ## 別PCから接続する（ネットワーク公開）
 

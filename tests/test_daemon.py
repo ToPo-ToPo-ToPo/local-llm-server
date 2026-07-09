@@ -1,6 +1,8 @@
 import http.client
 import json
+import os
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
@@ -1358,3 +1360,168 @@ def test_gateway_oversized_content_length_returns_413(monkeypatch):
         server.shutdown(); server.server_close(); mgr.shutdown()
         for u in ups:
             u.shutdown(); u.server_close()
+
+
+# --- 設定のホットリロード（gateway.toml 保存で無停止反映） --------------------------
+# apply_live_config は読み直した設定を稼働中の server/manager/cfg へ無停止で反映する。
+# ポリシー設定は即適用、host/port/[[models]] 等の構造設定は「要再起動」を警告するだけ。
+
+def _live_server(cfg):
+    """cfg から _run_gateway_locked と同じ配線で manager + server を組む（bind は port 0）。"""
+    mgr = gw.ModelManager(
+        cfg.models, max_resident=cfg.max_resident, load_timeout=cfg.load_timeout,
+        start_timeout=cfg.start_timeout, dynamic=cfg.dynamic,
+        default_disable_thinking=cfg.disable_thinking, default_draft=cfg.draft_model,
+        default_parallel=cfg.parallel, max_memory_fraction=cfg.max_memory_fraction,
+        internal_base_port=cfg.internal_base_port, public_port=cfg.port,
+    )
+    server = gw.GatewayServer(
+        ("127.0.0.1", 0), mgr, catalog=[c.model for c in cfg.models],
+        default_model=cfg.default_model, timeout_s=cfg.request_timeout,
+        max_resident=cfg.max_resident, idle_timeout=cfg.idle_timeout,
+        load_timeout=cfg.load_timeout, session_ttl=cfg.session_ttl,
+        api_key=cfg.api_key, vision_model=cfg.vision_model,
+    )
+    return server, mgr
+
+
+def test_apply_live_config_updates_policy_fields(tmp_path):
+    base = ('vision_model = "org/vis-a"\nidle_timeout = 1200\nrequest_timeout = 600\n'
+            'session_ttl = 90\ndraft_model = "auto"\n')
+    cfg = gw.load_gateway_config(_write(tmp_path, base))
+    server, mgr = _live_server(cfg)
+    try:
+        new = gw.load_gateway_config(_write(
+            tmp_path,
+            'vision_model = "org/vis-b"\nidle_timeout = 60\nrequest_timeout = 0\n'
+            'session_ttl = 30\ndraft_model = "off"\ndefault_model = "org/dft"\n'))
+        changed, restart = gw.apply_live_config(server, mgr, cfg, new)
+        # サーバーが per-request で読む値が差し替わる。
+        assert server.vision_model == "org/vis-b"
+        assert server.default_model == "org/dft"
+        assert server.timeout_s == new.request_timeout   # request_timeout=0 → 無制限
+        assert server.idle_timeout == 60
+        assert server.session_ttl == 30
+        # 動的ロード既定（manager 側）も new 値へ差し替わる（"off" 等の正規化は各ロード時）。
+        assert mgr._default_draft == new.draft_model
+        # 掃除スレッドが読む cfg 本体も new に揃う。
+        assert cfg.vision_model == "org/vis-b" and cfg.idle_timeout == 60
+        assert restart == []
+        assert any("vision_model" in c for c in changed)
+    finally:
+        server.server_close(); mgr.shutdown()
+
+
+def test_apply_live_config_max_resident_uses_setter(tmp_path):
+    cfg = gw.load_gateway_config(_write(tmp_path, "max_resident = 2\n"))
+    server, mgr = _live_server(cfg)
+    try:
+        new = gw.load_gateway_config(_write(tmp_path, "max_resident = 5\n"))
+        changed, restart = gw.apply_live_config(server, mgr, cfg, new)
+        assert mgr._max_resident == 5          # set_max_resident 経由で更新
+        assert server.max_resident == 5        # /admin/status の表示にも反映
+        assert cfg.max_resident == 5
+        assert any("max_resident" in c for c in changed) and restart == []
+    finally:
+        server.server_close(); mgr.shutdown()
+
+
+def test_apply_live_config_structural_change_warns_not_applied(tmp_path):
+    cfg = gw.load_gateway_config(_write(tmp_path, "port = 8799\ninternal_base_port = 9001\n"))
+    server, mgr = _live_server(cfg)
+    bound_port = server.server_address[1]
+    try:
+        new = gw.load_gateway_config(_write(
+            tmp_path, 'host = "0.0.0.0"\nport = 9999\ninternal_base_port = 9500\n'))
+        changed, restart = gw.apply_live_config(server, mgr, cfg, new)
+        # 構造設定は「要再起動」に積まれるだけで、稼働中の bind は変わらない。
+        assert "port" in restart and "host" in restart and "internal_base_port" in restart
+        assert server.server_address[1] == bound_port   # ソケットは旧ポートのまま
+        assert changed == []
+    finally:
+        server.server_close(); mgr.shutdown()
+
+
+def test_apply_live_config_models_change_is_restart_only(tmp_path):
+    cfg = gw.load_gateway_config(_write(tmp_path, "port = 8799\n"))
+    server, mgr = _live_server(cfg)
+    try:
+        new = gw.load_gateway_config(_write(
+            tmp_path,
+            'port = 8799\n[[models]]\nmodel = "org/m1"\nbackend = "mlx"\n'))
+        changed, restart = gw.apply_live_config(server, mgr, cfg, new)
+        assert "models" in restart          # [[models]] 変更は要再起動
+    finally:
+        server.server_close(); mgr.shutdown()
+
+
+def test_apply_live_config_no_change_is_noop(tmp_path):
+    text = 'vision_model = "org/x"\nmax_resident = 2\nidle_timeout = 300\n'
+    cfg = gw.load_gateway_config(_write(tmp_path, text))
+    server, mgr = _live_server(cfg)
+    try:
+        new = gw.load_gateway_config(_write(tmp_path, text))
+        changed, restart = gw.apply_live_config(server, mgr, cfg, new)
+        assert changed == [] and restart == []
+    finally:
+        server.server_close(); mgr.shutdown()
+
+
+def test_apply_live_config_api_key_not_logged(tmp_path):
+    cfg = gw.load_gateway_config(_write(tmp_path, "port = 8799\n"))
+    server, mgr = _live_server(cfg)
+    try:
+        new = gw.load_gateway_config(_write(tmp_path, 'port = 8799\napi_key = "s3cr3t"\n'))
+        changed, restart = gw.apply_live_config(server, mgr, cfg, new)
+        assert server.api_key == "s3cr3t"         # 実際には差し替わる
+        assert not any("s3cr3t" in c for c in changed)   # ログ文字列には出さない
+        assert any("api_key" in c for c in changed)
+    finally:
+        server.server_close(); mgr.shutdown()
+
+
+def _resave(path, text, mtime):
+    """内容を書き換え、mtime を明示的に進める（ファイルシステムの mtime 粒度に依存しない）。"""
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    os.utime(path, (mtime, mtime))
+
+
+def _wait_until(pred, timeout=3.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if pred():
+            return True
+        time.sleep(0.02)
+    return pred()
+
+
+def test_watch_config_file_applies_on_save(tmp_path):
+    # gateway.toml を保存すると監視スレッドがポリシー設定を無停止で反映する（E2E）。
+    path = _write(tmp_path, 'vision_model = "org/a"\nmax_resident = 2\n')
+    os.utime(path, (1_000_000, 1_000_000))
+    cfg = gw.load_gateway_config(path)
+    server, mgr = _live_server(cfg)
+    stop = threading.Event()
+    t = threading.Thread(
+        target=gw.watch_config_file, args=(server, mgr, cfg, path, stop),
+        kwargs={"poll_interval": 0.05}, daemon=True)
+    t.start()
+    try:
+        _resave(path, 'vision_model = "org/b"\nmax_resident = 4\n', 1_000_100)
+        assert _wait_until(
+            lambda: server.vision_model == "org/b" and mgr._max_resident == 4)
+        assert server.vision_model == "org/b"
+        assert mgr._max_resident == 4
+
+        # 不正 TOML を保存しても監視スレッドは落ちず、直前の有効値を保つ。
+        _resave(path, "this is = = broken [[[", 1_000_200)
+        time.sleep(0.3)
+        assert server.vision_model == "org/b"   # 旧値のまま
+
+        # その後に有効な設定を保存すれば、また反映される（壊れた保存で止まらない）。
+        _resave(path, 'vision_model = "org/c"\nmax_resident = 4\n', 1_000_300)
+        assert _wait_until(lambda: server.vision_model == "org/c")
+    finally:
+        stop.set(); t.join(timeout=2)
+        server.server_close(); mgr.shutdown()
