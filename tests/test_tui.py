@@ -508,15 +508,22 @@ def test_splash_screen_auto_dismisses_after_timeout(tmp_path, monkeypatch):
     monkeypatch.setattr(tui_app, "server_status", lambda h, p: {"ready": True})
     monkeypatch.setattr(tui_app, "gateway_admin_status", lambda h, p: None)
     monkeypatch.setattr(tui_app, "is_ready", lambda url, **k: False)
-    monkeypatch.setattr(tui_app, "SPLASH_AUTO_DISMISS_SECONDS", 0.05)  # すぐタイムアウトさせる
+    monkeypatch.setattr(tui_app, "SPLASH_AUTO_DISMISS_SECONDS", 0.3)  # タイマーで閉じる
 
     async def scenario():
         app = tui_app.GatewayMonitor(gcfg, show_splash=True)
         async with app.run_test(size=(100, 30)) as pilot:
-            await pilot.pause()
-            assert isinstance(app.screen, tui_app.SplashScreen)
-            await pilot.pause(0.3)  # タイマー経過を待つ（実時間）
-            assert not isinstance(app.screen, tui_app.SplashScreen)
+            # タイマー（0.3s）経過でスプラッシュが自動的に閉じ、ダッシュボードへ戻る。
+            # CI の速度差で「起動直後に存在」を assert するとレースする（タイマーが先に発火し得る）
+            # ため、ここでは消えることだけをポーリングで待って検証する。スプラッシュが「出る」
+            # 検証は test_splash_screen_shows_then_dismisses_on_key（長いタイマー）が担う。
+            dismissed = False
+            for _ in range(80):  # 最大 ~4s（0.3s タイマーに対し十分な余裕）
+                await pilot.pause(0.05)
+                if not isinstance(app.screen, tui_app.SplashScreen):
+                    dismissed = True
+                    break
+            assert dismissed
 
     asyncio.run(scenario())
 
