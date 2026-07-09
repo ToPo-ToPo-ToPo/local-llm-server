@@ -29,7 +29,8 @@ def main() -> int:
         print(f"Failed to load ./gateway.toml: {exc}", file=sys.stderr)
         return 2
     install_shutdown_handlers()
-    return run_gateway(gcfg)
+    # config_path を渡して、gateway.toml の保存でポリシー設定を無停止反映（ホットリロード）。
+    return run_gateway(gcfg, config_path=config_path)
 
 
 if __name__ == "__main__":

@@ -1298,6 +1298,9 @@ def start_gateway_background(
         "stdin": subprocess.DEVNULL,
         "stdout": log_file,
         "stderr": subprocess.STDOUT,
+        # /admin/status の launcher 表示用マーク。この関数経由（TUI の裏起動）で立った
+        # ゲートウェイは "tui"、直接の `python -m local_llm_server` は無印で "headless" になる。
+        "env": {**os.environ, "LOCAL_LLM_GW_LAUNCHER": "tui"},
     }
     if os.name == "nt":
         # 端末から切り離し、新プロセスグループにする（stop の taskkill /T と対）。

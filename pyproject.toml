@@ -1,6 +1,6 @@
 [project]
 name = "local-llm-server"
-version = "0.24.0"
+version = "0.28.0"
 description = "ローカルLLM（mlx / mlx-vlm / llama.cpp）を OpenAI 互換 API で束ねるマルチモデルゲートウェイ（サーバー）。gateway.toml のカタログを 1 ポートで配信し、model で振り分け・遅延起動・LRU 退避・MTP 高速化（Ollama 流の共有デーモン）。接続用クライアントは別パッケージ local-llm-client。"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -45,6 +45,10 @@ dependencies = [
 [dependency-groups]
 dev = [
     "pytest>=8.0",
+    # 結線テスト用（tests/test_client_integration.py）。対リポジトリで開発する公開クライアントを
+    # PyPI 版で取り込み、server の変更が client の公開 API を壊していないかを常時検証する
+    # （リポジトリ統合はしない決定 2026-06-28 / 再確認 2026-07-09。その代償をこのテストが担う）。
+    "local-llm-client>=0.6.0",
 ]
 
 [project.urls]

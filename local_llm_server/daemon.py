@@ -28,11 +28,12 @@ from __future__ import annotations
 
 import hmac
 import json
+import os
 import sys
 import threading
 import time
 import urllib.parse
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import multipart
@@ -994,6 +995,14 @@ class GatewayServer(ThreadingHTTPServer):
         self.idle_timeout = idle_timeout
         self.load_timeout = load_timeout
         self.session_ttl = session_ttl
+        # 起動元情報（provenance）。「いつ・どこから・どの経路で立ったゲートウェイか」を
+        # /admin/status で見えるようにする——コーディングエージェント等が裏でヘッドレス起動
+        # した場合でも、TUI attach や curl 一発で出所を特定できる。経路は TUI の裏起動
+        # （start_gateway_background）が環境変数でマークし、無印は "headless"（直接起動）。
+        self.pid = os.getpid()
+        self.started_at = time.strftime("%Y-%m-%d %H:%M:%S")
+        self.start_cwd = os.getcwd()
+        self.launcher = os.environ.get("LOCAL_LLM_GW_LAUNCHER", "headless")
 
 
 # 受け付けるリクエストボディの上限（バイト）。vision の base64 画像を見込んでも十分大きく、
@@ -1111,6 +1120,12 @@ class _GatewayHandler(BaseHTTPRequestHandler):
                 "vision_model": srv.vision_model,
                 "uptime": round(srv.manager.uptime(), 1),
                 "requests": sum(m.get("requests", 0) for m in models),
+                # 起動元情報: いつ・どこから・どの経路（tui の裏起動 / headless 直接起動）で
+                # 立ったゲートウェイかを示す。出所不明のサーバーの特定用。
+                "pid": srv.pid,
+                "started_at": srv.started_at,
+                "cwd": srv.start_cwd,
+                "launcher": srv.launcher,
                 "models": models,
                 # キャッシュにある DL 済みモデル（TUI が未ロード候補として一覧する）。
                 "available": discover_cached_models(),
@@ -1564,7 +1579,175 @@ def load_gateway_config(path: str) -> GatewayConfig:
     )
 
 
-def run_gateway(cfg: GatewayConfig) -> int:
+# gateway.toml を保存した瞬間に反映するホットリロードの監視周期（秒）。mtime ポーリング。
+_CONFIG_POLL_INTERVAL = 1.0
+# 稼働中には変えられない構造設定（ソケットは bind 済み、内部ポート割当は起動時に固定）。
+# 変更を検知したら「要再起動」を警告するだけで、サーバーは止めず旧値のまま動かし続ける。
+_RESTART_ONLY_FIELDS = ("host", "port", "internal_base_port", "models")
+
+
+def apply_live_config(
+    server: GatewayServer,
+    manager: ModelManager,
+    cfg: GatewayConfig,
+    new: GatewayConfig,
+) -> tuple[list[str], list[str]]:
+    """読み直した設定 `new` を稼働中の server / manager / cfg へ無停止で反映する。
+
+    ポリシー設定（vision_model・各 timeout・max_resident・api_key・動的ロード既定）は
+    その場で差し替える。動的ロード既定（draft_model / parallel / disable_thinking /
+    max_memory_fraction / dynamic / start_timeout）は**次回ロードから**有効。
+    host / port / internal_base_port / [[models]] は稼働中に変えられない（ソケット bind 済み・
+    ポート割当の一貫性）ので、変更検知時は「要再起動」として警告用リストに積むだけで適用しない。
+
+    戻り値 `(changed, restart_needed)`: それぞれ変更フィールドの人間向け説明。副作用として
+    server / manager と、掃除スレッドが毎周期読む `cfg` を書き換える（末尾で cfg を new に揃える）。
+    """
+    changed: list[str] = []
+    restart_needed: list[str] = []
+
+    def note(label: str, old, newv) -> None:
+        changed.append(f"{label}: {old!r} → {newv!r}")
+
+    # --- 稼働中に変えられない構造設定は警告のみ（適用しない） ---
+    for fld in _RESTART_ONLY_FIELDS:
+        if getattr(cfg, fld) != getattr(new, fld):
+            restart_needed.append(fld)
+
+    # --- max_resident: 退避を伴うので専用セッター経由（超過分は非同期 LRU 退避） ---
+    if cfg.max_resident != new.max_resident:
+        note("max_resident", cfg.max_resident, new.max_resident)
+        manager.set_max_resident(new.max_resident)
+        server.max_resident = new.max_resident
+
+    # --- サーバーがリクエスト毎に読むポリシー ---
+    if cfg.vision_model != new.vision_model:
+        note("vision_model", cfg.vision_model, new.vision_model)
+        server.vision_model = new.vision_model
+    if cfg.default_model != new.default_model:
+        note("default_model", cfg.default_model, new.default_model)
+        server.default_model = new.default_model
+    if cfg.request_timeout != new.request_timeout:
+        note("request_timeout", cfg.request_timeout, new.request_timeout)
+        server.timeout_s = new.request_timeout
+    if cfg.api_key != new.api_key:
+        # キー実体はログに出さない（設定の有無だけ示す）。
+        note("api_key", "set" if cfg.api_key else None, "set" if new.api_key else None)
+        server.api_key = new.api_key
+
+    # --- 掃除スレッドが cfg から毎周期読む閾値（server にも監視表示用のコピーを持つ） ---
+    if cfg.idle_timeout != new.idle_timeout:
+        note("idle_timeout", cfg.idle_timeout, new.idle_timeout)
+        server.idle_timeout = new.idle_timeout
+    if cfg.session_ttl != new.session_ttl:
+        note("session_ttl", cfg.session_ttl, new.session_ttl)
+        server.session_ttl = new.session_ttl
+    if cfg.load_timeout != new.load_timeout:
+        note("load_timeout", cfg.load_timeout, new.load_timeout)
+        server.load_timeout = new.load_timeout
+        manager._load_timeout = new.load_timeout
+
+    # --- 動的ロードの既定（次回ロードから有効） ---
+    if cfg.start_timeout != new.start_timeout:
+        note("start_timeout", cfg.start_timeout, new.start_timeout)
+        manager._start_timeout = new.start_timeout
+    if cfg.dynamic != new.dynamic:
+        note("dynamic", cfg.dynamic, new.dynamic)
+        manager._dynamic = new.dynamic
+    if cfg.disable_thinking != new.disable_thinking:
+        note("disable_thinking", cfg.disable_thinking, new.disable_thinking)
+        manager._default_disable_thinking = new.disable_thinking
+    if cfg.draft_model != new.draft_model:
+        note("draft_model", cfg.draft_model, new.draft_model)
+        manager._default_draft = new.draft_model
+    if cfg.parallel != new.parallel:
+        note("parallel", cfg.parallel, new.parallel)
+        manager._default_parallel = new.parallel
+    if cfg.max_memory_fraction != new.max_memory_fraction:
+        # 有効化するには総RAMが要る。取得できていなければ適用を見送って警告に回す。
+        if new.max_memory_fraction and manager._mem_total is None:
+            total = _total_ram()
+            if not total:
+                restart_needed.append(
+                    "max_memory_fraction (total RAM を取得できず未適用)"
+                )
+            else:
+                manager._mem_total = total
+                manager._mem_fraction = new.max_memory_fraction
+                note("max_memory_fraction", cfg.max_memory_fraction,
+                     new.max_memory_fraction)
+        else:
+            manager._mem_fraction = new.max_memory_fraction
+            note("max_memory_fraction", cfg.max_memory_fraction,
+                 new.max_memory_fraction)
+
+    # cfg を new に揃える: ①掃除スレッドが cfg.idle_timeout / cfg.session_ttl を毎周期読む
+    # ②次回リロードの比較基準を「今の設定」にして、未適用の構造設定を毎回警告し続けないため。
+    # 構造設定(host/port/...)も cfg 上は new に寄せる（稼働中の bind 済みソケットは旧値のまま
+    # だが、cfg のこれらは起動時以外に参照されない）。
+    for f in fields(GatewayConfig):
+        setattr(cfg, f.name, getattr(new, f.name))
+
+    return changed, restart_needed
+
+
+def watch_config_file(
+    server: GatewayServer,
+    manager: ModelManager,
+    cfg: GatewayConfig,
+    config_path: str,
+    stop_event: threading.Event,
+    poll_interval: float = _CONFIG_POLL_INTERVAL,
+) -> None:
+    """gateway.toml の mtime を監視し、保存された瞬間に apply_live_config で無停止反映する。
+
+    `stop_event` がセットされるまでポーリングし続ける（掃除スレッドと同じ停止イベントを共有）。
+    編集途中の不正な TOML は握りつぶして旧設定のまま動かし続け、同じ mtime では再警告しない。
+    """
+    try:
+        last_mtime = os.path.getmtime(config_path)
+    except OSError:
+        last_mtime = None
+    skip_mtime = None  # 直近に読み込み失敗した mtime（同一内容の再警告・再試行を避ける）
+    while not stop_event.wait(poll_interval):
+        try:
+            mtime = os.path.getmtime(config_path)
+        except OSError:
+            continue  # 一時的に消えた（エディタの原子的保存の隙間など）。次周期で拾う。
+        if mtime == last_mtime or mtime == skip_mtime:
+            continue
+        try:
+            new_cfg = load_gateway_config(config_path)
+        except (OSError, ValueError) as exc:  # TOMLDecodeError も ValueError の subclass
+            skip_mtime = mtime
+            print(
+                f"Config reload skipped (invalid gateway.toml, keeping current "
+                f"settings): {exc}",
+                file=sys.stderr,
+            )
+            continue
+        try:
+            changed, restart_needed = apply_live_config(server, manager, cfg, new_cfg)
+        except Exception as exc:  # noqa: BLE001 - 監視スレッドは落とさない
+            skip_mtime = mtime
+            print(f"Config reload failed to apply: {exc}", file=sys.stderr)
+            continue
+        last_mtime = mtime
+        skip_mtime = None
+        if changed:
+            print("Config reloaded (applied live): " + "; ".join(changed),
+                  file=sys.stderr)
+        if restart_needed:
+            print(
+                "Config reloaded: these changes need a restart to take effect "
+                "(still running with the old values): " + ", ".join(restart_needed),
+                file=sys.stderr,
+            )
+        if not changed and not restart_needed:
+            print("Config reloaded: no effective change.", file=sys.stderr)
+
+
+def run_gateway(cfg: GatewayConfig, config_path: str | None = None) -> int:
     """ゲートウェイを起動し、割り込み（Ctrl+C / SIGTERM）まで動かす。
 
     終了時に配下のモデルサーバーを全て停止する。SIGTERM/SIGHUP を
@@ -1574,6 +1757,9 @@ def run_gateway(cfg: GatewayConfig) -> int:
     起動時にマシン単位の単一起動ロック（GatewayLock）を取る。既に別のゲートウェイが
     起動していれば、2 個目を立てずに明示エラー（戻り値 3）で終わる。これで開発ツール等が
     別ディレクトリから勝手に起動してもゲートウェイが乱立しない（1 マシン 1 ゲートウェイ）。
+
+    `config_path`（gateway.toml のパス）を渡すと、そのファイルを保存した瞬間にポリシー設定を
+    無停止で反映するホットリロード監視を有効にする（→ apply_live_config）。
     """
     # 単一起動ガード: サーバー本体（ポート bind やモデル起動）に入る前に取る。
     try:
@@ -1582,13 +1768,17 @@ def run_gateway(cfg: GatewayConfig) -> int:
         print(f"Refusing to start: {exc}", file=sys.stderr)
         return 3
     try:
-        return _run_gateway_locked(cfg)
+        return _run_gateway_locked(cfg, config_path)
     finally:
         lock.release()
 
 
-def _run_gateway_locked(cfg: GatewayConfig) -> int:
-    """単一起動ロック取得済みで実際にゲートウェイを回す本体（run_gateway が呼ぶ）。"""
+def _run_gateway_locked(cfg: GatewayConfig, config_path: str | None = None) -> int:
+    """単一起動ロック取得済みで実際にゲートウェイを回す本体（run_gateway が呼ぶ）。
+
+    `config_path` が渡されれば、gateway.toml を保存した瞬間に設定を無停止で反映する
+    ホットリロード監視スレッドを起動する（→ apply_live_config）。
+    """
     manager = ModelManager(
         cfg.models, max_resident=cfg.max_resident, load_timeout=cfg.load_timeout,
         start_timeout=cfg.start_timeout,
@@ -1701,6 +1891,15 @@ def _run_gateway_locked(cfg: GatewayConfig) -> int:
                 pass
 
     threading.Thread(target=_reaper, daemon=True).start()
+
+    # ホットリロード監視: gateway.toml を保存した瞬間に、ポリシー設定を無停止で反映する。
+    # 構造設定（host/port/internal_base_port/[[models]]）の変更は「要再起動」を警告するだけ。
+    if config_path:
+        threading.Thread(
+            target=watch_config_file,
+            args=(server, manager, cfg, config_path, stop_reaper),
+            daemon=True,
+        ).start()
 
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()

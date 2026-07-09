@@ -411,3 +411,130 @@ def test_merge_status_ready_is_passed_in_not_probed(tmp_path):
     assert tui.merge_status(gcfg, None)["ready"] is False          # admin なし → 停止扱い
     assert tui.merge_status(gcfg, None, ready=True)["ready"] is True   # 明示指定を優先
     assert tui.merge_status(gcfg, admin, ready=False)["ready"] is False
+
+
+def test_title_shows_name_and_version(tmp_path, monkeypatch):
+    # TUI タイトルに製品名と稼働中バージョンを出す（自動更新でどの版が動くか分かるように）。
+    from local_llm_server import tui_app
+
+    gcfg = load_gateway_config(str(_write_cfg(tmp_path, "port = 8799\n")))
+    monkeypatch.setattr(tui_app.update, "installed_version", lambda: "9.9.9")
+    title = tui_app.GatewayMonitor(gcfg)._title().plain
+    assert "local-llm-server" in title      # 名前
+    assert "v9.9.9" in title                 # バージョン
+
+
+def test_title_falls_back_to_dev_when_version_unknown(tmp_path, monkeypatch):
+    # ソース実行等で版が取れないときは (dev) 表示にして落ちない。
+    from local_llm_server import tui_app
+
+    gcfg = load_gateway_config(str(_write_cfg(tmp_path, "port = 8799\n")))
+    monkeypatch.setattr(tui_app.update, "installed_version", lambda: None)
+    title = tui_app.GatewayMonitor(gcfg)._title().plain
+    assert "local-llm-server" in title and "(dev)" in title
+
+
+def test_policy_line_shows_provenance(tmp_path, monkeypatch):
+    # ポリシー行に起動元情報（いつ・どの経路・pid・どこから）が出る。裏でヘッドレス起動された
+    # ゲートウェイに attach しても、TUI を開くだけで出所が分かる。
+    from local_llm_server import tui_app
+
+    gcfg = load_gateway_config(str(_write_cfg(tmp_path, "port = 8799\n")))
+    admin = {
+        "uptime": 5.0, "requests": 0, "models": [], "available": [],
+        "max_resident": 2, "idle_timeout": 1200,
+        "started_at": "2026-07-09 12:00:00", "launcher": "headless",
+        "pid": 4242, "cwd": "/somewhere/else",
+    }
+    monkeypatch.setattr(tui_app, "server_status", lambda h, p: {"ready": True})
+    monkeypatch.setattr(tui_app, "gateway_admin_status", lambda h, p: admin)
+    monkeypatch.setattr(tui_app, "is_ready", lambda url, **k: True)
+
+    async def scenario():
+        app = tui_app.GatewayMonitor(gcfg)
+        async with app.run_test(size=(120, 30)) as pilot:
+            app._apply(admin)
+            await pilot.pause()
+            text = str(app.query_one("#policy").render())
+            assert "started 2026-07-09 12:00:00" in text
+            assert "headless" in text          # 起動経路
+            assert "pid 4242" in text
+            assert "/somewhere/else" in text   # 起動 cwd（= どの gateway.toml か）
+
+    asyncio.run(scenario())
+
+
+# --- 起動スプラッシュ（Claude Code CLI 風のロゴ画面） -------------------------------
+
+def test_ascii_logo_lines_are_aligned():
+    # 升目フォントの手打ちアートで一番事故りやすいのは文字ごとの幅ズレ。全行が同じ幅
+    # （空行を除く）であることを保証する——ズレていればロゴが盤面からはみ出て崩れる。
+    from local_llm_server.tui_app import ascii_logo_big
+
+    lines = [line for line in ascii_logo_big().split("\n") if line]
+    assert len(lines) == 10  # LOCAL-LLM 5 行 + SERVER 5 行（空行は除外済み）
+    assert len({len(line) for line in lines}) == 1  # 全行同じ幅
+
+
+def test_splash_screen_shows_then_dismisses_on_key(tmp_path, monkeypatch):
+    # 起動直後はスプラッシュがトップ画面。キーを押すとダッシュボードに戻る。
+    from local_llm_server import tui_app
+
+    gcfg = load_gateway_config(str(_write_cfg(tmp_path, "port = 8799\n")))
+    monkeypatch.setattr(tui_app, "server_status", lambda h, p: {"ready": True})
+    monkeypatch.setattr(tui_app, "gateway_admin_status", lambda h, p: None)
+    monkeypatch.setattr(tui_app, "is_ready", lambda url, **k: False)
+    # 実運用の自動判定（headless では出さない）を明示的にオーバーライドしてテストする。
+    monkeypatch.setattr(tui_app, "SPLASH_AUTO_DISMISS_SECONDS", 30.0)  # タイマーでは閉じさせない
+
+    async def scenario():
+        app = tui_app.GatewayMonitor(gcfg, show_splash=True)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            assert isinstance(app.screen, tui_app.SplashScreen)
+            # ダッシュボードの裏側は普段どおり起動処理を進めている（ポーリング等が動く）。
+            await pilot.press("x")
+            await pilot.pause()
+            assert not isinstance(app.screen, tui_app.SplashScreen)
+            assert app.query_one("#hints") is not None  # ダッシュボードに戻っている
+
+    asyncio.run(scenario())
+
+
+def test_splash_screen_auto_dismisses_after_timeout(tmp_path, monkeypatch):
+    from local_llm_server import tui_app
+
+    gcfg = load_gateway_config(str(_write_cfg(tmp_path, "port = 8799\n")))
+    monkeypatch.setattr(tui_app, "server_status", lambda h, p: {"ready": True})
+    monkeypatch.setattr(tui_app, "gateway_admin_status", lambda h, p: None)
+    monkeypatch.setattr(tui_app, "is_ready", lambda url, **k: False)
+    monkeypatch.setattr(tui_app, "SPLASH_AUTO_DISMISS_SECONDS", 0.05)  # すぐタイムアウトさせる
+
+    async def scenario():
+        app = tui_app.GatewayMonitor(gcfg, show_splash=True)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            assert isinstance(app.screen, tui_app.SplashScreen)
+            await pilot.pause(0.3)  # タイマー経過を待つ（実時間）
+            assert not isinstance(app.screen, tui_app.SplashScreen)
+
+    asyncio.run(scenario())
+
+
+def test_splash_disabled_by_default_under_headless_test_run(tmp_path, monkeypatch):
+    # show_splash を明示しない既定は「headless（pytest 実行）では出さない」。
+    # これが無ければ既存の全 TUI テストがスプラッシュに阻まれて壊れる。
+    from local_llm_server import tui_app
+
+    gcfg = load_gateway_config(str(_write_cfg(tmp_path, "port = 8799\n")))
+    monkeypatch.setattr(tui_app, "server_status", lambda h, p: {"ready": True})
+    monkeypatch.setattr(tui_app, "gateway_admin_status", lambda h, p: None)
+    monkeypatch.setattr(tui_app, "is_ready", lambda url, **k: False)
+
+    async def scenario():
+        app = tui_app.GatewayMonitor(gcfg)  # show_splash 省略
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert not isinstance(app.screen, tui_app.SplashScreen)
+
+    asyncio.run(scenario())

@@ -48,9 +48,13 @@ def test_worker_runs_gateway_headless(in_gateway_dir, monkeypatch):
     # __main__ は TUI を出さず、シャットダウンハンドラを張ってゲートウェイ本体を回す。
     called = {}
     monkeypatch.setattr(worker, "install_shutdown_handlers", lambda: called.update(sig=True))
-    monkeypatch.setattr(worker, "run_gateway", lambda cfg: called.update(port=cfg.port) or 0)
+    monkeypatch.setattr(
+        worker, "run_gateway",
+        lambda cfg, config_path=None: called.update(port=cfg.port, cfg_path=config_path) or 0)
     assert worker.main() == 0
-    assert called == {"sig": True, "port": 8799}
+    # config_path を run_gateway に渡している（ホットリロード監視を有効化するため）。
+    assert called["sig"] is True and called["port"] == 8799
+    assert called["cfg_path"] and called["cfg_path"].endswith("gateway.toml")
 
 
 def test_worker_errors_without_gateway_toml(tmp_path, monkeypatch, capsys):
