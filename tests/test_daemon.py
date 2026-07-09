@@ -1119,6 +1119,94 @@ def test_reclaim_stale_workers_kills_only_ours(monkeypatch):
     assert killed == [111, 333]
 
 
+# --- 画像入りリクエストの vision_model への振り分け ----------------------------
+# 一部の vision モデル（Qwen3.6-27B/qwen3_5 等）は現行 mlx_vlm で画像入力が壊れている。
+# vision_model を設定すると、画像を含むリクエストだけをそのモデル（gemma-4 系など、画像が確実に
+# 動くもの）へ振り分ける。テキストは元モデルのまま。
+
+def test_request_has_images_detects_vision_content():
+    assert gw._request_has_images({
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "what is this"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]}]
+    }) is True
+    assert gw._request_has_images({
+        "messages": [{"role": "user", "content": [{"type": "input_image", "image": "x"}]}]
+    }) is True
+    assert gw._request_has_images({"images": ["data:image/png;base64,AAAA"]}) is True
+
+
+def test_request_has_images_false_for_text_only():
+    assert gw._request_has_images(
+        {"messages": [{"role": "user", "content": "hi"}]}) is False
+    assert gw._request_has_images(
+        {"messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]}) is False
+    assert gw._request_has_images({}) is False
+
+
+def test_load_gateway_config_parses_vision_model(tmp_path):
+    cfg = gw.load_gateway_config(_write(tmp_path, 'vision_model = "org/gemma-vision"\n'))
+    assert cfg.vision_model == "org/gemma-vision"
+    assert gw.load_gateway_config(_write(tmp_path, "port = 8080\n")).vision_model is None
+    # 空文字は None 扱い。
+    assert gw.load_gateway_config(_write(tmp_path, 'vision_model = ""\n')).vision_model is None
+
+
+def _start_routing_gateway(monkeypatch):
+    """text-model（MTP 有り）と vision-model を持ち、vision_model を設定したゲートウェイ。"""
+    up_text = _make_upstream("text-up")
+    up_vision = _make_upstream("vision-up")
+    monkeypatch.setattr(gw, "LocalServer",
+                        lambda config, log_path=None: _FakeServer(config, log_path))
+    configs = [
+        ServerConfig(backend="mlx-vlm", model="text-model", host="127.0.0.1",
+                     port=up_text.server_address[1], draft_model="org/draft"),
+        ServerConfig(backend="mlx-vlm", model="vision-model", host="127.0.0.1",
+                     port=up_vision.server_address[1]),
+    ]
+    mgr = gw.ModelManager(configs, dynamic=False)
+    server = gw.GatewayServer(("127.0.0.1", 0), mgr, catalog=["text-model", "vision-model"],
+                              vision_model="vision-model")
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, mgr, (up_text, up_vision)
+
+
+def test_image_request_routed_to_vision_model(monkeypatch):
+    server, mgr, ups = _start_routing_gateway(monkeypatch)
+    try:
+        port = server.server_address[1]
+        # テキストは元モデルへ（振り分けない）。
+        s, o = _post(port, "/v1/chat/completions",
+                     {"model": "text-model", "messages": [{"role": "user", "content": "hi"}]})
+        assert s == 200 and o["backend"] == "text-up"
+        # 画像入りは vision-model へ振り分け。
+        img = [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]}]
+        s, o = _post(port, "/v1/chat/completions", {"model": "text-model", "messages": img})
+        assert s == 200 and o["backend"] == "vision-up"
+        # 実際に vision-model がロードされ、text-model は画像では起動していない。
+        assert mgr._models["vision-model"].instances
+    finally:
+        server.shutdown(); server.server_close(); mgr.shutdown()
+        for u in ups:
+            u.shutdown(); u.server_close()
+
+
+def test_image_request_to_vision_model_itself_not_rerouted(monkeypatch):
+    # 既に vision_model 宛のリクエストは二度振り分けしない（自分自身へループしない）。
+    server, mgr, ups = _start_routing_gateway(monkeypatch)
+    try:
+        port = server.server_address[1]
+        img = [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]}]
+        s, o = _post(port, "/v1/chat/completions", {"model": "vision-model", "messages": img})
+        assert s == 200 and o["backend"] == "vision-up"
+    finally:
+        server.shutdown(); server.server_close(); mgr.shutdown()
+        for u in ups:
+            u.shutdown(); u.server_close()
+
+
 def test_load_gateway_config_rejects_unsupported_wildcards(tmp_path):
     # ゲートウェイは IPv4 で bind する。"::" / "*" は bind 時の分かりにくい OSError ではなく
     # 設定読み込みで明確に断る。

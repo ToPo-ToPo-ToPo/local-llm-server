@@ -4,6 +4,28 @@
 モデルが先読みし、本体がまとめて検証する。Qwen3.6-27B で実測 **~2倍速**（38→75 tok/s、
 採択率 93%）。**`mlx-vlm` バックエンドのみ**有効。
 
+## 画像入力（vision）と現行 mlx_vlm の注意
+
+**MTP は画像入力を壊しません。** 画像入力の可否は**モデルファミリ**次第です（現行 mlx_vlm 0.6.3 実測）:
+
+- **gemma-4 系**（`gemma-4-31b` / `26B-A4B` 等）… 画像入力は **MTP 有りでも正常**に動く。
+- **Qwen3.6-27B（qwen3_5 系）**… 画像入力が **MTP の有無に関わらず壊れている**
+  （`mlx_vlm/models/qwen3_5/language.py::get_rope_index` の `attention_mask.tolist()` が
+  バッチ用 GPU スレッドと別スレッドの MLX ストリームをまたいで評価し、`RuntimeError: There is
+  no Stream(gpu, N) in current thread` になる → クライアントには返らずタイムアウト）。これは
+  上流 `mlx_vlm` のバグで、ゲートウェイ側では直せない。
+
+**対処**: `gateway.toml` に `vision_model` を設定し、**画像入りリクエストを gemma-4 系へ振り分ける**。
+テキストは元モデル（Qwen3.6 の MTP 高速化そのまま）、画像だけを画像が動くモデルへ流せる。
+
+```toml
+vision_model = "ToPo-ToPo/gemma-4-31b-it-mlx-4bit"   # 画像入りリクエストの振り分け先（MTP 有りで可）
+```
+
+- 画像を含むリクエストは、元の `model` が何であってもこの `vision_model` へ流れる（テキストは素通り）。
+- `vision_model` 自身が 1 モデル常駐するので、テキスト用モデルと合わせて `max_resident` に余裕を（2 以上）。
+- gemma-4 の画像入力は MTP 有りで動くので、`vision_model` の MTP を切る必要はない。
+
 ## 設定（`gateway.toml`）
 
 **対応表に在る mlx-vlm モデルは設定不要** —— 事前登録せず動的ロードしただけで、本体名から
