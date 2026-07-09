@@ -340,11 +340,13 @@ def test_install_shutdown_handlers_converts_sigterm(monkeypatch):
     # SIGTERM を KeyboardInterrupt に変換して、各エントリポイントの finally（stop）を通す。
     import os
     import signal
-    import sys
     from local_llm_server import install_shutdown_handlers
 
-    if not hasattr(signal, "SIGTERM"):
-        return  # POSIX 以外はスキップ
+    # Windows も SIGTERM を持つが、os.kill(pid, SIGTERM) は TerminateProcess として即プロセスを
+    # 殺す（登録ハンドラは走らない）ため、この変換はそもそも成立せずテストプロセス自体が死ぬ。
+    # SIGTERM/SIGHUP 変換は POSIX の運用（kill・端末クローズ）向けなので Windows では skip する。
+    if os.name == "nt":
+        pytest.skip("SIGTERM conversion is POSIX-only (os.kill terminates on Windows)")
     original = signal.getsignal(signal.SIGTERM)
     try:
         install_shutdown_handlers()

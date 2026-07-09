@@ -1097,7 +1097,9 @@ class GatewayLock:
             os.close(fd)
             raise GatewayAlreadyRunning(pid, self._path) from exc
         # 取得できた → 自分の PID を記録（失敗した取得者がこれを読んで相手を示す）。
+        # Windows のロックは番兵オフセットへ seek した状態なので、書き込み前に必ず先頭へ戻す。
         try:
+            os.lseek(fd, 0, os.SEEK_SET)
             os.ftruncate(fd, 0)
             os.write(fd, f"{os.getpid()}\n".encode())
         except OSError:
@@ -1130,15 +1132,21 @@ class GatewayLock:
 # --- プラットフォーム別のファイルロック実装 -----------------------------------
 # POSIX は fcntl.flock、Windows は msvcrt.locking を使う。どちらも「他プロセスが
 # 握っていれば即エラー（非ブロッキング）」で、プロセス終了時に OS が自動解放する。
+#
+# Windows の msvcrt.locking は POSIX の flock（advisory）と違い**強制ロック**で、
+# ロックした領域は他ハンドルからの読み書きもブロックされる。そのため保持者 PID は
+# ファイル先頭に書き、ロックは PID データと重ならない**高オフセットの番兵 1 バイト**に掛ける
+# （EOF を越えた領域もロック可）。こうすれば _read_lock_pid が先頭の PID を普通に読める。
+_LOCK_SENTINEL_OFFSET = 1 << 30  # 1 GiB 目。PID 文字列（先頭数バイト）と絶対に重ならない
 if os.name == "nt":  # pragma: no cover - Windows 専用パス
     import msvcrt
 
     def _flock_exclusive_nb(fd: int) -> None:
-        os.lseek(fd, 0, os.SEEK_SET)
+        os.lseek(fd, _LOCK_SENTINEL_OFFSET, os.SEEK_SET)
         msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
 
     def _flock_unlock(fd: int) -> None:
-        os.lseek(fd, 0, os.SEEK_SET)
+        os.lseek(fd, _LOCK_SENTINEL_OFFSET, os.SEEK_SET)
         msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
 else:
     import fcntl
