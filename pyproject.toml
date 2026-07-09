@@ -45,6 +45,10 @@ dependencies = [
 [dependency-groups]
 dev = [
     "pytest>=8.0",
+    # 結線テスト用（tests/test_client_integration.py）。対リポジトリで開発する公開クライアントを
+    # PyPI 版で取り込み、server の変更が client の公開 API を壊していないかを常時検証する
+    # （リポジトリ統合はしない決定 2026-06-28 / 再確認 2026-07-09。その代償をこのテストが担う）。
+    "local-llm-client>=0.6.0",
 ]
 
 [project.urls]
