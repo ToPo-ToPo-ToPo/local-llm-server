@@ -9,6 +9,17 @@ from local_llm_server import ServerConfig
 from local_llm_server import daemon as gw
 
 
+@pytest.fixture(autouse=True)
+def _no_reclaim(monkeypatch):
+    """ワーカー起動直前の孤児回収（実 lsof/kill）を無効化する。
+
+    テストのフェイク上流はテストプロセス内でポートを LISTEN しているので、実回収を走らせると
+    無関係なプロセス探索（lsof）が毎 acquire で走る。回収ロジック自体は専用テスト
+    （test_reclaim_stale_workers_kills_only_ours、server モジュールを直接叩く）で検証する。
+    """
+    monkeypatch.setattr(gw, "reclaim_stale_workers", lambda *a, **k: [])
+
+
 # --- 設定ロード -----------------------------------------------------------
 
 def _write(tmp_path, text):
@@ -1025,6 +1036,87 @@ def test_load_gateway_config_request_and_start_timeout(tmp_path):
         _write(tmp_path, "request_timeout = 0\n" + base)).request_timeout is None
     with pytest.raises(ValueError, match="start_timeout"):
         gw.load_gateway_config(_write(tmp_path, "start_timeout = 0\n" + base))
+
+
+# --- ワーカー健全性チェック / 孤児回収 -----------------------------------------
+
+class _HealthStub:
+    """LocalServer 差し替え。is_alive / pid / stop を持ち、生死を制御できる。"""
+
+    def __init__(self, pid=1234, alive=True):
+        self._pid = pid
+        self._alive = alive
+        self.stops = 0
+
+    @property
+    def pid(self):
+        return self._pid
+
+    def is_alive(self):
+        return self._alive
+
+    def stop(self, grace: float = 10.0):
+        self.stops += 1
+
+
+def _install_instance(mgr, model, *, alive=True, inflight=0, dynamic=False, port=9000):
+    srv = _HealthStub(alive=alive)
+    cfg = ServerConfig(backend="mlx-vlm", model=model, port=port)
+    inst = gw._Instance(config=cfg, server=srv, ready=True, inflight=inflight)
+    mgr._models[model] = gw._Model(config=cfg, instances=[inst], dynamic=dynamic)
+    return srv
+
+
+def test_reap_dead_instances_removes_only_dead():
+    mgr = gw.ModelManager([], dynamic=True)
+    dead = _install_instance(mgr, "crashed", alive=False, port=9001)
+    live = _install_instance(mgr, "healthy", alive=True, port=9002)
+    n = mgr.reap_dead_instances()
+    assert n == 1
+    assert mgr._models["crashed"].instances == []   # 死んだインスタンスは外れる
+    assert dead.stops == 1                            # stop でログ fd 等を掃除
+    assert len(mgr._models["healthy"].instances) == 1  # 生きているものは残る
+    assert live.stops == 0
+
+
+def test_reap_dead_instances_drops_empty_dynamic_model():
+    # クラッシュで空になった動的モデルは登録ごと消える（表示から外れる）。
+    mgr = gw.ModelManager([], dynamic=True)
+    _install_instance(mgr, "dyn/crashed", alive=False, dynamic=True, port=9001)
+    assert mgr.reap_dead_instances() == 1
+    assert "dyn/crashed" not in mgr._models
+
+
+def test_reap_dead_instances_reaps_even_with_inflight():
+    # プロセスが死んでいれば inflight>0 でも外す（もう進まない。枠を戻す）。
+    mgr = gw.ModelManager([], dynamic=True)
+    _install_instance(mgr, "crashed", alive=False, inflight=3, port=9001)
+    assert mgr.reap_dead_instances() == 1
+    assert mgr._models["crashed"].instances == []
+
+
+def test_status_includes_worker_pids():
+    mgr = gw.ModelManager([], dynamic=True)
+    _install_instance(mgr, "m", alive=True, port=9001)
+    st = {row["model"]: row for row in mgr.status()}
+    assert st["m"]["pids"] == [1234]
+
+
+def test_reclaim_stale_workers_kills_only_ours(monkeypatch):
+    from local_llm_server import server as srv_mod
+    killed = []
+    monkeypatch.setattr(srv_mod, "find_pids_on_port", lambda port: [111, 222, 333])
+    # 111/333 は our-worker、222 は無関係。
+    monkeypatch.setattr(srv_mod, "pid_looks_like_ours", lambda pid: pid in (111, 333))
+
+    def _stop(pid, timeout=10.0):
+        killed.append(pid)
+        return True
+
+    monkeypatch.setattr(srv_mod, "stop_pid", _stop)
+    reclaimed = srv_mod.reclaim_stale_workers(9001)
+    assert reclaimed == [111, 333]   # 無関係な 222 には手を出さない
+    assert killed == [111, 333]
 
 
 def test_load_gateway_config_rejects_unsupported_wildcards(tmp_path):

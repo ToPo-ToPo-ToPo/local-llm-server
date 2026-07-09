@@ -50,6 +50,7 @@ from .server import (
     infer_backend,
     parallel_supported,
     primary_lan_ip,
+    reclaim_stale_workers,
     resolve_drafter,
 )
 
@@ -311,6 +312,25 @@ class ModelManager:
         port = base if not self._port_in_use_locked(base) else self._alloc_port_locked()
         return replace(mm.config, port=port)
 
+    def _reclaim_stale_port(self, port: int) -> None:
+        """ワーカー起動の直前、対象ポートに残る自分由来の孤児ワーカーを回収する。
+
+        前回のクラッシュ / `kill -9` で取り残されたモデルサーバーが同じ内部ポートを掴んで
+        いると、新ワーカーが bind できず起動失敗になり、加えて GPU メモリを無駄に占有する。
+        起動する側（このゲートウェイ）が握っている枠は追跡済みポートを避けて割り当てられる
+        ので、そこに居る our-worker は必ず未追跡＝孤児。回収失敗で起動自体は止めない。
+        """
+        try:
+            stale = reclaim_stale_workers(port)
+        except Exception:  # noqa: BLE001 - 回収失敗（lsof 不在等）は起動を妨げない
+            return
+        if stale:
+            print(
+                f"Reclaimed orphaned worker(s) {stale} on internal port {port} "
+                "before starting a fresh one.",
+                file=sys.stderr,
+            )
+
     def acquire(self, model_id: str) -> tuple[tuple[str, int], _Instance]:
         """model_id のインスタンスを（必要なら起動して）確保し、(内部アドレス, ハンドル) を返す。
 
@@ -375,6 +395,7 @@ class ModelManager:
                 if self._closing:
                     raise RuntimeError("gateway is shutting down")
                 self._starting.add(server)  # shutdown が起動途中のサーバーも止められるように
+            self._reclaim_stale_port(cfg.port)  # 同ポートに残る孤児ワーカーを先に掃除
             try:
                 server.start()
                 server.wait_until_ready(timeout=self._start_timeout)
@@ -461,6 +482,7 @@ class ModelManager:
                     if self._closing:
                         return
                     self._starting.add(server)  # shutdown が起動途中の複製も止められるように
+                self._reclaim_stale_port(cfg.port)  # 同ポートに残る孤児ワーカーを先に掃除
                 try:
                     server.start()
                     server.wait_until_ready(timeout=self._start_timeout)
@@ -683,6 +705,32 @@ class ModelManager:
                         self._models.pop(m.config.model, None)
         return len(victims)
 
+    def reap_dead_instances(self) -> int:
+        """ワーカープロセスが死んだインスタンスを登録から外す（健全性チェック）。
+
+        クラッシュや `kill -9` で内部ワーカーが落ちると、ゲートウェイはそれを ready と信じた
+        まま新規リクエストをその内部ポートへ流し、502 を返し続ける（かつ枠を占有し続ける）。
+        掃除スレッドから定期的に呼び、死んだインスタンスを外して枠を戻す（次リクエストで新規
+        ロードし直せる）。停止した数を返す。inflight>0 でもプロセスが死んでいればもう進まない
+        ので外す（担当ハンドラは上流の接続断で forward が返り、finally の release で整合する）。
+        control を握って起動（slow path）/退避と直列化し、ポート再利用衝突を避ける。
+        """
+        with self._control:
+            with self._state:
+                victims = []
+                for m in self._models.values():
+                    for i in list(m.instances):
+                        if i.server is not None and i.ready and not i.server.is_alive():
+                            victims.append((m, i.server))
+                            m.instances.remove(i)
+            for _m, srv in victims:
+                srv.stop()  # ログ fd を閉じ、死んだプロセスグループを掃除する
+            with self._state:
+                for m, _srv in victims:  # 全インスタンスが消えた動的モデルは登録ごと消す
+                    if m.dynamic and not m.instances:
+                        self._models.pop(m.config.model, None)
+        return len(victims)
+
     # --- エージェント在席（セッション）管理 -----------------------------------
     #
     # idle_timeout / LRU とは別の「即時解放」経路。エージェントが register で在席を宣言し、
@@ -839,6 +887,11 @@ class ModelManager:
                     "loaded": loaded,
                     # 起動中インスタンス数（負荷ベースの複製で >1 になる。並列度の目安）。
                     "instances": len(ready),
+                    # 各インスタンスのワーカー PID（健全性の確認・孤児との突き合わせ用）。
+                    "pids": [
+                        pid for i in ready
+                        if (pid := getattr(i.server, "pid", None)) is not None
+                    ],
                     "inflight": inflight,
                     "requests": m.requests,
                     "idle_for": idle_for,
@@ -1533,32 +1586,41 @@ def run_gateway(cfg: GatewayConfig) -> int:
         file=sys.stderr,
     )
 
-    # 掃除スレッド: ①idle TTL 超過モデルのアンロード ②在席ハートビート途絶の掃除。
-    # どちらかが有効なら起動する。チェック間隔は有効な閾値から短い方に合わせる。
+    # 掃除スレッド: ①クラッシュした内部ワーカーの健全性チェック（常時）②idle TTL 超過モデルの
+    # アンロード ③在席ハートビート途絶の掃除。健全性チェックは常に走らせる（死んだワーカーへ
+    # 流し続けて 502 を返す事態を防ぐ）。チェック間隔は有効な閾値と健全性チェック周期の短い方。
     stop_reaper = threading.Event()
-    if cfg.idle_timeout or cfg.session_ttl:
-        bounds = [t / 2 for t in (cfg.idle_timeout, cfg.session_ttl) if t]
-        interval = min(max(min(bounds), 1.0), 30.0)  # チェック間隔（最大 30s）
+    _HEALTH_INTERVAL = 15.0  # 死んだワーカーの検知周期（idle/session が無効でもこの周期で回す）
+    bounds = [t / 2 for t in (cfg.idle_timeout, cfg.session_ttl) if t]
+    bounds.append(_HEALTH_INTERVAL)
+    interval = min(max(min(bounds), 1.0), 30.0)  # チェック間隔（最大 30s）
 
-        def _reaper() -> None:
-            while not stop_reaper.wait(interval):
-                try:
-                    if cfg.session_ttl:
-                        gone = manager.reap_sessions(cfg.session_ttl)
-                        if gone:
-                            print(
-                                f"Session unload: stopped {gone} model(s) "
-                                "(agent heartbeat timed out).",
-                                file=sys.stderr,
-                            )
-                    if cfg.idle_timeout:
-                        freed = manager.evict_idle(cfg.idle_timeout)
-                        if freed:
-                            print(f"Idle unload: stopped {freed} model(s).", file=sys.stderr)
-                except Exception:  # noqa: BLE001 - 掃除スレッドは落とさない
-                    pass
+    def _reaper() -> None:
+        while not stop_reaper.wait(interval):
+            try:
+                dead = manager.reap_dead_instances()
+                if dead:
+                    print(
+                        f"Health check: removed {dead} dead worker instance(s) "
+                        "(crashed); the slot is free to reload on the next request.",
+                        file=sys.stderr,
+                    )
+                if cfg.session_ttl:
+                    gone = manager.reap_sessions(cfg.session_ttl)
+                    if gone:
+                        print(
+                            f"Session unload: stopped {gone} model(s) "
+                            "(agent heartbeat timed out).",
+                            file=sys.stderr,
+                        )
+                if cfg.idle_timeout:
+                    freed = manager.evict_idle(cfg.idle_timeout)
+                    if freed:
+                        print(f"Idle unload: stopped {freed} model(s).", file=sys.stderr)
+            except Exception:  # noqa: BLE001 - 掃除スレッドは落とさない
+                pass
 
-        threading.Thread(target=_reaper, daemon=True).start()
+    threading.Thread(target=_reaper, daemon=True).start()
 
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()

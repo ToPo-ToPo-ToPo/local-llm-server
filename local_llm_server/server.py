@@ -253,6 +253,26 @@ def _stop_pid_windows(pid: int) -> bool:
     return result.returncode == 0
 
 
+def reclaim_stale_workers(port: int, timeout: float = 6.0) -> list[int]:
+    """port を LISTEN している「このパッケージ由来の」孤児ワーカーを止めて回収する。
+
+    ゲートウェイがワーカーを起動する直前に呼ぶ。前回のクラッシュや `kill -9` で取り残された
+    モデルサーバー（`_OUR_CMD_MARKERS` にマッチ）がそのポートを掴んでいると、新しいワーカーが
+    bind できず起動失敗→502 になり、加えて GPU メモリを無駄に占有し続ける。ここで止めてから
+    起動することで衝突を防ぎメモリを解放する。**無関係な別プロセスには手を出さない**
+    （`pid_looks_like_ours` で選別し、判定不能なものは残す）。停止した PID の一覧を返す。
+    """
+    reclaimed: list[int] = []
+    for pid in find_pids_on_port(port):
+        # 自分自身（ゲートウェイ本体）は絶対に殺さない。内部ワーカーは別プロセスなので、
+        # ここに現れる our-worker は孤児だけ。万一 self が現れても手を出さない安全弁。
+        if pid == os.getpid():
+            continue
+        if pid_looks_like_ours(pid) and stop_pid(pid, timeout=timeout):
+            reclaimed.append(pid)
+    return reclaimed
+
+
 @dataclass
 class ServerConfig:
     """起動するローカルLLMサーバーの設定。"""
@@ -870,6 +890,19 @@ class LocalServer:
     @property
     def base_url(self) -> str:
         return self.config.base_url
+
+    @property
+    def pid(self) -> int | None:
+        """起動済みワーカーの PID（未起動・停止後は None）。"""
+        return self._proc.pid if self._proc is not None else None
+
+    def is_alive(self) -> bool:
+        """ワーカーのサブプロセスが起動済みでまだ生きているか（poll が None）。
+
+        クラッシュ等で落ちていれば False。ゲートウェイの健全性チェックが、ready と信じている
+        インスタンスの内部ワーカーが実際に生存しているかを確認するのに使う（安価な poll のみ）。
+        """
+        return self._proc is not None and self._proc.poll() is None
 
     def start(self) -> None:
         if self._proc is not None:
