@@ -1,0 +1,46 @@
+name: test
+
+# Linux / Windows / macOS の 3 OS でテストを回す。開発機は macOS のみなので、この
+# マトリクスが Linux/Windows 対応（llama.cpp 自動導入・動画入力）の回帰を防ぐ土台になる。
+# mlx 系依存は pyproject の環境マーカーで Apple Silicon のときだけ入るため、Linux/Windows と
+# GitHub の macOS runner（mlx 不在）でもテストは通る想定（フェイク中心・実 LLM 不使用）。
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3 OS は主要 Python で、バージョン範囲（最小/最大）は ubuntu で追加確認する。
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ["3.12"]
+        include:
+          - os: ubuntu-latest
+            python: "3.11"
+          - os: ubuntu-latest
+            python: "3.13"
+    runs-on: ${{ matrix.os }}
+    name: ${{ matrix.os }} · py${{ matrix.python }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+
+      - name: Sync (dev deps)
+        run: uv sync --dev
+
+      - name: Pytest
+        run: uv run pytest -q
