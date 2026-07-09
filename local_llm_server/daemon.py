@@ -84,6 +84,33 @@ def _total_ram() -> int | None:
         return None
 
 
+def _request_has_images(payload: dict) -> bool:
+    """chat リクエストに画像入力が含まれるか（OpenAI vision 形式を検出）。
+
+    OpenAI 互換の vision は `messages[].content` が配列で、その要素に `{"type": "image_url", ...}`
+    （mlx_vlm は `image`/`input_image` も受ける）が混ざる。一部クライアントはトップレベル
+    `images=[...]` を渡すのでそれも見る。type に "image" を含むかで緩く判定する。動画等の他
+    モダリティは対象外（画像固有）。`vision_model` への振り分け判定に使う。
+    """
+    if payload.get("images"):
+        return True
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return False
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if isinstance(part, dict):
+                t = part.get("type")
+                if isinstance(t, str) and "image" in t:
+                    return True
+    return False
+
+
 class CapacityError(RuntimeError):
     """常駐枠が全て処理中で、待っても空かず新モデルをロードできなかった（→ 503）。"""
 
@@ -892,12 +919,16 @@ class GatewayServer(ThreadingHTTPServer):
         load_timeout: float | None = None,
         session_ttl: float | None = None,
         api_key: str | None = None,
+        vision_model: str | None = None,
     ) -> None:
         super().__init__(addr, _GatewayHandler)
         self.manager = manager
         self.catalog = catalog            # /v1/models で返すモデル一覧
         self.default_model = default_model
         self.timeout_s = timeout_s        # None なら無制限（長時間生成に備える）
+        # 画像入りリクエストの振り分け先モデル（None で無効）。画像が壊れている vision モデルを
+        # 避け、画像だけを確実に動くモデル（gemma-4 系など）へ流すための任意設定。
+        self.vision_model = vision_model
         # ネットワーク公開時の API キー（None/空 で認証なし）。chat（/v1/*）と在席セッション
         # （/admin/sessions/*）に Authorization: Bearer <key> を要求する。/admin/status と
         # /admin/config はループバック限定（キーではなく接続元で制限）。
@@ -1022,6 +1053,7 @@ class _GatewayHandler(BaseHTTPRequestHandler):
                 "load_timeout": srv.load_timeout,
                 "session_ttl": srv.session_ttl,
                 "default_model": srv.default_model,
+                "vision_model": srv.vision_model,
                 "uptime": round(srv.manager.uptime(), 1),
                 "requests": sum(m.get("requests", 0) for m in models),
                 "models": models,
@@ -1078,6 +1110,19 @@ class _GatewayHandler(BaseHTTPRequestHandler):
         if not model:
             send_error(self, 400, "no 'model' in the request and no default_model is configured")
             return
+        # vision_model が設定されていれば、**画像を含むリクエストはそのモデルへ振り分ける**。
+        # 一部の vision モデル（例: Qwen3.6-27B / qwen3_5）は現行 mlx_vlm で画像入力が壊れて
+        # いる（get_rope_index のスレッド/ストリーム不具合。MTP の有無に関係なくハング/エラー）。
+        # 画像だけを「画像が確実に動くモデル」（gemma-4 系など）へ流すことで、テキストは元モデルの
+        # まま・画像は読める、を両立する。既に vision_model 宛ならそのまま。body の model も書き換える。
+        vmodel = getattr(srv, "vision_model", None)
+        if (
+            vmodel and isinstance(model, str) and model != vmodel
+            and _request_has_images(payload)
+        ):
+            model = vmodel
+            payload["model"] = vmodel
+            body = json.dumps(payload).encode("utf-8")
         self._acquire_and_forward(srv, model, body)
 
     def _handle_audio(self, srv, body: bytes) -> None:
@@ -1248,6 +1293,8 @@ class GatewayConfig:
     internal_base_port: int = 9001     # 内部サーバーの割当開始ポート（動的モデルもこの続きから割り当て）
     api_key: str | None = None         # ネットワーク公開時の API キー（None/空 で認証なし）。chat と在席セッションに要求
     auto_update: bool = True           # TUI が PyPI 新版を検知したら git pull で自動追従する（既定 true。false で無効）
+    vision_model: str | None = None    # 画像入りリクエストの振り分け先モデル（None で無効）。画像が壊れている
+                                       # vision モデルを避け、画像だけを確実に動くモデル（gemma-4 系等）へ流す
 
 
 def _resolve_model_draft(
@@ -1335,6 +1382,10 @@ def load_gateway_config(path: str) -> GatewayConfig:
         if max_resident < 1:
             raise ValueError("max_resident must be 1 or greater")
     default_model = data.get("default_model")
+    # 画像入りリクエストの振り分け先モデル（省略で無効）。空文字は None 扱い。
+    vision_model = data.get("vision_model")
+    if vision_model is not None:
+        vision_model = str(vision_model).strip() or None
     # 一定時間使われないモデルを自動アンロードする秒数（idle TTL）。省略時 1200（=20分）、0 で無効。
     idle_timeout = data.get("idle_timeout", 1200)
     if idle_timeout is not None:
@@ -1453,6 +1504,7 @@ def load_gateway_config(path: str) -> GatewayConfig:
         internal_base_port=internal_base,
         api_key=api_key,
         auto_update=auto_update,
+        vision_model=vision_model,
     )
 
 
@@ -1482,6 +1534,7 @@ def run_gateway(cfg: GatewayConfig) -> int:
         load_timeout=cfg.load_timeout,
         session_ttl=cfg.session_ttl,
         api_key=cfg.api_key,
+        vision_model=cfg.vision_model,
     )
     public = f"http://{cfg.host}:{cfg.port}/v1"
     wildcard = cfg.host in ("0.0.0.0", "")
@@ -1527,6 +1580,12 @@ def run_gateway(cfg: GatewayConfig) -> int:
         + (f" (heartbeat TTL {cfg.session_ttl:g}s)" if cfg.session_ttl else " (release only)"),
         file=sys.stderr,
     )
+    if cfg.vision_model:
+        print(
+            f"  vision routing: image requests -> {cfg.vision_model} "
+            "(routes any request that includes an image)",
+            file=sys.stderr,
+        )
     print(
         f'Point each agent.toml at base_url = "{public}" and set its own `model`. '
         "Agents only connect; models load on first request.",

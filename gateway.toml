@@ -59,6 +59,10 @@ auto_update = true
 dynamic = true
 # disable_thinking = true   # 動的ロード時の既定（思考抑制）。事前登録は各 [[models]] が優先
 # default_model = "..."     # `model` 省略リクエスト時のモデル（任意）
+# vision_model = "ToPo-ToPo/gemma-4-31b-it-mlx-4bit"  # 画像入りリクエストの振り分け先（任意）。設定すると
+#                           # 画像を含むリクエストだけを（元 model に関わらず）このモデルへ流す。テキストは
+#                           # 元モデルのまま。現行 mlx_vlm で画像が壊れているモデル（Qwen3.6-27B 等）を避け、
+#                           # 画像だけを確実に動く gemma-4 系へ逃がす用途（→ docs/mtp.md「画像入力(vision)」）。
 # draft_model = "off"       # 動的ロード時の MTP 既定。既定（未指定）は mlx-vlm を "auto"（対応表から
 #                           # 自動選択）。"off" で動的 MTP を一律無効化、HF id で全モデルに明示指定
 # parallel = 4              # 動的ロードする llama-cpp モデルの並列スロット既定（mlx 系は無視。→ docs/llama-cpp.md）
