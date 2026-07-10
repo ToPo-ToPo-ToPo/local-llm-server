@@ -534,14 +534,14 @@ wheels = [
 
 [[package]]
 name = "local-llm-client"
-version = "0.6.0"
+version = "0.7.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "openai" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/29/45/dcc76a77e812230f7a2bae62b70e7787c3999004387ccaf8eee2ede8a255/local_llm_client-0.6.0.tar.gz", hash = "sha256:3ae6af2f0cc95adca5673fb0d8120f75d34e379da639efe58b483065850f05a6", size = 29202, upload-time = "2026-07-09T09:06:14.273Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/7a/d5/46a1032ade611259de6f1f69aa3144702a61049f095c6647feca77fec131/local_llm_client-0.7.0.tar.gz", hash = "sha256:7103ac32a2f931c68494581b340875233046627dc31f9fa0eced88a54a2e95e6", size = 29923, upload-time = "2026-07-10T01:11:32.041Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/cf/07/c9c8d81b7f0e25681b974602a008a76a09ddccb45f7ccf04d54886c0d4c6/local_llm_client-0.6.0-py3-none-any.whl", hash = "sha256:829d4e4d2f2fdb1fdddadc04fd191d299e076a438f9fb2b945c66746f0080ff4", size = 23165, upload-time = "2026-07-09T09:06:13.195Z" },
+    { url = "https://files.pythonhosted.org/packages/51/df/b2e841b1b63a4090326bb7d21c67a587fe09435362c56fc64b13492bbfc6/local_llm_client-0.7.0-py3-none-any.whl", hash = "sha256:fc2de5f7228f8def75fb95321dae65f7cdc61c5444b50737b65cce0fc77b4197", size = 23546, upload-time = "2026-07-10T01:11:30.812Z" },
 ]
 
 [[package]]
@@ -577,7 +577,7 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "local-llm-client", specifier = ">=0.6.0" },
+    { name = "local-llm-client", specifier = ">=0.7.0" },
     { name = "pytest", specifier = ">=8.0" },
 ]
 
