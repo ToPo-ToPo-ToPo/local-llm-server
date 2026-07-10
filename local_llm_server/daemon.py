@@ -36,7 +36,7 @@ import urllib.parse
 from dataclasses import dataclass, field, fields, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from . import multipart
+from . import multipart, provisioner
 from .proxy import forward, send_error, send_json
 from .server import (
     BACKENDS,
@@ -55,6 +55,7 @@ from .server import (
     primary_lan_ip,
     reclaim_stale_workers,
     resolve_drafter,
+    set_llama_server_binary,
 )
 
 # 複製インスタンス起動前の猶予秒数。ストリーミングのクライアントは [DONE] を受けた
@@ -1366,6 +1367,10 @@ class GatewayConfig:
     auto_update: bool = True           # TUI が PyPI 新版を検知したら git pull で自動追従する（既定 true。false で無効）
     vision_model: str | None = None    # 画像入りリクエストの振り分け先モデル（None で無効）。画像が壊れている
                                        # vision モデルを避け、画像だけを確実に動くモデル（gemma-4 系等）へ流す
+    # --- llama.cpp（llama-server）バイナリの自動導入。[llama_cpp] テーブルで設定 ---
+    llama_provision: str = "auto"      # auto=管理dirへ自動DL / system=PATH の llama-server / build=ソースビルド（Phase 3）
+    llama_accel: str = "auto"          # auto=検出（GPU なら vulkan、mac は metal、無ければ cpu）/ cuda / vulkan / metal / cpu
+    llama_build: str | None = None     # ビルド番号の固定（例 "b9946"）。省略で最新を取得し導入済みを使い続ける
 
 
 def _resolve_model_draft(
@@ -1516,6 +1521,20 @@ def load_gateway_config(path: str) -> GatewayConfig:
         if not (0.0 < max_memory_fraction <= 1.0):
             raise ValueError("max_memory_fraction must be in (0, 1]")
 
+    # [llama_cpp] テーブル: llama-server バイナリの自動導入設定（すべて省略可＝全自動）。
+    llama = data.get("llama_cpp") or {}
+    if not isinstance(llama, dict):
+        raise ValueError("[llama_cpp] must be a table")
+    llama_provision = str(llama.get("provision", "auto"))
+    if llama_provision not in ("auto", "system", "build"):
+        raise ValueError("llama_cpp.provision must be auto / system / build")
+    llama_accel = str(llama.get("accel", "auto"))
+    if llama_accel not in ("auto", "cuda", "vulkan", "metal", "cpu"):
+        raise ValueError("llama_cpp.accel must be auto / cuda / vulkan / metal / cpu")
+    llama_build = llama.get("pin")
+    if llama_build is not None:
+        llama_build = str(llama_build).strip() or None
+
     entries = data.get("models") or []
     if not isinstance(entries, list):
         raise ValueError("[[models]] must be an array")
@@ -1576,6 +1595,9 @@ def load_gateway_config(path: str) -> GatewayConfig:
         api_key=api_key,
         auto_update=auto_update,
         vision_model=vision_model,
+        llama_provision=llama_provision,
+        llama_accel=llama_accel,
+        llama_build=llama_build,
     )
 
 
@@ -1583,7 +1605,11 @@ def load_gateway_config(path: str) -> GatewayConfig:
 _CONFIG_POLL_INTERVAL = 1.0
 # 稼働中には変えられない構造設定（ソケットは bind 済み、内部ポート割当は起動時に固定）。
 # 変更を検知したら「要再起動」を警告するだけで、サーバーは止めず旧値のまま動かし続ける。
-_RESTART_ONLY_FIELDS = ("host", "port", "internal_base_port", "models")
+_RESTART_ONLY_FIELDS = (
+    "host", "port", "internal_base_port", "models",
+    # llama-server バイナリは起動時に導入・解決するため、変更は再起動が要る。
+    "llama_provision", "llama_accel", "llama_build",
+)
 
 
 def apply_live_config(
@@ -1773,12 +1799,51 @@ def run_gateway(cfg: GatewayConfig, config_path: str | None = None) -> int:
         lock.release()
 
 
+def _llama_cpp_in_use(cfg: GatewayConfig) -> bool:
+    """この構成で llama-server（llama-cpp）が使われ得るか。
+
+    - 事前登録に llama-cpp モデルがあれば True。
+    - 動的ロード有効で OS 既定バックエンドが llama-cpp（＝非 Apple Silicon）なら True。
+    Apple Silicon で llama-cpp モデルの登録が無い場合は、既定が mlx-vlm なので False
+    （GGUF を明示要求したときだけ llama-server が要る。その場合は PATH / system で賄う）。
+    """
+    if any(c.backend == "llama-cpp" for c in cfg.models):
+        return True
+    return cfg.dynamic and DEFAULT_BACKEND == "llama-cpp"
+
+
+def provision_llama_if_needed(cfg: GatewayConfig) -> None:
+    """必要なら起動時に llama-server を自動導入し、build_command に使わせる。
+
+    ダウンロード（初回のみ）を初回推論のレイテンシに混ぜないよう起動時に済ませる。
+    導入に失敗してもゲートウェイは起動する（mlx 等は動く。llama-cpp モデルの要求時に
+    分かりやすいエラーになる）。llama-cpp を使わない構成では何もしない（macOS で不要な
+    ダウンロードをしないため）。
+    """
+    if not _llama_cpp_in_use(cfg):
+        return
+    try:
+        binary = provisioner.ensure_llama_server(
+            provision=cfg.llama_provision,
+            accel=cfg.llama_accel,
+            build=cfg.llama_build,
+        )
+    except provisioner.ProvisionError as exc:
+        print(f"llama.cpp provisioning failed (continuing without it): {exc}",
+              file=sys.stderr)
+        return
+    set_llama_server_binary(binary)
+    print(f"llama.cpp ready: {binary} (provision={cfg.llama_provision}, "
+          f"accel={cfg.llama_accel})", file=sys.stderr)
+
+
 def _run_gateway_locked(cfg: GatewayConfig, config_path: str | None = None) -> int:
     """単一起動ロック取得済みで実際にゲートウェイを回す本体（run_gateway が呼ぶ）。
 
     `config_path` が渡されれば、gateway.toml を保存した瞬間に設定を無停止で反映する
     ホットリロード監視スレッドを起動する（→ apply_live_config）。
     """
+    provision_llama_if_needed(cfg)
     manager = ModelManager(
         cfg.models, max_resident=cfg.max_resident, load_timeout=cfg.load_timeout,
         start_timeout=cfg.start_timeout,

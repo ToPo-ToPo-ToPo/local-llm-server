@@ -56,6 +56,18 @@ def test_build_command_llama_parallel_and_thinking(hf_cache):
     assert "--chat-template-kwargs" in cmd
 
 
+def test_build_command_uses_provisioned_llama_binary(hf_cache, monkeypatch):
+    # プロビジョナが導入した絶対パスが build_command の先頭に入る（未設定なら "llama-server"）。
+    hf_cache("org/m-gguf", ["m-Q4_K_M.gguf"])
+    c = ServerConfig("llama-cpp", "org/m-gguf")
+    assert build_command(c)[0] == "llama-server"          # 既定（未プロビジョン）
+    try:
+        srv.set_llama_server_binary("/managed/b9946/bin/llama-server")
+        assert build_command(c)[0] == "/managed/b9946/bin/llama-server"
+    finally:
+        srv.set_llama_server_binary(None)                 # 他テストへ影響させない
+
+
 def test_resolve_gguf_rejects_non_repo_id(hf_cache):
     # model は HF repo-id 専用。実パスや repo-id 形式でないものは弾く
     for bad in ["/abs/model.gguf", "./rel.gguf", "just-a-name", "a/b/c"]:

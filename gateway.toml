@@ -67,6 +67,15 @@ dynamic = true
 #                           # 自動選択）。"off" で動的 MTP を一律無効化、HF id で全モデルに明示指定
 # parallel = 4              # 動的ロードする llama-cpp モデルの並列スロット既定（mlx 系は無視。→ docs/llama-cpp.md）
 
+# ── llama.cpp（llama-server）バイナリの自動導入（任意。全省略で全自動）──
+# Linux / Windows / macOS のどれでも、llama-cpp モデルを使う構成なら起動時に llama-server を
+# 自動でダウンロード・導入する（PATH は汚さず管理ディレクトリへ）。GPU があれば Vulkan、
+# 無ければ CPU、macOS は Metal を自動選択する。詳細は docs/llama-cpp.md。
+# [llama_cpp]
+# provision = "auto"        # auto=自動DL（既定）/ system=PATH の llama-server を使う / build=ソースビルド
+# accel = "auto"            # auto=検出 / cuda（Windows 限定・要 cudart）/ vulkan / metal / cpu を明示
+# pin = "b9946"             # ビルド番号を固定（省略で最新を取得し、以後は導入済みを使い続ける）
+
 # ───────────────────────────────────────────────────────────────────────────────
 # 事前登録（任意）。parallel・llama.cpp の MTP・llama-server への個別フラグ等、ID だけでは
 # 決まらない上書きが要るモデルだけ書く。dynamic = true なら下は全て省略可（mlx-vlm の MTP と

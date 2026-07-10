@@ -1555,3 +1555,82 @@ def test_launcher_defaults_to_headless(tmp_path, monkeypatch):
         assert server.launcher == "headless"
     finally:
         server.server_close(); mgr.shutdown()
+
+
+# --- llama.cpp 自動導入（provisioner）の配線 --------------------------------------
+
+def test_load_gateway_config_parses_llama_cpp_defaults(tmp_path):
+    cfg = gw.load_gateway_config(_write(tmp_path, "port = 8799\n"))
+    assert cfg.llama_provision == "auto"
+    assert cfg.llama_accel == "auto"
+    assert cfg.llama_build is None
+
+
+def test_load_gateway_config_parses_llama_cpp_table(tmp_path):
+    cfg = gw.load_gateway_config(_write(
+        tmp_path,
+        '[llama_cpp]\nprovision = "system"\naccel = "cuda"\npin = "b9946"\n'))
+    assert cfg.llama_provision == "system"
+    assert cfg.llama_accel == "cuda"
+    assert cfg.llama_build == "b9946"
+
+
+def test_load_gateway_config_rejects_bad_llama_values(tmp_path):
+    with pytest.raises(ValueError):
+        gw.load_gateway_config(_write(tmp_path, '[llama_cpp]\nprovision = "nope"\n'))
+    with pytest.raises(ValueError):
+        gw.load_gateway_config(_write(tmp_path, '[llama_cpp]\naccel = "opencl"\n'))
+
+
+def test_llama_cpp_in_use_true_when_llama_model_registered(tmp_path):
+    cfg = gw.load_gateway_config(_write(
+        tmp_path,
+        'dynamic = false\n[[models]]\nmodel = "org/m.gguf"\nbackend = "llama-cpp"\n'))
+    assert gw._llama_cpp_in_use(cfg) is True
+
+
+def test_llama_cpp_in_use_follows_os_default_for_dynamic(tmp_path, monkeypatch):
+    cfg = gw.load_gateway_config(_write(tmp_path, "dynamic = true\n"))
+    monkeypatch.setattr(gw, "DEFAULT_BACKEND", "llama-cpp")   # Linux/Windows 相当
+    assert gw._llama_cpp_in_use(cfg) is True
+    monkeypatch.setattr(gw, "DEFAULT_BACKEND", "mlx-vlm")     # Apple Silicon 相当
+    assert gw._llama_cpp_in_use(cfg) is False
+
+
+def test_provision_llama_sets_binary_when_used(tmp_path, monkeypatch):
+    cfg = gw.load_gateway_config(_write(
+        tmp_path,
+        'dynamic = false\n[[models]]\nmodel = "org/m.gguf"\nbackend = "llama-cpp"\n'))
+    monkeypatch.setattr(gw.provisioner, "ensure_llama_server",
+                        lambda **k: "/managed/llama-server")
+    set_calls = []
+    monkeypatch.setattr(gw, "set_llama_server_binary", lambda p: set_calls.append(p))
+    gw.provision_llama_if_needed(cfg)
+    assert set_calls == ["/managed/llama-server"]
+
+
+def test_provision_llama_skipped_when_not_used(tmp_path, monkeypatch):
+    # Apple Silicon 相当・llama-cpp モデル無し → 何も導入しない（無駄 DL しない）。
+    cfg = gw.load_gateway_config(_write(tmp_path, "dynamic = true\n"))
+    monkeypatch.setattr(gw, "DEFAULT_BACKEND", "mlx-vlm")
+    called = []
+    monkeypatch.setattr(gw.provisioner, "ensure_llama_server",
+                        lambda **k: called.append(1) or "x")
+    gw.provision_llama_if_needed(cfg)
+    assert called == []
+
+
+def test_provision_llama_continues_on_failure(tmp_path, monkeypatch):
+    # 導入失敗でもゲートウェイは起動を続ける（binary は差し込まれない）。
+    cfg = gw.load_gateway_config(_write(
+        tmp_path,
+        'dynamic = false\n[[models]]\nmodel = "org/m.gguf"\nbackend = "llama-cpp"\n'))
+
+    def boom(**k):
+        raise gw.provisioner.ProvisionError("no network")
+
+    monkeypatch.setattr(gw.provisioner, "ensure_llama_server", boom)
+    set_calls = []
+    monkeypatch.setattr(gw, "set_llama_server_binary", lambda p: set_calls.append(p))
+    gw.provision_llama_if_needed(cfg)  # 例外を投げない
+    assert set_calls == []

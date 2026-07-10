@@ -116,8 +116,8 @@ provision = "auto"    # auto: 管理バイナリを自動導入（既定）/ sys
 
 | Phase | 内容 | 主な成果物 | リリース |
 |---|---|---|---|
-| **0** | CI 3OS マトリクス整備 | `.github/workflows/test.yml`、mlx 依存テストの skip 整理、Windows でのテスト全緑 | なし（インフラ） |
-| **1** | llama.cpp プロビジョナ | `provisioner.py`（OS/arch/アクセラレータ検出・Releases 取得・管理dir・検証）、`[llama_cpp]` 設定、TUI 表示（導入済みビルド番号） | 0.29.0 |
+| **0** ✅ | CI 3OS マトリクス整備 | `.github/workflows/test.yml`、Windows ロック修正・SIGTERM テスト skip、3OS 全緑 | なし（インフラ） |
+| **1** ✅(コア) | llama.cpp プロビジョナ | `provisioner.py`（OS/arch/アクセラレータ検出・Releases 取得・管理dir・展開・検証）、`[llama_cpp]` 設定、起動時プロビジョニング配線、`gateway.toml` 例 | 0.29.0（TUI 表示は残タスク） |
 | **2** | 効率自動チューニング | `-ngl`/`--parallel`/`--threads`/`--flash-attn` の自動既定、`bench` コマンド、docs | 0.30.0 |
 | **3** | ソースビルド opt-in | `provision = "build"`（cmake/ツールチェーン検出、CUDA/Vulkan フラグ、失敗時 auto フォールバック） | 0.31.0 |
 | **4** | 動画入力 + 画像の 3OS 検証 | ゲートウェイのフレーム抽出（video_url → image_url 展開）、imageio-ffmpeg 全OS化、client の videos ヘルパ（別リポ）、結線テスト拡充 | 0.32.0 + client 0.7.0 |

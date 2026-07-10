@@ -35,6 +35,22 @@ def default_backend() -> str:
 DEFAULT_BACKEND = default_backend()
 
 
+# llama-server 実行ファイルのパス。ゲートウェイ起動時にプロビジョナ（provisioner）が解決して
+# set_llama_server_binary() で差し込む。未設定なら PATH の "llama-server"（従来挙動 / system）。
+_LLAMA_SERVER_BIN: str | None = None
+
+
+def set_llama_server_binary(path: str | None) -> None:
+    """起動時にプロビジョナが解決した llama-server の絶対パスを登録する。"""
+    global _LLAMA_SERVER_BIN
+    _LLAMA_SERVER_BIN = path
+
+
+def llama_server_binary() -> str:
+    """build_command が使う llama-server コマンド（未プロビジョン時は PATH 探索の名前）。"""
+    return _LLAMA_SERVER_BIN or "llama-server"
+
+
 # STT（音声→テキスト）モデルの id 判定に使う語。whisper 系は id に "mlx" を含む
 # （例 mlx-community/whisper-large-v3-mlx）ため、mlx-vlm 判定より先に見る必要がある。
 _STT_HINTS = ("whisper", "parakeet")
@@ -741,7 +757,7 @@ def build_command(config: ServerConfig) -> list[str]:
         # （キャッシュに無ければ ValueError。クライアントに見せる ID は repo-id のまま）。
         model_path = resolve_gguf(config.model)
         command = [
-            "llama-server",
+            llama_server_binary(),  # プロビジョナが導入した絶対パス、無ければ PATH の "llama-server"
             "-m", model_path,
             "--host", config.host,
             "--port", str(config.port),

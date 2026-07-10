@@ -1,0 +1,285 @@
+"""llama.cpp（llama-server）バイナリの自動導入（プロビジョナ）。
+
+Linux / Windows / macOS のどれでも `uv run gw` するだけで llama-server が使えるように、
+OS・CPU アーキ・アクセラレータを自動判定して **ggml-org/llama.cpp の GitHub Releases から
+プリビルトバイナリをダウンロード**し、管理ディレクトリへ展開して絶対パスで起動する。
+PATH は汚さない。PATH に既に llama-server があるなら `provision = "system"` で従来どおり使う。
+
+設計方針（実アセット命名 b9946 時点の調査に基づく）:
+  - 拡張子は macOS/Linux が .tar.gz、Windows が .zip。
+  - **auto の GPU 経路は Vulkan**。NVIDIA/AMD/Intel 共通の単一アセットで追加ランタイム不要。
+    Linux には CUDA プリビルトが無く、Windows CUDA は別途 cudart DLL が要るため、
+    「導入が簡単・確実に動く」を優先して Vulkan を既定の GPU 経路にする。
+  - macOS は Metal がバイナリに内蔵（accel トークン無し）。
+  - CUDA は Windows 限定の明示 opt-in（accel = "cuda"）。
+
+ソースビルド（provision = "build"）は別フェーズ。ここでは auto / system を実装する。
+"""
+from __future__ import annotations
+
+import json
+import os
+import platform
+import shutil
+import subprocess
+import sys
+import tarfile
+import urllib.request
+import zipfile
+
+_REPO = "ggml-org/llama.cpp"
+_RELEASES_API = f"https://api.github.com/repos/{_REPO}/releases"
+# Releases のダウンロード URL。<build> はタグ（例 "b9946"）、<name> はアセット名。
+_DL_URL = f"https://github.com/{_REPO}/releases/download/{{build}}/{{name}}"
+
+# llama-server 実行ファイル名（OS 依存）。
+_EXE = "llama-server.exe" if os.name == "nt" else "llama-server"
+
+
+# --- プラットフォーム検出 ----------------------------------------------------
+
+def detect_os() -> str:
+    """"macos" | "linux" | "windows"。未知は ValueError。"""
+    if sys.platform == "darwin":
+        return "macos"
+    if sys.platform.startswith("linux"):
+        return "linux"
+    if os.name == "nt" or sys.platform.startswith("win"):
+        return "windows"
+    raise ValueError(f"unsupported OS: {sys.platform!r}")
+
+
+def detect_arch() -> str:
+    """"x64" | "arm64"。llama.cpp のアセット命名に合わせて正規化する。"""
+    m = platform.machine().lower()
+    if m in ("arm64", "aarch64"):
+        return "arm64"
+    if m in ("x86_64", "amd64", "x64"):
+        return "x64"
+    raise ValueError(f"unsupported CPU arch: {platform.machine()!r}")
+
+
+def _has_nvidia_gpu() -> bool:
+    """NVIDIA GPU の存在を nvidia-smi で確認する（無ければ False）。"""
+    exe = shutil.which("nvidia-smi")
+    if not exe:
+        return False
+    try:
+        return subprocess.run(
+            [exe, "-L"], capture_output=True, timeout=5
+        ).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _has_vulkan() -> bool:
+    """Vulkan 対応 GPU/ローダの存在を vulkaninfo で確認する（無ければ False）。"""
+    exe = shutil.which("vulkaninfo")
+    if not exe:
+        return False
+    try:
+        return subprocess.run(
+            [exe, "--summary"], capture_output=True, timeout=5
+        ).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def detect_accelerator(os_name: str | None = None) -> str:
+    """auto 用のアクセラレータ自動判定。"metal" | "vulkan" | "cpu"。
+
+    macOS は常に metal（バイナリ内蔵）。Linux/Windows は GPU を検出できれば
+    vulkan（universal な GPU 経路）、できなければ cpu。誤検出しても accel を明示すれば
+    上書きできる。CUDA は自動では選ばない（Windows 限定・cudart 依存のため明示 opt-in）。
+    """
+    os_name = os_name or detect_os()
+    if os_name == "macos":
+        return "metal"
+    if _has_nvidia_gpu() or _has_vulkan():
+        return "vulkan"
+    return "cpu"
+
+
+# --- アセット名の解決 --------------------------------------------------------
+
+# CUDA を明示指定したときの既定 CUDA バージョン（Windows のみ）。実アセット: win-cuda-12.4-x64。
+_DEFAULT_CUDA = "12.4"
+
+
+def asset_name(build: str, os_name: str, arch: str, accel: str) -> str:
+    """Releases のアセットファイル名を組み立てる。
+
+    実アセット例（b9946）:
+      macos-arm64            → llama-<b>-bin-macos-arm64.tar.gz
+      linux cpu   x64        → llama-<b>-bin-ubuntu-x64.tar.gz
+      linux vulkan x64       → llama-<b>-bin-ubuntu-vulkan-x64.tar.gz
+      windows cpu  x64       → llama-<b>-bin-win-cpu-x64.zip
+      windows vulkan x64     → llama-<b>-bin-win-vulkan-x64.zip
+      windows cuda x64       → llama-<b>-bin-win-cuda-12.4-x64.zip
+    """
+    if os_name == "macos":
+        # macOS は accel トークン無し（Metal 内蔵）。
+        return f"llama-{build}-bin-macos-{arch}.tar.gz"
+    if os_name == "linux":
+        # Releases 上は "ubuntu" 命名。CPU は accel トークン無し。
+        token = "" if accel in ("cpu", "metal") else f"{accel}-"
+        return f"llama-{build}-bin-ubuntu-{token}{arch}.tar.gz"
+    if os_name == "windows":
+        if accel == "cuda":
+            return f"llama-{build}-bin-win-cuda-{_DEFAULT_CUDA}-{arch}.zip"
+        # Windows は CPU も明示トークン（win-cpu-...）。GPU は vulkan。
+        token = "cpu" if accel in ("cpu", "metal") else accel
+        return f"llama-{build}-bin-win-{token}-{arch}.zip"
+    raise ValueError(f"unsupported os: {os_name!r}")
+
+
+def asset_url(build: str, name: str) -> str:
+    return _DL_URL.format(build=build, name=name)
+
+
+def latest_build(timeout: float = 5.0) -> str:
+    """最新リリースのタグ（例 "b9946"）を GitHub API から取得する。"""
+    req = urllib.request.Request(
+        f"{_RELEASES_API}/latest", headers={"Accept": "application/vnd.github+json"}
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.load(resp)["tag_name"]
+
+
+# --- 管理ディレクトリと導入 --------------------------------------------------
+
+def managed_root() -> str:
+    """バイナリを置く管理ディレクトリ（PATH は汚さない）。
+
+    Windows は %LOCALAPPDATA%、その他は XDG（~/.cache）に置く。
+    """
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    else:
+        base = os.environ.get("XDG_CACHE_HOME") or os.path.join(
+            os.path.expanduser("~"), ".cache"
+        )
+    return os.path.join(base, "local-llm-server", "llama.cpp")
+
+
+def install_dir(build: str, os_name: str, arch: str, accel: str) -> str:
+    """この (build, os, arch, accel) 組み合わせの展開先ディレクトリ。"""
+    return os.path.join(managed_root(), f"{build}-{os_name}-{accel}-{arch}")
+
+
+def _find_llama_server(root: str) -> str | None:
+    """展開ディレクトリ配下から llama-server 実行ファイルを探す（無ければ None）。"""
+    for dirpath, _dirs, files in os.walk(root):
+        if _EXE in files:
+            return os.path.join(dirpath, _EXE)
+    return None
+
+
+def _download(url: str, dest: str, timeout: float = 300.0) -> None:
+    """url を dest へダウンロードする（親ディレクトリは作成）。"""
+    os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+    req = urllib.request.Request(url, headers={"User-Agent": "local-llm-server"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp, open(dest, "wb") as fh:
+        shutil.copyfileobj(resp, fh)
+
+
+def _extract(archive: str, dest: str) -> None:
+    """.tar.gz / .zip を dest へ展開する。"""
+    os.makedirs(dest, exist_ok=True)
+    if archive.endswith(".zip"):
+        with zipfile.ZipFile(archive) as zf:
+            zf.extractall(dest)
+    else:
+        with tarfile.open(archive) as tf:
+            # filter="data" はパストラバーサル等を弾く（信頼できない DL 物の安全な展開）。
+            # Python 3.12+ で追加。古い版では TypeError になるのでフォールバックする。
+            try:
+                tf.extractall(dest, filter="data")
+            except TypeError:
+                tf.extractall(dest)
+
+
+def _verify(binary: str, timeout: float = 15.0) -> bool:
+    """llama-server --version が動くか（正しく展開・実行できるか）を確認する。"""
+    try:
+        proc = subprocess.run(
+            [binary, "--version"], capture_output=True, timeout=timeout
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    # llama-server --version は "version: ..." を stderr に出して 0 で終わる（版により stdout）。
+    out = (proc.stdout + proc.stderr).decode("utf-8", "replace").lower()
+    return proc.returncode == 0 and "version" in out
+
+
+class ProvisionError(RuntimeError):
+    """llama-server の自動導入に失敗した（ダウンロード・展開・検証のいずれか）。"""
+
+
+def ensure_llama_server(
+    *,
+    provision: str = "auto",
+    accel: str = "auto",
+    build: str | None = None,
+    download=_download,
+    verify=_verify,
+) -> str:
+    """起動に使う llama-server の絶対パスを返す（必要なら自動導入する）。
+
+    - provision="system": PATH の llama-server を使う（無ければ ProvisionError）。
+    - provision="auto"  : 管理ディレクトリに導入済みならそれを、無ければ Releases から
+                          プリビルトを取得して展開・検証する。
+    - provision="build" : 未実装（Phase 3）。当面は auto にフォールバックする。
+
+    download/verify は差し替え可能（テスト用）。
+    """
+    if provision == "system":
+        found = shutil.which("llama-server")
+        if not found:
+            raise ProvisionError(
+                "provision='system' だが PATH に llama-server が見つからない。"
+                "provision='auto'（自動導入）にするか、llama-server を PATH に置く。"
+            )
+        return found
+
+    if provision == "build":
+        # Phase 3 で実装。それまではプリビルト自動導入で代替する。
+        provision = "auto"
+
+    os_name = detect_os()
+    arch = detect_arch()
+    accel = detect_accelerator(os_name) if accel == "auto" else accel
+    build = build or latest_build()
+
+    target = install_dir(build, os_name, arch, accel)
+    existing = _find_llama_server(target)
+    if existing and verify(existing):
+        return existing
+
+    name = asset_name(build, os_name, arch, accel)
+    url = asset_url(build, name)
+    archive = os.path.join(managed_root(), name)
+    try:
+        download(url, archive)
+        _extract(archive, target)
+    except Exception as exc:  # noqa: BLE001 - まとめて ProvisionError に包む
+        raise ProvisionError(
+            f"llama.cpp の自動導入に失敗（{name}）: {exc}. "
+            f"手動導入は docs/llama-cpp.md を参照、または gateway.toml で "
+            f"[llama_cpp] provision='system' / accel を指定する。URL: {url}"
+        ) from exc
+    finally:
+        try:
+            os.remove(archive)
+        except OSError:
+            pass
+
+    binary = _find_llama_server(target)
+    if not binary:
+        raise ProvisionError(f"展開したが llama-server が見つからない（{target}）")
+    if not verify(binary):
+        raise ProvisionError(
+            f"llama-server を導入したが --version に失敗（{binary}）。"
+            f"accel={accel} が環境に合っていない可能性（accel を cpu 等に変えて再試行）"
+        )
+    return binary
