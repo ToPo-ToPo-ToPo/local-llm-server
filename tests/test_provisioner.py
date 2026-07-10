@@ -93,7 +93,9 @@ def test_managed_root_windows_uses_localappdata(monkeypatch):
 def test_managed_root_unix_uses_xdg(monkeypatch):
     monkeypatch.setattr(pv.os, "name", "posix")
     monkeypatch.setenv("XDG_CACHE_HOME", "/home/me/.cache")
-    assert pv.managed_root() == "/home/me/.cache/local-llm-server/llama.cpp"
+    # 区切りは実行 OS の os.path に従うので os.path.join で期待値を組む（Windows でも一致）。
+    assert pv.managed_root() == os.path.join(
+        "/home/me/.cache", "local-llm-server", "llama.cpp")
 
 
 def test_install_dir_is_unique_per_combo():
@@ -104,8 +106,13 @@ def test_install_dir_is_unique_per_combo():
 
 # --- 導入フロー（download/verify を差し替え）--------------------------------
 
-def _fake_tarball(path, exe_name="llama-server"):
-    """llama-server を1つ含む tar.gz を作る（ダウンロード結果の代役）。"""
+def _fake_tarball(path, exe_name=None):
+    """llama-server を1つ含む tar.gz を作る（ダウンロード結果の代役）。
+
+    実行ファイル名は実行 OS の期待値（pv._EXE = Windows は llama-server.exe）に合わせる。
+    そうしないと _find_llama_server が Windows で見つけられない。
+    """
+    exe_name = exe_name or pv._EXE
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     data = b"#!/bin/sh\necho version\n"
     with tarfile.open(path, "w:gz") as tf:
@@ -131,7 +138,7 @@ def test_ensure_downloads_extracts_and_returns_path(tmp_path, monkeypatch):
         provision="auto", accel="cpu", build="b9946",
         download=fake_download, verify=lambda p, **k: True,
     )
-    assert path.endswith(os.path.join("bin", "llama-server"))
+    assert path.endswith(os.path.join("bin", pv._EXE))
     assert os.path.exists(path)
     assert "llama-b9946-bin-ubuntu-x64.tar.gz" in downloaded["url"]
 
