@@ -4,6 +4,8 @@
 **マルチモデルゲートウェイ**。1 プロセス起動するだけで、1 つの公開ポートに複数モデルを配信する。
 
 - **モデルの事前登録は不要**。クライアントが指定した `model` をその場でロードする。画像入力（mmproj 自動検出）も mlx-vlm の MTP も設定なしで効く。
+- **画像・動画入力**。画像はそのまま、**動画（`video_url`）はゲートウェイが ffmpeg で等間隔にフレーム抽出して**モデルへ渡す（llama-cpp / mlx-vlm 共通。ffmpeg は pip 同梱で追加インストール不要 → [動画入力](docs/gateway.md)）。
+- **llama.cpp は自動導入**。Linux / Windows / Intel Mac では `llama-server` を OS・GPU 検出のうえ**起動時に自動ダウンロード**（手動導入不要。GPU は Vulkan、ソースビルドも opt-in で可 → [docs/llama-cpp.md](docs/llama-cpp.md)）。
 - **音声認識（STT）も同じポートで**。`/v1/audio/transcriptions` に音声を投げれば mlx-whisper が遅延起動して文字起こしする。エージェント側に mlx 依存は要らない（→ [音声認識（STT / whisper）](docs/gateway.md#音声認識stt--whisper)）。
 - 1 つの公開ポートで複数モデルを配信し、リクエストの `model` で振り分ける。
 - **TUI ダッシュボードが使えるモデルを自動一覧**。どれを指定すればよいか一目で分かる。
@@ -25,9 +27,12 @@ uv sync
 
 以降このフォルダで `gateway.toml` を編集し、`uv run gw` で起動する（→ [使い方](#使い方)）。
 
-> **他 OS（Linux / Windows / Intel Mac）＝ llama.cpp**: `uv sync` は mlx を入れずに済むので、追加で
-> `llama-server` をインストールして PATH に通すだけ（OS 別手順は [docs/llama-cpp.md](docs/llama-cpp.md)）。
-> `gateway.toml` の `[[models]]` で `backend = "llama-cpp"` を指定する。
+> **他 OS（Linux / Windows / Intel Mac）＝ llama.cpp（追加インストール不要）**: `uv sync` は mlx を
+> 入れずに済む。`llama-server` はゲートウェイ起動時に**自動でダウンロード・導入される**（OS・CPU
+> アーキ・GPU を検出し、GPU なら Vulkan・無ければ CPU を選択。PATH は汚さない）。手動導入や PATH
+> 設定は不要で、`uv run gw` して GGUF モデルの ID を投げるだけで動く。挙動の調整・ソースビルド・
+> `system`（PATH の llama-server を使う）は `gateway.toml` の `[llama_cpp]` で
+> （→ [docs/llama-cpp.md](docs/llama-cpp.md)）。
 
 <details>
 <summary>クローンせず PyPI の公開パッケージを使う場合（任意）</summary>

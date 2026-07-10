@@ -120,15 +120,20 @@ provision = "auto"    # auto: 管理バイナリを自動導入（既定）/ sys
 | Phase | 内容 | 主な成果物 | リリース |
 |---|---|---|---|
 | **0** ✅ | CI 3OS マトリクス整備 | `.github/workflows/test.yml`、Windows ロック修正・SIGTERM テスト skip、3OS 全緑 | なし（インフラ） |
-| **1** ✅(コア) | llama.cpp プロビジョナ | `provisioner.py`（OS/arch/アクセラレータ検出・Releases 取得・管理dir・展開・検証）、`[llama_cpp]` 設定、起動時プロビジョニング配線、`gateway.toml` 例 | 0.29.0（TUI 表示は残タスク） |
-| **2** | 効率自動チューニング | `-ngl`/`--parallel`/`--threads`/`--flash-attn` の自動既定、`bench` コマンド、docs | 0.30.0 |
-| **3** | ソースビルド opt-in | `provision = "build"`（cmake/ツールチェーン検出、CUDA/Vulkan フラグ、失敗時 auto フォールバック） | 0.31.0 |
-| **4** | 動画入力 + 画像の 3OS 検証 | ゲートウェイのフレーム抽出（video_url → image_url 展開）、imageio-ffmpeg 全OS化、client の videos ヘルパ（別リポ）、結線テスト拡充 | 0.32.0 + client 0.7.0 |
-| **5** | 導入導線・総仕上げ | README / docs の OS 別ゼロから手順（`uv tool install` one-liner）、operation.md 更新、既知の制約一覧 | 0.33.0 |
+| **1** ✅ | llama.cpp プロビジョナ | `provisioner.py`（OS/arch/アクセラレータ検出・Releases 取得・管理dir・展開・検証）、`[llama_cpp]` 設定、起動時配線、build/accel の TUI・/admin/status 表示 | 0.29.0 |
+| **2** ✅ | 効率自動チューニング | accel に応じた `-ngl 999`（GPU）/`--threads`（CPU）自動付与、TUI `bench` コマンド（tok/s） | 0.30.0 |
+| **3** ✅ | ソースビルド opt-in | `provision = "build"`（cmake/git 検出、CUDA/Vulkan/HIP フラグ、失敗時 auto フォールバック） | 0.31.0 |
+| **4** ✅ | 動画入力 | `video.py`（video_url → ffmpeg フレーム抽出 → image_url 展開・バックエンド非依存）、`video_frames`/`video_max_edge` 設定、imageio-ffmpeg 全OS化 | 0.32.0 |
+| **5** ✅ | 導入導線・総仕上げ | README（自動導入・動画を反映）、docs/llama-cpp.md に自動導入節、gateway.toml 例 | 0.33.0 |
 
-フェーズ間の依存: 0 → 1 → 2 → 3 は直列。4 は 1 完了後なら並行可。5 は最後。
-1 フェーズ = 1 ブランチ（`feat/llamacpp-provisioner` 等）で、main へのマージごとに
-これまで同様テスト全緑 + 実機スモークを経てリリースする。
+すべて `feat/crossplatform-llamacpp` ブランチ上で実装・3OS CI 緑まで完了（main 統合は最後にまとめて）。
+実装で得た主な学び: (1) アクセラレータは Vulkan 一本化（実アセット調査）、(2) macOS は llama-cpp 使用時
+のみ導入、(3) CI が Windows の実バグ（強制ロックでの PID 読み取り）を検出。
+
+**残タスク（別リポジトリ / 実機）**:
+- client（local-llm-client）の `respond(..., videos=[...])` ヘルパと結線テスト拡充（別リポ・0.7.0）。
+  現状もサーバー側は raw `video_url` を受けられるので、クライアントから直接送れば動く。
+- 実 GPU（Linux/Windows 実機）での自動導入・生成・動画の Tier2 スモーク（CI では実 GPU 検証不可）。
 
 ## 各フェーズの詳細
 
