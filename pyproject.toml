@@ -36,10 +36,10 @@ dependencies = [
     # STT（音声→テキスト）バックエンド。backend="whisper" が同梱の stt_server 経由で使う。
     # Apple Silicon でのみ解決・インストールされる。
     "mlx-whisper>=0.4.3 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
-    # STT の音声デコード用 ffmpeg を pip 同梱バイナリで供給する（brew/apt を使わず uv だけで
-    # 完結）。stt_server が、システム PATH に ffmpeg が無ければこの同梱 ffmpeg を "ffmpeg" として
-    # 見せる。STT が動く Apple Silicon でのみ入れる（他OSは STT 非対応なので不要）。
-    "imageio-ffmpeg>=0.4.9 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    # ffmpeg を pip 同梱バイナリで供給する（brew/apt を使わず uv だけで完結）。用途は 2 つ:
+    # ① STT の音声デコード（Apple Silicon）② 動画入力のフレーム抽出（全 OS。video.py）。
+    # 動画入力は llama-cpp / mlx-vlm どちらでも効くので、全 OS に入れる。
+    "imageio-ffmpeg>=0.4.9",
 ]
 
 [dependency-groups]

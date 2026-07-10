@@ -36,7 +36,7 @@ import urllib.parse
 from dataclasses import dataclass, field, fields, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from . import multipart, provisioner
+from . import multipart, provisioner, video
 from .proxy import forward, send_error, send_json
 from .server import (
     BACKENDS,
@@ -978,6 +978,8 @@ class GatewayServer(ThreadingHTTPServer):
         session_ttl: float | None = None,
         api_key: str | None = None,
         vision_model: str | None = None,
+        video_frames: int = 8,
+        video_max_edge: int = 768,
     ) -> None:
         super().__init__(addr, _GatewayHandler)
         self.manager = manager
@@ -987,6 +989,9 @@ class GatewayServer(ThreadingHTTPServer):
         # 画像入りリクエストの振り分け先モデル（None で無効）。画像が壊れている vision モデルを
         # 避け、画像だけを確実に動くモデル（gemma-4 系など）へ流すための任意設定。
         self.vision_model = vision_model
+        # 動画入力: video_url をゲートウェイでフレーム画像列に展開する設定（バックエンド非依存）。
+        self.video_frames = video_frames
+        self.video_max_edge = video_max_edge
         # ネットワーク公開時の API キー（None/空 で認証なし）。chat（/v1/*）と在席セッション
         # （/admin/sessions/*）に Authorization: Bearer <key> を要求する。/admin/status と
         # /admin/config はループバック限定（キーではなく接続元で制限）。
@@ -1184,6 +1189,16 @@ class _GatewayHandler(BaseHTTPRequestHandler):
         if not model:
             send_error(self, 400, "no 'model' in the request and no default_model is configured")
             return
+        # 動画入力: video_url をフレーム画像（image_url）列に展開してから先へ進む。展開した
+        # フレームは以降の画像扱い（vision_model 振り分けの対象にもなる）。抽出失敗は 400。
+        if video.request_has_video(payload):
+            try:
+                video.expand_video_parts(
+                    payload, srv.video_frames, srv.video_max_edge)
+            except video.VideoError as exc:
+                send_error(self, 400, f"video input could not be processed: {exc}")
+                return
+            body = json.dumps(payload).encode("utf-8")
         # vision_model が設定されていれば、**画像を含むリクエストはそのモデルへ振り分ける**。
         # 一部の vision モデル（例: Qwen3.6-27B / qwen3_5）は現行 mlx_vlm で画像入力が壊れて
         # いる（get_rope_index のスレッド/ストリーム不具合。MTP の有無に関係なくハング/エラー）。
@@ -1374,6 +1389,9 @@ class GatewayConfig:
     llama_provision: str = "auto"      # auto=管理dirへ自動DL / system=PATH の llama-server / build=ソースビルド（Phase 3）
     llama_accel: str = "auto"          # auto=検出（GPU なら vulkan、mac は metal、無ければ cpu）/ cuda / vulkan / metal / cpu
     llama_build: str | None = None     # ビルド番号の固定（例 "b9946"）。省略で最新を取得し導入済みを使い続ける
+    # --- 動画入力: ゲートウェイが video_url をフレーム画像列へ展開して上流へ渡す ---
+    video_frames: int = 8              # 1 本の動画から等間隔で抜くフレーム数
+    video_max_edge: int = 768          # 各フレームの縮小サイズ（長辺ピクセル）
 
 
 def _resolve_model_draft(
@@ -1538,6 +1556,14 @@ def load_gateway_config(path: str) -> GatewayConfig:
     if llama_build is not None:
         llama_build = str(llama_build).strip() or None
 
+    # 動画入力のフレーム展開設定。省略で 8 フレーム / 長辺 768px。
+    video_frames = int(data.get("video_frames", 8))
+    if video_frames < 1:
+        raise ValueError("video_frames must be 1 or greater")
+    video_max_edge = int(data.get("video_max_edge", 768))
+    if video_max_edge < 64:
+        raise ValueError("video_max_edge must be 64 or greater")
+
     entries = data.get("models") or []
     if not isinstance(entries, list):
         raise ValueError("[[models]] must be an array")
@@ -1601,6 +1627,8 @@ def load_gateway_config(path: str) -> GatewayConfig:
         llama_provision=llama_provision,
         llama_accel=llama_accel,
         llama_build=llama_build,
+        video_frames=video_frames,
+        video_max_edge=video_max_edge,
     )
 
 
@@ -1653,6 +1681,12 @@ def apply_live_config(
     if cfg.vision_model != new.vision_model:
         note("vision_model", cfg.vision_model, new.vision_model)
         server.vision_model = new.vision_model
+    if cfg.video_frames != new.video_frames:
+        note("video_frames", cfg.video_frames, new.video_frames)
+        server.video_frames = new.video_frames
+    if cfg.video_max_edge != new.video_max_edge:
+        note("video_max_edge", cfg.video_max_edge, new.video_max_edge)
+        server.video_max_edge = new.video_max_edge
     if cfg.default_model != new.default_model:
         note("default_model", cfg.default_model, new.default_model)
         server.default_model = new.default_model
@@ -1874,6 +1908,8 @@ def _run_gateway_locked(cfg: GatewayConfig, config_path: str | None = None) -> i
         session_ttl=cfg.session_ttl,
         api_key=cfg.api_key,
         vision_model=cfg.vision_model,
+        video_frames=cfg.video_frames,
+        video_max_edge=cfg.video_max_edge,
     )
     public = f"http://{cfg.host}:{cfg.port}/v1"
     wildcard = cfg.host in ("0.0.0.0", "")

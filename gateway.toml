@@ -76,6 +76,13 @@ dynamic = true
 # accel = "auto"            # auto=検出 / cuda（Windows 限定・要 cudart）/ vulkan / metal / cpu を明示
 # pin = "b9946"             # ビルド番号を固定（省略で最新を取得し、以後は導入済みを使い続ける）
 
+# ── 動画入力（任意）──
+# リクエストの content に video_url（data URI / http URL / ローカルパス）を入れると、ゲートウェイが
+# ffmpeg で等間隔にフレーム抽出し image_url 列に展開して上流へ渡す（llama-cpp / mlx-vlm 共通）。
+# ffmpeg は pip 同梱（imageio-ffmpeg）で供給されるので追加インストール不要。ホットリロード対象。
+# video_frames = 8          # 1 本の動画から抜くフレーム数（多いほど精細だがトークン増）
+# video_max_edge = 768      # 各フレームの長辺ピクセル（縮小してトークン量を抑える）
+
 # ───────────────────────────────────────────────────────────────────────────────
 # 事前登録（任意）。parallel・llama.cpp の MTP・llama-server への個別フラグ等、ID だけでは
 # 決まらない上書きが要るモデルだけ書く。dynamic = true なら下は全て省略可（mlx-vlm の MTP と
