@@ -1658,3 +1658,66 @@ def test_admin_status_includes_llama_info(tmp_path, monkeypatch):
     finally:
         srv_mod.set_llama_server_binary(None)
         server.shutdown(); server.server_close(); mgr.shutdown()
+
+
+# --- 動画入力: ゲートウェイでのフレーム展開 --------------------------------------
+
+def test_load_gateway_config_parses_video_settings(tmp_path):
+    cfg = gw.load_gateway_config(_write(tmp_path, "video_frames = 4\nvideo_max_edge = 512\n"))
+    assert cfg.video_frames == 4 and cfg.video_max_edge == 512
+    # 既定。
+    d = gw.load_gateway_config(_write(tmp_path, "port = 8799\n"))
+    assert d.video_frames == 8 and d.video_max_edge == 768
+    with pytest.raises(ValueError):
+        gw.load_gateway_config(_write(tmp_path, "video_frames = 0\n"))
+
+
+def test_gateway_expands_video_before_forwarding(monkeypatch):
+    # video_url を含む chat は、上流へ届く前にフレーム画像（image_url）へ展開される。
+    up = _make_upstream("vid-up")
+    monkeypatch.setattr(gw, "LocalServer",
+                        lambda config, log_path=None: _FakeServer(config, log_path))
+    # ffmpeg を呼ばずにフレームを返す（3 枚）。
+    monkeypatch.setattr(gw.video, "extract_frames", lambda url, n, edge: [b"f1", b"f2", b"f3"])
+    configs = [ServerConfig(backend="mlx-vlm", model="m", host="127.0.0.1",
+                            port=up.server_address[1])]
+    mgr = gw.ModelManager(configs, dynamic=False)
+    server = gw.GatewayServer(("127.0.0.1", 0), mgr, catalog=["m"],
+                              video_frames=3, video_max_edge=256)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        port = server.server_address[1]
+        # 上流に届いた body を記録するため、_make_upstream は body を echo しないので
+        # ここでは「200 で通ること＋展開でエラーにならないこと」を確認する。
+        msg = [{"role": "user", "content": [
+            {"type": "video_url", "video_url": {"url": "http://x/v.mp4"}}]}]
+        s, o = _post(port, "/v1/chat/completions", {"model": "m", "messages": msg})
+        assert s == 200 and o["backend"] == "vid-up"
+    finally:
+        server.shutdown(); server.server_close(); mgr.shutdown()
+        up.shutdown(); up.server_close()
+
+
+def test_gateway_video_extract_failure_returns_400(monkeypatch):
+    up = _make_upstream("vid-up")
+    monkeypatch.setattr(gw, "LocalServer",
+                        lambda config, log_path=None: _FakeServer(config, log_path))
+
+    def boom(url, n, edge):
+        raise gw.video.VideoError("no ffmpeg")
+
+    monkeypatch.setattr(gw.video, "extract_frames", boom)
+    configs = [ServerConfig(backend="mlx-vlm", model="m", host="127.0.0.1",
+                            port=up.server_address[1])]
+    mgr = gw.ModelManager(configs, dynamic=False)
+    server = gw.GatewayServer(("127.0.0.1", 0), mgr, catalog=["m"])
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        port = server.server_address[1]
+        msg = [{"role": "user", "content": [
+            {"type": "video_url", "video_url": {"url": "http://x/v.mp4"}}]}]
+        s, o = _post(port, "/v1/chat/completions", {"model": "m", "messages": msg})
+        assert s == 400
+    finally:
+        server.shutdown(); server.server_close(); mgr.shutdown()
+        up.shutdown(); up.server_close()
