@@ -271,3 +271,66 @@ def test_ensure_build_falls_back_to_prebuilt(tmp_path, monkeypatch):
     )
     assert os.path.exists(path)                      # プリビルトで導入できた
     assert "ubuntu-x64.tar.gz" in downloaded["url"]  # プリビルト経路を通った
+
+
+# --- 総点検で見つかった不具合の回帰テスト ------------------------------------------
+
+def test_ensure_reuses_installed_build_without_network(tmp_path, monkeypatch):
+    # pin 未指定の 2 回目以降はネットワーク（latest_build）に触れず導入済みを再利用する。
+    # これが無いと (1) オフラインで起動不能 (2) 上流の新リリースごとに再DL、が起きる。
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    monkeypatch.setattr(pv.os, "name", "posix")
+    monkeypatch.setattr(pv, "detect_os", lambda: "linux")
+    monkeypatch.setattr(pv, "detect_arch", lambda: "x64")
+
+    # 1 回目: latest=b9946 を導入。
+    monkeypatch.setattr(pv, "latest_build", lambda timeout=5.0: "b9946")
+    kw = dict(provision="auto", accel="cpu",
+              download=lambda url, dest, timeout=300.0: _fake_tarball(dest),
+              verify=lambda p, **k: True)
+    p1 = pv.ensure_llama_server(build=None, **kw)
+
+    # 2 回目: ネットワーク断＋上流には新ビルドがある想定 → それでも導入済みを使う。
+    def offline(timeout=5.0):
+        raise OSError("network unreachable")
+
+    monkeypatch.setattr(pv, "latest_build", offline)
+    p2 = pv.ensure_llama_server(build=None, **kw)
+    assert p2 == p1
+    assert pv.last_info()["build"] == "b9946"
+
+
+def test_ensure_offline_without_install_raises_provision_error(tmp_path, monkeypatch):
+    # オフラインで未導入なら、素の URLError ではなく案内付き ProvisionError（起動側で握れる）。
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    monkeypatch.setattr(pv.os, "name", "posix")
+    monkeypatch.setattr(pv, "detect_os", lambda: "linux")
+    monkeypatch.setattr(pv, "detect_arch", lambda: "x64")
+
+    def offline(timeout=5.0):
+        raise OSError("network unreachable")
+
+    monkeypatch.setattr(pv, "latest_build", offline)
+    with pytest.raises(pv.ProvisionError):
+        pv.ensure_llama_server(provision="auto", accel="cpu", build=None,
+                               download=lambda *a, **k: None,
+                               verify=lambda p, **k: True)
+
+
+def test_installed_builds_sorted_newest_first(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    monkeypatch.setattr(pv.os, "name", "posix")
+    root = pv.managed_root()
+    for name in ("b9900-linux-cpu-x64", "b10002-linux-cpu-x64", "b9946-linux-cpu-x64",
+                 "b9999-linux-vulkan-x64",   # accel 違いは含めない
+                 "src-b9946", "junk"):        # 形式外は無視
+        os.makedirs(os.path.join(root, name), exist_ok=True)
+    assert pv.installed_builds("linux", "x64", "cpu") == ["b10002", "b9946", "b9900"]
+
+
+def test_last_info_records_system_without_accel(monkeypatch):
+    # system はユーザー管理バイナリ＝素性不明。accel を None にして auto フラグの対象外にする。
+    monkeypatch.setattr(pv.shutil, "which", lambda name: "/usr/bin/llama-server")
+    pv.ensure_llama_server(provision="system")
+    info = pv.last_info()
+    assert info["provision"] == "system" and info["accel"] is None

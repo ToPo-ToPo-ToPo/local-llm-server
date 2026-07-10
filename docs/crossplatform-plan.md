@@ -74,13 +74,14 @@ provision = "auto"    # auto: 管理バイナリを自動導入（既定）/ sys
 
 ### 方針B: 計算効率は「検出 → 安全な最大値を既定に、明示指定が常に優先」
 
-| 項目 | 自動決定ロジック | 上書き手段 |
+| 項目 | 自動決定ロジック（実装で確定した最終形） | 上書き手段 |
 |---|---|---|
-| GPU オフロード | GPU 検出時 `-ngl 999`（全層）。VRAM 不足は llama.cpp 側の再配置に任せ、失敗ログを TUI に露出 | `[[models]] extra_args` |
-| 並列スロット | `--parallel`: GPU なら 4、CPU のみなら 物理コア数/4（最低1）を既定に。ゲートウェイの複製インスタンス機構とは役割分担（1プロセス内=continuous batching、プロセス複製=負荷分散）を docs に明記 | gateway.toml `parallel` |
-| スレッド | `--threads` 物理コア数（P コアのみ相当）。Windows の E コア混在は psutil で物理コア取得 | extra_args |
-| flash-attn | GPU 検出時 `--flash-attn` を既定付与（未対応バックエンドでは llama.cpp が無視/エラー → 起動失敗検知でリトライ時に外す） | extra_args |
+| GPU オフロード | GPU 検出時 `-ngl 999`（全層）。VRAM 不足は llama.cpp 側の再配置に任せる | `[[models]] extra_args` |
+| スレッド | CPU 実行時のみ `--threads` 物理コア数（psutil。E コア混在でも物理コア数） | extra_args |
+| 並列スロット | **自動付与しない**（実装時に方針変更）。`--parallel` は KV キャッシュ/コンテキストをスロット数で分割するため、黙って付けると単一ストリームの実効コンテキストが減る。明示設定（gateway.toml `parallel`）に委ね、負荷時はゲートウェイの複製インスタンス機構が並列化を担う | gateway.toml `parallel` |
+| flash-attn | **自動付与しない**（実装時に方針変更）。近年の llama.cpp は `-fa auto` が既定で、対応環境では自動で有効になる。二重に付ける必要が無い | extra_args |
 | KV 量子化 | 既定では付けない（品質影響があるため）。docs で `-ctk q8_0` 等を案内のみ | extra_args |
+| system 例外 | `provision = "system"`（ユーザー管理バイナリ・素性不明）には一切自動付与しない | — |
 
 - 実装は「自動フラグは**ユーザーの extra_args に同項目が無いときだけ**付ける」原則で統一
   （mmproj 自動検出と同じ流儀。既存ユーザーの設定を壊さない）。

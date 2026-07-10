@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -167,6 +168,33 @@ def install_dir(build: str, os_name: str, arch: str, accel: str) -> str:
     return os.path.join(managed_root(), f"{build}-{os_name}-{accel}-{arch}")
 
 
+def installed_builds(os_name: str, arch: str, accel: str) -> list[str]:
+    """管理ディレクトリに導入済みのビルドタグ一覧（新しい順）。
+
+    `pin` 未指定の 2 回目以降の起動はここから再利用する——毎回 GitHub API に最新を
+    照会すると、オフラインで起動できず、llama.cpp の頻繁なリリース（日に数回）のたびに
+    数十 MB を再ダウンロードしてしまうため。更新したいときは `pin` を変えるか、
+    管理ディレクトリを消して次回起動で最新を取らせる。
+    """
+    suffix = f"-{os_name}-{accel}-{arch}"
+    try:
+        names = os.listdir(managed_root())
+    except OSError:
+        return []
+    builds = [n[: -len(suffix)] for n in names if n.endswith(suffix)]
+    builds = [b for b in builds if re.fullmatch(r"b\d+", b)]
+    return sorted(builds, key=lambda b: int(b[1:]), reverse=True)
+
+
+# 直近に ensure_llama_server が解決した素性（build/accel/provision）。TUI・/admin/status の
+# 表示用に、呼び出し側（daemon）が last_info() で取得する。
+_LAST_INFO: dict | None = None
+
+
+def last_info() -> dict | None:
+    return _LAST_INFO
+
+
 def _find_llama_server(root: str) -> str | None:
     """展開ディレクトリ配下から llama-server 実行ファイルを探す（無ければ None）。"""
     for dirpath, _dirs, files in os.walk(root):
@@ -292,6 +320,7 @@ def ensure_llama_server(
 
     download/verify は差し替え可能（テスト用）。
     """
+    global _LAST_INFO
     if provision == "system":
         found = shutil.which("llama-server")
         if not found:
@@ -299,22 +328,44 @@ def ensure_llama_server(
                 "provision='system' だが PATH に llama-server が見つからない。"
                 "provision='auto'（自動導入）にするか、llama-server を PATH に置く。"
             )
+        # system はユーザー管理のバイナリ（accel 等の素性は不明）。auto フラグ付与の対象外。
+        _LAST_INFO = {"provision": "system", "build": None, "accel": None}
         return found
 
     os_name = detect_os()
     arch = detect_arch()
     accel = detect_accelerator(os_name) if accel == "auto" else accel
-    build = build or latest_build()
+
+    if build is None:
+        # pin 未指定: まず導入済みを再利用する（オフラインでも起動でき、上流の頻繁な
+        # リリースのたびに再ダウンロードしない）。無いときだけ最新を照会する。
+        for installed in installed_builds(os_name, arch, accel):
+            binary = _find_llama_server(install_dir(installed, os_name, arch, accel))
+            if binary and verify(binary):
+                _LAST_INFO = {"provision": provision, "build": installed,
+                              "accel": accel}
+                return binary
+        try:
+            build = latest_build()
+        except (OSError, ValueError, KeyError) as exc:  # URLError も OSError の subclass
+            raise ProvisionError(
+                f"llama.cpp の最新ビルド番号を取得できない（オフライン?）: {exc}. "
+                f"[llama_cpp] pin でビルド番号を固定するか、provision='system' で "
+                f"手動導入の llama-server を使う。"
+            ) from exc
 
     target = install_dir(build, os_name, arch, accel)
     existing = _find_llama_server(target)
     if existing and verify(existing):
+        _LAST_INFO = {"provision": provision, "build": build, "accel": accel}
         return existing
 
     if provision == "build":
         try:
-            return build_from_source(build, os_name, arch, accel, target,
-                                     verify=verify)
+            built = build_from_source(build, os_name, arch, accel, target,
+                                      verify=verify)
+            _LAST_INFO = {"provision": "build", "build": build, "accel": accel}
+            return built
         except BuildUnavailable as exc:
             print(f"llama.cpp source build unavailable, falling back to prebuilt: "
                   f"{exc}", file=sys.stderr)
@@ -346,4 +397,5 @@ def ensure_llama_server(
             f"llama-server を導入したが --version に失敗（{binary}）。"
             f"accel={accel} が環境に合っていない可能性（accel を cpu 等に変えて再試行）"
         )
+    _LAST_INFO = {"provision": provision, "build": build, "accel": accel}
     return binary

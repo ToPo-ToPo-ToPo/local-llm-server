@@ -1859,26 +1859,25 @@ def provision_llama_if_needed(cfg: GatewayConfig) -> None:
     """
     if not _llama_cpp_in_use(cfg):
         return
-    # 実際に使う accel を先に確定させる（auto は検出結果を表示・記録するため）。
-    resolved_accel = (
-        provisioner.detect_accelerator() if cfg.llama_accel == "auto"
-        else cfg.llama_accel
-    )
     try:
         binary = provisioner.ensure_llama_server(
             provision=cfg.llama_provision,
             accel=cfg.llama_accel,
             build=cfg.llama_build,
         )
-    except provisioner.ProvisionError as exc:
+    except Exception as exc:  # noqa: BLE001 - 導入失敗で起動を止めない（オフライン・未知アーキ等も含む）
         print(f"llama.cpp provisioning failed (continuing without it): {exc}",
               file=sys.stderr)
         return
+    # 実際に解決された素性（実ビルド番号・accel）はプロビジョナが記録している。
+    # system はユーザー管理バイナリで素性不明（accel=None）→ auto フラグ付与の対象外になる。
+    info = provisioner.last_info() or {}
     set_llama_server_binary(
-        binary, build=cfg.llama_build, accel=resolved_accel,
-        provision=cfg.llama_provision)
+        binary, build=info.get("build"), accel=info.get("accel"),
+        provision=info.get("provision", cfg.llama_provision))
     print(f"llama.cpp ready: {binary} (provision={cfg.llama_provision}, "
-          f"accel={resolved_accel})", file=sys.stderr)
+          f"build={info.get('build') or '-'}, accel={info.get('accel') or '-'})",
+          file=sys.stderr)
 
 
 def _run_gateway_locked(cfg: GatewayConfig, config_path: str | None = None) -> int:

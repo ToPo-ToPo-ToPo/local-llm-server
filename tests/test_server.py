@@ -726,3 +726,12 @@ def test_bench_model_raises_on_failure(monkeypatch):
     monkeypatch.setattr(s.urllib.request, "urlopen", boom)
     with pytest.raises(RuntimeError):
         s.bench_model("org/m")
+
+
+def test_auto_llama_flags_none_accel_is_noop(hf_cache, monkeypatch):
+    # provision=system は accel=None で記録される → 素性不明バイナリにフラグを足さない。
+    hf_cache("org/m-gguf", ["m-Q4_K_M.gguf"])
+    monkeypatch.setattr(srv, "llama_provision_info",
+                        lambda: {"accel": None, "provision": "system"})
+    cmd = build_command(ServerConfig("llama-cpp", "org/m-gguf"))
+    assert "-ngl" not in cmd and "--threads" not in cmd

@@ -93,8 +93,11 @@ def auto_llama_flags(config: "ServerConfig") -> list[str]:
     if not info:
         return []
     accel = info.get("accel")
+    if not accel:
+        # provision=system（素性不明のユーザー管理バイナリ）は accel=None → 何も足さない。
+        return []
     extra = config.extra_args
-    if accel and accel != "cpu":
+    if accel != "cpu":
         if not any(a in _NGL_FLAGS for a in extra):
             return ["-ngl", "999"]
         return []

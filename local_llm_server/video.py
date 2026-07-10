@@ -11,11 +11,13 @@ ffmpeg 呼び出し（run）と抽出（extract）は差し替え可能にして
 from __future__ import annotations
 
 import base64
+import binascii
 import os
 import re
 import shutil
 import subprocess
 import tempfile
+import urllib.request
 
 # ffmpeg が stderr に出す "  Duration: 00:00:12.34, ..." をパースする。
 _DURATION_RE = re.compile(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)")
@@ -41,26 +43,68 @@ def _is_url(s: str) -> bool:
     return s.startswith("http://") or s.startswith("https://")
 
 
+# リモート動画の取得上限（バイト）。無制限に落とすとディスクを食い潰すため。
+_MAX_REMOTE_BYTES = 512 * 1024 * 1024
+
+
 def _source_to_path(url: str) -> tuple[str, bool]:
-    """video の url を ffmpeg が読めるパスにする。戻り値 (path, is_temp)。
+    """video の url を ffmpeg が読めるローカルパスにする。戻り値 (path, is_temp)。
 
     - data URI（data:video/...;base64,...）→ 一時ファイルに書き出す（is_temp=True）。
-    - http(s) URL → そのまま（ffmpeg が直接読む）。
+    - http(s) URL → **一度だけ**一時ファイルへダウンロードする（is_temp=True）。ffmpeg に
+      URL を直接渡すと probe + フレームごとに再取得され、8 フレーム設定で 9 回 DL になるため。
     - ローカルパス → そのまま。
+    壊れた base64・取得失敗は VideoError（呼び出し側が 400 に変換できるよう集約する）。
     """
     if url.startswith("data:"):
         _, _, b64 = url.partition(",")
-        raw = base64.b64decode(b64)
+        try:
+            raw = base64.b64decode(b64)
+        except (ValueError, binascii.Error) as exc:
+            raise VideoError(f"video の data URI が壊れています（base64 不正）: {exc}") from exc
         fd, path = tempfile.mkstemp(suffix=".video")
         with os.fdopen(fd, "wb") as fh:
             fh.write(raw)
         return path, True
+    if _is_url(url):
+        fd, path = tempfile.mkstemp(suffix=".video")
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "local-llm-server"})
+            with urllib.request.urlopen(req, timeout=120) as resp, \
+                    os.fdopen(fd, "wb") as fh:
+                copied = 0
+                while True:
+                    chunk = resp.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    copied += len(chunk)
+                    if copied > _MAX_REMOTE_BYTES:
+                        raise VideoError(
+                            f"video URL が大きすぎます（> {_MAX_REMOTE_BYTES} bytes）")
+                    fh.write(chunk)
+        except VideoError:
+            _try_remove(path)
+            raise
+        except (OSError, ValueError) as exc:
+            _try_remove(path)
+            raise VideoError(f"video URL を取得できません: {exc}") from exc
+        return path, True
     return url, False
 
 
+def _try_remove(path: str) -> None:
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
 def _probe_duration(exe: str, src: str, run) -> float:
-    """ffmpeg の情報出力から尺（秒）を得る。取れなければ 0.0。"""
-    proc = run([exe, "-nostdin", "-i", src], capture_output=True, timeout=30)
+    """ffmpeg の情報出力から尺（秒）を得る。取れなければ 0.0（先頭付近から抜く）。"""
+    try:
+        proc = run([exe, "-nostdin", "-i", src], capture_output=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return 0.0
     text = (getattr(proc, "stderr", b"") or b"").decode("utf-8", "replace")
     m = _DURATION_RE.search(text)
     if not m:
@@ -89,25 +133,29 @@ def extract_frames(
             "動画入力には ffmpeg が要ります。"
         )
     path, is_temp = _source_to_path(src)
+    # 長辺を max_edge に収める（縦横どちら向きでも）。拡大はしない。filtergraph 中の
+    # min() のカンマは \, でエスケープが必要（カンマはフィルタ区切りのため）。
+    vf = (f"scale=min(iw\\,{max_edge}):min(ih\\,{max_edge})"
+          f":force_original_aspect_ratio=decrease")
     out: list[bytes] = []
     try:
         duration = _probe_duration(exe, path, run)
         for t in _frame_timestamps(duration, frames):
-            proc = run(
-                [exe, "-nostdin", "-ss", f"{t:.3f}", "-i", path, "-frames:v", "1",
-                 "-vf", f"scale='min(iw,{max_edge})':-2", "-f", "image2",
-                 "-c:v", "png", "-"],
-                capture_output=True, timeout=60,
-            )
+            try:
+                proc = run(
+                    [exe, "-nostdin", "-ss", f"{t:.3f}", "-i", path,
+                     "-frames:v", "1", "-vf", vf, "-f", "image2",
+                     "-c:v", "png", "-"],
+                    capture_output=True, timeout=60,
+                )
+            except (OSError, subprocess.SubprocessError) as exc:
+                raise VideoError(f"ffmpeg の実行に失敗: {exc}") from exc
             data = getattr(proc, "stdout", b"") or b""
             if getattr(proc, "returncode", 1) == 0 and data:
                 out.append(data)
     finally:
         if is_temp:
-            try:
-                os.remove(path)
-            except OSError:
-                pass
+            _try_remove(path)
     if not out:
         raise VideoError("動画からフレームを抽出できませんでした（ffmpeg 失敗）")
     return out
