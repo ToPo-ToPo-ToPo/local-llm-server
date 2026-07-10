@@ -51,6 +51,7 @@ from .server import (
     estimate_model_bytes,
     ignore_shutdown_signals,
     infer_backend,
+    llama_provision_info,
     parallel_supported,
     primary_lan_ip,
     reclaim_stale_workers,
@@ -1127,6 +1128,8 @@ class _GatewayHandler(BaseHTTPRequestHandler):
                 "started_at": srv.started_at,
                 "cwd": srv.start_cwd,
                 "launcher": srv.launcher,
+                # 導入した llama.cpp の素性（build/accel/binary）。未導入は None。
+                "llama": llama_provision_info(),
                 "models": models,
                 # キャッシュにある DL 済みモデル（TUI が未ロード候補として一覧する）。
                 "available": discover_cached_models(),
@@ -1822,6 +1825,11 @@ def provision_llama_if_needed(cfg: GatewayConfig) -> None:
     """
     if not _llama_cpp_in_use(cfg):
         return
+    # 実際に使う accel を先に確定させる（auto は検出結果を表示・記録するため）。
+    resolved_accel = (
+        provisioner.detect_accelerator() if cfg.llama_accel == "auto"
+        else cfg.llama_accel
+    )
     try:
         binary = provisioner.ensure_llama_server(
             provision=cfg.llama_provision,
@@ -1832,9 +1840,11 @@ def provision_llama_if_needed(cfg: GatewayConfig) -> None:
         print(f"llama.cpp provisioning failed (continuing without it): {exc}",
               file=sys.stderr)
         return
-    set_llama_server_binary(binary)
+    set_llama_server_binary(
+        binary, build=cfg.llama_build, accel=resolved_accel,
+        provision=cfg.llama_provision)
     print(f"llama.cpp ready: {binary} (provision={cfg.llama_provision}, "
-          f"accel={cfg.llama_accel})", file=sys.stderr)
+          f"accel={resolved_accel})", file=sys.stderr)
 
 
 def _run_gateway_locked(cfg: GatewayConfig, config_path: str | None = None) -> int:

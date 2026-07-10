@@ -38,17 +38,30 @@ DEFAULT_BACKEND = default_backend()
 # llama-server 実行ファイルのパス。ゲートウェイ起動時にプロビジョナ（provisioner）が解決して
 # set_llama_server_binary() で差し込む。未設定なら PATH の "llama-server"（従来挙動 / system）。
 _LLAMA_SERVER_BIN: str | None = None
+# 導入した llama.cpp の素性（build/accel/binary/provision）。/admin/status・TUI 表示用。
+_LLAMA_INFO: dict | None = None
 
 
-def set_llama_server_binary(path: str | None) -> None:
-    """起動時にプロビジョナが解決した llama-server の絶対パスを登録する。"""
-    global _LLAMA_SERVER_BIN
+def set_llama_server_binary(
+    path: str | None, *, build: str | None = None, accel: str | None = None,
+    provision: str | None = None,
+) -> None:
+    """起動時にプロビジョナが解決した llama-server の絶対パス（と素性）を登録する。"""
+    global _LLAMA_SERVER_BIN, _LLAMA_INFO
     _LLAMA_SERVER_BIN = path
+    _LLAMA_INFO = None if path is None else {
+        "binary": path, "build": build, "accel": accel, "provision": provision,
+    }
 
 
 def llama_server_binary() -> str:
     """build_command が使う llama-server コマンド（未プロビジョン時は PATH 探索の名前）。"""
     return _LLAMA_SERVER_BIN or "llama-server"
+
+
+def llama_provision_info() -> dict | None:
+    """導入済み llama.cpp の素性（未導入は None）。/admin/status・TUI が表示に使う。"""
+    return _LLAMA_INFO
 
 
 # STT（音声→テキスト）モデルの id 判定に使う語。whisper 系は id に "mlx" を含む

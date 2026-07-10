@@ -525,6 +525,11 @@ class GatewayMonitor(App):
                 f"\nstarted {admin['started_at']} · {admin.get('launcher', '?')}"
                 f" · pid {admin.get('pid', '?')} · {cwd}"
             )
+        # 自動導入した llama.cpp の素性（どのビルド・どのアクセラレータで動いているか）。
+        llama = admin.get("llama")
+        if llama:
+            build = llama.get("build") or "latest"
+            policy += f"\nllama.cpp {build} · {llama.get('accel', '?')}"
         self.query_one("#policy", Static).update(policy)
 
     # --- 操作（別スレッドで実行して UI を固めない） ---

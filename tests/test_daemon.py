@@ -1604,7 +1604,8 @@ def test_provision_llama_sets_binary_when_used(tmp_path, monkeypatch):
     monkeypatch.setattr(gw.provisioner, "ensure_llama_server",
                         lambda **k: "/managed/llama-server")
     set_calls = []
-    monkeypatch.setattr(gw, "set_llama_server_binary", lambda p: set_calls.append(p))
+    monkeypatch.setattr(gw, "set_llama_server_binary",
+                        lambda p, **k: set_calls.append(p))
     gw.provision_llama_if_needed(cfg)
     assert set_calls == ["/managed/llama-server"]
 
@@ -1631,6 +1632,29 @@ def test_provision_llama_continues_on_failure(tmp_path, monkeypatch):
 
     monkeypatch.setattr(gw.provisioner, "ensure_llama_server", boom)
     set_calls = []
-    monkeypatch.setattr(gw, "set_llama_server_binary", lambda p: set_calls.append(p))
+    monkeypatch.setattr(gw, "set_llama_server_binary",
+                        lambda p, **k: set_calls.append(p))
     gw.provision_llama_if_needed(cfg)  # 例外を投げない
     assert set_calls == []
+
+
+def test_admin_status_includes_llama_info(tmp_path, monkeypatch):
+    # 導入した llama.cpp の素性（build/accel）が /admin/status に出る。
+    from local_llm_server import server as srv_mod
+    cfg = gw.load_gateway_config(_write(tmp_path, "port = 8799\n"))
+    server, mgr = _live_server(cfg)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        srv_mod.set_llama_server_binary(
+            "/managed/b9946/bin/llama-server", build="b9946", accel="vulkan",
+            provision="auto")
+        st, obj = _get(server.server_address[1], "/admin/status")
+        assert obj["llama"]["build"] == "b9946"
+        assert obj["llama"]["accel"] == "vulkan"
+        # 未導入に戻すと None。
+        srv_mod.set_llama_server_binary(None)
+        _, obj2 = _get(server.server_address[1], "/admin/status")
+        assert obj2["llama"] is None
+    finally:
+        srv_mod.set_llama_server_binary(None)
+        server.shutdown(); server.server_close(); mgr.shutdown()
