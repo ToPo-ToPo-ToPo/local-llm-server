@@ -1721,3 +1721,93 @@ def test_gateway_video_extract_failure_returns_400(monkeypatch):
     finally:
         server.shutdown(); server.server_close(); mgr.shutdown()
         up.shutdown(); up.server_close()
+
+
+# --- drain（再起動準備: アイドル確認＋新規受付停止を原子的に）------------------------
+# 自動更新の再起動で「確認と kill の間に生成が滑り込んで落ちる」事故を防ぐ仕組み。
+
+def test_begin_drain_refuses_when_inflight():
+    mgr = gw.ModelManager([], dynamic=True)
+    _install_instance(mgr, "busy-model", alive=True, inflight=2, port=9001)
+    res = mgr.begin_drain()
+    assert res["ok"] is False and res["inflight"] == 2
+    # 拒否時は何も変わらない（新規受付は止まらない）。
+    with mgr._state:
+        assert mgr._draining_locked() is False
+
+
+def test_begin_drain_refuses_when_sessions_present():
+    mgr = gw.ModelManager([], dynamic=True)
+    mgr.register_session("agent-1", "some/model")
+    res = mgr.begin_drain()
+    assert res["ok"] is False and res["sessions"] == 1
+
+
+def test_begin_drain_ok_when_idle_then_acquire_rejected():
+    mgr = gw.ModelManager([], dynamic=True)
+    _install_instance(mgr, "m", alive=True, inflight=0, port=9001)
+    assert mgr.begin_drain()["ok"] is True
+    # drain 中の新規 acquire は GatewayDraining（ハンドラで 503 になる）。
+    with pytest.raises(gw.GatewayDraining):
+        mgr.acquire("m")
+    # 解除すれば通常に戻る。
+    mgr.end_drain()
+    addr, inst = mgr.acquire("m")
+    mgr.release(inst)
+
+
+def test_drain_expires_after_ttl():
+    # 再起動側が死んで drain だけ残っても、TTL で自動復帰する（受付不能のまま固まらない）。
+    mgr = gw.ModelManager([], dynamic=True)
+    _install_instance(mgr, "m", alive=True, port=9001)
+    assert mgr.begin_drain(ttl=0.05)["ok"] is True
+    time.sleep(0.1)
+    addr, inst = mgr.acquire("m")  # 期限切れ → 受け付ける
+    mgr.release(inst)
+
+
+def test_admin_drain_endpoint_and_503(monkeypatch):
+    # HTTP レベル: /admin/drain で開始→chat は 503、enable=false で解除→200。
+    server, mgr, ups = _start_gateway(monkeypatch)
+    try:
+        port = server.server_address[1]
+        # ウォームアップ（m1 をロード）後、アイドルなので drain が通る。
+        s, o = _post(port, "/v1/chat/completions",
+                     {"model": "m1", "messages": [{"role": "user", "content": "hi"}]})
+        assert s == 200
+        s, o = _post(port, "/admin/drain", {"enable": True})
+        assert s == 200 and o["draining"] is True
+        # drain 中の chat は 503（クライアントの自動リトライ対象）。
+        s, o = _post(port, "/v1/chat/completions",
+                     {"model": "m1", "messages": [{"role": "user", "content": "hi"}]})
+        assert s == 503
+        # 解除すれば受け付ける。
+        s, o = _post(port, "/admin/drain", {"enable": False})
+        assert s == 200 and o["draining"] is False
+        s, o = _post(port, "/v1/chat/completions",
+                     {"model": "m1", "messages": [{"role": "user", "content": "hi"}]})
+        assert s == 200
+    finally:
+        server.shutdown(); server.server_close(); mgr.shutdown()
+        for u in ups:
+            u.shutdown(); u.server_close()
+
+
+def test_admin_drain_refused_while_busy(monkeypatch):
+    # 処理中（inflight>0）は drain が開始されず、既存の生成は無傷のまま。
+    server, mgr, ups = _start_gateway(monkeypatch)
+    try:
+        port = server.server_address[1]
+        s, _ = _post(port, "/v1/chat/completions",
+                     {"model": "m1", "messages": [{"role": "user", "content": "hi"}]})
+        assert s == 200
+        with mgr._state:  # 生成中を模擬
+            mgr._models["m1"].instances[0].inflight = 1
+        s, o = _post(port, "/admin/drain", {"enable": True})
+        assert s == 200 and o["draining"] is False and o["inflight"] == 1
+        with mgr._state:
+            mgr._models["m1"].instances[0].inflight = 0
+    finally:
+        server.shutdown(); server.server_close(); mgr.shutdown()
+        for u in ups:
+            u.shutdown(); u.server_close()

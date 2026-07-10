@@ -1372,6 +1372,34 @@ def gateway_set_max_resident(
     return data if isinstance(data, dict) else None
 
 
+def gateway_drain(
+    enable: bool = True,
+    host: str = "127.0.0.1",
+    port: int = 8799,
+    timeout: float = 5.0,
+) -> dict | None:
+    """稼働中のゲートウェイに POST /admin/drain で再起動準備を要求する（TUI の自動更新用）。
+
+    enable=True: ゲートウェイが原子的に「処理中 0・在席 0」を確認し、満たせば新規受付を
+    止めて {"draining": True} を返す。busy なら {"draining": False, "inflight": n,
+    "sessions": n}（何も変えない）。enable=False で解除。応答しない（未起動・旧版で
+    エンドポイントが無い）ときは None。
+    """
+    url = f"http://{host}:{port}/admin/drain"
+    body = json.dumps({"enable": enable}).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=body, headers={"Content-Type": "application/json"}, method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            if resp.status != 200:
+                return None
+            data = json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
 def gateway_log_path(port: int) -> str:
     """バックグラウンド起動したゲートウェイ本体（公開ポート）の出力ログ保存先。
 

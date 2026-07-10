@@ -137,6 +137,9 @@ def test_auto_update_applies_when_idle(tmp_path, monkeypatch):
         return True, "done"
 
     monkeypatch.setattr(tui_app.update, "apply_update", _fake_apply)
+    # drain は実 HTTP を叩かせない（実機のゲートウェイを誤って drain しないため）。
+    monkeypatch.setattr(tui_app, "gateway_drain",
+                        lambda *a, **k: {"draining": True, "ok": True})
 
     async def scenario():
         app = tui_app.GatewayMonitor(gcfg)
@@ -170,6 +173,8 @@ def test_auto_update_holds_when_dirty(tmp_path, monkeypatch):
         return True, "x"
 
     monkeypatch.setattr(tui_app.update, "apply_update", _fake_apply)
+    monkeypatch.setattr(tui_app, "gateway_drain",
+                        lambda *a, **k: {"draining": True, "ok": True})
 
     async def scenario():
         app = tui_app.GatewayMonitor(gcfg)
@@ -180,6 +185,60 @@ def test_auto_update_holds_when_dirty(tmp_path, monkeypatch):
         assert applied.get("called") is None       # 汚れているので適用しない
         assert app.restart_after_exit is False
         assert app._update is not None and app._update.reason == "dirty"
+
+    asyncio.run(scenario())
+
+
+def test_auto_update_defers_restart_until_drain_succeeds(tmp_path, monkeypatch):
+    # 本題の回帰テスト: pull/sync 中に作業が入った（drain 拒否）ら**何も止めず**保留し、
+    # 空いた瞬間（drain 成功）に初めて再起動する。旧実装はアイドル観測→長い pull→無確認 kill
+    # だったため、pull 中に始まった生成が落ちていた。
+    from local_llm_server import tui_app, update
+
+    gcfg = load_gateway_config(str(_write_cfg(tmp_path, "auto_update = true\nport = 8799\n")))
+    monkeypatch.setattr(tui_app, "server_status", lambda h, p: {"ready": True})
+    monkeypatch.setattr(tui_app, "gateway_admin_status", lambda h, p: None)  # 見かけ上アイドル
+    monkeypatch.setattr(tui_app, "is_ready", lambda url, **k: False)
+    st = update.UpdateStatus(current="0.21.0", latest="0.22.0", available=True,
+                             can_apply=True, reason="ok")
+    monkeypatch.setattr(tui_app.update, "check", lambda timeout=3.0: st)
+    monkeypatch.setattr(tui_app.update, "apply_update", lambda *a, **k: (True, "done"))
+
+    # 1 回目の drain は「処理中あり」で拒否（pull 中に作業が入ったのと同じ状況）。
+    drain_results = iter([
+        {"draining": False, "ok": False, "inflight": 1, "sessions": 0},
+        {"draining": True, "ok": True, "inflight": 0, "sessions": 0},
+    ])
+    drain_calls = []
+
+    def fake_drain(enable=True, *a, **k):
+        drain_calls.append(enable)
+        return next(drain_results)
+
+    monkeypatch.setattr(tui_app, "gateway_drain", fake_drain)
+
+    async def scenario():
+        app = tui_app.GatewayMonitor(gcfg)
+        killed = []
+        app._kill_ports = lambda: killed.append(True)
+        async with app.run_test() as pilot:
+            # 1 回目の適用サイクル: drain 拒否 → 保留（kill されない）。
+            for _ in range(10):
+                await pilot.pause()
+                if app._restart_pending:
+                    break
+            assert app._restart_pending is True
+            assert killed == []                      # 何も止めていない（生成は無傷）
+            assert app.restart_after_exit is False
+            # 以後のポーリングで drain が通った瞬間に再起動する（1s 周期のポーリングは
+            # テスト内では発火しないので、_apply でポーリング 1 周分を模擬する）。
+            for _ in range(20):
+                app._apply(None, ready=False)
+                await pilot.pause()
+                if app.restart_after_exit:
+                    break
+        assert killed == [True]
+        assert app.restart_after_exit is True
 
     asyncio.run(scenario())
 

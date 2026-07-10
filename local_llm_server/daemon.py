@@ -121,6 +121,16 @@ class CapacityError(RuntimeError):
     """常駐枠が全て処理中で、待っても空かず新モデルをロードできなかった（→ 503）。"""
 
 
+class GatewayDraining(RuntimeError):
+    """ゲートウェイが再起動準備（drain）中で、新規リクエストを受け付けない（→ 503）。
+
+    自動更新の再起動前に「実行中の処理・在席が無いことの確認」と「新規受付の停止」を
+    同一ロック内で原子的に行うための状態。確認と kill の間に新しい生成が滑り込んで
+    強制終了される事故（作業中の処理が落ちる）を防ぐ。クライアント（openai SDK）は
+    503 を自動リトライするので、数秒後に上がる新ゲートウェイへ繋ぎ直される。
+    """
+
+
 @dataclass
 class _Instance:
     """1 モデルの 1 起動インスタンス（独立プロセス・独立ポート）。
@@ -227,6 +237,9 @@ class ModelManager:
         # 即アンロードする判定に使う。_state ロック下で操作する。
         self._sessions: dict[str, _Session] = {}
         self._model_sessions: dict[str, set[str]] = {}
+        # drain（再起動準備）の期限。monotonic 時刻がこれ未満の間は新規 acquire を
+        # GatewayDraining で拒否する。0.0 で無効。再起動側が死んでも TTL で自動復帰する。
+        self._drain_deadline: float = 0.0
         # 同一モデルの複製インスタンスを裏で起動中の model_id 集合（多重起動を防ぐ）。
         self._spawning: set[str] = set()
         # shutdown 済みフラグと、起動処理中（start〜instances 登録前）のサーバー集合。
@@ -378,6 +391,12 @@ class ModelManager:
         # 高速パス: ready なインスタンスがあれば、最も空いているものへ割り当てる（state のみ）。
         spawn = False
         with self._state:
+            # drain（再起動準備）中は新規を受けない。inflight の増加と同一ロックなので、
+            # begin_drain の「アイドル確認」とここが競合しても取りこぼしが起きない。
+            if self._draining_locked():
+                raise GatewayDraining(
+                    "gateway is restarting to apply an update; retry in a few seconds"
+                )
             mm = self._models.get(model_id)
             ready = (
                 [i for i in mm.instances if i.ready and i.server is not None] if mm else []
@@ -395,6 +414,11 @@ class ModelManager:
         # 低速パス: ready インスタンスが1つも無い → 初回インスタンスを起動（control で直列化）。
         with self._control:
             with self._state:
+                if self._draining_locked():
+                    raise GatewayDraining(
+                        "gateway is restarting to apply an update; "
+                        "retry in a few seconds"
+                    )
                 if self._closing:
                     raise RuntimeError("gateway is shutting down")
                 mm = self._models.get(model_id)
@@ -663,6 +687,35 @@ class ModelManager:
                 if victim_model.dynamic and not victim_model.instances:  # 空なら登録ごと消す
                     with self._state:
                         self._models.pop(victim_model.config.model, None)
+
+    def begin_drain(self, ttl: float = 120.0) -> dict:
+        """再起動準備（drain）を試みる。アイドル確認と新規受付停止を**原子的に**行う。
+
+        `_state` ロック下で「処理中リクエスト 0 かつ 在席エージェント 0」を確認し、
+        満たすときだけ drain を開始する（以後 acquire は GatewayDraining → 503）。
+        busy なら開始せず現状を返す（呼び出し側は空くのを待って再試行する）。
+        再起動側が死んで drain だけ残っても、ttl 秒で自動解除され通常運転へ戻る。
+
+        戻り値: {"ok": bool, "inflight": n, "sessions": n}
+        """
+        with self._state:
+            inflight = sum(
+                i.inflight for m in self._models.values() for i in m.instances
+            )
+            sessions = len(self._sessions)
+            if inflight or sessions:
+                return {"ok": False, "inflight": inflight, "sessions": sessions}
+            self._drain_deadline = time.monotonic() + ttl
+            return {"ok": True, "inflight": 0, "sessions": 0}
+
+    def end_drain(self) -> None:
+        """drain を解除して通常受付に戻す（更新の見送り・失敗時）。"""
+        with self._state:
+            self._drain_deadline = 0.0
+
+    def _draining_locked(self) -> bool:
+        """drain 中か（_state ロック下で呼ぶ）。期限切れは自動的に False。"""
+        return time.monotonic() < self._drain_deadline
 
     def set_max_resident(self, value: int | None) -> None:
         """常駐上限（max_resident）を実行中に変更する。処理中（busy）のモデルは止めない。
@@ -1176,6 +1229,20 @@ class _GatewayHandler(BaseHTTPRequestHandler):
         if path.endswith("/admin/config"):
             self._handle_config_update(srv, payload)
             return
+        # 再起動準備（drain）。自動更新が「アイドル確認＋新規受付停止」を原子的に行うために
+        # 使う（→ ModelManager.begin_drain）。ローカルの管理操作なので loopback 限定。
+        if path.endswith("/admin/drain"):
+            if not self._require_loopback():
+                return
+            if payload.get("enable", True):
+                res = srv.manager.begin_drain()
+                send_json(self, 200, {"object": "gateway.drain",
+                                      "draining": res["ok"], **res})
+            else:
+                srv.manager.end_drain()
+                send_json(self, 200, {"object": "gateway.drain",
+                                      "draining": False, "ok": True})
+            return
         if path.endswith("/admin/sessions/register"):
             self._handle_session_register(srv, payload)
             return
@@ -1260,6 +1327,10 @@ class _GatewayHandler(BaseHTTPRequestHandler):
         except ValueError as exc:
             # モデル指定/解決の不正（未キャッシュの repo-id 等）。
             send_error(self, 400, f"cannot load model '{model}': {exc}")
+            return
+        except GatewayDraining as exc:
+            # 再起動準備中 → 一時的な 503（openai SDK は自動リトライし、新プロセスへ繋ぎ直る）。
+            send_error(self, 503, str(exc))
             return
         except CapacityError as exc:
             # 全枠が処理中で空かなかった → 混雑（後で再試行を促す）。

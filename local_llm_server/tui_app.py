@@ -24,6 +24,7 @@ from .server import (
     bench_model,
     find_pids_on_port,
     gateway_admin_status,
+    gateway_drain,
     gateway_log_path,
     gateway_set_max_resident,
     is_ready,
@@ -363,6 +364,9 @@ class GatewayMonitor(App):
         self._update = None            # update.UpdateStatus（新版検知時のみ）
         self._update_applying = False  # 適用中（多重起動を防ぐ）
         self._update_done = False      # 適用完了→再起動待ち
+        # ソースは更新済みだが、drain（処理中/在席が空くのを待つ）が通らず再起動を保留中。
+        # 以後のポーリングごとに drain を再試行し、空いた瞬間に再起動する。
+        self._restart_pending = False
         self.restart_after_exit = False  # run_tui が見て、新コードで TUI を再 exec する合図
 
     def compose(self) -> ComposeResult:
@@ -457,6 +461,8 @@ class GatewayMonitor(App):
             style=_DIM,
         )
         # 自動更新バナー: 適用できる場合は「適用予定/適用中」、保留（ローカル変更等）は理由つき。
+        if self._restart_pending and not self._update_applying:
+            st.append("    ⬆ 更新適用済み・処理中/在席が空き次第 再起動", style=_AMBER)
         up = self._update
         if up is not None and up.available:
             if self._update_applying:
@@ -590,8 +596,9 @@ class GatewayMonitor(App):
         self.call_from_thread(self._on_update_status, st)
 
     def _on_update_status(self, st) -> None:
-        # 新版があるときだけ保持する（無ければバナーを消す）。適用済み待ちのときは触らない。
-        if self._update_done:
+        # 新版があるときだけ保持する（無ければバナーを消す）。適用済み待ち・再起動保留中は
+        # 触らない（保留中は sync 済みで current==latest になり、消すと再起動が迷子になる）。
+        if self._update_done or self._restart_pending:
             return
         self._update = st if st.available else None
         self._render()
@@ -612,11 +619,22 @@ class GatewayMonitor(App):
         return inflight == 0 and sessions == 0
 
     def _maybe_apply_update(self) -> None:
-        """保留中の更新を、条件が揃っていれば自動適用する（アイドル時のみ）。"""
+        """保留中の更新を、条件が揃っていれば自動適用する（アイドル時のみ）。
+
+        ここでの _gateway_idle() は「無駄な git pull を避ける」ための事前ゲートに過ぎない。
+        本当の安全性はゲートウェイ側の drain（begin_drain）が担う——アイドル確認と新規
+        受付停止を同一ロックで原子的に行うので、確認と kill の間に生成が滑り込まない。
+        """
+        if self._update_applying or self._update_done:
+            return
+        # ソース更新済み・再起動だけ保留中: 空いた瞬間に drain → 再起動する。
+        if self._restart_pending:
+            if self._gateway_idle():
+                self._update_applying = True
+                self._apply_update_worker(already_applied=True)
+            return
         st = self._update
         if st is None or not st.available or not st.can_apply:
-            return
-        if self._update_applying or self._update_done:
             return
         if not self._gateway_idle():
             return  # 処理中/在席あり → 完了を待つ（次のポーリングで再判定）
@@ -643,25 +661,51 @@ class GatewayMonitor(App):
         self._apply_update_worker()
 
     @work(thread=True, group="update-apply")
-    def _apply_update_worker(self) -> None:
-        """git pull（＋uv sync）で更新し、成功したら新コードで TUI を再起動する。"""
+    def _apply_update_worker(self, already_applied: bool = False) -> None:
+        """更新を取得し、drain（原子的なアイドル確認＋新規受付停止）が通ったら再起動する。
+
+        順序が重要: ①git pull + uv sync は稼働中のゲートウェイに影響しないので先に済ませる
+        （数秒〜数十秒かかる。この間も通常どおりリクエストを受ける）。②その後で drain を
+        要求し、ゲートウェイが「処理中 0・在席 0」をロック内で確認して新規受付を止めた
+        ときだけ kill → 再起動する。busy なら何も止めず保留（_restart_pending）に回し、
+        空いた瞬間のポーリングで再試行する。
+
+        旧実装は「アイドル観測 → pull/sync（長い）→ 無確認で kill」だったため、pull 中に
+        始まった生成が kill で落ちていた（作業中の処理が落ちる報告の原因）。
+        """
         self.busy = "updating…"
         self.call_from_thread(self._render)
-        ok, msg = update.apply_update()
-        if ok:
-            # 旧ゲートウェイを止めてから抜ける（再 exec した新 TUI が新コードで起動し直す）。
-            self._kill_ports()
-            self._update_done = True
-            self.restart_after_exit = True
-            self.call_from_thread(self.exit)
+        if not already_applied:
+            ok, msg = update.apply_update()
+            if not ok:
+                # 失敗（作業ツリーが汚れた・ff 不可・pull 失敗）: 落とさず通知し、手動 u で再試行。
+                self._update_applying = False
+                self.busy = ""
+                self.call_from_thread(
+                    self.notify, f"自動更新を見送りました: {msg}",
+                    severity="warning", timeout=10,
+                )
+                self.call_from_thread(self._render)
+                return
+        # 原子的な drain。None はゲートウェイ未起動/旧版（=止める作業が無い/従来挙動）→ 続行。
+        res = gateway_drain(True, self.host, self.port)
+        if res is not None and not res.get("draining"):
+            # 適用後に作業が入った → 何も止めずに保留へ。空き次第ポーリングが再試行する。
+            self._restart_pending = True
+            self._update_applying = False
+            self.busy = ""
+            self.call_from_thread(
+                self.notify,
+                "更新は取得済み。処理中/在席が空き次第、自動で再起動します",
+                timeout=6,
+            )
+            self.call_from_thread(self._render)
             return
-        # 失敗（作業ツリーが汚れた・ff 不可・pull 失敗）: 落とさず通知し、手動 u で再試行できる。
-        self._update_applying = False
-        self.busy = ""
-        self.call_from_thread(
-            self.notify, f"自動更新を見送りました: {msg}", severity="warning", timeout=10
-        )
-        self.call_from_thread(self._render)
+        # 旧ゲートウェイを止めてから抜ける（再 exec した新 TUI が新コードで起動し直す）。
+        self._kill_ports()
+        self._update_done = True
+        self.restart_after_exit = True
+        self.call_from_thread(self.exit)
 
     def action_prefill_max(self) -> None:
         # `m` キー: コマンド欄に "max " を入れてフォーカスし、数値だけ打てば送信できるようにする。
