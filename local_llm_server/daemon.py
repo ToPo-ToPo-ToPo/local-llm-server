@@ -36,7 +36,7 @@ import urllib.parse
 from dataclasses import dataclass, field, fields, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from . import multipart
+from . import multipart, provisioner, video
 from .proxy import forward, send_error, send_json
 from .server import (
     BACKENDS,
@@ -51,10 +51,12 @@ from .server import (
     estimate_model_bytes,
     ignore_shutdown_signals,
     infer_backend,
+    llama_provision_info,
     parallel_supported,
     primary_lan_ip,
     reclaim_stale_workers,
     resolve_drafter,
+    set_llama_server_binary,
 )
 
 # 複製インスタンス起動前の猶予秒数。ストリーミングのクライアントは [DONE] を受けた
@@ -117,6 +119,16 @@ def _request_has_images(payload: dict) -> bool:
 
 class CapacityError(RuntimeError):
     """常駐枠が全て処理中で、待っても空かず新モデルをロードできなかった（→ 503）。"""
+
+
+class GatewayDraining(RuntimeError):
+    """ゲートウェイが再起動準備（drain）中で、新規リクエストを受け付けない（→ 503）。
+
+    自動更新の再起動前に「実行中の処理・在席が無いことの確認」と「新規受付の停止」を
+    同一ロック内で原子的に行うための状態。確認と kill の間に新しい生成が滑り込んで
+    強制終了される事故（作業中の処理が落ちる）を防ぐ。クライアント（openai SDK）は
+    503 を自動リトライするので、数秒後に上がる新ゲートウェイへ繋ぎ直される。
+    """
 
 
 @dataclass
@@ -225,6 +237,9 @@ class ModelManager:
         # 即アンロードする判定に使う。_state ロック下で操作する。
         self._sessions: dict[str, _Session] = {}
         self._model_sessions: dict[str, set[str]] = {}
+        # drain（再起動準備）の期限。monotonic 時刻がこれ未満の間は新規 acquire を
+        # GatewayDraining で拒否する。0.0 で無効。再起動側が死んでも TTL で自動復帰する。
+        self._drain_deadline: float = 0.0
         # 同一モデルの複製インスタンスを裏で起動中の model_id 集合（多重起動を防ぐ）。
         self._spawning: set[str] = set()
         # shutdown 済みフラグと、起動処理中（start〜instances 登録前）のサーバー集合。
@@ -376,6 +391,12 @@ class ModelManager:
         # 高速パス: ready なインスタンスがあれば、最も空いているものへ割り当てる（state のみ）。
         spawn = False
         with self._state:
+            # drain（再起動準備）中は新規を受けない。inflight の増加と同一ロックなので、
+            # begin_drain の「アイドル確認」とここが競合しても取りこぼしが起きない。
+            if self._draining_locked():
+                raise GatewayDraining(
+                    "gateway is restarting to apply an update; retry in a few seconds"
+                )
             mm = self._models.get(model_id)
             ready = (
                 [i for i in mm.instances if i.ready and i.server is not None] if mm else []
@@ -393,6 +414,11 @@ class ModelManager:
         # 低速パス: ready インスタンスが1つも無い → 初回インスタンスを起動（control で直列化）。
         with self._control:
             with self._state:
+                if self._draining_locked():
+                    raise GatewayDraining(
+                        "gateway is restarting to apply an update; "
+                        "retry in a few seconds"
+                    )
                 if self._closing:
                     raise RuntimeError("gateway is shutting down")
                 mm = self._models.get(model_id)
@@ -661,6 +687,35 @@ class ModelManager:
                 if victim_model.dynamic and not victim_model.instances:  # 空なら登録ごと消す
                     with self._state:
                         self._models.pop(victim_model.config.model, None)
+
+    def begin_drain(self, ttl: float = 120.0) -> dict:
+        """再起動準備（drain）を試みる。アイドル確認と新規受付停止を**原子的に**行う。
+
+        `_state` ロック下で「処理中リクエスト 0 かつ 在席エージェント 0」を確認し、
+        満たすときだけ drain を開始する（以後 acquire は GatewayDraining → 503）。
+        busy なら開始せず現状を返す（呼び出し側は空くのを待って再試行する）。
+        再起動側が死んで drain だけ残っても、ttl 秒で自動解除され通常運転へ戻る。
+
+        戻り値: {"ok": bool, "inflight": n, "sessions": n}
+        """
+        with self._state:
+            inflight = sum(
+                i.inflight for m in self._models.values() for i in m.instances
+            )
+            sessions = len(self._sessions)
+            if inflight or sessions:
+                return {"ok": False, "inflight": inflight, "sessions": sessions}
+            self._drain_deadline = time.monotonic() + ttl
+            return {"ok": True, "inflight": 0, "sessions": 0}
+
+    def end_drain(self) -> None:
+        """drain を解除して通常受付に戻す（更新の見送り・失敗時）。"""
+        with self._state:
+            self._drain_deadline = 0.0
+
+    def _draining_locked(self) -> bool:
+        """drain 中か（_state ロック下で呼ぶ）。期限切れは自動的に False。"""
+        return time.monotonic() < self._drain_deadline
 
     def set_max_resident(self, value: int | None) -> None:
         """常駐上限（max_resident）を実行中に変更する。処理中（busy）のモデルは止めない。
@@ -976,6 +1031,8 @@ class GatewayServer(ThreadingHTTPServer):
         session_ttl: float | None = None,
         api_key: str | None = None,
         vision_model: str | None = None,
+        video_frames: int = 8,
+        video_max_edge: int = 768,
     ) -> None:
         super().__init__(addr, _GatewayHandler)
         self.manager = manager
@@ -985,6 +1042,9 @@ class GatewayServer(ThreadingHTTPServer):
         # 画像入りリクエストの振り分け先モデル（None で無効）。画像が壊れている vision モデルを
         # 避け、画像だけを確実に動くモデル（gemma-4 系など）へ流すための任意設定。
         self.vision_model = vision_model
+        # 動画入力: video_url をゲートウェイでフレーム画像列に展開する設定（バックエンド非依存）。
+        self.video_frames = video_frames
+        self.video_max_edge = video_max_edge
         # ネットワーク公開時の API キー（None/空 で認証なし）。chat（/v1/*）と在席セッション
         # （/admin/sessions/*）に Authorization: Bearer <key> を要求する。/admin/status と
         # /admin/config はループバック限定（キーではなく接続元で制限）。
@@ -1126,6 +1186,8 @@ class _GatewayHandler(BaseHTTPRequestHandler):
                 "started_at": srv.started_at,
                 "cwd": srv.start_cwd,
                 "launcher": srv.launcher,
+                # 導入した llama.cpp の素性（build/accel/binary）。未導入は None。
+                "llama": llama_provision_info(),
                 "models": models,
                 # キャッシュにある DL 済みモデル（TUI が未ロード候補として一覧する）。
                 "available": discover_cached_models(),
@@ -1167,6 +1229,20 @@ class _GatewayHandler(BaseHTTPRequestHandler):
         if path.endswith("/admin/config"):
             self._handle_config_update(srv, payload)
             return
+        # 再起動準備（drain）。自動更新が「アイドル確認＋新規受付停止」を原子的に行うために
+        # 使う（→ ModelManager.begin_drain）。ローカルの管理操作なので loopback 限定。
+        if path.endswith("/admin/drain"):
+            if not self._require_loopback():
+                return
+            if payload.get("enable", True):
+                res = srv.manager.begin_drain()
+                send_json(self, 200, {"object": "gateway.drain",
+                                      "draining": res["ok"], **res})
+            else:
+                srv.manager.end_drain()
+                send_json(self, 200, {"object": "gateway.drain",
+                                      "draining": False, "ok": True})
+            return
         if path.endswith("/admin/sessions/register"):
             self._handle_session_register(srv, payload)
             return
@@ -1180,6 +1256,16 @@ class _GatewayHandler(BaseHTTPRequestHandler):
         if not model:
             send_error(self, 400, "no 'model' in the request and no default_model is configured")
             return
+        # 動画入力: video_url をフレーム画像（image_url）列に展開してから先へ進む。展開した
+        # フレームは以降の画像扱い（vision_model 振り分けの対象にもなる）。抽出失敗は 400。
+        if video.request_has_video(payload):
+            try:
+                video.expand_video_parts(
+                    payload, srv.video_frames, srv.video_max_edge)
+            except video.VideoError as exc:
+                send_error(self, 400, f"video input could not be processed: {exc}")
+                return
+            body = json.dumps(payload).encode("utf-8")
         # vision_model が設定されていれば、**画像を含むリクエストはそのモデルへ振り分ける**。
         # 一部の vision モデル（例: Qwen3.6-27B / qwen3_5）は現行 mlx_vlm で画像入力が壊れて
         # いる（get_rope_index のスレッド/ストリーム不具合。MTP の有無に関係なくハング/エラー）。
@@ -1241,6 +1327,10 @@ class _GatewayHandler(BaseHTTPRequestHandler):
         except ValueError as exc:
             # モデル指定/解決の不正（未キャッシュの repo-id 等）。
             send_error(self, 400, f"cannot load model '{model}': {exc}")
+            return
+        except GatewayDraining as exc:
+            # 再起動準備中 → 一時的な 503（openai SDK は自動リトライし、新プロセスへ繋ぎ直る）。
+            send_error(self, 503, str(exc))
             return
         except CapacityError as exc:
             # 全枠が処理中で空かなかった → 混雑（後で再試行を促す）。
@@ -1366,6 +1456,13 @@ class GatewayConfig:
     auto_update: bool = True           # TUI が PyPI 新版を検知したら git pull で自動追従する（既定 true。false で無効）
     vision_model: str | None = None    # 画像入りリクエストの振り分け先モデル（None で無効）。画像が壊れている
                                        # vision モデルを避け、画像だけを確実に動くモデル（gemma-4 系等）へ流す
+    # --- llama.cpp（llama-server）バイナリの自動導入。[llama_cpp] テーブルで設定 ---
+    llama_provision: str = "auto"      # auto=管理dirへ自動DL / system=PATH の llama-server / build=ソースビルド（Phase 3）
+    llama_accel: str = "auto"          # auto=検出（GPU なら vulkan、mac は metal、無ければ cpu）/ cuda / vulkan / metal / cpu
+    llama_build: str | None = None     # ビルド番号の固定（例 "b9946"）。省略で最新を取得し導入済みを使い続ける
+    # --- 動画入力: ゲートウェイが video_url をフレーム画像列へ展開して上流へ渡す ---
+    video_frames: int = 8              # 1 本の動画から等間隔で抜くフレーム数
+    video_max_edge: int = 768          # 各フレームの縮小サイズ（長辺ピクセル）
 
 
 def _resolve_model_draft(
@@ -1516,6 +1613,28 @@ def load_gateway_config(path: str) -> GatewayConfig:
         if not (0.0 < max_memory_fraction <= 1.0):
             raise ValueError("max_memory_fraction must be in (0, 1]")
 
+    # [llama_cpp] テーブル: llama-server バイナリの自動導入設定（すべて省略可＝全自動）。
+    llama = data.get("llama_cpp") or {}
+    if not isinstance(llama, dict):
+        raise ValueError("[llama_cpp] must be a table")
+    llama_provision = str(llama.get("provision", "auto"))
+    if llama_provision not in ("auto", "system", "build"):
+        raise ValueError("llama_cpp.provision must be auto / system / build")
+    llama_accel = str(llama.get("accel", "auto"))
+    if llama_accel not in ("auto", "cuda", "vulkan", "metal", "cpu"):
+        raise ValueError("llama_cpp.accel must be auto / cuda / vulkan / metal / cpu")
+    llama_build = llama.get("pin")
+    if llama_build is not None:
+        llama_build = str(llama_build).strip() or None
+
+    # 動画入力のフレーム展開設定。省略で 8 フレーム / 長辺 768px。
+    video_frames = int(data.get("video_frames", 8))
+    if video_frames < 1:
+        raise ValueError("video_frames must be 1 or greater")
+    video_max_edge = int(data.get("video_max_edge", 768))
+    if video_max_edge < 64:
+        raise ValueError("video_max_edge must be 64 or greater")
+
     entries = data.get("models") or []
     if not isinstance(entries, list):
         raise ValueError("[[models]] must be an array")
@@ -1576,6 +1695,11 @@ def load_gateway_config(path: str) -> GatewayConfig:
         api_key=api_key,
         auto_update=auto_update,
         vision_model=vision_model,
+        llama_provision=llama_provision,
+        llama_accel=llama_accel,
+        llama_build=llama_build,
+        video_frames=video_frames,
+        video_max_edge=video_max_edge,
     )
 
 
@@ -1583,7 +1707,11 @@ def load_gateway_config(path: str) -> GatewayConfig:
 _CONFIG_POLL_INTERVAL = 1.0
 # 稼働中には変えられない構造設定（ソケットは bind 済み、内部ポート割当は起動時に固定）。
 # 変更を検知したら「要再起動」を警告するだけで、サーバーは止めず旧値のまま動かし続ける。
-_RESTART_ONLY_FIELDS = ("host", "port", "internal_base_port", "models")
+_RESTART_ONLY_FIELDS = (
+    "host", "port", "internal_base_port", "models",
+    # llama-server バイナリは起動時に導入・解決するため、変更は再起動が要る。
+    "llama_provision", "llama_accel", "llama_build",
+)
 
 
 def apply_live_config(
@@ -1624,6 +1752,12 @@ def apply_live_config(
     if cfg.vision_model != new.vision_model:
         note("vision_model", cfg.vision_model, new.vision_model)
         server.vision_model = new.vision_model
+    if cfg.video_frames != new.video_frames:
+        note("video_frames", cfg.video_frames, new.video_frames)
+        server.video_frames = new.video_frames
+    if cfg.video_max_edge != new.video_max_edge:
+        note("video_max_edge", cfg.video_max_edge, new.video_max_edge)
+        server.video_max_edge = new.video_max_edge
     if cfg.default_model != new.default_model:
         note("default_model", cfg.default_model, new.default_model)
         server.default_model = new.default_model
@@ -1773,12 +1907,57 @@ def run_gateway(cfg: GatewayConfig, config_path: str | None = None) -> int:
         lock.release()
 
 
+def _llama_cpp_in_use(cfg: GatewayConfig) -> bool:
+    """この構成で llama-server（llama-cpp）が使われ得るか。
+
+    - 事前登録に llama-cpp モデルがあれば True。
+    - 動的ロード有効で OS 既定バックエンドが llama-cpp（＝非 Apple Silicon）なら True。
+    Apple Silicon で llama-cpp モデルの登録が無い場合は、既定が mlx-vlm なので False
+    （GGUF を明示要求したときだけ llama-server が要る。その場合は PATH / system で賄う）。
+    """
+    if any(c.backend == "llama-cpp" for c in cfg.models):
+        return True
+    return cfg.dynamic and DEFAULT_BACKEND == "llama-cpp"
+
+
+def provision_llama_if_needed(cfg: GatewayConfig) -> None:
+    """必要なら起動時に llama-server を自動導入し、build_command に使わせる。
+
+    ダウンロード（初回のみ）を初回推論のレイテンシに混ぜないよう起動時に済ませる。
+    導入に失敗してもゲートウェイは起動する（mlx 等は動く。llama-cpp モデルの要求時に
+    分かりやすいエラーになる）。llama-cpp を使わない構成では何もしない（macOS で不要な
+    ダウンロードをしないため）。
+    """
+    if not _llama_cpp_in_use(cfg):
+        return
+    try:
+        binary = provisioner.ensure_llama_server(
+            provision=cfg.llama_provision,
+            accel=cfg.llama_accel,
+            build=cfg.llama_build,
+        )
+    except Exception as exc:  # noqa: BLE001 - 導入失敗で起動を止めない（オフライン・未知アーキ等も含む）
+        print(f"llama.cpp provisioning failed (continuing without it): {exc}",
+              file=sys.stderr)
+        return
+    # 実際に解決された素性（実ビルド番号・accel）はプロビジョナが記録している。
+    # system はユーザー管理バイナリで素性不明（accel=None）→ auto フラグ付与の対象外になる。
+    info = provisioner.last_info() or {}
+    set_llama_server_binary(
+        binary, build=info.get("build"), accel=info.get("accel"),
+        provision=info.get("provision", cfg.llama_provision))
+    print(f"llama.cpp ready: {binary} (provision={cfg.llama_provision}, "
+          f"build={info.get('build') or '-'}, accel={info.get('accel') or '-'})",
+          file=sys.stderr)
+
+
 def _run_gateway_locked(cfg: GatewayConfig, config_path: str | None = None) -> int:
     """単一起動ロック取得済みで実際にゲートウェイを回す本体（run_gateway が呼ぶ）。
 
     `config_path` が渡されれば、gateway.toml を保存した瞬間に設定を無停止で反映する
     ホットリロード監視スレッドを起動する（→ apply_live_config）。
     """
+    provision_llama_if_needed(cfg)
     manager = ModelManager(
         cfg.models, max_resident=cfg.max_resident, load_timeout=cfg.load_timeout,
         start_timeout=cfg.start_timeout,
@@ -1799,6 +1978,8 @@ def _run_gateway_locked(cfg: GatewayConfig, config_path: str | None = None) -> i
         session_ttl=cfg.session_ttl,
         api_key=cfg.api_key,
         vision_model=cfg.vision_model,
+        video_frames=cfg.video_frames,
+        video_max_edge=cfg.video_max_edge,
     )
     public = f"http://{cfg.host}:{cfg.port}/v1"
     wildcard = cfg.host in ("0.0.0.0", "")

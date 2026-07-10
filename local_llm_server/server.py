@@ -35,6 +35,77 @@ def default_backend() -> str:
 DEFAULT_BACKEND = default_backend()
 
 
+# llama-server 実行ファイルのパス。ゲートウェイ起動時にプロビジョナ（provisioner）が解決して
+# set_llama_server_binary() で差し込む。未設定なら PATH の "llama-server"（従来挙動 / system）。
+_LLAMA_SERVER_BIN: str | None = None
+# 導入した llama.cpp の素性（build/accel/binary/provision）。/admin/status・TUI 表示用。
+_LLAMA_INFO: dict | None = None
+
+
+def set_llama_server_binary(
+    path: str | None, *, build: str | None = None, accel: str | None = None,
+    provision: str | None = None,
+) -> None:
+    """起動時にプロビジョナが解決した llama-server の絶対パス（と素性）を登録する。"""
+    global _LLAMA_SERVER_BIN, _LLAMA_INFO
+    _LLAMA_SERVER_BIN = path
+    _LLAMA_INFO = None if path is None else {
+        "binary": path, "build": build, "accel": accel, "provision": provision,
+    }
+
+
+def llama_server_binary() -> str:
+    """build_command が使う llama-server コマンド（未プロビジョン時は PATH 探索の名前）。"""
+    return _LLAMA_SERVER_BIN or "llama-server"
+
+
+def llama_provision_info() -> dict | None:
+    """導入済み llama.cpp の素性（未導入は None）。/admin/status・TUI が表示に使う。"""
+    return _LLAMA_INFO
+
+
+def _physical_cores() -> int:
+    """物理コア数（ハイパースレッド/E コアを除く。取れなければ論理コア数）。"""
+    try:
+        import psutil
+        n = psutil.cpu_count(logical=False)
+        if n:
+            return int(n)
+    except Exception:  # noqa: BLE001 - psutil 不在・取得失敗はフォールバック
+        pass
+    return os.cpu_count() or 4
+
+
+# 既にユーザーが extra_args で指定していれば自動付与しないフラグ群（等価表記も含む）。
+_NGL_FLAGS = ("-ngl", "--n-gpu-layers", "--gpu-layers")
+_THREAD_FLAGS = ("-t", "--threads")
+
+
+def auto_llama_flags(config: "ServerConfig") -> list[str]:
+    """自動導入した llama.cpp の accel に応じた計算効率フラグ（ユーザー未指定時のみ）。
+
+    - GPU（accel が cpu 以外）: `-ngl 999`（全層 GPU オフロード。llama.cpp が実層数に丸める）。
+    - CPU（accel == cpu）: `--threads <物理コア数>`（既定の論理コア数より CPU 推論で速いことが多い）。
+    自動導入していない（provision=system 等で素性不明）ときは何もしない
+    （利用者が自分でフラグ管理している前提。既存挙動を壊さない）。
+    """
+    info = llama_provision_info()
+    if not info:
+        return []
+    accel = info.get("accel")
+    if not accel:
+        # provision=system（素性不明のユーザー管理バイナリ）は accel=None → 何も足さない。
+        return []
+    extra = config.extra_args
+    if accel != "cpu":
+        if not any(a in _NGL_FLAGS for a in extra):
+            return ["-ngl", "999"]
+        return []
+    if not any(a in _THREAD_FLAGS for a in extra):
+        return ["--threads", str(_physical_cores())]
+    return []
+
+
 # STT（音声→テキスト）モデルの id 判定に使う語。whisper 系は id に "mlx" を含む
 # （例 mlx-community/whisper-large-v3-mlx）ため、mlx-vlm 判定より先に見る必要がある。
 _STT_HINTS = ("whisper", "parakeet")
@@ -741,7 +812,7 @@ def build_command(config: ServerConfig) -> list[str]:
         # （キャッシュに無ければ ValueError。クライアントに見せる ID は repo-id のまま）。
         model_path = resolve_gguf(config.model)
         command = [
-            "llama-server",
+            llama_server_binary(),  # プロビジョナが導入した絶対パス、無ければ PATH の "llama-server"
             "-m", model_path,
             "--host", config.host,
             "--port", str(config.port),
@@ -773,6 +844,8 @@ def build_command(config: ServerConfig) -> list[str]:
                 command += ["-md", draft_path]
                 if "mtp" in os.path.basename(draft_path).lower():
                     command += ["--spec-type", "draft-mtp"]
+        # 計算効率の自動チューニング（自動導入バイナリの accel に合わせる。extra_args 優先）。
+        command += auto_llama_flags(config)
     elif config.backend == "whisper":
         # mlx-whisper を OpenAI 互換の STT サーバ（1 モデル 1 プロセス）として起動する。
         # 専用サーバは同梱の local_llm_server.stt_server（標準ライブラリのみ）。
@@ -1097,7 +1170,9 @@ class GatewayLock:
             os.close(fd)
             raise GatewayAlreadyRunning(pid, self._path) from exc
         # 取得できた → 自分の PID を記録（失敗した取得者がこれを読んで相手を示す）。
+        # Windows のロックは番兵オフセットへ seek した状態なので、書き込み前に必ず先頭へ戻す。
         try:
+            os.lseek(fd, 0, os.SEEK_SET)
             os.ftruncate(fd, 0)
             os.write(fd, f"{os.getpid()}\n".encode())
         except OSError:
@@ -1130,15 +1205,21 @@ class GatewayLock:
 # --- プラットフォーム別のファイルロック実装 -----------------------------------
 # POSIX は fcntl.flock、Windows は msvcrt.locking を使う。どちらも「他プロセスが
 # 握っていれば即エラー（非ブロッキング）」で、プロセス終了時に OS が自動解放する。
+#
+# Windows の msvcrt.locking は POSIX の flock（advisory）と違い**強制ロック**で、
+# ロックした領域は他ハンドルからの読み書きもブロックされる。そのため保持者 PID は
+# ファイル先頭に書き、ロックは PID データと重ならない**高オフセットの番兵 1 バイト**に掛ける
+# （EOF を越えた領域もロック可）。こうすれば _read_lock_pid が先頭の PID を普通に読める。
+_LOCK_SENTINEL_OFFSET = 1 << 30  # 1 GiB 目。PID 文字列（先頭数バイト）と絶対に重ならない
 if os.name == "nt":  # pragma: no cover - Windows 専用パス
     import msvcrt
 
     def _flock_exclusive_nb(fd: int) -> None:
-        os.lseek(fd, 0, os.SEEK_SET)
+        os.lseek(fd, _LOCK_SENTINEL_OFFSET, os.SEEK_SET)
         msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
 
     def _flock_unlock(fd: int) -> None:
-        os.lseek(fd, 0, os.SEEK_SET)
+        os.lseek(fd, _LOCK_SENTINEL_OFFSET, os.SEEK_SET)
         msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
 else:
     import fcntl
@@ -1224,6 +1305,46 @@ def gateway_admin_status(
     return data if isinstance(data, dict) else None
 
 
+def bench_model(
+    model: str,
+    base_url: str = "http://127.0.0.1:8799/v1",
+    *,
+    api_key: str | None = None,
+    max_tokens: int = 128,
+    timeout: float = 180.0,
+) -> dict:
+    """モデルに短文生成を投げ、生成スループット（tok/s）を測る（チューニング効果の確認用）。
+
+    非ストリームで `max_tokens` トークンを生成させ、応答の usage.completion_tokens を
+    実測秒数で割る。初回はモデルロード込みなので、TUI 側は「2 回目」を測るとよい。
+    戻り値: {"model", "tokens", "seconds", "tok_per_s"}。失敗は RuntimeError。
+    """
+    body = json.dumps({
+        "model": model,
+        "messages": [{"role": "user",
+                      "content": "Write a short story about the sea."}],
+        "max_tokens": max_tokens,
+        "temperature": 0.0,
+        "stream": False,
+    }).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    req = urllib.request.Request(f"{base_url}/chat/completions", data=body,
+                                 headers=headers)
+    t0 = time.monotonic()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        raise RuntimeError(f"bench request failed: {exc}") from exc
+    seconds = time.monotonic() - t0
+    tokens = int((data.get("usage") or {}).get("completion_tokens") or 0)
+    tps = tokens / seconds if seconds > 0 else 0.0
+    return {"model": model, "tokens": tokens, "seconds": round(seconds, 2),
+            "tok_per_s": round(tps, 1)}
+
+
 def gateway_set_max_resident(
     value: int | None,
     host: str = "127.0.0.1",
@@ -1238,6 +1359,34 @@ def gateway_set_max_resident(
     """
     url = f"http://{host}:{port}/admin/config"
     body = json.dumps({"max_resident": value}).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=body, headers={"Content-Type": "application/json"}, method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            if resp.status != 200:
+                return None
+            data = json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def gateway_drain(
+    enable: bool = True,
+    host: str = "127.0.0.1",
+    port: int = 8799,
+    timeout: float = 5.0,
+) -> dict | None:
+    """稼働中のゲートウェイに POST /admin/drain で再起動準備を要求する（TUI の自動更新用）。
+
+    enable=True: ゲートウェイが原子的に「処理中 0・在席 0」を確認し、満たせば新規受付を
+    止めて {"draining": True} を返す。busy なら {"draining": False, "inflight": n,
+    "sessions": n}（何も変えない）。enable=False で解除。応答しない（未起動・旧版で
+    エンドポイントが無い）ときは None。
+    """
+    url = f"http://{host}:{port}/admin/drain"
+    body = json.dumps({"enable": enable}).encode("utf-8")
     req = urllib.request.Request(
         url, data=body, headers={"Content-Type": "application/json"}, method="POST"
     )

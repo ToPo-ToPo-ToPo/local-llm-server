@@ -1,11 +1,42 @@
 # llama.cpp バックエンドの導入
 
 - GGUF（`org/repo` に `.gguf` を含む）のモデルは、llama.cpp の **`llama-server` バイナリ**を呼び出して提供する。
-- ゲートウェイ本体は `llama-server` を **PATH 上から実行するだけ**なので、必要なのは「`llama-server` が　PATH に通っていること」だけ。
+- **`llama-server` はゲートウェイが自動導入する**（下記「自動導入」）。手動インストールや PATH 設定は
+  基本不要。すでに PATH に `llama-server` があればそれを使わせることもできる（`provision = "system"`）。
 - Python バインディング（`llama-cpp-python`）とは別物なので、uv add では使えない点に注意。
 - 導入後は**事前登録なしでよい** —— クライアントが GGUF の repo-id を `model` に指定すれば、バックエンドは
   ID から llama-cpp と推論されて動的ロードされる（画像入力の mmproj も自動検出）。`parallel` や MTP、
   `llama-server` への個別フラグが要るモデルだけ `gateway.toml` の `[[models]]` に書く（→ [docs/gateway.md](gateway.md)）。
+
+## 自動導入（`[llama_cpp]`）
+
+ゲートウェイは、llama-cpp を使う構成なら**起動時に `llama-server` を自動でダウンロード・導入**する
+（ggml-org/llama.cpp の公式 Releases から、OS・CPU アーキ・アクセラレータを検出して合うプリビルトを
+取得。管理ディレクトリ `~/.cache/local-llm-server/llama.cpp/`（Windows は `%LOCALAPPDATA%`）に置き、
+PATH は汚さず絶対パスで起動する）。導入したビルド番号・アクセラレータは TUI と `GET /admin/status`
+（`llama` フィールド）で確認できる。
+
+```toml
+[llama_cpp]              # すべて省略可（＝全自動）
+provision = "auto"       # auto: 自動DL（既定）/ system: PATH の llama-server を使う / build: ソースビルド
+accel = "auto"           # auto: 検出 / cuda / vulkan / metal / cpu を明示
+pin = "b9946"            # ビルド番号を固定（省略で最新を取得し、以後は導入済みを使い続ける）
+```
+
+- **アクセラレータの自動選択**: macOS は Metal（バイナリ内蔵）。Linux/Windows は GPU を検出できれば
+  **Vulkan**（NVIDIA/AMD/Intel 共通・追加ランタイム不要）、無ければ CPU。誤検出時や CUDA を使いたい
+  ときは `accel` を明示する（**CUDA は Windows 限定**。別途 cudart が要る。Linux の NVIDIA は Vulkan 推奨）。
+- **計算効率の自動チューニング**: GPU なら `-ngl 999`（全層 GPU オフロード）、CPU なら `--threads`
+  （物理コア数）を自動付与する（`[[models]]` の `extra_args` で明示すればそちらが優先）。生成スループット
+  は TUI の `bench [model]` で tok/s を実測できる。
+- **ソースビルド（`provision = "build"`）**: cmake で指定ビルドをその場でビルドする（`-march=native`
+  最適化や配布版に無い構成が欲しい上級者向け）。cmake/git が無い・ビルド失敗時は自動でプリビルトへ
+  フォールバックするので、ゲートウェイが立たなくなることはない。
+- **macOS の注意**: Apple Silicon は既定が mlx-vlm なので、llama-cpp を使うときだけ導入される
+  （`[[models]]` に `backend = "llama-cpp"` を登録するか GGUF を要求する構成）。
+
+以下の「OS 別の主導線」「配布バイナリ」「ソースビルド」は、`provision = "system"` で自分の
+`llama-server` を使いたいとき向けの手動導入手順（自動導入を使うなら読まなくてよい）。
 
 ## model の書き方（HF repo-id）
 

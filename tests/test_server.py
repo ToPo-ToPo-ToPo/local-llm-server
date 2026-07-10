@@ -56,6 +56,18 @@ def test_build_command_llama_parallel_and_thinking(hf_cache):
     assert "--chat-template-kwargs" in cmd
 
 
+def test_build_command_uses_provisioned_llama_binary(hf_cache, monkeypatch):
+    # プロビジョナが導入した絶対パスが build_command の先頭に入る（未設定なら "llama-server"）。
+    hf_cache("org/m-gguf", ["m-Q4_K_M.gguf"])
+    c = ServerConfig("llama-cpp", "org/m-gguf")
+    assert build_command(c)[0] == "llama-server"          # 既定（未プロビジョン）
+    try:
+        srv.set_llama_server_binary("/managed/b9946/bin/llama-server")
+        assert build_command(c)[0] == "/managed/b9946/bin/llama-server"
+    finally:
+        srv.set_llama_server_binary(None)                 # 他テストへ影響させない
+
+
 def test_resolve_gguf_rejects_non_repo_id(hf_cache):
     # model は HF repo-id 専用。実パスや repo-id 形式でないものは弾く
     for bad in ["/abs/model.gguf", "./rel.gguf", "just-a-name", "a/b/c"]:
@@ -340,11 +352,13 @@ def test_install_shutdown_handlers_converts_sigterm(monkeypatch):
     # SIGTERM を KeyboardInterrupt に変換して、各エントリポイントの finally（stop）を通す。
     import os
     import signal
-    import sys
     from local_llm_server import install_shutdown_handlers
 
-    if not hasattr(signal, "SIGTERM"):
-        return  # POSIX 以外はスキップ
+    # Windows も SIGTERM を持つが、os.kill(pid, SIGTERM) は TerminateProcess として即プロセスを
+    # 殺す（登録ハンドラは走らない）ため、この変換はそもそも成立せずテストプロセス自体が死ぬ。
+    # SIGTERM/SIGHUP 変換は POSIX の運用（kill・端末クローズ）向けなので Windows では skip する。
+    if os.name == "nt":
+        pytest.skip("SIGTERM conversion is POSIX-only (os.kill terminates on Windows)")
     original = signal.getsignal(signal.SIGTERM)
     try:
         install_shutdown_handlers()
@@ -646,3 +660,78 @@ def test_start_gateway_background_marks_launcher_env(tmp_path, monkeypatch):
     env = calls["kwargs"]["env"]
     assert env["LOCAL_LLM_GW_LAUNCHER"] == "tui"
     assert "PATH" in env  # os.environ を引き継いだ上でマークを足している
+
+
+def test_auto_llama_flags_gpu_offloads_all_layers(hf_cache, monkeypatch):
+    # GPU（vulkan）で自動導入されていれば -ngl 999 が付く（全層オフロード）。
+    hf_cache("org/m-gguf", ["m-Q4_K_M.gguf"])
+    monkeypatch.setattr(srv, "llama_provision_info",
+                        lambda: {"accel": "vulkan", "build": "b9946"})
+    cmd = build_command(ServerConfig("llama-cpp", "org/m-gguf"))
+    assert "-ngl" in cmd and "999" in cmd
+    assert "--threads" not in cmd  # GPU 時はスレッド指定しない
+
+
+def test_auto_llama_flags_cpu_sets_threads(hf_cache, monkeypatch):
+    hf_cache("org/m-gguf", ["m-Q4_K_M.gguf"])
+    monkeypatch.setattr(srv, "llama_provision_info", lambda: {"accel": "cpu"})
+    monkeypatch.setattr(srv, "_physical_cores", lambda: 8)
+    cmd = build_command(ServerConfig("llama-cpp", "org/m-gguf"))
+    assert cmd[cmd.index("--threads") + 1] == "8"
+    assert "-ngl" not in cmd
+
+
+def test_auto_llama_flags_respects_user_extra_args(hf_cache, monkeypatch):
+    # ユーザーが -ngl を明示していれば自動付与しない（尊重する）。
+    hf_cache("org/m-gguf", ["m-Q4_K_M.gguf"])
+    monkeypatch.setattr(srv, "llama_provision_info", lambda: {"accel": "vulkan"})
+    c = ServerConfig("llama-cpp", "org/m-gguf", extra_args=["-ngl", "20"])
+    cmd = build_command(c)
+    assert cmd.count("-ngl") == 1 and "20" in cmd and "999" not in cmd
+
+
+def test_auto_llama_flags_noop_when_not_provisioned(hf_cache, monkeypatch):
+    # 自動導入していない（system 等）なら何も足さない（既存挙動を壊さない）。
+    hf_cache("org/m-gguf", ["m-Q4_K_M.gguf"])
+    monkeypatch.setattr(srv, "llama_provision_info", lambda: None)
+    cmd = build_command(ServerConfig("llama-cpp", "org/m-gguf"))
+    assert "-ngl" not in cmd and "--threads" not in cmd
+
+
+def test_bench_model_computes_tok_per_s(monkeypatch):
+    # bench_model は usage.completion_tokens を実測秒で割って tok/s を出す。
+    import json as _json
+    import local_llm_server.server as s
+
+    class _Resp:
+        status = 200
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self):
+            return _json.dumps({"usage": {"completion_tokens": 100}}).encode()
+
+    times = iter([10.0, 12.0])  # 2 秒経過
+    monkeypatch.setattr(s.time, "monotonic", lambda: next(times))
+    monkeypatch.setattr(s.urllib.request, "urlopen", lambda req, timeout=0: _Resp())
+    r = s.bench_model("org/m", base_url="http://x/v1")
+    assert r["tokens"] == 100 and r["seconds"] == 2.0 and r["tok_per_s"] == 50.0
+
+
+def test_bench_model_raises_on_failure(monkeypatch):
+    import local_llm_server.server as s
+
+    def boom(req, timeout=0):
+        raise OSError("refused")
+
+    monkeypatch.setattr(s.urllib.request, "urlopen", boom)
+    with pytest.raises(RuntimeError):
+        s.bench_model("org/m")
+
+
+def test_auto_llama_flags_none_accel_is_noop(hf_cache, monkeypatch):
+    # provision=system は accel=None で記録される → 素性不明バイナリにフラグを足さない。
+    hf_cache("org/m-gguf", ["m-Q4_K_M.gguf"])
+    monkeypatch.setattr(srv, "llama_provision_info",
+                        lambda: {"accel": None, "provision": "system"})
+    cmd = build_command(ServerConfig("llama-cpp", "org/m-gguf"))
+    assert "-ngl" not in cmd and "--threads" not in cmd

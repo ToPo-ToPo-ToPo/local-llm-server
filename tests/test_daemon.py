@@ -1555,3 +1555,259 @@ def test_launcher_defaults_to_headless(tmp_path, monkeypatch):
         assert server.launcher == "headless"
     finally:
         server.server_close(); mgr.shutdown()
+
+
+# --- llama.cpp 自動導入（provisioner）の配線 --------------------------------------
+
+def test_load_gateway_config_parses_llama_cpp_defaults(tmp_path):
+    cfg = gw.load_gateway_config(_write(tmp_path, "port = 8799\n"))
+    assert cfg.llama_provision == "auto"
+    assert cfg.llama_accel == "auto"
+    assert cfg.llama_build is None
+
+
+def test_load_gateway_config_parses_llama_cpp_table(tmp_path):
+    cfg = gw.load_gateway_config(_write(
+        tmp_path,
+        '[llama_cpp]\nprovision = "system"\naccel = "cuda"\npin = "b9946"\n'))
+    assert cfg.llama_provision == "system"
+    assert cfg.llama_accel == "cuda"
+    assert cfg.llama_build == "b9946"
+
+
+def test_load_gateway_config_rejects_bad_llama_values(tmp_path):
+    with pytest.raises(ValueError):
+        gw.load_gateway_config(_write(tmp_path, '[llama_cpp]\nprovision = "nope"\n'))
+    with pytest.raises(ValueError):
+        gw.load_gateway_config(_write(tmp_path, '[llama_cpp]\naccel = "opencl"\n'))
+
+
+def test_llama_cpp_in_use_true_when_llama_model_registered(tmp_path):
+    cfg = gw.load_gateway_config(_write(
+        tmp_path,
+        'dynamic = false\n[[models]]\nmodel = "org/m.gguf"\nbackend = "llama-cpp"\n'))
+    assert gw._llama_cpp_in_use(cfg) is True
+
+
+def test_llama_cpp_in_use_follows_os_default_for_dynamic(tmp_path, monkeypatch):
+    cfg = gw.load_gateway_config(_write(tmp_path, "dynamic = true\n"))
+    monkeypatch.setattr(gw, "DEFAULT_BACKEND", "llama-cpp")   # Linux/Windows 相当
+    assert gw._llama_cpp_in_use(cfg) is True
+    monkeypatch.setattr(gw, "DEFAULT_BACKEND", "mlx-vlm")     # Apple Silicon 相当
+    assert gw._llama_cpp_in_use(cfg) is False
+
+
+def test_provision_llama_sets_binary_when_used(tmp_path, monkeypatch):
+    cfg = gw.load_gateway_config(_write(
+        tmp_path,
+        'dynamic = false\n[[models]]\nmodel = "org/m.gguf"\nbackend = "llama-cpp"\n'))
+    monkeypatch.setattr(gw.provisioner, "ensure_llama_server",
+                        lambda **k: "/managed/llama-server")
+    set_calls = []
+    monkeypatch.setattr(gw, "set_llama_server_binary",
+                        lambda p, **k: set_calls.append(p))
+    gw.provision_llama_if_needed(cfg)
+    assert set_calls == ["/managed/llama-server"]
+
+
+def test_provision_llama_skipped_when_not_used(tmp_path, monkeypatch):
+    # Apple Silicon 相当・llama-cpp モデル無し → 何も導入しない（無駄 DL しない）。
+    cfg = gw.load_gateway_config(_write(tmp_path, "dynamic = true\n"))
+    monkeypatch.setattr(gw, "DEFAULT_BACKEND", "mlx-vlm")
+    called = []
+    monkeypatch.setattr(gw.provisioner, "ensure_llama_server",
+                        lambda **k: called.append(1) or "x")
+    gw.provision_llama_if_needed(cfg)
+    assert called == []
+
+
+def test_provision_llama_continues_on_failure(tmp_path, monkeypatch):
+    # 導入失敗でもゲートウェイは起動を続ける（binary は差し込まれない）。
+    cfg = gw.load_gateway_config(_write(
+        tmp_path,
+        'dynamic = false\n[[models]]\nmodel = "org/m.gguf"\nbackend = "llama-cpp"\n'))
+
+    def boom(**k):
+        raise gw.provisioner.ProvisionError("no network")
+
+    monkeypatch.setattr(gw.provisioner, "ensure_llama_server", boom)
+    set_calls = []
+    monkeypatch.setattr(gw, "set_llama_server_binary",
+                        lambda p, **k: set_calls.append(p))
+    gw.provision_llama_if_needed(cfg)  # 例外を投げない
+    assert set_calls == []
+
+
+def test_admin_status_includes_llama_info(tmp_path, monkeypatch):
+    # 導入した llama.cpp の素性（build/accel）が /admin/status に出る。
+    from local_llm_server import server as srv_mod
+    cfg = gw.load_gateway_config(_write(tmp_path, "port = 8799\n"))
+    server, mgr = _live_server(cfg)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        srv_mod.set_llama_server_binary(
+            "/managed/b9946/bin/llama-server", build="b9946", accel="vulkan",
+            provision="auto")
+        st, obj = _get(server.server_address[1], "/admin/status")
+        assert obj["llama"]["build"] == "b9946"
+        assert obj["llama"]["accel"] == "vulkan"
+        # 未導入に戻すと None。
+        srv_mod.set_llama_server_binary(None)
+        _, obj2 = _get(server.server_address[1], "/admin/status")
+        assert obj2["llama"] is None
+    finally:
+        srv_mod.set_llama_server_binary(None)
+        server.shutdown(); server.server_close(); mgr.shutdown()
+
+
+# --- 動画入力: ゲートウェイでのフレーム展開 --------------------------------------
+
+def test_load_gateway_config_parses_video_settings(tmp_path):
+    cfg = gw.load_gateway_config(_write(tmp_path, "video_frames = 4\nvideo_max_edge = 512\n"))
+    assert cfg.video_frames == 4 and cfg.video_max_edge == 512
+    # 既定。
+    d = gw.load_gateway_config(_write(tmp_path, "port = 8799\n"))
+    assert d.video_frames == 8 and d.video_max_edge == 768
+    with pytest.raises(ValueError):
+        gw.load_gateway_config(_write(tmp_path, "video_frames = 0\n"))
+
+
+def test_gateway_expands_video_before_forwarding(monkeypatch):
+    # video_url を含む chat は、上流へ届く前にフレーム画像（image_url）へ展開される。
+    up = _make_upstream("vid-up")
+    monkeypatch.setattr(gw, "LocalServer",
+                        lambda config, log_path=None: _FakeServer(config, log_path))
+    # ffmpeg を呼ばずにフレームを返す（3 枚）。
+    monkeypatch.setattr(gw.video, "extract_frames", lambda url, n, edge: [b"f1", b"f2", b"f3"])
+    configs = [ServerConfig(backend="mlx-vlm", model="m", host="127.0.0.1",
+                            port=up.server_address[1])]
+    mgr = gw.ModelManager(configs, dynamic=False)
+    server = gw.GatewayServer(("127.0.0.1", 0), mgr, catalog=["m"],
+                              video_frames=3, video_max_edge=256)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        port = server.server_address[1]
+        # 上流に届いた body を記録するため、_make_upstream は body を echo しないので
+        # ここでは「200 で通ること＋展開でエラーにならないこと」を確認する。
+        msg = [{"role": "user", "content": [
+            {"type": "video_url", "video_url": {"url": "http://x/v.mp4"}}]}]
+        s, o = _post(port, "/v1/chat/completions", {"model": "m", "messages": msg})
+        assert s == 200 and o["backend"] == "vid-up"
+    finally:
+        server.shutdown(); server.server_close(); mgr.shutdown()
+        up.shutdown(); up.server_close()
+
+
+def test_gateway_video_extract_failure_returns_400(monkeypatch):
+    up = _make_upstream("vid-up")
+    monkeypatch.setattr(gw, "LocalServer",
+                        lambda config, log_path=None: _FakeServer(config, log_path))
+
+    def boom(url, n, edge):
+        raise gw.video.VideoError("no ffmpeg")
+
+    monkeypatch.setattr(gw.video, "extract_frames", boom)
+    configs = [ServerConfig(backend="mlx-vlm", model="m", host="127.0.0.1",
+                            port=up.server_address[1])]
+    mgr = gw.ModelManager(configs, dynamic=False)
+    server = gw.GatewayServer(("127.0.0.1", 0), mgr, catalog=["m"])
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        port = server.server_address[1]
+        msg = [{"role": "user", "content": [
+            {"type": "video_url", "video_url": {"url": "http://x/v.mp4"}}]}]
+        s, o = _post(port, "/v1/chat/completions", {"model": "m", "messages": msg})
+        assert s == 400
+    finally:
+        server.shutdown(); server.server_close(); mgr.shutdown()
+        up.shutdown(); up.server_close()
+
+
+# --- drain（再起動準備: アイドル確認＋新規受付停止を原子的に）------------------------
+# 自動更新の再起動で「確認と kill の間に生成が滑り込んで落ちる」事故を防ぐ仕組み。
+
+def test_begin_drain_refuses_when_inflight():
+    mgr = gw.ModelManager([], dynamic=True)
+    _install_instance(mgr, "busy-model", alive=True, inflight=2, port=9001)
+    res = mgr.begin_drain()
+    assert res["ok"] is False and res["inflight"] == 2
+    # 拒否時は何も変わらない（新規受付は止まらない）。
+    with mgr._state:
+        assert mgr._draining_locked() is False
+
+
+def test_begin_drain_refuses_when_sessions_present():
+    mgr = gw.ModelManager([], dynamic=True)
+    mgr.register_session("agent-1", "some/model")
+    res = mgr.begin_drain()
+    assert res["ok"] is False and res["sessions"] == 1
+
+
+def test_begin_drain_ok_when_idle_then_acquire_rejected():
+    mgr = gw.ModelManager([], dynamic=True)
+    _install_instance(mgr, "m", alive=True, inflight=0, port=9001)
+    assert mgr.begin_drain()["ok"] is True
+    # drain 中の新規 acquire は GatewayDraining（ハンドラで 503 になる）。
+    with pytest.raises(gw.GatewayDraining):
+        mgr.acquire("m")
+    # 解除すれば通常に戻る。
+    mgr.end_drain()
+    addr, inst = mgr.acquire("m")
+    mgr.release(inst)
+
+
+def test_drain_expires_after_ttl():
+    # 再起動側が死んで drain だけ残っても、TTL で自動復帰する（受付不能のまま固まらない）。
+    mgr = gw.ModelManager([], dynamic=True)
+    _install_instance(mgr, "m", alive=True, port=9001)
+    assert mgr.begin_drain(ttl=0.05)["ok"] is True
+    time.sleep(0.1)
+    addr, inst = mgr.acquire("m")  # 期限切れ → 受け付ける
+    mgr.release(inst)
+
+
+def test_admin_drain_endpoint_and_503(monkeypatch):
+    # HTTP レベル: /admin/drain で開始→chat は 503、enable=false で解除→200。
+    server, mgr, ups = _start_gateway(monkeypatch)
+    try:
+        port = server.server_address[1]
+        # ウォームアップ（m1 をロード）後、アイドルなので drain が通る。
+        s, o = _post(port, "/v1/chat/completions",
+                     {"model": "m1", "messages": [{"role": "user", "content": "hi"}]})
+        assert s == 200
+        s, o = _post(port, "/admin/drain", {"enable": True})
+        assert s == 200 and o["draining"] is True
+        # drain 中の chat は 503（クライアントの自動リトライ対象）。
+        s, o = _post(port, "/v1/chat/completions",
+                     {"model": "m1", "messages": [{"role": "user", "content": "hi"}]})
+        assert s == 503
+        # 解除すれば受け付ける。
+        s, o = _post(port, "/admin/drain", {"enable": False})
+        assert s == 200 and o["draining"] is False
+        s, o = _post(port, "/v1/chat/completions",
+                     {"model": "m1", "messages": [{"role": "user", "content": "hi"}]})
+        assert s == 200
+    finally:
+        server.shutdown(); server.server_close(); mgr.shutdown()
+        for u in ups:
+            u.shutdown(); u.server_close()
+
+
+def test_admin_drain_refused_while_busy(monkeypatch):
+    # 処理中（inflight>0）は drain が開始されず、既存の生成は無傷のまま。
+    server, mgr, ups = _start_gateway(monkeypatch)
+    try:
+        port = server.server_address[1]
+        s, _ = _post(port, "/v1/chat/completions",
+                     {"model": "m1", "messages": [{"role": "user", "content": "hi"}]})
+        assert s == 200
+        with mgr._state:  # 生成中を模擬
+            mgr._models["m1"].instances[0].inflight = 1
+        s, o = _post(port, "/admin/drain", {"enable": True})
+        assert s == 200 and o["draining"] is False and o["inflight"] == 1
+        with mgr._state:
+            mgr._models["m1"].instances[0].inflight = 0
+    finally:
+        server.shutdown(); server.server_close(); mgr.shutdown()
+        for u in ups:
+            u.shutdown(); u.server_close()

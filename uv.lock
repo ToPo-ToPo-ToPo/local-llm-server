@@ -384,6 +384,10 @@ sdist = { url = "https://files.pythonhosted.org/packages/44/bd/c3343c721f2a1b0c9
 wheels = [
     { url = "https://files.pythonhosted.org/packages/da/58/87ef68ac83f4c7690961bce288fd8e382bc5f1513860fc7f90a9c1c1c6bf/imageio_ffmpeg-0.6.0-py3-none-macosx_10_9_intel.macosx_10_9_x86_64.whl", hash = "sha256:9d2baaf867088508d4a3458e61eeb30e945c4ad8016025545f66c4b5aaef0a61", size = 24932969, upload-time = "2025-01-16T21:34:20.464Z" },
     { url = "https://files.pythonhosted.org/packages/40/5c/f3d8a657d362cc93b81aab8feda487317da5b5d31c0e1fdfd5e986e55d17/imageio_ffmpeg-0.6.0-py3-none-macosx_11_0_arm64.whl", hash = "sha256:b1ae3173414b5fc5f538a726c4e48ea97edc0d2cdc11f103afee655c463fa742", size = 21113891, upload-time = "2025-01-16T21:34:00.277Z" },
+    { url = "https://files.pythonhosted.org/packages/33/e7/1925bfbc563c39c1d2e82501d8372734a5c725e53ac3b31b4c2d081e895b/imageio_ffmpeg-0.6.0-py3-none-manylinux2014_aarch64.whl", hash = "sha256:1d47bebd83d2c5fc770720d211855f208af8a596c82d17730aa51e815cdee6dc", size = 25632706, upload-time = "2025-01-16T21:33:53.475Z" },
+    { url = "https://files.pythonhosted.org/packages/a0/2d/43c8522a2038e9d0e7dbdf3a61195ecc31ca576fb1527a528c877e87d973/imageio_ffmpeg-0.6.0-py3-none-manylinux2014_x86_64.whl", hash = "sha256:c7e46fcec401dd990405049d2e2f475e2b397779df2519b544b8aab515195282", size = 29498237, upload-time = "2025-01-16T21:34:13.726Z" },
+    { url = "https://files.pythonhosted.org/packages/a0/13/59da54728351883c3c1d9fca1710ab8eee82c7beba585df8f25ca925f08f/imageio_ffmpeg-0.6.0-py3-none-win32.whl", hash = "sha256:196faa79366b4a82f95c0f4053191d2013f4714a715780f0ad2a68ff37483cc2", size = 19652251, upload-time = "2025-01-16T21:34:06.812Z" },
+    { url = "https://files.pythonhosted.org/packages/2c/c6/fa760e12a2483469e2bf5058c5faff664acf66cadb4df2ad6205b016a73d/imageio_ffmpeg-0.6.0-py3-none-win_amd64.whl", hash = "sha256:02fa47c83703c37df6bfe4896aab339013f62bf02c5ebf2dce6da56af04ffc0a", size = 31246824, upload-time = "2025-01-16T21:34:28.6Z" },
 ]
 
 [[package]]
@@ -530,22 +534,22 @@ wheels = [
 
 [[package]]
 name = "local-llm-client"
-version = "0.6.0"
+version = "0.7.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "openai" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/29/45/dcc76a77e812230f7a2bae62b70e7787c3999004387ccaf8eee2ede8a255/local_llm_client-0.6.0.tar.gz", hash = "sha256:3ae6af2f0cc95adca5673fb0d8120f75d34e379da639efe58b483065850f05a6", size = 29202, upload-time = "2026-07-09T09:06:14.273Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/7a/d5/46a1032ade611259de6f1f69aa3144702a61049f095c6647feca77fec131/local_llm_client-0.7.0.tar.gz", hash = "sha256:7103ac32a2f931c68494581b340875233046627dc31f9fa0eced88a54a2e95e6", size = 29923, upload-time = "2026-07-10T01:11:32.041Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/cf/07/c9c8d81b7f0e25681b974602a008a76a09ddccb45f7ccf04d54886c0d4c6/local_llm_client-0.6.0-py3-none-any.whl", hash = "sha256:829d4e4d2f2fdb1fdddadc04fd191d299e076a438f9fb2b945c66746f0080ff4", size = 23165, upload-time = "2026-07-09T09:06:13.195Z" },
+    { url = "https://files.pythonhosted.org/packages/51/df/b2e841b1b63a4090326bb7d21c67a587fe09435362c56fc64b13492bbfc6/local_llm_client-0.7.0-py3-none-any.whl", hash = "sha256:fc2de5f7228f8def75fb95321dae65f7cdc61c5444b50737b65cce0fc77b4197", size = 23546, upload-time = "2026-07-10T01:11:30.812Z" },
 ]
 
 [[package]]
 name = "local-llm-server"
-version = "0.28.0"
+version = "0.30.0"
 source = { editable = "." }
 dependencies = [
-    { name = "imageio-ffmpeg", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'" },
+    { name = "imageio-ffmpeg" },
     { name = "mlx-lm", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'" },
     { name = "mlx-vlm", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'" },
     { name = "mlx-whisper", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'" },
@@ -562,7 +566,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "imageio-ffmpeg", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'", specifier = ">=0.4.9" },
+    { name = "imageio-ffmpeg", specifier = ">=0.4.9" },
     { name = "mlx-lm", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'", specifier = ">=0.31.3" },
     { name = "mlx-vlm", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'", specifier = ">=0.6.3,<0.6.4" },
     { name = "mlx-whisper", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'", specifier = ">=0.4.3" },
@@ -573,7 +577,7 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "local-llm-client", specifier = ">=0.6.0" },
+    { name = "local-llm-client", specifier = ">=0.7.0" },
     { name = "pytest", specifier = ">=8.0" },
 ]
 

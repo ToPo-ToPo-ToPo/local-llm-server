@@ -54,6 +54,9 @@ backend = "mlx-vlm"
 | `draft_model` | mlx-vlm は `auto` | 動的ロード時の MTP 既定。省略時は mlx-vlm が対応表から自動選択、`"off"` で無効。各 `[[models]]` で上書き。→ [mtp.md](mtp.md) |
 | `dynamic` | `true` | 未登録モデルを ID 推論で動的ロードする。`false` で事前登録のみ（旧挙動） |
 | `disable_thinking` | `false` | 動的ロード時の既定。事前登録モデルは各 `[[models]]` の値が優先 |
+| `video_frames` | `8` | **動画入力**で 1 本から等間隔に抜くフレーム数。`video_url` をこの枚数の画像に展開して渡す |
+| `video_max_edge` | `768` | 動画フレームの縮小サイズ（長辺 px）。大きいほど精細だがトークン増 |
+| `[llama_cpp]` | 全自動 | `llama-server` の自動導入テーブル。`provision`（auto/system/build）・`accel`（auto/cuda/vulkan/metal/cpu）・`pin`（ビルド番号）。→ [llama-cpp.md](llama-cpp.md#自動導入llama_cpp) |
 
 `[[models]]` は 1 モデル 1 エントリ。`model`（HuggingFace ID）と `backend`（`mlx` / `mlx-vlm` /
 `llama-cpp` / `whisper`）が必須。各エントリで `draft_model` を上書きできる。`dynamic = true` なら
@@ -165,8 +168,15 @@ OpenAI SDK からもそのまま使える（`client.audio.transcriptions.create(
   `git pull --ff-only`（＋`uv sync`）を実行する。開発中で未コミット変更がある PC では**適用せず**、
   ステータス行に「`⬆ x.y.z 利用可（ローカル変更あり・保留）`」を出すだけ（`u` キーで手動適用）。
   → その PC の編集中コードを勝手に上書きしない。
-- **中断しない**: 実行中はゲートウェイが**アイドル（処理中0・在席エージェント0）になった瞬間**に
-  適用する。生成・文字起こしの最中は待つ。
+- **中断しない（drain 方式）**: 更新の取得（`git pull` + `uv sync`）は**稼働中のゲートウェイに
+  触れずに**先に済ませる（この間も通常どおりリクエストを受ける）。再起動は、ゲートウェイ自身が
+  **「処理中 0・在席エージェント 0」の確認と新規受付の停止を同一ロックで原子的に行う drain**
+  （`POST /admin/drain`）が通ったときだけ実行する。確認と再起動の間に生成が滑り込んで
+  強制終了される余地が無い。処理中/在席があれば何も止めずに保留し、空いた瞬間に再起動する
+  （ステータス行に「⬆ 更新適用済み・処理中/在席が空き次第 再起動」）。drain 中〜再起動直後の
+  数秒間に届いた新規リクエストは 503 になるが、クライアント（openai SDK / local-llm-client）は
+  自動リトライするので新プロセスへ繋ぎ直される。drain は 120 秒で自動失効する
+  （再起動側が死んでも受付不能のまま固まらない）。
 - **git 運用でないとき**: `.git` が無い（PyPI から `uv tool install` した等）場合は何もしない。
 - **無効化**: `auto_update = false`。
 - **手動**: TUI の `u` キー（またはコマンド欄 `update`）でいつでも今すぐ確認・適用できる。

@@ -123,6 +123,21 @@ def test_client_respond_round_trip_and_presence_unload(monkeypatch):
         _teardown(server, mgr, upstream)
 
 
+def test_client_video_flows_through_gateway_expansion(monkeypatch):
+    # 対パッケージの動画契約: client の respond(videos=...) が video_url を送り、gateway が
+    # ffmpeg でフレーム展開して上流へ渡す（client 0.7.0 + server の動画入力の噛み合わせ）。
+    monkeypatch.setattr(gw.video, "extract_frames",
+                        lambda url, n, edge: [b"f1", b"f2"])  # ffmpeg を呼ばない
+    server, mgr, upstream, base = _start_gateway(monkeypatch)
+    client = llc.LLMClient(model="itest-model", base_url=base, stream=False)
+    try:
+        # 動画付きでもエラーにならず応答が返る（展開 → 上流フェイクが pong）。
+        assert client.respond("この動画は？", videos=["http://x/v.mp4"]) == "pong"
+    finally:
+        client.close()
+        _teardown(server, mgr, upstream)
+
+
 def test_client_api_key_auth(monkeypatch):
     # 認証ありゲートウェイの契約: client が api_key を Bearer で送り、正キーは通り
     # 誤キーは 401 で弾かれる（client 0.4.0 で server の api_key 対応に追随した機能）。
