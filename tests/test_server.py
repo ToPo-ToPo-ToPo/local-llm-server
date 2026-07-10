@@ -660,3 +660,39 @@ def test_start_gateway_background_marks_launcher_env(tmp_path, monkeypatch):
     env = calls["kwargs"]["env"]
     assert env["LOCAL_LLM_GW_LAUNCHER"] == "tui"
     assert "PATH" in env  # os.environ を引き継いだ上でマークを足している
+
+
+def test_auto_llama_flags_gpu_offloads_all_layers(hf_cache, monkeypatch):
+    # GPU（vulkan）で自動導入されていれば -ngl 999 が付く（全層オフロード）。
+    hf_cache("org/m-gguf", ["m-Q4_K_M.gguf"])
+    monkeypatch.setattr(srv, "llama_provision_info",
+                        lambda: {"accel": "vulkan", "build": "b9946"})
+    cmd = build_command(ServerConfig("llama-cpp", "org/m-gguf"))
+    assert "-ngl" in cmd and "999" in cmd
+    assert "--threads" not in cmd  # GPU 時はスレッド指定しない
+
+
+def test_auto_llama_flags_cpu_sets_threads(hf_cache, monkeypatch):
+    hf_cache("org/m-gguf", ["m-Q4_K_M.gguf"])
+    monkeypatch.setattr(srv, "llama_provision_info", lambda: {"accel": "cpu"})
+    monkeypatch.setattr(srv, "_physical_cores", lambda: 8)
+    cmd = build_command(ServerConfig("llama-cpp", "org/m-gguf"))
+    assert cmd[cmd.index("--threads") + 1] == "8"
+    assert "-ngl" not in cmd
+
+
+def test_auto_llama_flags_respects_user_extra_args(hf_cache, monkeypatch):
+    # ユーザーが -ngl を明示していれば自動付与しない（尊重する）。
+    hf_cache("org/m-gguf", ["m-Q4_K_M.gguf"])
+    monkeypatch.setattr(srv, "llama_provision_info", lambda: {"accel": "vulkan"})
+    c = ServerConfig("llama-cpp", "org/m-gguf", extra_args=["-ngl", "20"])
+    cmd = build_command(c)
+    assert cmd.count("-ngl") == 1 and "20" in cmd and "999" not in cmd
+
+
+def test_auto_llama_flags_noop_when_not_provisioned(hf_cache, monkeypatch):
+    # 自動導入していない（system 等）なら何も足さない（既存挙動を壊さない）。
+    hf_cache("org/m-gguf", ["m-Q4_K_M.gguf"])
+    monkeypatch.setattr(srv, "llama_provision_info", lambda: None)
+    cmd = build_command(ServerConfig("llama-cpp", "org/m-gguf"))
+    assert "-ngl" not in cmd and "--threads" not in cmd

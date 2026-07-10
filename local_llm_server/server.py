@@ -64,6 +64,45 @@ def llama_provision_info() -> dict | None:
     return _LLAMA_INFO
 
 
+def _physical_cores() -> int:
+    """物理コア数（ハイパースレッド/E コアを除く。取れなければ論理コア数）。"""
+    try:
+        import psutil
+        n = psutil.cpu_count(logical=False)
+        if n:
+            return int(n)
+    except Exception:  # noqa: BLE001 - psutil 不在・取得失敗はフォールバック
+        pass
+    return os.cpu_count() or 4
+
+
+# 既にユーザーが extra_args で指定していれば自動付与しないフラグ群（等価表記も含む）。
+_NGL_FLAGS = ("-ngl", "--n-gpu-layers", "--gpu-layers")
+_THREAD_FLAGS = ("-t", "--threads")
+
+
+def auto_llama_flags(config: "ServerConfig") -> list[str]:
+    """自動導入した llama.cpp の accel に応じた計算効率フラグ（ユーザー未指定時のみ）。
+
+    - GPU（accel が cpu 以外）: `-ngl 999`（全層 GPU オフロード。llama.cpp が実層数に丸める）。
+    - CPU（accel == cpu）: `--threads <物理コア数>`（既定の論理コア数より CPU 推論で速いことが多い）。
+    自動導入していない（provision=system 等で素性不明）ときは何もしない
+    （利用者が自分でフラグ管理している前提。既存挙動を壊さない）。
+    """
+    info = llama_provision_info()
+    if not info:
+        return []
+    accel = info.get("accel")
+    extra = config.extra_args
+    if accel and accel != "cpu":
+        if not any(a in _NGL_FLAGS for a in extra):
+            return ["-ngl", "999"]
+        return []
+    if not any(a in _THREAD_FLAGS for a in extra):
+        return ["--threads", str(_physical_cores())]
+    return []
+
+
 # STT（音声→テキスト）モデルの id 判定に使う語。whisper 系は id に "mlx" を含む
 # （例 mlx-community/whisper-large-v3-mlx）ため、mlx-vlm 判定より先に見る必要がある。
 _STT_HINTS = ("whisper", "parakeet")
@@ -802,6 +841,8 @@ def build_command(config: ServerConfig) -> list[str]:
                 command += ["-md", draft_path]
                 if "mtp" in os.path.basename(draft_path).lower():
                     command += ["--spec-type", "draft-mtp"]
+        # 計算効率の自動チューニング（自動導入バイナリの accel に合わせる。extra_args 優先）。
+        command += auto_llama_flags(config)
     elif config.backend == "whisper":
         # mlx-whisper を OpenAI 互換の STT サーバ（1 モデル 1 プロセス）として起動する。
         # 専用サーバは同梱の local_llm_server.stt_server（標準ライブラリのみ）。
