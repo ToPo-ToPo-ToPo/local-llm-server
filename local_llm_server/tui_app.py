@@ -21,6 +21,7 @@ from textual.screen import ModalScreen
 from textual.widgets import DataTable, Input, Static
 
 from .server import (
+    bench_model,
     find_pids_on_port,
     gateway_admin_status,
     gateway_log_path,
@@ -368,7 +369,7 @@ class GatewayMonitor(App):
         # コマンド欄を最上部に固定する（dock: top）。モデル一覧が増えて #dash が縦に伸びても、
         # 入力欄が画面外へ押し出されない。中央の一覧は #dash 内でスクロールする。
         yield Input(
-            placeholder="command — stop · restart · start · max <n> · mtp [model] · log · update · quit",
+            placeholder="command — stop · restart · start · max <n> · mtp [model] · bench [model] · log · update · quit",
             id="cmd",
         )
         with VerticalScroll(id="dash"):
@@ -669,6 +670,29 @@ class GatewayMonitor(App):
         inp.focus()
         inp.cursor_position = len(inp.value)
 
+    def _first_loaded_model(self) -> str | None:
+        """現在ロード中のモデルの先頭（bench の既定対象）。無ければ None。"""
+        for m in (self.admin or {}).get("models", []):
+            if m.get("loaded"):
+                return m.get("model")
+        return None
+
+    @work(thread=True, group="bench")
+    def _run_bench(self, model: str) -> None:
+        """生成スループット（tok/s）を測って通知する（HTTP はワーカースレッドで）。"""
+        self.call_from_thread(setattr, self, "busy", f"benchmarking {model}…")
+        try:
+            base = f"http://{self.host}:{self.port}/v1"
+            r = bench_model(model, base_url=base, api_key=self.gcfg.api_key)
+            msg = (f"bench {model}: {r['tok_per_s']} tok/s "
+                   f"({r['tokens']} tok / {r['seconds']}s)")
+            self.call_from_thread(self.notify, msg, timeout=8)
+        except Exception as exc:  # noqa: BLE001 - ワーカー例外でアプリを落とさない
+            self.call_from_thread(
+                self.notify, f"bench failed: {exc}", severity="error", timeout=6)
+        finally:
+            self.call_from_thread(setattr, self, "busy", "")
+
     def _set_max_resident(self, arg: str) -> None:
         """`max <n>` / `max off` を解釈して稼働中のゲートウェイに反映する（再起動不要・busy 継続）。
 
@@ -755,6 +779,15 @@ class GatewayMonitor(App):
         # モデル ID は大文字小文字を区別するので raw から取る（cmd に落とさない）。
         if head.lower() == "mtp":
             self.push_screen(MtpScreen(tail.strip() or None))
+            return
+        # `bench [model]`: 生成スループット（tok/s）を測る。model 省略時はロード中の先頭を使う。
+        if head.lower() == "bench":
+            model = tail.strip() or self._first_loaded_model()
+            if not model:
+                self.notify("bench: 測るモデルを指定してください（例 bench org/model）",
+                            severity="warning", timeout=4)
+            else:
+                self._run_bench(model)
             return
         handler = {
             "s": self.action_stop, "stop": self.action_stop,

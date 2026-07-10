@@ -696,3 +696,33 @@ def test_auto_llama_flags_noop_when_not_provisioned(hf_cache, monkeypatch):
     monkeypatch.setattr(srv, "llama_provision_info", lambda: None)
     cmd = build_command(ServerConfig("llama-cpp", "org/m-gguf"))
     assert "-ngl" not in cmd and "--threads" not in cmd
+
+
+def test_bench_model_computes_tok_per_s(monkeypatch):
+    # bench_model は usage.completion_tokens を実測秒で割って tok/s を出す。
+    import json as _json
+    import local_llm_server.server as s
+
+    class _Resp:
+        status = 200
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self):
+            return _json.dumps({"usage": {"completion_tokens": 100}}).encode()
+
+    times = iter([10.0, 12.0])  # 2 秒経過
+    monkeypatch.setattr(s.time, "monotonic", lambda: next(times))
+    monkeypatch.setattr(s.urllib.request, "urlopen", lambda req, timeout=0: _Resp())
+    r = s.bench_model("org/m", base_url="http://x/v1")
+    assert r["tokens"] == 100 and r["seconds"] == 2.0 and r["tok_per_s"] == 50.0
+
+
+def test_bench_model_raises_on_failure(monkeypatch):
+    import local_llm_server.server as s
+
+    def boom(req, timeout=0):
+        raise OSError("refused")
+
+    monkeypatch.setattr(s.urllib.request, "urlopen", boom)
+    with pytest.raises(RuntimeError):
+        s.bench_model("org/m")

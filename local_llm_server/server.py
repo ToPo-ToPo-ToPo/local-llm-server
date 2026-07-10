@@ -1302,6 +1302,46 @@ def gateway_admin_status(
     return data if isinstance(data, dict) else None
 
 
+def bench_model(
+    model: str,
+    base_url: str = "http://127.0.0.1:8799/v1",
+    *,
+    api_key: str | None = None,
+    max_tokens: int = 128,
+    timeout: float = 180.0,
+) -> dict:
+    """モデルに短文生成を投げ、生成スループット（tok/s）を測る（チューニング効果の確認用）。
+
+    非ストリームで `max_tokens` トークンを生成させ、応答の usage.completion_tokens を
+    実測秒数で割る。初回はモデルロード込みなので、TUI 側は「2 回目」を測るとよい。
+    戻り値: {"model", "tokens", "seconds", "tok_per_s"}。失敗は RuntimeError。
+    """
+    body = json.dumps({
+        "model": model,
+        "messages": [{"role": "user",
+                      "content": "Write a short story about the sea."}],
+        "max_tokens": max_tokens,
+        "temperature": 0.0,
+        "stream": False,
+    }).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    req = urllib.request.Request(f"{base_url}/chat/completions", data=body,
+                                 headers=headers)
+    t0 = time.monotonic()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        raise RuntimeError(f"bench request failed: {exc}") from exc
+    seconds = time.monotonic() - t0
+    tokens = int((data.get("usage") or {}).get("completion_tokens") or 0)
+    tps = tokens / seconds if seconds > 0 else 0.0
+    return {"model": model, "tokens": tokens, "seconds": round(seconds, 2),
+            "tok_per_s": round(tps, 1)}
+
+
 def gateway_set_max_resident(
     value: int | None,
     host: str = "127.0.0.1",
