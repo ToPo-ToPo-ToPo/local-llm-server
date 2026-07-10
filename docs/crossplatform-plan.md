@@ -55,17 +55,20 @@
 [llama_cpp]
 provision = "auto"    # auto: 管理バイナリを自動導入（既定）/ system: PATH の llama-server を使う
                       # / build: ソースから自動ビルド（cmake・ツールチェーン必要。失敗時 auto へ）
-# accel = "auto"      # auto（検出: cuda > vulkan > metal > cpu）/ cuda / vulkan / cpu を明示
-# pin = "b9999"       # ビルド番号の固定（省略時は導入済みを使い続け、`gw` の update で追従）
+# accel = "auto"      # auto（GPU なら vulkan / mac は metal / 無ければ cpu）/ cuda / vulkan / metal / cpu
+# pin = "b9946"       # ビルド番号の固定（省略時は最新を取得し、以後は導入済みを使い続ける）
 ```
 
 - 導入先は HF キャッシュと同じ発想の**管理ディレクトリ**
   （`~/.cache/local-llm-server/llama.cpp/<build>/`。Windows は `%LOCALAPPDATA%`）。
   PATH は汚さず、ゲートウェイが絶対パスで起動する。PATH に既存の `llama-server` が
   あれば `provision = "system"` で従来どおり尊重。
-- **アクセラレータ検出**: CUDA（`nvidia-smi` の有無/成功）→ Vulkan（`vulkaninfo` /
-  Windows は DLL 存在）→ Metal（darwin）→ CPU の優先順。ROCm はプリビルトの提供状況が
-  不安定なため Vulkan を経路にする（AMD GPU は Vulkan で動く）。
+- **アクセラレータ検出（実装で修正）**: 当初 CUDA 優先を想定したが、実 Releases 調査で
+  **Linux に CUDA プリビルトが無く**、**Windows CUDA は別途 cudart DLL が要る**と判明。
+  「導入が簡単・確実に動く」を優先し、**auto の GPU 経路は Vulkan に一本化**した
+  （NVIDIA/AMD/Intel 共通・単一アセット・追加ランタイム不要）。判定順は macOS→Metal（内蔵）、
+  Linux/Windows は GPU 検出（`nvidia-smi` or `vulkaninfo`）→ Vulkan、無ければ CPU。
+  **CUDA は Windows 限定の明示 opt-in**（`accel = "cuda"`）。ROCm も同様に Vulkan 経路で代替。
 - Releases のアセット命名は上流都合で変わり得るため、命名パターンはコード内テーブル＋
   gateway.toml で上書き可能にしておく（壊れたら設定で即応、後追いでコード修正）。
 
@@ -141,7 +144,7 @@ provision = "auto"    # auto: 管理バイナリを自動導入（既定）/ sys
 
 新モジュール `local_llm_server/provisioner.py`:
 
-1. `detect_platform()` → `(os, arch, accel)`（例 `("linux", "x64", "cuda")`）
+1. `detect_platform()` → `(os, arch, accel)`（例 `("linux", "x64", "vulkan")`）
 2. `resolve_asset(build, platform)` → Releases のアセット名（命名テーブル + 上書き設定）
 3. `ensure_llama_server()` → 管理ディレクトリに導入済みならそのパス、無ければ
    ダウンロード → 展開 → `llama-server --version` で自己検証 → パスを返す。
@@ -151,6 +154,11 @@ provision = "auto"    # auto: 管理バイナリを自動導入（既定）/ sys
 - ダウンロードは初回リクエスト時ではなく**ゲートウェイ起動時**に行う（初回推論の
   レイテンシに混ぜない。起動ログ / TUI に進捗を出す）。
 - 更新は自動更新と同じ思想で「TUI の update 導線」に統合（`pin` 指定時は固定）。
+- **実装時の判断（macOS の無駄DL回避）**: 起動時プロビジョニングは「llama-cpp が使われる
+  構成」でだけ走らせる（llama-cpp モデルが事前登録済み or OS 既定が llama-cpp＝非 Apple）。
+  Apple Silicon（既定 mlx-vlm）で llama-cpp モデル未登録の場合は自動導入しない。macOS で
+  GGUF を動的要求したいときは `[[models]]` 登録か `provision = "system"` を使う（macOS の
+  初回 GGUF 遅延自動導入は将来の改善候補）。
 
 ### Phase 2: 効率チューニング
 
