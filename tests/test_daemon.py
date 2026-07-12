@@ -1999,3 +1999,53 @@ def test_no_inject_when_disabled():
     srv = _mk_srv(None, {"org/gemma": "mlx-vlm"})
     got = _inject(srv, "org/gemma", {"model": "org/gemma", "messages": []})
     assert "repetition_penalty" not in got
+
+
+# --- 構造化リクエストの注入除外（既定オフの機能） ------------------------------
+
+def test_skip_structured_default_off(tmp_path):
+    """既定は false（＝tools 付きでも従来どおり注入する）。"""
+    cfg = gw.load_gateway_config(_write(tmp_path, "port = 8799\n"))
+    assert cfg.repetition_penalty_skip_structured is False
+
+
+def test_skip_structured_parsed(tmp_path):
+    cfg = gw.load_gateway_config(_write(
+        tmp_path, "port = 8799\nrepetition_penalty_skip_structured = true\n"))
+    assert cfg.repetition_penalty_skip_structured is True
+
+
+def _mk_srv_skip(rp, backends, skip):
+    from types import SimpleNamespace
+    mgr = SimpleNamespace(backend_for=lambda m: backends[m])
+    return SimpleNamespace(repetition_penalty=rp, repetition_context_size=None,
+                           repetition_penalty_skip_structured=skip, manager=mgr)
+
+
+def test_skip_structured_off_still_injects_for_tools():
+    """既定（skip=False）: tools 付きでも注入する（現状維持）。"""
+    srv = _mk_srv_skip(1.1, {"org/gemma": "mlx-vlm"}, skip=False)
+    got = _inject(srv, "org/gemma", {"model": "org/gemma", "messages": [], "tools": [{"x": 1}]})
+    assert got["repetition_penalty"] == 1.1
+
+
+def test_skip_structured_on_skips_tools():
+    """skip=True: tools を含むリクエストには注入しない。"""
+    srv = _mk_srv_skip(1.1, {"org/gemma": "mlx-vlm"}, skip=True)
+    got = _inject(srv, "org/gemma", {"model": "org/gemma", "messages": [], "tools": [{"x": 1}]})
+    assert "repetition_penalty" not in got
+
+
+def test_skip_structured_on_skips_response_format():
+    """skip=True: response_format を含むリクエストにも注入しない。"""
+    srv = _mk_srv_skip(1.1, {"org/gemma": "mlx-vlm"}, skip=True)
+    got = _inject(srv, "org/gemma",
+                  {"model": "org/gemma", "messages": [], "response_format": {"type": "json_object"}})
+    assert "repetition_penalty" not in got
+
+
+def test_skip_structured_on_still_injects_plain_chat():
+    """skip=True でも、構造化でない通常 chat には従来どおり注入する。"""
+    srv = _mk_srv_skip(1.1, {"org/gemma": "mlx-vlm"}, skip=True)
+    got = _inject(srv, "org/gemma", {"model": "org/gemma", "messages": []})
+    assert got["repetition_penalty"] == 1.1
