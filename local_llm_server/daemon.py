@@ -1051,6 +1051,7 @@ class GatewayServer(ThreadingHTTPServer):
         video_max_edge: int = 768,
         repetition_penalty: float | None = None,
         repetition_context_size: int | None = None,
+        repetition_penalty_skip_structured: bool = False,
     ) -> None:
         super().__init__(addr, _GatewayHandler)
         self.manager = manager
@@ -1058,6 +1059,8 @@ class GatewayServer(ThreadingHTTPServer):
         # 付与する（クライアントが自分で指定していれば尊重して上書きしない）。
         self.repetition_penalty = repetition_penalty
         self.repetition_context_size = repetition_context_size
+        # true なら tools / response_format を含む structured リクエストには注入しない（既定 false）。
+        self.repetition_penalty_skip_structured = repetition_penalty_skip_structured
         self.catalog = catalog            # /v1/models で返すモデル一覧
         self.default_model = default_model
         self.timeout_s = timeout_s        # None なら無制限（長時間生成に備える）
@@ -1322,6 +1325,13 @@ class _GatewayHandler(BaseHTTPRequestHandler):
             return body
         if "repetition_penalty" in payload:
             return body
+        # 構造化リクエスト保護（既定オフ）: tools（native ツールコール）や response_format
+        # （構造化出力）を含むリクエストには注入しない。JSON 構文の必須の繰り返しを減点しうる
+        # のを避ける保険（有効化は gateway.toml の repetition_penalty_skip_structured = true）。
+        if getattr(srv, "repetition_penalty_skip_structured", False) and (
+            "tools" in payload or "response_format" in payload
+        ):
+            return body
         try:
             backend = srv.manager.backend_for(model)
         except Exception:  # noqa: BLE001 - 判定不能なら注入しない（安全側）
@@ -1530,6 +1540,11 @@ class GatewayConfig:
                                              # 0 / false / "off" で無効化（注入しない）＝設定しない選択
     repetition_context_size: int | None = None  # 併せて注入する参照窓（mlx 既定 20。研究推奨 64）。
                                                 # None なら注入しない（repetition_penalty だけ付ける）
+    # 構造化リクエスト（`tools`＝native ツールコール / `response_format`＝構造化出力）には
+    # repetition_penalty を注入しないオプション。既定 false（＝従来どおり全 chat に注入）。
+    # true にすると、必須の繰り返し記号（JSON 構文・フィールド名）を減点しうる structured 生成を
+    # 保護できる（実測では 1.1 で実害は無いが、保険として明示的に切れるようにする）。
+    repetition_penalty_skip_structured: bool = False
 
 
 def _resolve_model_draft(
@@ -1701,6 +1716,8 @@ def load_gateway_config(path: str) -> GatewayConfig:
     repetition_context_size = None if rcs_raw is None else int(rcs_raw)
     if repetition_context_size is not None and repetition_context_size < 1:
         raise ValueError("repetition_context_size must be 1 or greater")
+    # 構造化リクエスト（tools / response_format）を注入対象から外すか（既定 false）。
+    repetition_penalty_skip_structured = bool(data.get("repetition_penalty_skip_structured", False))
 
     # [llama_cpp] テーブル: llama-server バイナリの自動導入設定（すべて省略可＝全自動）。
     llama = data.get("llama_cpp") or {}
@@ -1809,6 +1826,7 @@ def load_gateway_config(path: str) -> GatewayConfig:
         video_max_edge=video_max_edge,
         repetition_penalty=repetition_penalty,
         repetition_context_size=repetition_context_size,
+        repetition_penalty_skip_structured=repetition_penalty_skip_structured,
     )
 
 
@@ -1873,6 +1891,10 @@ def apply_live_config(
     if cfg.repetition_context_size != new.repetition_context_size:
         note("repetition_context_size", cfg.repetition_context_size, new.repetition_context_size)
         server.repetition_context_size = new.repetition_context_size
+    if cfg.repetition_penalty_skip_structured != new.repetition_penalty_skip_structured:
+        note("repetition_penalty_skip_structured",
+             cfg.repetition_penalty_skip_structured, new.repetition_penalty_skip_structured)
+        server.repetition_penalty_skip_structured = new.repetition_penalty_skip_structured
     if cfg.default_model != new.default_model:
         note("default_model", cfg.default_model, new.default_model)
         server.default_model = new.default_model
@@ -2145,6 +2167,7 @@ def _run_gateway_locked(cfg: GatewayConfig, config_path: str | None = None) -> i
         video_max_edge=cfg.video_max_edge,
         repetition_penalty=cfg.repetition_penalty,
         repetition_context_size=cfg.repetition_context_size,
+        repetition_penalty_skip_structured=cfg.repetition_penalty_skip_structured,
     )
     public = f"http://{cfg.host}:{cfg.port}/v1"
     wildcard = cfg.host in ("0.0.0.0", "")
