@@ -1817,7 +1817,10 @@ def test_admin_drain_refused_while_busy(monkeypatch):
 
 def test_load_gateway_config_parses_vllm_defaults(tmp_path):
     cfg = gw.load_gateway_config(_write(tmp_path, "port = 8799\n"))
-    assert cfg.vllm_provision == "auto"
+    # 既定は system（勝手に自動DLしない。extras で入れて使う）。auto で隔離 venv 自動導入。
+    assert cfg.vllm_provision == "system"
+    assert gw.load_gateway_config(
+        _write(tmp_path, '[vllm]\nprovision = "auto"\n')).vllm_provision == "auto"
 
 
 def test_load_gateway_config_parses_vllm_table(tmp_path):
@@ -1876,7 +1879,7 @@ def test_provision_vllm_continues_on_failure(tmp_path, monkeypatch):
 # --- SGLang バックエンドの配線 ------------------------------------------------------
 
 def test_load_gateway_config_parses_sglang(tmp_path):
-    assert gw.load_gateway_config(_write(tmp_path, "port = 8799\n")).sglang_provision == "auto"
+    assert gw.load_gateway_config(_write(tmp_path, "port = 8799\n")).sglang_provision == "system"
     cfg = gw.load_gateway_config(_write(tmp_path, '[sglang]\nprovision = "system"\n'))
     assert cfg.sglang_provision == "system"
     with pytest.raises(ValueError):

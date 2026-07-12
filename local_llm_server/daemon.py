@@ -1467,8 +1467,10 @@ class GatewayConfig:
     llama_accel: str = "auto"          # auto=検出（GPU なら vulkan、mac は metal、無ければ cpu）/ cuda / vulkan / metal / cpu
     llama_build: str | None = None     # ビルド番号の固定（例 "b9946"）。省略で最新を取得し導入済みを使い続ける
     # --- vLLM / SGLang（Linux/NVIDIA・Windows は WSL2）。[vllm]/[sglang] で設定。明示 opt-in 時のみ ---
-    vllm_provision: str = "auto"       # auto=隔離 venv へ自動 pip install / system=現在の環境の vllm を使う
-    sglang_provision: str = "auto"     # auto=隔離 venv へ自動 pip install / system=現在の環境の sglang を使う
+    # 既定は system（勝手に数GB を自動DLしない）。extras で入れて使う: pip install ...[vllm]。
+    # 隔離 venv へ自動導入させたいなら provision='auto'（両立したいときはこちら＝別環境）。
+    vllm_provision: str = "system"     # system=現在の環境の vllm を使う（既定）/ auto=隔離 venv へ自動 pip install
+    sglang_provision: str = "system"   # system=現在の環境の sglang を使う（既定）/ auto=隔離 venv へ自動 pip install
     # --- 動画入力: ゲートウェイが video_url をフレーム画像列へ展開して上流へ渡す ---
     video_frames: int = 8              # 1 本の動画から等間隔で抜くフレーム数
     video_max_edge: int = 768          # 各フレームの縮小サイズ（長辺ピクセル）
@@ -1640,7 +1642,7 @@ def load_gateway_config(path: str) -> GatewayConfig:
     vllm = data.get("vllm") or {}
     if not isinstance(vllm, dict):
         raise ValueError("[vllm] must be a table")
-    vllm_provision = str(vllm.get("provision", "auto"))
+    vllm_provision = str(vllm.get("provision", "system"))
     if vllm_provision not in ("auto", "system"):
         raise ValueError("vllm.provision must be auto / system")
 
@@ -1648,7 +1650,7 @@ def load_gateway_config(path: str) -> GatewayConfig:
     sglang = data.get("sglang") or {}
     if not isinstance(sglang, dict):
         raise ValueError("[sglang] must be a table")
-    sglang_provision = str(sglang.get("provision", "auto"))
+    sglang_provision = str(sglang.get("provision", "system"))
     if sglang_provision not in ("auto", "system"):
         raise ValueError("sglang.provision must be auto / system")
 

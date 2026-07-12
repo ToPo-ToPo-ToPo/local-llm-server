@@ -42,6 +42,22 @@ dependencies = [
     "imageio-ffmpeg>=0.4.9",
 ]
 
+# 高スループット生成バックエンド（明示 opt-in の extras）。torch+CUDA を含む重量級で、
+# Linux/NVIDIA 専用（Windows は WSL2 内、macOS 非対応）なので base 依存には入れず、
+# 使う人だけ `uv pip install local-llm-server[vllm]` 等で入れる（→ [vllm]/[sglang] provision='system'）。
+# vLLM と SGLang は torch/flashinfer のピンが食い違い**同一環境に共存できないことが多い**ため、
+# 両方使いたいときは各 backend の provision='auto'（隔離 venv・別環境）を使う。
+# 環境マーカーで Linux 以外では解決対象から外す（Mac/Win にネイティブ wheel が無い）。
+[project.optional-dependencies]
+vllm = ["vllm ; sys_platform == 'linux'"]
+sglang = ["sglang ; sys_platform == 'linux'"]
+
+# vLLM と SGLang は同一環境に共存できない（torch/flashinfer のピンが食い違う）。排他 extras
+# として宣言し、uv が両者を1つの解決に混ぜない／同時 install を拒む（両立は各 provision='auto'
+# の隔離 venv で）。
+[tool.uv]
+conflicts = [[{ extra = "vllm" }, { extra = "sglang" }]]
+
 [dependency-groups]
 dev = [
     "pytest>=8.0",

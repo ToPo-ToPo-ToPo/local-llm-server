@@ -78,8 +78,9 @@ def ensure_backend(
         if importable(sys.executable, run):
             return sys.executable
         raise unavailable(
-            f"provision='system' だが現在の環境に {package} が無い。provision='auto'"
-            f"（自動導入）にするか、この環境へ {package} を入れる。"
+            f"provision='system'（既定）だが現在の環境に {package} が無い。"
+            f"`uv pip install local-llm-server[{package}]`（または現在の環境へ {package} を"
+            f"導入）してから使う。隔離 venv へ自動導入させたいなら [{package}] provision='auto'。"
         )
 
     vdir = os.path.normpath(venv_dir)

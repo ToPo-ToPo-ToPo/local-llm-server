@@ -78,17 +78,17 @@ dynamic = true
 
 # ── vLLM（任意。高スループット生成。Linux/NVIDIA・Windows は WSL2）──
 # backend = "vllm" のモデルを [[models]] に登録すると使える（明示 opt-in）。torch+CUDA を含む
-# 重量級パッケージなので、隔離した専用 venv へ起動時に自動導入する（数GB・初回のみ・要 GPU）。
-# 多人数同時・高スループットが要るとき向け。単人数・広い環境なら llama.cpp で十分。詳細は docs/vllm.md。
+# 重量級パッケージ（要 GPU・Linux/NVIDIA）。多人数同時・高スループット向け。詳細は docs/vllm.md。
+# 導入は extras が既定: `uv pip install local-llm-server[vllm]` で入れてから使う（勝手に自動DLしない）。
 # [vllm]
-# provision = "auto"        # auto=隔離 venv へ自動 pip install（既定）/ system=現在の環境の vllm を使う
+# provision = "system"      # system=現在の環境の vllm を使う（既定・extras で入れる）/ auto=隔離 venv へ自動 pip install
 
 # ── SGLang（任意。vLLM の対抗。Linux/NVIDIA・Windows は WSL2）──
 # backend = "sglang" のモデルで使える。RadixAttention（プレフィックスキャッシュ）で、同じ
-# システムプロンプト/ツール定義を毎回送る「エージェント運用」に強い。vLLM と同じく隔離 venv へ
-# 起動時に自動導入（要 GPU）。vLLM とどちらが速いかは実機・実ワークロードで bench して選ぶ。
+# システムプロンプト/ツール定義を毎回送る「エージェント運用」に強い。要 GPU・Linux/NVIDIA。
+# 導入は extras が既定: `uv pip install local-llm-server[sglang]`。bench で vLLM と比較して選ぶ。
 # [sglang]
-# provision = "auto"        # auto=隔離 venv へ自動 pip install（既定）/ system=現在の環境の sglang を使う
+# provision = "system"      # system=現在の環境の sglang を使う（既定・extras で入れる）/ auto=隔離 venv へ自動 pip install
 
 # ── 動画入力（任意）──
 # リクエストの content に video_url（data URI / http URL / ローカルパス）を入れると、ゲートウェイが

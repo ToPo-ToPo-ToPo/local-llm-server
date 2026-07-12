@@ -25,23 +25,32 @@ backend = "vllm"
 画像入力・ゲートウェイの動画フレーム展開・動的ロード・LRU・在席即時解放・drain 再起動も
 そのまま効く。
 
-## 自動導入（隔離 venv）
+## 導入（extras が既定）
 
-vLLM は torch+CUDA を含む**重量級パッケージ（数 GB）**なので、local-llm-server 本体には
-混ぜず、**管理ディレクトリ配下の専用 venv**（`~/.cache/local-llm-server/vllm-venv`）へ
-起動時に自動導入する（初回のみ・数分・要ネットワーク & GPU）。導入済みなら再利用する。
-本体の環境（mlx 等）は汚さない。
+vLLM は torch+CUDA を含む**重量級パッケージ（数 GB）**なので base 依存には入れない。使う人だけ
+**extras で明示的に入れる**（既定 `provision = "system"`＝勝手に数 GB を自動DLしない）:
+
+```bash
+uv pip install "local-llm-server[vllm]"   # 現在の環境へ vLLM を入れる（Linux/NVIDIA）
+```
 
 ```toml
 [vllm]
-provision = "auto"   # auto=隔離 venv へ自動 pip install（既定）/ system=現在の環境の vllm を使う
+provision = "system"   # 既定。現在の環境の vllm を使う（extras で入れる）
+# provision = "auto"   # 隔離 venv へ起動時に自動 pip install（下記）
 ```
 
-- **`provision = "system"`**: 既にこの Python 環境に vllm を入れてある（自分で管理している）
-  ときに使う。無ければ明示エラー。
-- 導入に失敗（GPU 非検出・pip 失敗・CUDA 不整合）してもゲートウェイは起動を続け、vllm モデルの
-  要求時に分かりやすいエラーになる（他バックエンドは動く）。
+- **`provision = "auto"`（隔離 venv・自動導入）**: `~/.cache/local-llm-server/vllm-venv` へ起動時に
+  自動導入する（初回のみ・要ネットワーク & GPU）。導入済みは再利用。本体環境を汚さない。
+  **vLLM と SGLang を同一マシンで両立**したいときはこちら —— 両者は torch/flashinfer のピンが
+  食い違い**同一環境に共存できないことが多い**ので、別々の隔離 venv に入れる必要がある
+  （extras で両方を1環境に入れると壊れる）。
+- どちらも、導入に失敗（GPU 非検出・pip 失敗・CUDA 不整合）してもゲートウェイは起動を続け、
+  vllm モデルの要求時に分かりやすいエラーになる（他バックエンドは動く）。
 - 導入した vLLM の素性は `GET /admin/status` の `vllm` フィールドと TUI に出る。
+
+> **まとめ**: 1 つだけ使う → `pip install ...[vllm]` ＋ 既定（system）。vLLM と SGLang を
+> 両方使う → 各 backend で `provision = "auto"`（別々の隔離 venv）。
 
 ## Windows（WSL2）
 
