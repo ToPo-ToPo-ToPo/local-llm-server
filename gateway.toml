@@ -76,6 +76,13 @@ dynamic = true
 # accel = "auto"            # auto=検出 / cuda（Windows 限定・要 cudart）/ vulkan / metal / cpu を明示
 # pin = "b9946"             # ビルド番号を固定（省略で最新を取得し、以後は導入済みを使い続ける）
 
+# ── vLLM（任意。高スループット生成。Linux/NVIDIA・Windows は WSL2）──
+# backend = "vllm" のモデルを [[models]] に登録すると使える（明示 opt-in）。torch+CUDA を含む
+# 重量級パッケージなので、隔離した専用 venv へ起動時に自動導入する（数GB・初回のみ・要 GPU）。
+# 多人数同時・高スループットが要るとき向け。単人数・広い環境なら llama.cpp で十分。詳細は docs/vllm.md。
+# [vllm]
+# provision = "auto"        # auto=隔離 venv へ自動 pip install（既定）/ system=現在の環境の vllm を使う
+
 # ── 動画入力（任意）──
 # リクエストの content に video_url（data URI / http URL / ローカルパス）を入れると、ゲートウェイが
 # ffmpeg で等間隔にフレーム抽出し image_url 列に展開して上流へ渡す（llama-cpp / mlx-vlm 共通）。
@@ -93,6 +100,12 @@ dynamic = true
 # model = "ToPo-ToPo/Qwen3.6-27B-mlx-4bit"
 # backend = "mlx-vlm"
 # draft_model = "off"       # このモデルだけ MTP を無効化（HF id を書けば別ドラフターを明示）
+#
+# vLLM（Linux/NVIDIA。Windows は WSL2 内で）。HF repo-id（safetensors）を指定。高スループット:
+# [[models]]
+# model = "Qwen/Qwen3-8B"
+# backend = "vllm"
+# extra_args = ["--max-model-len", "8192"]   # vLLM への個別フラグはそのまま渡る（任意）
 #
 # llama.cpp GGUF（vision・parallel）。model は HF repo-id（org/repo[:量子化]）。mmproj は自動検出:
 # [[models]]

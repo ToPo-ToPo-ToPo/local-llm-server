@@ -1,0 +1,64 @@
+# vLLM バックエンド
+
+[vLLM](https://vllm.ai) を使った高スループット生成を、ゲートウェイのバックエンドとして
+`backend = "vllm"` で選べる。PagedAttention・連続バッチングで**多人数同時・高スループット**に
+強い。単人数・広い環境なら llama.cpp で十分なので、vLLM は**明示 opt-in**（自動選択しない）。
+
+## 対象環境
+
+- **Linux + NVIDIA GPU**（本命）。
+- **Windows 11 は WSL2 内**で動かす（vLLM は Windows ネイティブ非対応。→ 下記「Windows（WSL2）」）。
+- macOS・GPU 無しは非対応（Apple Silicon は `backend = "mlx-vlm"`、GPU 無しは `llama-cpp` を使う）。
+
+## 使い方
+
+`[[models]]` に `backend = "vllm"` で登録するだけ。HF repo-id（safetensors）を指定する。
+
+```toml
+[[models]]
+model = "Qwen/Qwen3-8B"
+backend = "vllm"
+# extra_args = ["--max-model-len", "8192", "--tensor-parallel-size", "2"]  # vLLM への個別フラグ（任意）
+```
+
+クライアントは公開ポートに `model = "Qwen/Qwen3-8B"` を指定して繋ぐだけ（他バックエンドと同じ）。
+画像入力・ゲートウェイの動画フレーム展開・動的ロード・LRU・在席即時解放・drain 再起動も
+そのまま効く。
+
+## 自動導入（隔離 venv）
+
+vLLM は torch+CUDA を含む**重量級パッケージ（数 GB）**なので、local-llm-server 本体には
+混ぜず、**管理ディレクトリ配下の専用 venv**（`~/.cache/local-llm-server/vllm-venv`）へ
+起動時に自動導入する（初回のみ・数分・要ネットワーク & GPU）。導入済みなら再利用する。
+本体の環境（mlx 等）は汚さない。
+
+```toml
+[vllm]
+provision = "auto"   # auto=隔離 venv へ自動 pip install（既定）/ system=現在の環境の vllm を使う
+```
+
+- **`provision = "system"`**: 既にこの Python 環境に vllm を入れてある（自分で管理している）
+  ときに使う。無ければ明示エラー。
+- 導入に失敗（GPU 非検出・pip 失敗・CUDA 不整合）してもゲートウェイは起動を続け、vllm モデルの
+  要求時に分かりやすいエラーになる（他バックエンドは動く）。
+- 導入した vLLM の素性は `GET /admin/status` の `vllm` フィールドと TUI に出る。
+
+## Windows（WSL2）
+
+vLLM は Windows にネイティブ対応しない（公式）。Windows 11 では **WSL2**（Windows 内の実 Linux ＋
+NVIDIA GPU パススルー）で動かす:
+
+1. WSL2 と NVIDIA の WSL 用ドライバを入れる（`wsl --install`、GPU ドライバは Windows 側の最新版）。
+2. WSL2 の Ubuntu で本サーバを動かす（`uv run gw`）。以後は Linux とまったく同じ。
+3. Windows 側のクライアントからは WSL2 の IP:ポートに繋ぐ（`host = "0.0.0.0"` で公開）。
+
+Windows でネイティブに（WSL2 無しで）GPU 生成したい場合は `backend = "llama-cpp"` を使う
+（llama.cpp は Windows ネイティブ対応・自動導入される）。
+
+## llama.cpp / mlx との使い分け
+
+| 使いたいこと | 推奨バックエンド |
+|---|---|
+| 多人数同時・高スループット（Linux/NVIDIA） | **vllm** |
+| 単人数・広い環境（CPU/各種 GPU）・GGUF・手軽さ | **llama-cpp** |
+| Apple Silicon（Mac） | **mlx-vlm** / **mlx** |

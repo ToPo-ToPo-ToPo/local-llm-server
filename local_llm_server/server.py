@@ -64,6 +64,29 @@ def llama_provision_info() -> dict | None:
     return _LLAMA_INFO
 
 
+# vLLM を起動する python（隔離 venv）のパス。起動時に vllm_provisioner が解決して差し込む。
+# 未設定なら sys.executable（provision=system 相当）。build_command の vllm 分岐が使う。
+_VLLM_PYTHON: str | None = None
+_VLLM_INFO: dict | None = None
+
+
+def set_vllm_python(path: str | None, *, provision: str | None = None) -> None:
+    """起動時にプロビジョナが解決した vLLM 用 python のパス（と素性）を登録する。"""
+    global _VLLM_PYTHON, _VLLM_INFO
+    _VLLM_PYTHON = path
+    _VLLM_INFO = None if path is None else {"python": path, "provision": provision}
+
+
+def vllm_python() -> str:
+    """build_command が使う vLLM 用 python（未プロビジョン時は現在の python）。"""
+    return _VLLM_PYTHON or sys.executable
+
+
+def vllm_provision_info() -> dict | None:
+    """導入済み vLLM の素性（未導入は None）。/admin/status・TUI が表示に使う。"""
+    return _VLLM_INFO
+
+
 def _physical_cores() -> int:
     """物理コア数（ハイパースレッド/E コアを除く。取れなければ論理コア数）。"""
     try:
@@ -854,6 +877,19 @@ def build_command(config: ServerConfig) -> list[str]:
         command = [
             sys.executable, "-m", "local_llm_server.stt_server",
             "--model", config.model,
+            "--host", config.host,
+            "--port", str(config.port),
+        ]
+    elif config.backend == "vllm":
+        # vLLM の OpenAI 互換 API サーバを、隔離 venv の python から起動する（→ vllm_provisioner）。
+        # model は HF repo-id。事前 DL 済みを前提に確認する（未取得は案内付き ValueError）。
+        # クライアントに見せる id を repo-id に固定するため --served-model-name も同じ id にする。
+        # 逐次でなく連続バッチングで多人数同時に強い（並列は vLLM が内部で捌く）。
+        ensure_cached(config.model)
+        command = [
+            vllm_python(), "-m", "vllm.entrypoints.openai.api_server",
+            "--model", config.model,
+            "--served-model-name", config.model,
             "--host", config.host,
             "--port", str(config.port),
         ]

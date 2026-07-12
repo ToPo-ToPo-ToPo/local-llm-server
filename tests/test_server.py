@@ -735,3 +735,32 @@ def test_auto_llama_flags_none_accel_is_noop(hf_cache, monkeypatch):
                         lambda: {"accel": None, "provision": "system"})
     cmd = build_command(ServerConfig("llama-cpp", "org/m-gguf"))
     assert "-ngl" not in cmd and "--threads" not in cmd
+
+
+def test_build_command_vllm(hf_cache, monkeypatch):
+    # vllm バックエンドは隔離 venv の python から OpenAI API サーバを起動する。
+    hf_cache("org/vllm-model", ["config.json"])
+    monkeypatch.setattr(srv, "ensure_cached", lambda repo, **k: repo)  # DL チェックは別テスト
+    try:
+        srv.set_vllm_python("/managed/vllm-venv/bin/python")
+        cmd = build_command(ServerConfig("vllm", "org/vllm-model", port=9100))
+        assert cmd[0] == "/managed/vllm-venv/bin/python"
+        assert cmd[1:3] == ["-m", "vllm.entrypoints.openai.api_server"]
+        assert "--model" in cmd and "org/vllm-model" in cmd
+        # クライアントに見せる id を repo-id に固定する。
+        assert cmd[cmd.index("--served-model-name") + 1] == "org/vllm-model"
+        assert "9100" in cmd
+    finally:
+        srv.set_vllm_python(None)
+
+
+def test_build_command_vllm_falls_back_to_current_python(hf_cache, monkeypatch):
+    hf_cache("org/m", ["config.json"])
+    monkeypatch.setattr(srv, "ensure_cached", lambda repo, **k: repo)
+    srv.set_vllm_python(None)  # 未プロビジョン → 現在の python
+    cmd = build_command(ServerConfig("vllm", "org/m"))
+    assert cmd[0] == srv.sys.executable
+
+
+def test_vllm_in_backends():
+    assert "vllm" in srv.BACKENDS

@@ -1811,3 +1811,63 @@ def test_admin_drain_refused_while_busy(monkeypatch):
         server.shutdown(); server.server_close(); mgr.shutdown()
         for u in ups:
             u.shutdown(); u.server_close()
+
+
+# --- vLLM バックエンドの配線 --------------------------------------------------------
+
+def test_load_gateway_config_parses_vllm_defaults(tmp_path):
+    cfg = gw.load_gateway_config(_write(tmp_path, "port = 8799\n"))
+    assert cfg.vllm_provision == "auto"
+
+
+def test_load_gateway_config_parses_vllm_table(tmp_path):
+    cfg = gw.load_gateway_config(_write(tmp_path, '[vllm]\nprovision = "system"\n'))
+    assert cfg.vllm_provision == "system"
+    with pytest.raises(ValueError):
+        gw.load_gateway_config(_write(tmp_path, '[vllm]\nprovision = "nope"\n'))
+
+
+def test_vllm_in_use_only_when_registered(tmp_path):
+    cfg = gw.load_gateway_config(_write(
+        tmp_path,
+        'dynamic = false\n[[models]]\nmodel = "org/m"\nbackend = "vllm"\n'))
+    assert gw._vllm_in_use(cfg) is True
+    # backend 未指定（既定）の動的構成では vLLM を使わない。
+    d = gw.load_gateway_config(_write(tmp_path, "dynamic = true\n"))
+    assert gw._vllm_in_use(d) is False
+
+
+def test_provision_vllm_sets_python_when_used(tmp_path, monkeypatch):
+    cfg = gw.load_gateway_config(_write(
+        tmp_path,
+        'dynamic = false\n[[models]]\nmodel = "org/m"\nbackend = "vllm"\n'))
+    monkeypatch.setattr(gw.vllm_provisioner, "ensure_vllm",
+                        lambda **k: "/managed/vllm-venv/bin/python")
+    set_calls = []
+    monkeypatch.setattr(gw, "set_vllm_python", lambda p, **k: set_calls.append(p))
+    gw.provision_vllm_if_needed(cfg)
+    assert set_calls == ["/managed/vllm-venv/bin/python"]
+
+
+def test_provision_vllm_skipped_when_not_used(tmp_path, monkeypatch):
+    cfg = gw.load_gateway_config(_write(tmp_path, "dynamic = true\n"))
+    called = []
+    monkeypatch.setattr(gw.vllm_provisioner, "ensure_vllm",
+                        lambda **k: called.append(1) or "x")
+    gw.provision_vllm_if_needed(cfg)
+    assert called == []
+
+
+def test_provision_vllm_continues_on_failure(tmp_path, monkeypatch):
+    cfg = gw.load_gateway_config(_write(
+        tmp_path,
+        'dynamic = false\n[[models]]\nmodel = "org/m"\nbackend = "vllm"\n'))
+
+    def boom(**k):
+        raise gw.vllm_provisioner.VllmUnavailable("no gpu")
+
+    monkeypatch.setattr(gw.vllm_provisioner, "ensure_vllm", boom)
+    set_calls = []
+    monkeypatch.setattr(gw, "set_vllm_python", lambda p, **k: set_calls.append(p))
+    gw.provision_vllm_if_needed(cfg)  # 例外を投げない
+    assert set_calls == []
