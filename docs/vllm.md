@@ -55,10 +55,30 @@ NVIDIA GPU パススルー）で動かす:
 Windows でネイティブに（WSL2 無しで）GPU 生成したい場合は `backend = "llama-cpp"` を使う
 （llama.cpp は Windows ネイティブ対応・自動導入される）。
 
+## SGLang（vLLM の対抗）
+
+`backend = "sglang"` でも高スループット生成ができる。導入・対象環境（Linux/NVIDIA・WSL2）・
+隔離 venv への自動導入（`[sglang] provision`）は vLLM と同じ。違いは **RadixAttention
+（プレフィックスキャッシュ）**で、**共有プレフィックスの多い用途に強い**——同じシステムプロンプトや
+ツール定義を毎回送る**エージェント運用**では、共有部分のプレフィルを一度で済ませて後続を
+スキップするので、高同時実行での TTFT（初回トークンまでの時間）が下がる。
+
+```toml
+[[models]]
+model = "Qwen/Qwen3-8B"
+backend = "sglang"
+```
+
+どちらが速いかは**モデルサイズとプロンプトの共有度に依る**（プロンプトがほぼ毎回ユニークなら
+両者ほぼ互角）。実機で `bench [model]` を両方に対して測り、あなたのワークロードで勝った方を
+使うのが確実。vLLM の方がハード対応・モデル即日対応・コミュニティ規模で優る「安全な既定」、
+SGLang はエージェント的な共有プレフィックスで効く、という関係。
+
 ## llama.cpp / mlx との使い分け
 
 | 使いたいこと | 推奨バックエンド |
 |---|---|
-| 多人数同時・高スループット（Linux/NVIDIA） | **vllm** |
+| 多人数同時・高スループット（Linux/NVIDIA） | **vllm** / **sglang** |
+| エージェント（共有システムプロンプト/ツール定義が多い） | **sglang**（RadixAttention） |
 | 単人数・広い環境（CPU/各種 GPU）・GGUF・手軽さ | **llama-cpp** |
 | Apple Silicon（Mac） | **mlx-vlm** / **mlx** |

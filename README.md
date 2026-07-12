@@ -6,7 +6,7 @@
 - **モデルの事前登録は不要**。クライアントが指定した `model` をその場でロードする。画像入力（mmproj 自動検出）も mlx-vlm の MTP も設定なしで効く。
 - **画像・動画入力**。画像はそのまま、**動画（`video_url`）はゲートウェイが ffmpeg で等間隔にフレーム抽出して**モデルへ渡す（llama-cpp / mlx-vlm 共通。ffmpeg は pip 同梱で追加インストール不要 → [動画入力](docs/gateway.md)）。
 - **llama.cpp は自動導入**。Linux / Windows / Intel Mac では `llama-server` を OS・GPU 検出のうえ**起動時に自動ダウンロード**（手動導入不要。GPU は Vulkan、ソースビルドも opt-in で可 → [docs/llama-cpp.md](docs/llama-cpp.md)）。
-- **vLLM も選べる**（Linux/NVIDIA・Windows は WSL2）。`backend = "vllm"` で高スループット生成。重量級なので隔離 venv へ**起動時に自動導入**（明示 opt-in → [docs/vllm.md](docs/vllm.md)）。
+- **vLLM / SGLang も選べる**（Linux/NVIDIA・Windows は WSL2）。`backend = "vllm"` または `"sglang"` で高スループット生成。重量級なので隔離 venv へ**起動時に自動導入**（明示 opt-in。SGLang は RadixAttention でエージェント用途に強い → [docs/vllm.md](docs/vllm.md)）。
 - **音声認識（STT）も同じポートで**。`/v1/audio/transcriptions` に音声を投げれば mlx-whisper が遅延起動して文字起こしする。エージェント側に mlx 依存は要らない（→ [音声認識（STT / whisper）](docs/gateway.md#音声認識stt--whisper)）。
 - 1 つの公開ポートで複数モデルを配信し、リクエストの `model` で振り分ける。
 - **TUI ダッシュボードが使えるモデルを自動一覧**。どれを指定すればよいか一目で分かる。

@@ -1871,3 +1871,54 @@ def test_provision_vllm_continues_on_failure(tmp_path, monkeypatch):
     monkeypatch.setattr(gw, "set_vllm_python", lambda p, **k: set_calls.append(p))
     gw.provision_vllm_if_needed(cfg)  # 例外を投げない
     assert set_calls == []
+
+
+# --- SGLang バックエンドの配線 ------------------------------------------------------
+
+def test_load_gateway_config_parses_sglang(tmp_path):
+    assert gw.load_gateway_config(_write(tmp_path, "port = 8799\n")).sglang_provision == "auto"
+    cfg = gw.load_gateway_config(_write(tmp_path, '[sglang]\nprovision = "system"\n'))
+    assert cfg.sglang_provision == "system"
+    with pytest.raises(ValueError):
+        gw.load_gateway_config(_write(tmp_path, '[sglang]\nprovision = "nope"\n'))
+
+
+def test_sglang_in_use_only_when_registered(tmp_path):
+    cfg = gw.load_gateway_config(_write(
+        tmp_path, 'dynamic = false\n[[models]]\nmodel = "org/m"\nbackend = "sglang"\n'))
+    assert gw._sglang_in_use(cfg) is True
+    assert gw._sglang_in_use(gw.load_gateway_config(_write(tmp_path, "dynamic = true\n"))) is False
+
+
+def test_provision_sglang_sets_python_when_used(tmp_path, monkeypatch):
+    cfg = gw.load_gateway_config(_write(
+        tmp_path, 'dynamic = false\n[[models]]\nmodel = "org/m"\nbackend = "sglang"\n'))
+    monkeypatch.setattr(gw.sglang_provisioner, "ensure_sglang",
+                        lambda **k: "/managed/sglang-venv/bin/python")
+    set_calls = []
+    monkeypatch.setattr(gw, "set_sglang_python", lambda p, **k: set_calls.append(p))
+    gw.provision_sglang_if_needed(cfg)
+    assert set_calls == ["/managed/sglang-venv/bin/python"]
+
+
+def test_provision_sglang_skipped_when_not_used(tmp_path, monkeypatch):
+    cfg = gw.load_gateway_config(_write(tmp_path, "dynamic = true\n"))
+    called = []
+    monkeypatch.setattr(gw.sglang_provisioner, "ensure_sglang",
+                        lambda **k: called.append(1) or "x")
+    gw.provision_sglang_if_needed(cfg)
+    assert called == []
+
+
+def test_provision_sglang_continues_on_failure(tmp_path, monkeypatch):
+    cfg = gw.load_gateway_config(_write(
+        tmp_path, 'dynamic = false\n[[models]]\nmodel = "org/m"\nbackend = "sglang"\n'))
+
+    def boom(**k):
+        raise gw.sglang_provisioner.SglangUnavailable("no gpu")
+
+    monkeypatch.setattr(gw.sglang_provisioner, "ensure_sglang", boom)
+    set_calls = []
+    monkeypatch.setattr(gw, "set_sglang_python", lambda p, **k: set_calls.append(p))
+    gw.provision_sglang_if_needed(cfg)
+    assert set_calls == []

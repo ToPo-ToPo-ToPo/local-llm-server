@@ -539,6 +539,8 @@ class GatewayMonitor(App):
             policy += f"\nllama.cpp {build} · {llama.get('accel', '?')}"
         if admin.get("vllm"):
             policy += f"\nvLLM ({admin['vllm'].get('provision', '?')})"
+        if admin.get("sglang"):
+            policy += f"\nSGLang ({admin['sglang'].get('provision', '?')})"
         self.query_one("#policy", Static).update(policy)
 
     # --- 操作（別スレッドで実行して UI を固めない） ---

@@ -764,3 +764,24 @@ def test_build_command_vllm_falls_back_to_current_python(hf_cache, monkeypatch):
 
 def test_vllm_in_backends():
     assert "vllm" in srv.BACKENDS
+
+
+def test_build_command_sglang(hf_cache, monkeypatch):
+    # sglang バックエンドは隔離 venv の python から launch_server を起動する（--model-path）。
+    hf_cache("org/sg-model", ["config.json"])
+    monkeypatch.setattr(srv, "ensure_cached", lambda repo, **k: repo)
+    try:
+        srv.set_sglang_python("/managed/sglang-venv/bin/python")
+        cmd = build_command(ServerConfig("sglang", "org/sg-model", port=9200))
+        assert cmd[0] == "/managed/sglang-venv/bin/python"
+        assert cmd[1:3] == ["-m", "sglang.launch_server"]
+        # vLLM と違い --model-path を使う。
+        assert cmd[cmd.index("--model-path") + 1] == "org/sg-model"
+        assert cmd[cmd.index("--served-model-name") + 1] == "org/sg-model"
+        assert "9200" in cmd
+    finally:
+        srv.set_sglang_python(None)
+
+
+def test_sglang_in_backends():
+    assert "sglang" in srv.BACKENDS

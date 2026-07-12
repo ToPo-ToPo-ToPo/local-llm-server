@@ -87,6 +87,28 @@ def vllm_provision_info() -> dict | None:
     return _VLLM_INFO
 
 
+# SGLang を起動する python（隔離 venv）のパス。起動時に sglang_provisioner が解決して差し込む。
+_SGLANG_PYTHON: str | None = None
+_SGLANG_INFO: dict | None = None
+
+
+def set_sglang_python(path: str | None, *, provision: str | None = None) -> None:
+    """起動時にプロビジョナが解決した SGLang 用 python のパス（と素性）を登録する。"""
+    global _SGLANG_PYTHON, _SGLANG_INFO
+    _SGLANG_PYTHON = path
+    _SGLANG_INFO = None if path is None else {"python": path, "provision": provision}
+
+
+def sglang_python() -> str:
+    """build_command が使う SGLang 用 python（未プロビジョン時は現在の python）。"""
+    return _SGLANG_PYTHON or sys.executable
+
+
+def sglang_provision_info() -> dict | None:
+    """導入済み SGLang の素性（未導入は None）。/admin/status・TUI が表示に使う。"""
+    return _SGLANG_INFO
+
+
 def _physical_cores() -> int:
     """物理コア数（ハイパースレッド/E コアを除く。取れなければ論理コア数）。"""
     try:
@@ -889,6 +911,18 @@ def build_command(config: ServerConfig) -> list[str]:
         command = [
             vllm_python(), "-m", "vllm.entrypoints.openai.api_server",
             "--model", config.model,
+            "--served-model-name", config.model,
+            "--host", config.host,
+            "--port", str(config.port),
+        ]
+    elif config.backend == "sglang":
+        # SGLang の OpenAI 互換 API サーバを、隔離 venv の python から起動する（→ sglang_provisioner）。
+        # SGLang は引数が vLLM と違い、モデルは --model-path で渡す。RadixAttention で
+        # 共有プレフィックス（システムプロンプト/ツール定義）の多い用途に強い。
+        ensure_cached(config.model)
+        command = [
+            sglang_python(), "-m", "sglang.launch_server",
+            "--model-path", config.model,
             "--served-model-name", config.model,
             "--host", config.host,
             "--port", str(config.port),

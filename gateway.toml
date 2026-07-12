@@ -83,6 +83,13 @@ dynamic = true
 # [vllm]
 # provision = "auto"        # auto=隔離 venv へ自動 pip install（既定）/ system=現在の環境の vllm を使う
 
+# ── SGLang（任意。vLLM の対抗。Linux/NVIDIA・Windows は WSL2）──
+# backend = "sglang" のモデルで使える。RadixAttention（プレフィックスキャッシュ）で、同じ
+# システムプロンプト/ツール定義を毎回送る「エージェント運用」に強い。vLLM と同じく隔離 venv へ
+# 起動時に自動導入（要 GPU）。vLLM とどちらが速いかは実機・実ワークロードで bench して選ぶ。
+# [sglang]
+# provision = "auto"        # auto=隔離 venv へ自動 pip install（既定）/ system=現在の環境の sglang を使う
+
 # ── 動画入力（任意）──
 # リクエストの content に video_url（data URI / http URL / ローカルパス）を入れると、ゲートウェイが
 # ffmpeg で等間隔にフレーム抽出し image_url 列に展開して上流へ渡す（llama-cpp / mlx-vlm 共通）。
@@ -106,6 +113,12 @@ dynamic = true
 # model = "Qwen/Qwen3-8B"
 # backend = "vllm"
 # extra_args = ["--max-model-len", "8192"]   # vLLM への個別フラグはそのまま渡る（任意）
+#
+# SGLang（vLLM の対抗。プレフィックス共有が多いエージェント用途に強い）。model は HF repo-id:
+# [[models]]
+# model = "Qwen/Qwen3-8B"
+# backend = "sglang"
+# extra_args = ["--context-length", "8192"]  # SGLang への個別フラグはそのまま渡る（任意）
 #
 # llama.cpp GGUF（vision・parallel）。model は HF repo-id（org/repo[:量子化]）。mmproj は自動検出:
 # [[models]]

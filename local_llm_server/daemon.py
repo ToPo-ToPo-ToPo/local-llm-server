@@ -36,7 +36,7 @@ import urllib.parse
 from dataclasses import dataclass, field, fields, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from . import multipart, provisioner, video, vllm_provisioner
+from . import multipart, provisioner, sglang_provisioner, video, vllm_provisioner
 from .proxy import forward, send_error, send_json
 from .server import (
     BACKENDS,
@@ -57,7 +57,9 @@ from .server import (
     reclaim_stale_workers,
     resolve_drafter,
     set_llama_server_binary,
+    set_sglang_python,
     set_vllm_python,
+    sglang_provision_info,
     vllm_provision_info,
 )
 
@@ -1188,9 +1190,10 @@ class _GatewayHandler(BaseHTTPRequestHandler):
                 "started_at": srv.started_at,
                 "cwd": srv.start_cwd,
                 "launcher": srv.launcher,
-                # 導入した llama.cpp / vLLM の素性。未導入は None。
+                # 導入した llama.cpp / vLLM / SGLang の素性。未導入は None。
                 "llama": llama_provision_info(),
                 "vllm": vllm_provision_info(),
+                "sglang": sglang_provision_info(),
                 "models": models,
                 # キャッシュにある DL 済みモデル（TUI が未ロード候補として一覧する）。
                 "available": discover_cached_models(),
@@ -1463,8 +1466,9 @@ class GatewayConfig:
     llama_provision: str = "auto"      # auto=管理dirへ自動DL / system=PATH の llama-server / build=ソースビルド（Phase 3）
     llama_accel: str = "auto"          # auto=検出（GPU なら vulkan、mac は metal、無ければ cpu）/ cuda / vulkan / metal / cpu
     llama_build: str | None = None     # ビルド番号の固定（例 "b9946"）。省略で最新を取得し導入済みを使い続ける
-    # --- vLLM（Linux/NVIDIA・Windows は WSL2）。[vllm] テーブルで設定。backend="vllm" 明示時のみ ---
+    # --- vLLM / SGLang（Linux/NVIDIA・Windows は WSL2）。[vllm]/[sglang] で設定。明示 opt-in 時のみ ---
     vllm_provision: str = "auto"       # auto=隔離 venv へ自動 pip install / system=現在の環境の vllm を使う
+    sglang_provision: str = "auto"     # auto=隔離 venv へ自動 pip install / system=現在の環境の sglang を使う
     # --- 動画入力: ゲートウェイが video_url をフレーム画像列へ展開して上流へ渡す ---
     video_frames: int = 8              # 1 本の動画から等間隔で抜くフレーム数
     video_max_edge: int = 768          # 各フレームの縮小サイズ（長辺ピクセル）
@@ -1640,6 +1644,14 @@ def load_gateway_config(path: str) -> GatewayConfig:
     if vllm_provision not in ("auto", "system"):
         raise ValueError("vllm.provision must be auto / system")
 
+    # [sglang] テーブル: SGLang の導入設定（backend="sglang" のモデルがあるときだけ効く）。
+    sglang = data.get("sglang") or {}
+    if not isinstance(sglang, dict):
+        raise ValueError("[sglang] must be a table")
+    sglang_provision = str(sglang.get("provision", "auto"))
+    if sglang_provision not in ("auto", "system"):
+        raise ValueError("sglang.provision must be auto / system")
+
     # 動画入力のフレーム展開設定。省略で 8 フレーム / 長辺 768px。
     video_frames = int(data.get("video_frames", 8))
     if video_frames < 1:
@@ -1712,6 +1724,7 @@ def load_gateway_config(path: str) -> GatewayConfig:
         llama_accel=llama_accel,
         llama_build=llama_build,
         vllm_provision=vllm_provision,
+        sglang_provision=sglang_provision,
         video_frames=video_frames,
         video_max_edge=video_max_edge,
     )
@@ -1723,8 +1736,8 @@ _CONFIG_POLL_INTERVAL = 1.0
 # 変更を検知したら「要再起動」を警告するだけで、サーバーは止めず旧値のまま動かし続ける。
 _RESTART_ONLY_FIELDS = (
     "host", "port", "internal_base_port", "models",
-    # llama-server バイナリ・vLLM venv は起動時に導入・解決するため、変更は再起動が要る。
-    "llama_provision", "llama_accel", "llama_build", "vllm_provision",
+    # llama-server バイナリ・vLLM/SGLang venv は起動時に導入・解決するため、変更は再起動が要る。
+    "llama_provision", "llama_accel", "llama_build", "vllm_provision", "sglang_provision",
 )
 
 
@@ -1988,6 +2001,29 @@ def provision_vllm_if_needed(cfg: GatewayConfig) -> None:
     print(f"vLLM ready: {py} (provision={cfg.vllm_provision})", file=sys.stderr)
 
 
+def _sglang_in_use(cfg: GatewayConfig) -> bool:
+    """事前登録に backend="sglang" のモデルがあるか（SGLang は明示 opt-in 専用）。"""
+    return any(c.backend == "sglang" for c in cfg.models)
+
+
+def provision_sglang_if_needed(cfg: GatewayConfig) -> None:
+    """sglang モデルが登録された構成のときだけ、起動時に SGLang を隔離 venv へ導入する。
+
+    導入は数 GB・数分かかる（初回のみ）。失敗してもゲートウェイは起動を続ける
+    （他バックエンドは動く。sglang モデルの要求時に分かりやすいエラーになる）。
+    """
+    if not _sglang_in_use(cfg):
+        return
+    try:
+        py = sglang_provisioner.ensure_sglang(provision=cfg.sglang_provision)
+    except Exception as exc:  # noqa: BLE001 - 導入失敗で起動を止めない（GPU 非検出・pip 失敗等）
+        print(f"SGLang provisioning failed (continuing without it): {exc}",
+              file=sys.stderr)
+        return
+    set_sglang_python(py, provision=cfg.sglang_provision)
+    print(f"SGLang ready: {py} (provision={cfg.sglang_provision})", file=sys.stderr)
+
+
 def _run_gateway_locked(cfg: GatewayConfig, config_path: str | None = None) -> int:
     """単一起動ロック取得済みで実際にゲートウェイを回す本体（run_gateway が呼ぶ）。
 
@@ -1996,6 +2032,7 @@ def _run_gateway_locked(cfg: GatewayConfig, config_path: str | None = None) -> i
     """
     provision_llama_if_needed(cfg)
     provision_vllm_if_needed(cfg)
+    provision_sglang_if_needed(cfg)
     manager = ModelManager(
         cfg.models, max_resident=cfg.max_resident, load_timeout=cfg.load_timeout,
         start_timeout=cfg.start_timeout,
