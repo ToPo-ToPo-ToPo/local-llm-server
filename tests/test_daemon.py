@@ -1925,3 +1925,77 @@ def test_provision_sglang_continues_on_failure(tmp_path, monkeypatch):
     monkeypatch.setattr(gw, "set_sglang_python", lambda p, **k: set_calls.append(p))
     gw.provision_sglang_if_needed(cfg)
     assert set_calls == []
+
+
+# --- 繰り返しループ抑制: repetition_penalty の既定注入（mlx 系のみ） ----------
+
+def test_repetition_penalty_default_is_injected(tmp_path):
+    """gateway.toml に書かなくても既定 1.1 が有効（既定注入）。context_size は既定 None。"""
+    cfg = gw.load_gateway_config(_write(tmp_path, "port = 8799\n"))
+    assert cfg.repetition_penalty == 1.1
+    assert cfg.repetition_context_size is None
+
+
+def test_repetition_penalty_explicit_values(tmp_path):
+    cfg = gw.load_gateway_config(_write(
+        tmp_path, "port = 8799\nrepetition_penalty = 1.2\nrepetition_context_size = 64\n"))
+    assert cfg.repetition_penalty == 1.2
+    assert cfg.repetition_context_size == 64
+
+
+@pytest.mark.parametrize("val", ["0", "false", '"off"', '"none"'])
+def test_repetition_penalty_disabled(tmp_path, val):
+    """0 / false / "off" / "none" で無効化（＝設定しない選択。注入しない）。"""
+    cfg = gw.load_gateway_config(_write(tmp_path, f"port = 8799\nrepetition_penalty = {val}\n"))
+    assert cfg.repetition_penalty is None
+
+
+def test_repetition_penalty_below_one_rejected(tmp_path):
+    """< 1.0 は繰り返しを助長するので拒否（無効化は 0/false を使う）。"""
+    with pytest.raises(ValueError):
+        gw.load_gateway_config(_write(tmp_path, "port = 8799\nrepetition_penalty = 0.8\n"))
+
+
+def _mk_srv(rp, backends, rcs=None):
+    from types import SimpleNamespace
+    mgr = SimpleNamespace(backend_for=lambda m: backends[m])
+    return SimpleNamespace(repetition_penalty=rp, repetition_context_size=rcs, manager=mgr)
+
+
+def _inject(srv, model, payload):
+    body = json.dumps(payload).encode("utf-8")
+    out = gw._GatewayHandler._maybe_inject_repetition(None, srv, model, payload, body)
+    return json.loads(out)
+
+
+def test_inject_repetition_for_mlx():
+    srv = _mk_srv(1.1, {"org/gemma": "mlx-vlm"})
+    got = _inject(srv, "org/gemma", {"model": "org/gemma", "messages": []})
+    assert got["repetition_penalty"] == 1.1
+
+
+def test_inject_repetition_with_context_size():
+    srv = _mk_srv(1.15, {"org/gemma": "mlx-vlm"}, rcs=64)
+    got = _inject(srv, "org/gemma", {"model": "org/gemma", "messages": []})
+    assert got["repetition_penalty"] == 1.15 and got["repetition_context_size"] == 64
+
+
+def test_no_inject_for_llama_cpp():
+    """mlx 系以外（llama-cpp は repeat_penalty で別物）には付けない。"""
+    srv = _mk_srv(1.1, {"org/gguf": "llama-cpp"})
+    got = _inject(srv, "org/gguf", {"model": "org/gguf", "messages": []})
+    assert "repetition_penalty" not in got
+
+
+def test_client_specified_is_respected():
+    """クライアントが自分で指定していれば上書きしない。"""
+    srv = _mk_srv(1.1, {"org/gemma": "mlx-vlm"})
+    got = _inject(srv, "org/gemma", {"model": "org/gemma", "messages": [], "repetition_penalty": 1.3})
+    assert got["repetition_penalty"] == 1.3
+
+
+def test_no_inject_when_disabled():
+    """サーバー設定が無効（None）なら何も付けない。"""
+    srv = _mk_srv(None, {"org/gemma": "mlx-vlm"})
+    got = _inject(srv, "org/gemma", {"model": "org/gemma", "messages": []})
+    assert "repetition_penalty" not in got
