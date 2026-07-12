@@ -316,6 +316,18 @@ class ModelManager:
     def model_ids(self) -> list[str]:
         return list(self._models)
 
+    def backend_for(self, model_id: str) -> str:
+        """model_id のバックエンドを返す（登録済みは config 値、未登録は ID から推論）。
+
+        do_POST が「mlx 系のみ repetition_penalty を注入する」判定に使う。acquire 前でも
+        判定できるよう、まだ登録されていない動的モデルは ID から推論する。
+        """
+        with self._state:
+            mm = self._models.get(model_id)
+        if mm is not None:
+            return mm.config.backend
+        return infer_backend(model_id)
+
     def _capacity(self, config: ServerConfig) -> int:
         """1 インスタンスが同時に捌けるリクエスト数。llama-cpp は parallel スロット、他は 1。
 
@@ -1037,9 +1049,15 @@ class GatewayServer(ThreadingHTTPServer):
         vision_model: str | None = None,
         video_frames: int = 8,
         video_max_edge: int = 768,
+        repetition_penalty: float | None = None,
+        repetition_context_size: int | None = None,
     ) -> None:
         super().__init__(addr, _GatewayHandler)
         self.manager = manager
+        # 繰り返しループ抑制の既定注入（mlx 系のみ。None で無効）。do_POST が chat リクエストに
+        # 付与する（クライアントが自分で指定していれば尊重して上書きしない）。
+        self.repetition_penalty = repetition_penalty
+        self.repetition_context_size = repetition_context_size
         self.catalog = catalog            # /v1/models で返すモデル一覧
         self.default_model = default_model
         self.timeout_s = timeout_s        # None なら無制限（長時間生成に備える）
@@ -1285,7 +1303,36 @@ class _GatewayHandler(BaseHTTPRequestHandler):
             model = vmodel
             payload["model"] = vmodel
             body = json.dumps(payload).encode("utf-8")
+        # 繰り返しループ抑制: mlx 系宛の生成リクエストに repetition_penalty を既定注入する
+        # （chat/text completions のみ。クライアント明示は尊重。設定で無効化可）。
+        if path.endswith(("/chat/completions", "/completions")):
+            body = self._maybe_inject_repetition(srv, model, payload, body)
         self._acquire_and_forward(srv, model, body)
+
+    def _maybe_inject_repetition(self, srv, model, payload: dict, body: bytes) -> bytes:
+        """mlx / mlx-vlm 宛のリクエストに repetition_penalty（+任意で context_size）を付与する。
+
+        - サーバー設定が無効（None）なら何もしない（＝設定しない選択）。
+        - クライアントが自分で repetition_penalty を指定していれば尊重して上書きしない。
+        - バックエンドが mlx 系でなければ何もしない（llama-cpp は名前が repeat_penalty で別物）。
+        戻り値は（必要なら差し替えた）リクエストボディ。
+        """
+        rp = getattr(srv, "repetition_penalty", None)
+        if rp is None or not isinstance(model, str):
+            return body
+        if "repetition_penalty" in payload:
+            return body
+        try:
+            backend = srv.manager.backend_for(model)
+        except Exception:  # noqa: BLE001 - 判定不能なら注入しない（安全側）
+            return body
+        if backend not in ("mlx", "mlx-vlm"):
+            return body
+        payload["repetition_penalty"] = rp
+        rcs = getattr(srv, "repetition_context_size", None)
+        if rcs is not None and "repetition_context_size" not in payload:
+            payload["repetition_context_size"] = rcs
+        return json.dumps(payload).encode("utf-8")
 
     def _handle_audio(self, srv, body: bytes) -> None:
         """STT（/v1/audio/transcriptions・/translations）を振り分ける。
@@ -1474,6 +1521,15 @@ class GatewayConfig:
     # --- 動画入力: ゲートウェイが video_url をフレーム画像列へ展開して上流へ渡す ---
     video_frames: int = 8              # 1 本の動画から等間隔で抜くフレーム数
     video_max_edge: int = 768          # 各フレームの縮小サイズ（長辺ピクセル）
+    # --- 繰り返しループ抑制: mlx 系バックエンド（mlx / mlx-vlm）宛の chat リクエストに
+    #     repetition_penalty を既定注入する（mlx-lm/mlx-vlm 拡張パラメータ）。低温・量子化の
+    #     ローカル LLM が「同じ内容を繰り返して終わらない」degeneration の緩和。llama-cpp は
+    #     パラメータ名が異なる（repeat_penalty）ので対象外＝mlx 系だけに付ける（ユーザー方針）。
+    #     クライアントが自分で repetition_penalty を指定していれば尊重する（上書きしない）。---
+    repetition_penalty: float | None = 1.1   # 既定 1.1（llama.cpp 既定と同値の穏当な値）。
+                                             # 0 / false / "off" で無効化（注入しない）＝設定しない選択
+    repetition_context_size: int | None = None  # 併せて注入する参照窓（mlx 既定 20。研究推奨 64）。
+                                                # None なら注入しない（repetition_penalty だけ付ける）
 
 
 def _resolve_model_draft(
@@ -1624,6 +1680,28 @@ def load_gateway_config(path: str) -> GatewayConfig:
         if not (0.0 < max_memory_fraction <= 1.0):
             raise ValueError("max_memory_fraction must be in (0, 1]")
 
+    # 繰り返しループ抑制の既定注入（mlx 系のみ）。既定 1.1。0 / false / "off" / "none" で
+    # 無効化（＝注入しない＝「設定しない」選択）。< 1.0 は繰り返しを助長するので拒否する
+    # （1.0 は中立＝無効相当だが受け付ける）。
+    rp_raw = data.get("repetition_penalty", 1.1)
+    if (rp_raw is None or rp_raw is False
+            or (isinstance(rp_raw, str) and rp_raw.strip().lower() in ("off", "none", "false", ""))):
+        repetition_penalty = None
+    else:
+        repetition_penalty = float(rp_raw)
+        if repetition_penalty == 0.0:
+            repetition_penalty = None  # 0 も無効化として扱う
+        elif repetition_penalty < 1.0:
+            raise ValueError(
+                "repetition_penalty must be >= 1.0 (1.0 = neutral; < 1.0 encourages "
+                "repetition). Use 0 / false / \"off\" to disable injection."
+            )
+    # 併せて注入する参照窓（省略時は付けない＝上流の既定 20 に任せる）。
+    rcs_raw = data.get("repetition_context_size")
+    repetition_context_size = None if rcs_raw is None else int(rcs_raw)
+    if repetition_context_size is not None and repetition_context_size < 1:
+        raise ValueError("repetition_context_size must be 1 or greater")
+
     # [llama_cpp] テーブル: llama-server バイナリの自動導入設定（すべて省略可＝全自動）。
     llama = data.get("llama_cpp") or {}
     if not isinstance(llama, dict):
@@ -1729,6 +1807,8 @@ def load_gateway_config(path: str) -> GatewayConfig:
         sglang_provision=sglang_provision,
         video_frames=video_frames,
         video_max_edge=video_max_edge,
+        repetition_penalty=repetition_penalty,
+        repetition_context_size=repetition_context_size,
     )
 
 
@@ -1787,6 +1867,12 @@ def apply_live_config(
     if cfg.video_max_edge != new.video_max_edge:
         note("video_max_edge", cfg.video_max_edge, new.video_max_edge)
         server.video_max_edge = new.video_max_edge
+    if cfg.repetition_penalty != new.repetition_penalty:
+        note("repetition_penalty", cfg.repetition_penalty, new.repetition_penalty)
+        server.repetition_penalty = new.repetition_penalty
+    if cfg.repetition_context_size != new.repetition_context_size:
+        note("repetition_context_size", cfg.repetition_context_size, new.repetition_context_size)
+        server.repetition_context_size = new.repetition_context_size
     if cfg.default_model != new.default_model:
         note("default_model", cfg.default_model, new.default_model)
         server.default_model = new.default_model
@@ -2057,6 +2143,8 @@ def _run_gateway_locked(cfg: GatewayConfig, config_path: str | None = None) -> i
         vision_model=cfg.vision_model,
         video_frames=cfg.video_frames,
         video_max_edge=cfg.video_max_edge,
+        repetition_penalty=cfg.repetition_penalty,
+        repetition_context_size=cfg.repetition_context_size,
     )
     public = f"http://{cfg.host}:{cfg.port}/v1"
     wildcard = cfg.host in ("0.0.0.0", "")
