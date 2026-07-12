@@ -79,8 +79,9 @@ def ensure_backend(
             return sys.executable
         raise unavailable(
             f"provision='system'（既定）だが現在の環境に {package} が無い。"
-            f"`uv pip install local-llm-server[{package}]`（または現在の環境へ {package} を"
-            f"導入）してから使う。隔離 venv へ自動導入させたいなら [{package}] provision='auto'。"
+            f"`uv sync --extra {package}`（clone 運用）/ `uv tool install "
+            f"local-llm-server[{package}]` などで導入してから使う。隔離 venv へ自動導入"
+            f"させたいなら [{package}] provision='auto'。"
         )
 
     vdir = os.path.normpath(venv_dir)

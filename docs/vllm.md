@@ -28,16 +28,24 @@ backend = "vllm"
 ## 導入（extras が既定）
 
 vLLM は torch+CUDA を含む**重量級パッケージ（数 GB）**なので base 依存には入れない。使う人だけ
-**extras で明示的に入れる**（既定 `provision = "system"`＝勝手に数 GB を自動DLしない）:
+**extras で明示的に入れる**（既定 `provision = "system"`＝勝手に数 GB を自動DLしない）。**uv だけで完結**する:
 
 ```bash
-uv pip install "local-llm-server[vllm]"   # 現在の環境へ vLLM を入れる（Linux/NVIDIA）
+# このリポジトリを clone して uv run gw で動かす運用（既定）:
+uv sync --extra vllm          # プロジェクトの venv へ vLLM を入れる（Linux/NVIDIA。以後 uv run gw）
+# 一時的に有効化するだけなら: uv run --extra vllm gw
+
+# uv tool として入れている場合:
+uv tool install "local-llm-server[vllm]"
+
+# local-llm-server を別の uv プロジェクトの依存にしている場合:
+uv add "local-llm-server[vllm]"
 ```
 
 ```toml
 [vllm]
-provision = "system"   # 既定。現在の環境の vllm を使う（extras で入れる）
-# provision = "auto"   # 隔離 venv へ起動時に自動 pip install（下記）
+provision = "system"   # 既定。現在の環境の vllm を使う（uv sync --extra vllm で入れる）
+# provision = "auto"   # 隔離 venv へ起動時に自動導入（下記）
 ```
 
 - **`provision = "auto"`（隔離 venv・自動導入）**: `~/.cache/local-llm-server/vllm-venv` へ起動時に
@@ -49,8 +57,8 @@ provision = "system"   # 既定。現在の環境の vllm を使う（extras で
   vllm モデルの要求時に分かりやすいエラーになる（他バックエンドは動く）。
 - 導入した vLLM の素性は `GET /admin/status` の `vllm` フィールドと TUI に出る。
 
-> **まとめ**: 1 つだけ使う → `pip install ...[vllm]` ＋ 既定（system）。vLLM と SGLang を
-> 両方使う → 各 backend で `provision = "auto"`（別々の隔離 venv）。
+> **まとめ**: 1 つだけ使う → `uv sync --extra vllm` ＋ 既定（system）。vLLM と SGLang を
+> 両方使う → 各 backend で `provision = "auto"`（別々の隔離 venv・自動導入）。
 
 ## Windows（WSL2）
 
