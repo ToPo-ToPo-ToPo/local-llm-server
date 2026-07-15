@@ -1672,6 +1672,70 @@ def test_load_gateway_config_parses_video_settings(tmp_path):
         gw.load_gateway_config(_write(tmp_path, "video_frames = 0\n"))
 
 
+def test_load_gateway_config_parses_image_max_edge(tmp_path):
+    cfg = gw.load_gateway_config(_write(tmp_path, "image_max_edge = 1024\n"))
+    assert cfg.image_max_edge == 1024
+    # 既定 1568。
+    assert gw.load_gateway_config(_write(tmp_path, "port = 8799\n")).image_max_edge == 1568
+    # 0 は無効化として許可。
+    assert gw.load_gateway_config(_write(tmp_path, "image_max_edge = 0\n")).image_max_edge == 0
+    # 0 以外で 64 未満は拒否。
+    with pytest.raises(ValueError):
+        gw.load_gateway_config(_write(tmp_path, "image_max_edge = 32\n"))
+
+
+def test_gateway_downscales_image_before_forwarding(monkeypatch):
+    # 長辺が image_max_edge を超える画像は、上流へ届く前に縮小される。
+    import base64
+    import io
+
+    from PIL import Image
+
+    def _big_data_url():
+        buf = io.BytesIO()
+        Image.new("RGB", (3000, 2000)).save(buf, format="PNG")
+        return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+
+    seen = {}
+
+    class _Cap(BaseHTTPRequestHandler):
+        def log_message(self, *_a):
+            pass
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length") or 0)
+            seen["body"] = self.rfile.read(length)
+            data = json.dumps({"backend": "img-up"}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+    up = ThreadingHTTPServer(("127.0.0.1", 0), _Cap)
+    threading.Thread(target=up.serve_forever, daemon=True).start()
+    monkeypatch.setattr(gw, "LocalServer",
+                        lambda config, log_path=None: _FakeServer(config, log_path))
+    configs = [ServerConfig(backend="mlx-vlm", model="m", host="127.0.0.1",
+                            port=up.server_address[1])]
+    mgr = gw.ModelManager(configs, dynamic=False)
+    server = gw.GatewayServer(("127.0.0.1", 0), mgr, catalog=["m"], image_max_edge=1568)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        port = server.server_address[1]
+        msg = [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": _big_data_url()}}]}]
+        s, _o = _post(port, "/v1/chat/completions", {"model": "m", "messages": msg})
+        assert s == 200
+        body = json.loads(seen["body"])
+        url = body["messages"][0]["content"][0]["image_url"]["url"]
+        raw = base64.b64decode(url.split(",", 1)[1])
+        assert max(Image.open(io.BytesIO(raw)).size) == 1568   # 長辺が上限に縮小された
+    finally:
+        server.shutdown(); server.server_close(); mgr.shutdown()
+        up.shutdown(); up.server_close()
+
+
 def test_gateway_expands_video_before_forwarding(monkeypatch):
     # video_url を含む chat は、上流へ届く前にフレーム画像（image_url）へ展開される。
     up = _make_upstream("vid-up")

@@ -1,6 +1,6 @@
 [project]
 name = "local-llm-server"
-version = "0.32.0"
+version = "0.33.0"
 description = "ローカルLLM（mlx / mlx-vlm / llama.cpp / vLLM / SGLang）を OpenAI 互換 API で束ねるマルチモデルゲートウェイ（サーバー）。gateway.toml のカタログを 1 ポートで配信し、model で振り分け・遅延起動・LRU 退避・MTP 高速化（Ollama 流の共有デーモン）。接続用クライアントは別パッケージ local-llm-client。"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -40,6 +40,10 @@ dependencies = [
     # ① STT の音声デコード（Apple Silicon）② 動画入力のフレーム抽出（全 OS。video.py）。
     # 動画入力は llama-cpp / mlx-vlm どちらでも効くので、全 OS に入れる。
     "imageio-ffmpeg>=0.4.9",
+    # 画像入力の長辺リサイズ（image_max_edge）で使う。解像度上限の無い VLM に巨大画像を
+    # 渡すと vision トークンが数千〜万に膨れ prefill が数十秒〜数分になる（見かけ上ハング）ため、
+    # ゲートウェイ側で縮小してから上流へ渡す。バックエンド非依存なので全 OS に入れる（image.py）。
+    "pillow>=10.0",
 ]
 
 # 高スループット生成バックエンド（明示 opt-in の extras）。torch+CUDA を含む重量級で、

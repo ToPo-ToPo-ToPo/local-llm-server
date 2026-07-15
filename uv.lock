@@ -1959,13 +1959,14 @@ wheels = [
 
 [[package]]
 name = "local-llm-server"
-version = "0.32.0"
+version = "0.33.0"
 source = { editable = "." }
 dependencies = [
     { name = "imageio-ffmpeg" },
     { name = "mlx-lm", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine != 'arm64' and extra == 'extra-16-local-llm-server-sglang' and extra == 'extra-16-local-llm-server-vllm') or (sys_platform != 'darwin' and extra == 'extra-16-local-llm-server-sglang' and extra == 'extra-16-local-llm-server-vllm')" },
     { name = "mlx-vlm", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine != 'arm64' and extra == 'extra-16-local-llm-server-sglang' and extra == 'extra-16-local-llm-server-vllm') or (sys_platform != 'darwin' and extra == 'extra-16-local-llm-server-sglang' and extra == 'extra-16-local-llm-server-vllm')" },
     { name = "mlx-whisper", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine != 'arm64' and extra == 'extra-16-local-llm-server-sglang' and extra == 'extra-16-local-llm-server-vllm') or (sys_platform != 'darwin' and extra == 'extra-16-local-llm-server-sglang' and extra == 'extra-16-local-llm-server-vllm')" },
+    { name = "pillow" },
     { name = "psutil" },
     { name = "textual" },
     { name = "transformers" },
@@ -1991,6 +1992,7 @@ requires-dist = [
     { name = "mlx-lm", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'", specifier = ">=0.31.3" },
     { name = "mlx-vlm", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'", specifier = ">=0.6.3,<0.6.4" },
     { name = "mlx-whisper", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'", specifier = ">=0.4.3" },
+    { name = "pillow", specifier = ">=10.0" },
     { name = "psutil", specifier = ">=5.9" },
     { name = "sglang", marker = "sys_platform == 'linux' and extra == 'sglang'" },
     { name = "textual", specifier = ">=8.2.7" },
