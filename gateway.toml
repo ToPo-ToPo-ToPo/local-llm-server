@@ -73,10 +73,12 @@ auto_update = true
 dynamic = true
 # disable_thinking = true   # 動的ロード時の既定（思考抑制）。事前登録は各 [[models]] が優先
 # default_model = "..."     # `model` 省略リクエスト時のモデル（任意）
-# vision_model = "ToPo-ToPo/gemma-4-31b-it-mlx-4bit"  # 画像入りリクエストの振り分け先（任意）。設定すると
-#                           # 画像を含むリクエストだけを（元 model に関わらず）このモデルへ流す。テキストは
-#                           # 元モデルのまま。現行 mlx_vlm で画像が壊れているモデル（Qwen3.6-27B 等）を避け、
-#                           # 画像だけを確実に動く gemma-4 系へ逃がす用途（→ docs/mtp.md「画像入力(vision)」）。
+vision_model = "ToPo-ToPo/gemma-4-31b-it-mlx-4bit"  # 画像入りリクエストの振り分け先。設定すると
+                          # 画像を含むリクエストだけを（元 model に関わらず）このモデルへ流す。テキストは
+                          # 元モデルのまま。現行 mlx_vlm で画像が壊れているモデル（Qwen3.6-27B 等）を避け、
+                          # 画像だけを確実に動く gemma-4 系へ逃がす用途（→ docs/mtp.md「画像入力(vision)」）。
+                          # openscad-agent の CAD 形状レビュー（VLM）がここで詰まって進まなくなる
+                          # 不具合の対策として有効化（gemma-4-31b は既にロード済み）。
 # draft_model = "off"       # 動的ロード時の MTP 既定。既定（未指定）は mlx-vlm を "auto"（対応表から
 #                           # 自動選択）。"off" で動的 MTP を一律無効化、HF id で全モデルに明示指定
 # parallel = 4              # 動的ロードする llama-cpp モデルの並列スロット既定（mlx 系は無視。→ docs/llama-cpp.md）
@@ -131,6 +133,13 @@ dynamic = true
 #   思考（thinking）は既定OFF運用。mlx-vlm サーバは enable_thinking 未指定なら思考OFF（実測確認済み）。
 #   注意: Bonsai の公表ベンチ（三値 80.49 / FP16比 94.6%）は全て thinking mode の値。数学・コード・
 #   エージェント等の推論タスクで質を出したいリクエストだけ enable_thinking=true を送る運用にする。
+#
+#   思考チャネルの分離（thinking を出しても content を汚さない）: mlx-vlm 0.6.3 は生成テキストから
+#   reasoning を切り出して reasoning_content へ回す。その開始/終了マーカーはモデルごとに違い、
+#   gemma-4-A4B 系は「開 <|channel>thought / 閉 <channel|>」を使う（<think>…</think> とは別形式）。
+#   0.6.3 の既定マーカーには両形式が含まれるが、内部既定に依存しないよう server.py が mlx-vlm 起動時に
+#   MLX_VLM_THINKING_START_TOKEN/END_TOKEN を明示設定する。これにより gemma-4 の thought/<channel|> が
+#   content へ漏れない（旧 mlx-vlm ではこの既定が無く漏れていた＝要 0.6.3 以上、pyproject でピン済み）。
 [[models]]
 model = "prism-ml/Ternary-Bonsai-27B-mlx-2bit"
 backend = "mlx-vlm"       # 27B は vision-language。mlx-vlm なら画像入力も使える（三値パックは FP16 vision tower 同梱）
