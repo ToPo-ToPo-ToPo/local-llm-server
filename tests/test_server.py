@@ -785,3 +785,49 @@ def test_build_command_sglang(hf_cache, monkeypatch):
 
 def test_sglang_in_backends():
     assert "sglang" in srv.BACKENDS
+
+
+def _capture_start_env(monkeypatch, tmp_path, backend, preset_env=None):
+    """LocalServer.start() が Popen へ渡す env を捕捉する（実プロセスは起こさない）。"""
+    import subprocess
+    from local_llm_server import server as srv_mod
+    from local_llm_server import LocalServer, ServerConfig
+
+    monkeypatch.setattr(srv_mod, "build_command", lambda cfg: ["true"])
+    if preset_env is not None:
+        for k, v in preset_env.items():
+            monkeypatch.setenv(k, v)
+
+    captured = {}
+
+    class _FakePopen:
+        def __init__(self, *a, **k):
+            captured["env"] = k.get("env")
+        def poll(self):
+            return 0
+
+    monkeypatch.setattr(subprocess, "Popen", _FakePopen)
+    server = LocalServer(ServerConfig(backend, "dummy", "127.0.0.1", 9),
+                         log_path=str(tmp_path / "s.log"))
+    server.start()
+    return captured["env"]
+
+
+def test_mlx_vlm_sets_thinking_channel_markers(monkeypatch, tmp_path):
+    # mlx-vlm 起動時は gemma-4 系の思考チャネルマーカーを明示設定して漏れを防ぐ。
+    env = _capture_start_env(monkeypatch, tmp_path, "mlx-vlm")
+    assert env["MLX_VLM_THINKING_START_TOKEN"] == "<|channel>thought"
+    assert env["MLX_VLM_THINKING_END_TOKEN"] == "<channel|>"
+
+
+def test_non_mlx_vlm_backend_does_not_set_markers(monkeypatch, tmp_path):
+    # 他バックエンド（mlx / llama-cpp）には付けない（無関係なので触らない）。
+    env = _capture_start_env(monkeypatch, tmp_path, "mlx")
+    assert "MLX_VLM_THINKING_START_TOKEN" not in env
+
+
+def test_user_override_of_thinking_markers_is_respected(monkeypatch, tmp_path):
+    # ユーザーが env で明示していれば上書きしない（setdefault）。
+    env = _capture_start_env(monkeypatch, tmp_path, "mlx-vlm",
+                             preset_env={"MLX_VLM_THINKING_START_TOKEN": "<custom>"})
+    assert env["MLX_VLM_THINKING_START_TOKEN"] == "<custom>"

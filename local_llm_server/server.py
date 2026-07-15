@@ -1070,6 +1070,16 @@ class LocalServer:
                 "HF_HUB_OFFLINE": "1",
                 "TRANSFORMERS_OFFLINE": "1",
             }
+            # 思考チャネルの分離を明示設定する（mlx-vlm 経路）。mlx-vlm サーバは
+            # reasoning を content から切り出して reasoning_content へ回すが、その開始/終了
+            # マーカーはモデルごとに違う。gemma-4-A4B 系は「開 <|channel>thought / 閉
+            # <channel|>」を使う（他モデルの慣習 <think>…</think> とは別形式）。mlx-vlm
+            # 0.6.3 の既定マーカーには両形式が含まれるが、内部既定に依存せず将来のバージョン
+            # でも確実に分離させるため env で明示する（未設定時のみ。ユーザー上書きは尊重）。
+            # 設定したペアが最優先で試され、既定（<think> 等）も後段で効くので副作用はない。
+            if self.config.backend == "mlx-vlm":
+                env.setdefault("MLX_VLM_THINKING_START_TOKEN", "<|channel>thought")
+                env.setdefault("MLX_VLM_THINKING_END_TOKEN", "<channel|>")
             self._proc = subprocess.Popen(
                 build_command(self.config),
                 stdout=self._log_file,
