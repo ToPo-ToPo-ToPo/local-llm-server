@@ -245,7 +245,7 @@ OpenAI SDK からもそのまま使える（`client.audio.transcriptions.create(
 | 種別 | 対象 | 反映 |
 |---|---|---|
 | **即時反映（ポリシー）** | `vision_model`, `default_model`, `max_resident`, `request_timeout`, `idle_timeout`, `session_ttl`, `load_timeout`, `api_key` | 保存した瞬間に有効 |
-| **次回ロードから（動的既定）** | `draft_model`, `parallel`, `disable_thinking`, `max_memory_fraction`, `dynamic`, `start_timeout` | 既にロード済みのモデルは次にロードし直すまで旧設定のまま |
+| **次回ロードから（動的既定）** | トップレベルの `draft_model`, `parallel`, `disable_thinking`, `max_memory_fraction`, `dynamic`, `start_timeout` | 既にロード済みのモデルは次にロードし直すまで旧設定のまま |
 | **要再起動（構造）** | `host`, `port`, `internal_base_port`, `[[models]]` | 稼働中は変えられない（ソケット bind 済み・内部ポート割当は起動時固定）。変更を検知しても**適用せず「要再起動」をログ警告**し、旧値のまま動き続ける |
 
 - `max_resident` の即時反映は `POST /admin/config` と同じ挙動（**busy は止めず、超過アイドルのみ非同期
@@ -253,6 +253,15 @@ OpenAI SDK からもそのまま使える（`client.audio.transcriptions.create(
 - **編集途中の壊れた TOML は無視**して現行設定を維持する（保存の瞬間に構文エラーがあってもサーバーは
   落ちない）。直後に有効な内容を保存すれば、また反映される。
 - 構造設定（`host`/`port` 等）を本当に変えたいときだけ、TUI の `r`（再起動）またはプロセス再起動を行う。
+
+> ⚠ **`draft_model` / `parallel` / `disable_thinking` は名前がかぶる2つの別設定がある**。
+> トップレベル（動的ロードの既定値）は上表のとおり「次回ロードから」反映されるが、
+> **`[[models]]` の各エントリ内**に書いたものは配列 `[[models]]` の一部として扱われるため、
+> **エントリの追加・削除はもちろん、既存エントリ内の値を1つ変えるだけでも「要再起動」側**
+> になる（保存しても無視され、旧設定のまま動き続ける）。新しいモデルを事前登録して個別設定
+> （`draft_model = "off"` や `disable_thinking = true` 等）を効かせたいときは、保存後に
+> **必ずゲートウェイを再起動**すること。再起動を忘れると、そのモデルは登録した個別設定なしの
+> **動的ロード扱い**でサイレントに動いてしまい、意図した挙動と食い違う（気づきにくい事故の元）。
 
 ## 別PCから接続する（ネットワーク公開）
 

@@ -122,6 +122,52 @@ dynamic = true
 # backend = "mlx-vlm"
 # draft_model = "off"       # このモデルだけ MTP を無効化（HF id を書けば別ドラフターを明示）
 #
+# ── Ternary Bonsai 27B（Prism ML の三値モデル。Qwen3.6-27B ベースの vision-language）──
+# 三値 2bit の MLX パックは **素の mlx-vlm（本リポジトリが既にピンしている 0.6.3）で動く**
+# （フォーク不要。フォークが要るのは 1bit 版のみで、それは iPhone 向け）。事前登録するのは
+# ID から決まらない上書き（MTP 無効化）を効かせるためで、動的ロードでも backend は mlx-vlm に
+# 推論される。事前に `hf download prism-ml/Ternary-Bonsai-27B-mlx-2bit`（約8.5GB・公開リポ）で取得しておくこと。
+#   推奨サンプリング（クライアント側で指定）: temperature = 0.7 / top_p = 0.95 / top_k = 20
+#   思考（thinking）は既定OFF運用。mlx-vlm サーバは enable_thinking 未指定なら思考OFF（実測確認済み）。
+#   注意: Bonsai の公表ベンチ（三値 80.49 / FP16比 94.6%）は全て thinking mode の値。数学・コード・
+#   エージェント等の推論タスクで質を出したいリクエストだけ enable_thinking=true を送る運用にする。
+[[models]]
+model = "prism-ml/Ternary-Bonsai-27B-mlx-2bit"
+backend = "mlx-vlm"       # 27B は vision-language。mlx-vlm なら画像入力も使える（三値パックは FP16 vision tower 同梱）
+draft_model = "off"       # DSpark drafter は Apple Silicon の batch-1 では償却できず既定無効（→ off を明示）
+# disable_thinking は mlx-vlm では build_command が参照しない（無効）。既定OFF はサーバ側の挙動で担保される
+
+# ── Bonsai 27B 1-bit（GGUF / llama.cpp 経路。軽量テキスト運用）──
+# 1bit は MLX（素の mlx）では動かない（1bit カーネル無し）が、**GGUF なら mainline llama.cpp の
+# Metal でそのまま動く**（Q1_0 は upstream にマージ済み。フォーク不要。実測 ~59 tok/s）。
+# model は `org/repo:セレクタ`。`:Q1_0` で多量子化リポから本体1ファイル（Bonsai-27B-Q1_0.gguf, 3.8GB）を特定。
+# 取得: `hf download prism-ml/Bonsai-27B-gguf Bonsai-27B-Q1_0.gguf`
+# 画像入力を使うなら別途 mmproj を同じスナップショットへ置くと自動で --mmproj が付く:
+#   `hf download prism-ml/Bonsai-27B-gguf Bonsai-27B-mmproj-Q8_0.gguf`（0.63GB）
+# 導入後は実プロセス起動コマンドに再ロードが要る（mmproj は起動時フラグのため、既にロード済み
+# のインスタンスには効かない。次のリクエストで自動再ロードされるのを待つか、明示的に落とす）。
+# vision 実測確認済み: 図形（青四角・赤丸）と文字（"HELLO"）を含む画像を正しく認識・記述。
+# RSS は mmproj 分（0.63GB）増えて ~7.1GB（8GB VRAM機にはまだ収まる）。テキストのみの
+# リクエストには速度・精度とも影響なし（mmproj はロードされるが画像が来た時だけ使われる）。
+#
+# コーディング品質は実測で三値と同等（LeetCode easy〜medium 8問、thinking ON/OFF とも 24/24）。
+# 数学等の推論タスクでの三値との差は未検証（→ 必要なら追加で比較すること）。
+#
+# ⚠ メモリの罠: --ctx-size 未指定だと llama-server は Bonsai のネイティブ最大コンテキスト
+# （262144）分の KV キャッシュを FP16 で丸ごと事前確保する。動的ロード（この事前登録なし）で
+# 実測すると本体 3.8GB のはずが RSS ~24.5GB に膨張する（三値 mlx-vlm の 8.67GB より大きい＝
+# 「1bit だから軽い」が逆転する）。下の extra_args で -c 32768 に絞れば **実測 RSS 6.38GB**
+# （ゲートウェイ経由の実プロセスで確認済み。8GB VRAM機にも収まる）。用途に応じて -c を
+# 調整すること（大きい方が要 RAM、小さい方が省 RAM）。
+[[models]]
+model = "prism-ml/Bonsai-27B-gguf:Q1_0"
+backend = "llama-cpp"
+draft_model = "off"       # DSpark drafter は使わない（Apple Silicon batch-1 で非効率。上の三値と同方針）
+extra_args = ["-c", "32768"]  # コンテキストを32Kに制限してRAM膨張を防ぐ（上の罠を参照。既定262144は不可）
+disable_thinking = true   # 既定は思考OFF。起動時の --chat-template-kwargs で正しく抑制される
+                          # （ゲートウェイ経由の実プロセスで確認済み: 無指定→抑制、明示 true→思考する）。
+                          # 思考を効かせたいリクエストだけ chat_template_kwargs={"enable_thinking": true} を送る
+
 # vLLM（Linux/NVIDIA。Windows は WSL2 内で）。HF repo-id（safetensors）を指定。高スループット:
 # [[models]]
 # model = "Qwen/Qwen3-8B"
