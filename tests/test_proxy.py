@@ -62,17 +62,39 @@ class _SilentUpstream(BaseHTTPRequestHandler):
         pass
 
 
+class _SlowHeaderUpstream(BaseHTTPRequestHandler):
+    """応答ヘッダを送るまでに長時間かかる上流サーバー。
+
+    非ストリーミング生成の再現: バックエンドは生成が終わるまで応答ヘッダすら
+    返さないので、見捨てられたリクエストの切断はこの待ちの間に検知する必要がある。
+    """
+
+    protocol_version = "HTTP/1.1"
+
+    def do_POST(self) -> None:
+        length = int(self.headers.get("Content-Length") or 0)
+        if length:
+            self.rfile.read(length)
+        time.sleep(30)  # 「生成中」（テストはこれより先にクライアントが切断する）
+
+    def log_message(self, *_args) -> None:
+        pass
+
+
 class _ForwardingHandler(BaseHTTPRequestHandler):
     """受けたリクエストをそのまま forward() で上流へ中継するだけのゲートウェイ。"""
 
     protocol_version = "HTTP/1.0"
     upstream_addr: tuple[str, int] = ("127.0.0.1", 0)
     timeout_s: float | None = 10.0
+    finished: threading.Event | None = None  # forward() が return したら set
 
     def do_POST(self) -> None:
         length = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(length) if length else b""
         forward(self, self.upstream_addr, body, timeout_s=self.timeout_s)
+        if type(self).finished is not None:
+            type(self).finished.set()
 
     def log_message(self, *_args) -> None:
         pass
@@ -150,3 +172,59 @@ def test_forward_aborts_on_silent_upstream_timeout():
 
     # 上流の 30s 沈黙ではなく timeout_s(0.5s) 側で切れる（枠を握り続けない）。
     assert elapsed < 5.0, f"forward() did not abort on silent upstream ({elapsed:.1f}s)"
+
+
+def _run_client_disconnect_case(upstream_handler) -> float:
+    """クライアントがリクエスト直後に切断するシナリオを実行する。
+
+    forward() が return するまでの時間を返す（切断検知が無いと、上流の 30s
+    スリープか request_timeout まで枠を握り続ける）。
+    """
+    upstream = ThreadingHTTPServer(("127.0.0.1", 0), upstream_handler)
+    _ForwardingHandler.upstream_addr = ("127.0.0.1", upstream.server_address[1])
+    _ForwardingHandler.timeout_s = 20.0  # 切断検知の方がずっと先に効くことを示す
+    _ForwardingHandler.finished = threading.Event()
+    gw = ThreadingHTTPServer(("127.0.0.1", 0), _ForwardingHandler)
+    threading.Thread(target=upstream.serve_forever, daemon=True).start()
+    threading.Thread(target=gw.serve_forever, daemon=True).start()
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", gw.server_address[1], timeout=10)
+        conn.request("POST", "/v1/chat/completions", body=b"{}",
+                     headers={"Content-Type": "application/json"})
+        time.sleep(0.3)   # ゲートウェイが上流待ちに入るのを待つ
+        t0 = time.monotonic()
+        conn.close()      # クライアントが生成を見限って切断
+        assert _ForwardingHandler.finished.wait(5.0), (
+            "forward() did not return after client disconnect"
+        )
+        return time.monotonic() - t0
+    finally:
+        _ForwardingHandler.finished = None
+        _ForwardingHandler.timeout_s = 10.0
+        upstream.shutdown()
+        upstream.server_close()
+        gw.shutdown()
+        gw.server_close()
+
+
+def test_forward_aborts_when_client_disconnects_before_headers():
+    """応答ヘッダ待ち（非ストリーミング生成に相当）中のクライアント切断で、
+    forward() が速やかに return して inflight 枠を解放すること。
+
+    非ストリーミングでは上流は生成完了まで応答ヘッダすら返さないため、
+    切断検知が無いと見捨てられた生成が完了まで枠を握り続ける。
+    """
+    elapsed = _run_client_disconnect_case(_SlowHeaderUpstream)
+    assert elapsed < 3.0, (
+        f"forward() held the slot for {elapsed:.1f}s after client disconnect "
+        "(should abort within ~_CLIENT_POLL_S)"
+    )
+
+
+def test_forward_aborts_when_client_disconnects_during_upstream_silence():
+    """応答ヘッダ送出後、上流が沈黙している間のクライアント切断でも同様に
+    速やかに打ち切ること（request_timeout の 20s を待たない）。"""
+    elapsed = _run_client_disconnect_case(_SilentUpstream)
+    assert elapsed < 3.0, (
+        f"forward() held the slot for {elapsed:.1f}s after client disconnect"
+    )
