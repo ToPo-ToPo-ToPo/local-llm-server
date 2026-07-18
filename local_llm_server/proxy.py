@@ -10,6 +10,14 @@ JSON でエラー/結果を返したりする。HTTP/1.0（接続クローズ区
 打ち切るので、無駄な GPU 時間もそこで止まる。これが無いと、見捨てられた
 リクエストが生成完了（または request_timeout）まで枠を握り続け、逐次処理の
 バックエンドでは後続リクエストの開始も遅らせてしまう。
+
+既知の制約（Windows）: この切断検知（監視スレッドによる select+MSG_PEEK）は
+windows-latest の CI で 5 秒以内に発火しないことを確認済み（原因未特定。
+インタラクティブに調査できる Windows 環境が無いため保留。tests/test_proxy.py
+の該当テストは skipif で明示的にスキップしている）。macOS/Linux では機能する。
+Windows では本経路が効かなくても機能低下はしない（下記 request_timeout の
+経路にフォールバックするだけで、ハングはしない）が、切断からクリーンアップ
+までが速くならない。Windows 環境で調査できる場合は要見直し。
 """
 from __future__ import annotations
 
