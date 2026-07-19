@@ -9,11 +9,12 @@
 ```bash
 git clone https://github.com/ToPo-ToPo-ToPo/local-llm-server
 cd local-llm-server
-uv tool install --editable .     # `gw` を PATH に導入（Ollama 流。以後どこでも `gw`）
+make install                     # `gw` を PATH に導入（Ollama 流。以後どこでも `gw`）
 ```
 
-`--editable` なのでソースはこのクローンを指す（`gw update` / 自動更新の `git pull` がそのまま効く）。
-`~/.local/bin` が PATH に無いと言われたら `uv tool update-shell` を一度実行する。
+`make install` は `uv tool install --editable . --reinstall` を実行する（editable は確定なので畳んである。
+再実行で入れ直しにもなる）。**editable** なのでソースはこのクローンを指し、`gw update` / 自動更新の
+`git pull` がそのまま効く。`~/.local/bin` が PATH に無いと言われたら `uv tool update-shell` を一度実行する。
 
 ## 起動と状態確認（どのディレクトリからでも）
 

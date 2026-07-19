@@ -160,7 +160,7 @@ OpenAI SDK からもそのまま使える（`client.audio.transcriptions.create(
 
 ## 自動更新（PyPI 新版に git で追従）
 
-このリポジトリは PyPI に公開しつつ、実運用は **GitHub から clone して `uv tool install --editable .`** で動かす。
+このリポジトリは PyPI に公開しつつ、実運用は **GitHub から clone して `make install`（editable 導入）** で動かす。
 そのままだと新版が出るたび手で `git pull` が要る。`auto_update = true`（既定）なら **常駐デーモンが
 実行中（起動 1 分後に初回、以降 1 時間毎）に PyPI の最新版を確認し、新しければソースを追従して新コードで再起動する** ——
 複数 PC を「起動しておくだけで最新に揃う」状態にできる。
