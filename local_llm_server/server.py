@@ -1537,12 +1537,17 @@ def gateway_drain(
     return data if isinstance(data, dict) else None
 
 
-def gateway_log_path(port: int) -> str:
+def gateway_log_path(port: int, base: str | None = None) -> str:
     """バックグラウンド起動したゲートウェイ本体（公開ポート）の出力ログ保存先。
 
     モデルサーバーの daemon_log_path（server-<port>.log）と別に、ゲートウェイ自身の
-    起動ログを gateway-<port>.log に逃がす（TUI のログ表示から参照できる固定パス）。
+    起動ログを gateway-<port>.log に逃がす（`gw log` が参照する）。`base` に**デーモンの
+    作業ディレクトリ**（設定のある場所）を渡すと、そこ基準の `.local-llm-server/` を使う
+    —— CLI は任意のディレクトリから実行されるため、CLI の CWD 基準（既定）では
+    デーモンが実際に書く場所とずれる。省略時は従来どおり CWD 基準。
     """
+    if base:
+        return os.path.join(base, ".local-llm-server", f"gateway-{port}.log")
     return os.path.join(project_cache_dir(), f"gateway-{port}.log")
 
 
@@ -1576,7 +1581,9 @@ def start_gateway_background(
             f"respond as a gateway; stop it or change `port` in gateway.toml"
         )
 
-    log_path = gateway_log_path(port)
+    # ログはデーモンの作業ディレクトリ（cwd 引数＝設定のある場所）基準に置く。CLI がどこから
+    # 実行されても、デーモン側の daemon_log_path（cwd 基準）と同じ場所に揃う。
+    log_path = gateway_log_path(port, base=cwd)
     os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
     log_file = open(log_path, "a", encoding="utf-8")
     popen_kwargs: dict = {

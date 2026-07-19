@@ -1,8 +1,8 @@
 """起動口の検証: `gw`（cli.main）と裏の常駐ワーカー（__main__.main）。
 
-運用は `gw` の CLI サブコマンドで行う。ここでは 2 つの入口が `./gateway.toml` を正しく解決し、
-それぞれ「デーモンの裏起動」/「ヘッドレスのゲートウェイ実行」へ振り分けることを、重い依存
-（start_gateway_background / run_gateway）を差し替えて検証する。
+運用は `gw` の CLI サブコマンドで行う（起動は `gw start` の 1 つだけ。引数なしはコマンド一覧）。
+ここではデーモン側の `./gateway.toml` 解決（gw start が設定ディレクトリを cwd に spawn する前提）と、
+ヘッドレス実行への振り分けを、重い依存（start_gateway_background / run_gateway）を差し替えて検証する。
 """
 import pytest
 
@@ -30,25 +30,14 @@ def test_resolve_config_missing_returns_none(tmp_path, monkeypatch):
     assert cli.resolve_config() is None
 
 
-def test_bare_gw_starts_daemon(in_gateway_dir, monkeypatch):
-    # 引数なし `gw` はデーモンを裏起動して状態を表示する（従来の `uv run gw` 相当）。
-    seen = {}
-    monkeypatch.setattr(cli, "start_gateway_background",
-                        lambda cwd, host, port: seen.update(port=port) or 123)
-    monkeypatch.setattr(cli, "gateway_admin_status", lambda h, p: None)
-    monkeypatch.setattr(cli, "is_ready", lambda url, **k: True)
-    monkeypatch.setattr(cli, "mtp_status", lambda m: None)
-    assert cli.main([]) == 0
-    assert seen["port"] == 8799
-
-
-def test_gw_errors_without_gateway_toml(tmp_path, monkeypatch, capsys):
+def test_bare_gw_shows_help(tmp_path, monkeypatch, capsys):
+    # 引数なし `gw` はコマンド一覧を表示する（Ollama 流。起動の入口は `gw start` の 1 つだけ）。
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(cli, "find_config_path", lambda: None)  # CWD・~/.config・クローンも無い
     monkeypatch.setattr(cli, "start_gateway_background",
-                        lambda *a, **k: pytest.fail("must not start"))
-    assert cli.main([]) == 2
-    assert "gateway.toml" in capsys.readouterr().err
+                        lambda *a, **k: pytest.fail("bare gw must not start the daemon"))
+    assert cli.main([]) == 0
+    out = capsys.readouterr().out
+    assert "start" in out and "stop" in out and "status" in out
 
 
 def test_worker_runs_gateway_headless(in_gateway_dir, monkeypatch):

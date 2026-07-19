@@ -48,58 +48,65 @@ from .server import (
 )
 
 
-# --- 設定解決 ---------------------------------------------------------------
+# --- 設定解決（1 ライブラリ 1 使い方: 設定は user_config_path の 1 箇所だけ） -----
 def resolve_config() -> str | None:
-    """使う gateway.toml を決める。**カレントディレクトリの `./gateway.toml` のみ**。
+    """デーモン本体（__main__）が読む gateway.toml。**起動された cwd の `./gateway.toml` のみ**。
 
-    存在すればそのパス、無ければ None（呼び出し側がエラーにする）。場所は CWD 固定で、
-    位置引数やホーム等の外部は見ない（「gateway.toml は CWD に置く」という 1 ルール）。
+    `gw start` は設定ディレクトリ（user_config_path の親）を cwd にしてデーモンを spawn する
+    ので、デーモンから見れば常に `./gateway.toml`。存在すればそのパス、無ければ None。
     """
     path = os.path.join(os.getcwd(), "gateway.toml")
     return path if os.path.isfile(path) else None
 
 
 def user_config_path() -> str:
-    """ユーザー既定の gateway.toml パス（`~/.config/local-llm-server/gateway.toml`）。
+    """gateway.toml の置き場所（`~/.config/local-llm-server/gateway.toml`）。**ここだけ**。
 
-    `gw` を PATH に入れて**どこからでも起動**するとき用の常設置き場（Ollama 流）。
-    `XDG_CONFIG_HOME` があれば尊重する。ファイルの有無は問わずパスだけ返す。
+    Ollama 流に「設定の場所はユーザーが選ばない」——どこから `gw` を打っても常にこの 1 ファイル
+    を使う（`XDG_CONFIG_HOME` があれば尊重）。無ければ初回の `gw start` が自動生成する
+    （→ ensure_user_config）。ファイルの有無は問わずパスだけ返す。
     """
     base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
     return os.path.join(base, "local-llm-server", "gateway.toml")
 
 
-def _fallback_config_path() -> str | None:
-    """CWD 以外の既定の gateway.toml を探す（ユーザー既定 → editable クローン）。
+_DEFAULT_CONFIG = """\
+# local-llm-server の設定（`gw start` が初回に自動生成。編集したら保存するだけで
+# ポリシー設定は稼働中でも反映される → docs/gateway.md）
+host = "127.0.0.1"          # 別 PC から繋ぐなら "0.0.0.0"（api_key の設定を推奨）
+port = 8799                 # クライアントの base_url はここ（http://127.0.0.1:8799/v1）
+max_resident = 1            # 同時常駐モデル数の上限（超過は LRU 退避）
+# モデルは事前登録不要。クライアントが指定した model をその場でロードする。
+"""
 
-    - **ユーザー既定**（`~/.config/local-llm-server/gateway.toml`）—— `gw` を PATH に入れた
-      常設運用の置き場。
-    - **editable インストール元のクローンの `gateway.toml`** —— `uv tool install --editable`
-      で入れた場合、リポジトリの gateway.toml を自動発見する（何も移動せず動く）。
+
+def ensure_user_config() -> str:
+    """設定ファイルを用意して、そのパスを返す（初回 `gw start` 用の自動生成つき）。
+
+    無ければ自動生成する: editable インストール元のクローンに例（gateway.toml）があれば
+    それを**1 回だけ複製**し、無ければ最小の既定を書く。以降の編集・参照は常に
+    user_config_path の 1 ファイルだけ（クローン側の例は二度と読まない —— 読む場所を
+    2 つにしない。リポジトリを汚さないので自動更新のクリーン判定も妨げない）。
     """
-    user = user_config_path()
-    if os.path.isfile(user):
-        return user
+    path = user_config_path()
+    if os.path.isfile(path):
+        return path
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    seed = None
     try:
         from . import update
         root = update.repo_root()
         if root is not None:
-            clone = os.path.join(str(root), "gateway.toml")
-            if os.path.isfile(clone):
-                return clone
-    except Exception:  # noqa: BLE001 - 発見は best-effort（失敗は「無し」扱い）
-        pass
-    return None
-
-
-def find_config_path() -> str | None:
-    """`gw start` が使う gateway.toml を優先順位つきで探す（どこからでも起動できるように）。
-
-    CWD の `./gateway.toml`（最優先）→ ユーザー既定 → editable クローンの gateway.toml。
-    見つからなければ None。デーモン本体（__main__）は spawn 時の cwd で `./gateway.toml` を
-    読むので、CLI はここで決めた**設定のあるディレクトリ**を cwd として渡す。
-    """
-    return resolve_config() or _fallback_config_path()
+            example = os.path.join(str(root), "gateway.toml")
+            if os.path.isfile(example):
+                with open(example, encoding="utf-8") as fh:
+                    seed = fh.read()
+    except Exception:  # noqa: BLE001 - 例の複製は best-effort（失敗は既定で生成）
+        seed = None
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(seed if seed is not None else _DEFAULT_CONFIG)
+    print(f"created {path}", file=sys.stderr)
+    return path
 
 
 class _RuntimeConfig:
@@ -116,6 +123,8 @@ class _RuntimeConfig:
         self.models: list = []          # 事前登録は記録に無い（動的ロード分は admin から見える）
         self.idle_timeout = 0           # アイドル残りは記録だけでは出せない（admin にも idle_for はある）
         self.max_resident = None        # 実値は admin の max_resident を使う
+        # デーモンの作業ディレクトリ（＝ログの基準）。記録の cwd から引く（gw log 用）。
+        self._config_dir = rec.get("cwd")
 
 
 def load_config(path: str):
@@ -258,13 +267,15 @@ def _fmt_hms(seconds) -> str:
     return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
 
 
-def read_log_tail(port: int, max_lines: int = 1000, max_bytes: int = 512 * 1024) -> str:
+def read_log_tail(port: int, max_lines: int = 1000, max_bytes: int = 512 * 1024,
+                  base: str | None = None) -> str:
     """ゲートウェイログの末尾（最大 max_lines 行）を返す（`gw log` 表示用）。
 
-    ログはローテーションされず肥大化しうるので、末尾 max_bytes だけ読む（全読みを避ける）。
-    ログがまだ無い／空のときは案内文を返す。
+    `base` はデーモンの作業ディレクトリ（設定のある場所）。CLI がどこから実行されても
+    デーモンが実際に書いている場所を読むために渡す。ログはローテーションされず肥大化しうる
+    ので、末尾 max_bytes だけ読む（全読みを避ける）。ログがまだ無い／空のときは案内文を返す。
     """
-    path = gateway_log_path(port)
+    path = gateway_log_path(port, base=base)
     try:
         with open(path, "rb") as fh:
             fh.seek(0, 2)  # 末尾へ
@@ -434,8 +445,6 @@ def cmd_start(gcfg, args) -> int:
     except (RuntimeError, TimeoutError, OSError) as exc:
         print(f"start failed: {exc}", file=sys.stderr)
         return 1
-    if cwd != os.getcwd():
-        print(f"(using {os.path.join(cwd, 'gateway.toml')})")
     admin = gateway_admin_status(host, port)
     ready = admin is not None or is_ready(f"http://{host}:{port}/v1")
     print(render_status(gcfg, admin, ready))
@@ -484,16 +493,17 @@ def cmd_list(gcfg, args) -> int:
 
 def cmd_log(gcfg, args) -> int:
     _, port, _ = _endpoint(gcfg)
+    base = getattr(gcfg, "_config_dir", None)  # デーモンの作業ディレクトリ基準でログを読む
     if getattr(args, "follow", False):
-        return _follow_log(port)
-    print(read_log_tail(port, max_lines=args.lines))
+        return _follow_log(port, base)
+    print(read_log_tail(port, max_lines=args.lines, base=base))
     return 0
 
 
-def _follow_log(port: int) -> int:
+def _follow_log(port: int, base: str | None = None) -> int:
     """`gw log -f`: ログの新規行を追従表示する（Ctrl-C で終了）。"""
-    path = gateway_log_path(port)
-    print(read_log_tail(port), end="")
+    path = gateway_log_path(port, base=base)
+    print(read_log_tail(port, base=base), end="")
     try:
         with open(path, "rb") as fh:
             fh.seek(0, 2)
@@ -513,17 +523,18 @@ def _follow_log(port: int) -> int:
 
 def cmd_max(gcfg, args) -> int:
     host, port, _ = _endpoint(gcfg)
+    # 指定は「1 以上の整数」か「off（無制限）」の 2 形だけ（別名は設けない —— 1 使い方）。
     arg = args.value.strip().lower()
-    if arg in ("off", "none", "unlimited", "inf", "∞", "0"):
+    if arg == "off":
         value: int | None = None
     else:
         try:
             value = int(arg)
         except ValueError:
-            print(f"max_resident には数値か off を指定してください: '{args.value}'", file=sys.stderr)
+            print(f"max_resident には 1 以上の整数か off を指定してください: '{args.value}'", file=sys.stderr)
             return 2
         if value < 1:
-            print("max_resident は 1 以上、または off（無制限）です", file=sys.stderr)
+            print("max_resident は 1 以上の整数、または off（無制限）です", file=sys.stderr)
             return 2
     label = "∞" if value is None else str(value)
     res = gateway_set_max_resident(value, host, port)
@@ -575,28 +586,12 @@ def cmd_help(gcfg, args) -> int:
     return 0
 
 
-def cmd_default(gcfg, args) -> int:
-    """引数なし `gw`: start してから status/ps を表示する（従来の `uv run gw` 相当）。"""
-    host, port, _ = _endpoint(gcfg)
-    try:
-        start_gateway_background(_start_cwd(gcfg), host, port)
-    except (RuntimeError, TimeoutError, OSError) as exc:
-        print(f"start failed: {exc}", file=sys.stderr)
-        return 1
-    admin = gateway_admin_status(host, port)
-    ready = admin is not None or is_ready(f"http://{host}:{port}/v1")
-    print(render_status(gcfg, admin, ready))
-    ps = render_ps(gcfg, admin, ready)
-    if ps != "no models loaded":
-        print("\n" + ps)
-    return 0
-
-
 # --- argparse ---------------------------------------------------------------
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="gw",
-        description="ローカル LLM ゲートウェイ（./gateway.toml）を裏で常駐させて運用する。",
+        description="ローカル LLM ゲートウェイを裏で常駐させて運用する"
+                    "（設定は ~/.config/local-llm-server/gateway.toml の 1 箇所。初回 start で自動生成）。",
     )
     sub = p.add_subparsers(dest="cmd")
     sub.add_parser("start", help="デーモンを裏で常駐起動する")
@@ -623,24 +618,16 @@ _COMMANDS = {
     "max": cmd_max, "mtp": cmd_mtp, "update": cmd_update, "help": cmd_help,
 }
 
-# `./gateway.toml` を **必須** とするコマンド（何を配信するか＝models を知る必要がある）。
-# それ以外（status/stop/ps/list/log/max/update）は、CWD 設定が無ければ稼働中デーモンの
-# ランタイム記録から接続先を得て**どこからでも**動く（引数なし＝start なので必須側）。
-_NEEDS_CONFIG = {"start", "restart", None}
-_NO_CONFIG = {"help", "mtp"}  # 設定にまったく依存しない
-
 
 def _resolve_gcfg(cmd: str | None):
     """コマンドに応じて設定（gcfg）を解決する。戻り値: (gcfg, error_code)。
 
-    **launch 系（start/restart/引数なし）**: `find_config_path`（CWD → `~/.config` →
-    editable クローン）で gateway.toml を探し、その設定のあるディレクトリでデーモンを
-    起動する（どこからでも `gw start`）。見つからなければエラー。
+    設定の場所は user_config_path の **1 箇所だけ**（1 ライブラリ 1 使い方）。
 
-    **query/control 系（status/stop/ps/list/log/max/update）**: マシンに 1 つのデーモンが
-    真実なので、**CWD の明示設定 → 稼働中デーモンのランタイム記録 → ユーザー/クローン設定**
-    の順で接続先を決める。これで別ディレクトリの設定（別ポート）を掴んで実際の稼働デーモンを
-    見失う事故を防ぐ（記録＝実際に動いているデーモンを優先）。
+    - **launch 系（start/restart）**: 設定を用意して（無ければ自動生成 → ensure_user_config）
+      読む。設定ディレクトリを cwd にしてデーモンを起動するので、どこから打っても同じ。
+    - **query/control 系（status/stop/ps/list/log/max/update）**: 稼働中デーモンの
+      ランタイム記録（＝実物）を最優先し、未起動なら設定ファイルから接続先を出す。
     """
     def _load(path):
         try:
@@ -649,49 +636,41 @@ def _resolve_gcfg(cmd: str | None):
             print(f"Failed to load {path}: {exc}", file=sys.stderr)
             return None, 2
 
-    if cmd in _NEEDS_CONFIG:  # launch 系: 設定必須
-        path = find_config_path()
-        if path is None:
-            print(
-                "no gateway.toml found. `gw start` looks in: the current directory, "
-                f"{user_config_path()}, and (for editable installs) the clone. "
-                "Create one in a directory and run `gw start` there, or place it at the path above.",
-                file=sys.stderr,
-            )
+    if cmd in ("start", "restart"):  # launch 系: 設定を用意して読む（無ければ自動生成）
+        try:
+            return _load(ensure_user_config())
+        except OSError as exc:
+            print(f"failed to create {user_config_path()}: {exc}", file=sys.stderr)
             return None, 2
-        return _load(path)
 
-    # query/control 系: CWD の明示設定が最優先。
-    cwd_path = resolve_config()
-    if cwd_path is not None:
-        return _load(cwd_path)
-    # 次に稼働中デーモン（ランタイム記録）—— 実際に動いているものを優先する。
+    # query/control 系: 稼働中デーモン（ランタイム記録）＝実物を最優先。
     rec = read_gateway_runtime()
     if rec is not None:
         return _RuntimeConfig(rec), 0
-    # 最後にユーザー/クローン設定（未起動時に「そのURLで停止中」や list を出すため）。
-    path = _fallback_config_path()
-    if path is not None:
+    # 未起動なら設定ファイル（未作成でも「この URL で停止中」と案内できるよう自動生成はしない）。
+    path = user_config_path()
+    if os.path.isfile(path):
         return _load(path)
     print(
-        "no running gateway found, and no gateway.toml in the current directory / "
-        f"{user_config_path()}. Start one with `gw start`.",
+        f"no running gateway, and no config at {path} yet. Run `gw start` first.",
         file=sys.stderr,
     )
     return None, 2
 
 
 def main(argv: list[str] | None = None) -> int:
-    """`gw` コマンド本体。サブコマンドで運用する（引数なしは start + status）。
+    """`gw` コマンド本体。サブコマンドで運用する（引数なしはコマンド一覧を表示）。
 
-    `status`/`stop`/`ps`/`list`/`log`/`max`/`update` は、`./gateway.toml` の無い
-    ディレクトリからでも、稼働中デーモンのランタイム記録を辿って実行できる。
+    設定は user_config_path の 1 ファイルだけ・起動は `gw start` だけ、という
+    「1 ライブラリ 1 使い方」。query/control 系はどのディレクトリからでも、稼働中デーモンの
+    ランタイム記録を辿って同じ 1 つのデーモンに届く。
     """
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    # 設定にまったく依存しないコマンド（help / mtp）は先に処理する。
-    if args.cmd == "help":
+    # 設定にまったく依存しないコマンド。引数なしは Ollama 流にコマンド一覧を出す
+    # （起動の入口は `gw start` の 1 つだけにする）。
+    if args.cmd in (None, "help"):
         return cmd_help(None, args)
     if args.cmd == "mtp":
         return cmd_mtp(None, args)
@@ -699,9 +678,7 @@ def main(argv: list[str] | None = None) -> int:
     gcfg, code = _resolve_gcfg(args.cmd)
     if gcfg is None:
         return code
-
-    handler = _COMMANDS.get(args.cmd, cmd_default)
-    return handler(gcfg, args)
+    return _COMMANDS[args.cmd](gcfg, args)
 
 
 if __name__ == "__main__":

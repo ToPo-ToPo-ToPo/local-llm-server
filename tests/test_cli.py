@@ -20,12 +20,12 @@ def _write_cfg(tmp_path, body):
 def test_read_log_tail(tmp_path, monkeypatch):
     log = tmp_path / "gw.log"
     log.write_text("\n".join(f"line {i}" for i in range(1, 2001)) + "\n", encoding="utf-8")
-    monkeypatch.setattr(cli, "gateway_log_path", lambda port: str(log))
+    monkeypatch.setattr(cli, "gateway_log_path", lambda port, base=None: str(log))
     out = cli.read_log_tail(123, max_lines=10)
     lines = out.strip().splitlines()
     assert lines[-1] == "line 2000" and len(lines) == 10
     # ファイルが無いときは案内文
-    monkeypatch.setattr(cli, "gateway_log_path", lambda port: str(tmp_path / "nope.log"))
+    monkeypatch.setattr(cli, "gateway_log_path", lambda port, base=None: str(tmp_path / "nope.log"))
     assert cli.read_log_tail(123).startswith("(ログはまだ")
 
 
@@ -84,9 +84,17 @@ def test_render_ps_only_loaded(tmp_path, monkeypatch):
 
 
 # --- argparse ディスパッチ --------------------------------------------------
+# 設定は user_config_path の 1 箇所だけ。テストでは tmp 配下に差し替えて hermetic に保つ。
+def _use_cfg(tmp_path, monkeypatch, body="port = 8799\n"):
+    """user_config_path を tmp の gateway.toml に差し替える（実 ~/.config を触らない）。"""
+    p = _write_cfg(tmp_path, body)
+    monkeypatch.setattr(cli, "user_config_path", lambda: str(p))
+    return p
+
+
 def test_status_dispatch_running(tmp_path, monkeypatch):
-    _write_cfg(tmp_path, "port = 8799\n")
-    monkeypatch.chdir(tmp_path)
+    _use_cfg(tmp_path, monkeypatch)
+    monkeypatch.setattr(cli, "read_gateway_runtime", lambda: None)  # 記録なし → 設定で解決
     monkeypatch.setattr(cli, "mtp_status", lambda m: None)
     monkeypatch.setattr(cli, "gateway_admin_status",
                         lambda h, p: {"uptime": 1.0, "requests": 0, "max_resident": 1,
@@ -96,29 +104,49 @@ def test_status_dispatch_running(tmp_path, monkeypatch):
 
 
 def test_status_dispatch_stopped(tmp_path, monkeypatch):
-    _write_cfg(tmp_path, "port = 8799\n")
-    monkeypatch.chdir(tmp_path)
+    _use_cfg(tmp_path, monkeypatch)
+    monkeypatch.setattr(cli, "read_gateway_runtime", lambda: None)
     monkeypatch.setattr(cli, "gateway_admin_status", lambda h, p: None)
     monkeypatch.setattr(cli, "is_ready", lambda url, **k: False)
     assert cli.main(["status"]) == 1      # 停止中 → 1
 
 
 def test_start_dispatch_calls_background(tmp_path, monkeypatch):
-    _write_cfg(tmp_path, "port = 8799\n")
-    monkeypatch.chdir(tmp_path)
+    _use_cfg(tmp_path, monkeypatch)
     called = {}
     monkeypatch.setattr(cli, "start_gateway_background",
-                        lambda cwd, host, port: called.setdefault("pid", 111) or 111)
+                        lambda cwd, host, port: called.setdefault("cwd", cwd) or 111)
     monkeypatch.setattr(cli, "gateway_admin_status", lambda h, p: None)
     monkeypatch.setattr(cli, "is_ready", lambda url, **k: True)
     monkeypatch.setattr(cli, "mtp_status", lambda m: None)
     assert cli.main(["start"]) == 0
-    assert called.get("pid") == 111
+    # どこから打っても、設定ファイルのあるディレクトリを cwd にして起動する。
+    assert called["cwd"] == str(tmp_path)
+
+
+def test_start_autocreates_config(tmp_path, monkeypatch, capsys):
+    # 設定が未作成でも `gw start` が自動生成して起動する（初回のゼロ設定）。
+    from local_llm_server import update
+
+    cfg = tmp_path / "conf" / "gateway.toml"
+    monkeypatch.setattr(cli, "user_config_path", lambda: str(cfg))
+    monkeypatch.setattr(update, "repo_root", lambda: None)  # クローン例の複製ではなく既定を生成
+    monkeypatch.setattr(cli, "gateway_admin_status", lambda h, p: None)
+    monkeypatch.setattr(cli, "is_ready", lambda url, **k: True)
+    monkeypatch.setattr(cli, "mtp_status", lambda m: None)
+    seen = {}
+    monkeypatch.setattr(cli, "start_gateway_background",
+                        lambda cwd, host, port: seen.update(cwd=cwd, port=port) or 1)
+    assert cli.main(["start"]) == 0
+    assert cfg.is_file()                      # 自動生成された
+    assert seen["cwd"] == str(cfg.parent)     # 設定ディレクトリで起動
+    assert "created" in capsys.readouterr().err
 
 
 def test_stop_dispatch_only_kills_our_pids(tmp_path, monkeypatch):
-    _write_cfg(tmp_path, "port = 8799\n")
-    monkeypatch.chdir(tmp_path)
+    _use_cfg(tmp_path, monkeypatch)
+    monkeypatch.setattr(cli, "read_gateway_runtime", lambda: None)
+    monkeypatch.setattr(cli, "gateway_admin_status", lambda h, p: None)
     monkeypatch.setattr(cli, "find_pids_on_port", lambda p: [900, 901] if p == 8799 else [])
     monkeypatch.setattr(cli, "pid_looks_like_ours", lambda pid: pid == 900)  # 901 は無関係
     killed = []
@@ -128,64 +156,33 @@ def test_stop_dispatch_only_kills_our_pids(tmp_path, monkeypatch):
 
 
 def test_missing_config_returns_2(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)            # gateway.toml が無い
-    monkeypatch.setattr(cli, "_fallback_config_path", lambda: None)
+    # 稼働中デーモンも設定ファイルも無ければ、query 系は「まず gw start」を案内して終わる。
+    monkeypatch.setattr(cli, "user_config_path", lambda: str(tmp_path / "gateway.toml"))
     monkeypatch.setattr(cli, "read_gateway_runtime", lambda: None)
     assert cli.main(["status"]) == 2
 
 
 def test_status_from_anywhere_uses_runtime_record(tmp_path, monkeypatch):
-    # どこにも gateway.toml が無くても、稼働中デーモンのランタイム記録から接続先を引いて動く。
-    monkeypatch.chdir(tmp_path)  # gateway.toml 無し
-    monkeypatch.setattr(cli, "_fallback_config_path", lambda: None)  # ~/.config・クローンも無い想定
+    # 設定ファイルが無くても、稼働中デーモンのランタイム記録（＝実物）から接続先を引いて動く。
+    monkeypatch.setattr(cli, "user_config_path", lambda: str(tmp_path / "gateway.toml"))
     monkeypatch.setattr(cli, "mtp_status", lambda m: None)
     monkeypatch.setattr(cli, "read_gateway_runtime",
-                        lambda: {"host": "127.0.0.1", "port": 8799, "pid": 4242})
+                        lambda: {"host": "127.0.0.1", "port": 8795, "pid": 4242})
+    seen = {}
     monkeypatch.setattr(cli, "gateway_admin_status",
-                        lambda h, p: {"uptime": 3.0, "requests": 5, "max_resident": 1,
-                                      "pid": 4242, "models": [], "available": []})
+                        lambda h, p: seen.update(port=p) or
+                        {"uptime": 3.0, "requests": 5, "max_resident": 1,
+                         "pid": 4242, "models": [], "available": []})
     monkeypatch.setattr(cli, "is_ready", lambda url, **k: True)
     assert cli.main(["status"]) == 0
+    assert seen["port"] == 8795     # 記録のポート（＝実際に動いているデーモン）を見ている
 
 
 def test_remote_cmd_without_record_or_config_errors(tmp_path, monkeypatch, capsys):
-    # 稼働中デーモンも gateway.toml もどこにも無ければ、status は分かりやすいエラーで終わる。
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(cli, "_fallback_config_path", lambda: None)
+    monkeypatch.setattr(cli, "user_config_path", lambda: str(tmp_path / "gateway.toml"))
     monkeypatch.setattr(cli, "read_gateway_runtime", lambda: None)
     assert cli.main(["status"]) == 2
-    assert "no running gateway" in capsys.readouterr().err
-
-
-def test_start_requires_config_somewhere(tmp_path, monkeypatch, capsys):
-    # start は「何を配信するか」が要るので、どこにも gateway.toml が無ければエラー
-    # （記録があっても start はしない）。
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(cli, "find_config_path", lambda: None)
-    monkeypatch.setattr(cli, "read_gateway_runtime",
-                        lambda: {"host": "127.0.0.1", "port": 8799, "pid": 1})
-    monkeypatch.setattr(cli, "start_gateway_background",
-                        lambda *a, **k: pytest.fail("must not start without config"))
-    assert cli.main(["start"]) == 2
-    assert "gateway.toml" in capsys.readouterr().err
-
-
-def test_start_finds_config_from_anywhere(tmp_path, monkeypatch):
-    # gateway.toml が別ディレクトリにあっても find_config_path が見つければ、そのディレクトリを
-    # cwd にしてデーモンを起動する（どこからでも `gw start`）。
-    cfgdir = tmp_path / "proj"
-    cfgdir.mkdir()
-    _write_cfg(cfgdir, "port = 8799\n")
-    monkeypatch.chdir(tmp_path)  # 設定の無い場所から実行
-    monkeypatch.setattr(cli, "find_config_path", lambda: str(cfgdir / "gateway.toml"))
-    monkeypatch.setattr(cli, "mtp_status", lambda m: None)
-    monkeypatch.setattr(cli, "gateway_admin_status", lambda h, p: None)
-    monkeypatch.setattr(cli, "is_ready", lambda url, **k: True)
-    seen = {}
-    monkeypatch.setattr(cli, "start_gateway_background",
-                        lambda cwd, host, port: seen.update(cwd=cwd) or 1)
-    assert cli.main(["start"]) == 0
-    assert seen["cwd"] == str(cfgdir)   # 設定のあるディレクトリで起動している
+    assert "gw start" in capsys.readouterr().err
 
 
 def test_stop_collects_pids_from_admin_and_record(tmp_path, monkeypatch):
@@ -214,9 +211,10 @@ def test_help_lists_commands_without_config(tmp_path, monkeypatch, capsys):
 
 
 def test_max_dispatch_rejects_bad_value(tmp_path, monkeypatch):
-    _write_cfg(tmp_path, "port = 8799\n")
-    monkeypatch.chdir(tmp_path)
-    assert cli.main(["max", "-3"]) == 2    # 1 未満はエラー
+    _use_cfg(tmp_path, monkeypatch)
+    monkeypatch.setattr(cli, "read_gateway_runtime", lambda: None)
+    assert cli.main(["max", "-3"]) == 2       # 1 未満はエラー
+    assert cli.main(["max", "none"]) == 2     # 無制限の指定は off の 1 形だけ（別名なし）
 
 
 # --- デーモンの自動更新ウォッチャー ---------------------------------------

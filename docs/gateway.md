@@ -1,6 +1,7 @@
 # gateway.toml リファレンス
 
-サーバーはカレントディレクトリの `./gateway.toml` を 1 つの設定として読む。ここで運用方針（公開ポート・
+サーバーは `~/.config/local-llm-server/gateway.toml`（初回の `gw start` が自動生成）を
+唯一の設定として読む。ここで運用方針（公開ポート・
 同時常駐数・自動アンロード等）を決める。モデルは列挙しなくてよい（クライアントが指定した `model` を
 動的ロードする）—— ID だけでは決まらない個別の上書きが要るモデルだけ `[[models]]` に書く。
 リポジトリ直下にそのまま使える例を同梱している（[gateway.toml](../gateway.toml)）。
@@ -159,7 +160,7 @@ OpenAI SDK からもそのまま使える（`client.audio.transcriptions.create(
 
 ## 自動更新（PyPI 新版に git で追従）
 
-このリポジトリは PyPI に公開しつつ、実運用は **GitHub から clone して `uv run gw start`** で動かす。
+このリポジトリは PyPI に公開しつつ、実運用は **GitHub から clone して `uv tool install --editable .`** で動かす。
 そのままだと新版が出るたび手で `git pull` が要る。`auto_update = true`（既定）なら **常駐デーモンが
 実行中（起動 1 分後に初回、以降 1 時間毎）に PyPI の最新版を確認し、新しければソースを追従して新コードで再起動する** ——
 複数 PC を「起動しておくだけで最新に揃う」状態にできる。

@@ -641,7 +641,7 @@ def test_start_gateway_background_marks_launcher_env(tmp_path, monkeypatch):
     ready = iter([False, True])  # Popen 前は未起動 → 起動後 ready
     monkeypatch.setattr(srv, "is_ready", lambda url, **k: next(ready))
     monkeypatch.setattr(srv, "find_pids_on_port", lambda port: [])
-    monkeypatch.setattr(srv, "gateway_log_path", lambda port: str(tmp_path / "gw.log"))
+    monkeypatch.setattr(srv, "gateway_log_path", lambda port, base=None: str(tmp_path / "gw.log"))
 
     class _Proc:
         pid = 4242
