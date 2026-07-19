@@ -37,6 +37,13 @@ uv run gw ps         # ロード中モデルの状態（処理中数・在席・
   固定パスのランタイム記録（temp ディレクトリの `local-llm-server-gateway.json`）に残すので、
   マシンに 1 つのデーモンをそこから特定して叩く（単一起動＝`GatewayLock` の裏返し）。記録は正常
   停止で消え、クラッシュで残っても PID 生存チェックで stale を掴まない。
+
+  > **注意**: 「どこからでも」は `gw` コマンド自体が PATH にある前提。`uv run gw` は**プロジェクト
+  > 内でしか動かない**（`uv run` は CWD のプロジェクトから `gw` を探すため、ホーム等では
+  > `Failed to spawn: gw` になる）。プロジェクト外から打ちたいなら、次のいずれかにする:
+  > - `uv tool install --from /path/to/local-llm-server local-llm-server` → 以後どこでも素の `gw`
+  > - もしくは `uv run --project /path/to/local-llm-server gw status` のように `--project` を付ける
+  > - もしくは alias を張る（例: `alias gw='uv run --project /path/to/local-llm-server gw'`）
 - `start`/`restart` は CWD の `./gateway.toml` を読む。ログは `./.local-llm-server/gateway-<port>.log`。
 - `gw list` の一覧には**ロード中だけでなく、HF キャッシュにある DL 済みモデルも未ロード候補**として並ぶ。
 - **自動更新**は稼働中デーモンが裏で行う。PyPI 新版を検知し、作業ツリーがクリーン（git クローン運用）
