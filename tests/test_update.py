@@ -44,6 +44,7 @@ def test_check_dirty_tree_holds(monkeypatch, tmp_path):
     monkeypatch.setattr(update, "installed_version", lambda: "0.21.0")
     monkeypatch.setattr(update, "latest_pypi_version", lambda timeout=3.0: "0.22.0")
     monkeypatch.setattr(update, "repo_root", lambda: tmp_path)
+    monkeypatch.setattr(update, "_on_default_branch", lambda root: True)
     monkeypatch.setattr(update, "_tracks_upstream", lambda root: True)
     monkeypatch.setattr(update, "_working_tree_clean", lambda root: False)
     st = update.check()
@@ -54,25 +55,55 @@ def test_check_no_upstream_holds(monkeypatch, tmp_path):
     monkeypatch.setattr(update, "installed_version", lambda: "0.21.0")
     monkeypatch.setattr(update, "latest_pypi_version", lambda timeout=3.0: "0.22.0")
     monkeypatch.setattr(update, "repo_root", lambda: tmp_path)
+    monkeypatch.setattr(update, "_on_default_branch", lambda root: True)
     monkeypatch.setattr(update, "_tracks_upstream", lambda root: False)
     st = update.check()
     assert st.can_apply is False and st.reason == "no-upstream"
+
+
+def test_check_non_default_branch_holds(monkeypatch, tmp_path):
+    # 機能ブランチ（既定ブランチでない）では、新版があっても自動適用しない（開発を邪魔しない）。
+    monkeypatch.setattr(update, "installed_version", lambda: "0.21.0")
+    monkeypatch.setattr(update, "latest_pypi_version", lambda timeout=3.0: "0.22.0")
+    monkeypatch.setattr(update, "repo_root", lambda: tmp_path)
+    monkeypatch.setattr(update, "_on_default_branch", lambda root: False)
+    st = update.check()
+    assert st.available is True and st.can_apply is False
+    assert st.reason == "not-on-default-branch"
 
 
 def test_check_ok_can_apply(monkeypatch, tmp_path):
     monkeypatch.setattr(update, "installed_version", lambda: "0.21.0")
     monkeypatch.setattr(update, "latest_pypi_version", lambda timeout=3.0: "0.22.0")
     monkeypatch.setattr(update, "repo_root", lambda: tmp_path)
+    monkeypatch.setattr(update, "_on_default_branch", lambda root: True)
     monkeypatch.setattr(update, "_tracks_upstream", lambda root: True)
     monkeypatch.setattr(update, "_working_tree_clean", lambda root: True)
     st = update.check()
     assert st.available is True and st.can_apply is True and st.reason == "ok"
 
 
+def test_check_uses_source_version_over_metadata(monkeypatch, tmp_path):
+    # 現行版はクローンの pyproject（ソース）優先 —— pull で版が上がれば available が False に
+    # なりループしないことの担保。固定メタデータ(0.21.0)ではなくソース(0.22.0)を見る。
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "local-llm-server"\nversion = "0.22.0"\n', encoding="utf-8")
+    monkeypatch.setattr(update, "installed_version", lambda: "0.21.0")  # 固定メタデータは古い
+    monkeypatch.setattr(update, "latest_pypi_version", lambda timeout=3.0: "0.22.0")
+    monkeypatch.setattr(update, "repo_root", lambda: tmp_path)
+    monkeypatch.setattr(update, "_on_default_branch", lambda root: True)
+    monkeypatch.setattr(update, "_tracks_upstream", lambda root: True)
+    monkeypatch.setattr(update, "_working_tree_clean", lambda root: True)
+    st = update.check()
+    assert st.current == "0.22.0"          # ソース版を採用
+    assert st.available is False           # ソース==PyPI なので更新なし（＝ループしない）
+
+
 def test_check_same_version_not_available(monkeypatch, tmp_path):
     monkeypatch.setattr(update, "installed_version", lambda: "0.22.0")
     monkeypatch.setattr(update, "latest_pypi_version", lambda timeout=3.0: "0.22.0")
     monkeypatch.setattr(update, "repo_root", lambda: tmp_path)
+    monkeypatch.setattr(update, "_on_default_branch", lambda root: True)
     monkeypatch.setattr(update, "_tracks_upstream", lambda root: True)
     monkeypatch.setattr(update, "_working_tree_clean", lambda root: True)
     st = update.check()
