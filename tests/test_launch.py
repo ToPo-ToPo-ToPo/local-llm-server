@@ -1,12 +1,12 @@
-"""起動口の検証: `gw`（tui.main）と裏の常駐ワーカー（__main__.main）。
+"""起動口の検証: `gw`（cli.main）と裏の常駐ワーカー（__main__.main）。
 
-CLI の運用フラグは廃止し、運用はすべて TUI 内で行う。ここでは 2 つの入口が
-`./gateway.toml` を正しく解決し、それぞれ TUI 起動 / ヘッドレスのゲートウェイ実行へ
-振り分けることを、重い依存（textual / run_gateway）を差し替えて検証する。
+運用は `gw` の CLI サブコマンドで行う（起動は `gw start` の 1 つだけ。引数なしはコマンド一覧）。
+ここではデーモン側の `./gateway.toml` 解決（gw start が設定ディレクトリを cwd に spawn する前提）と、
+ヘッドレス実行への振り分けを、重い依存（start_gateway_background / run_gateway）を差し替えて検証する。
 """
 import pytest
 
-from local_llm_server import tui
+from local_llm_server import cli
 from local_llm_server import __main__ as worker
 
 
@@ -22,26 +22,22 @@ def in_gateway_dir(tmp_path, monkeypatch):
 
 
 def test_resolve_config_finds_cwd_toml(in_gateway_dir):
-    assert tui.resolve_config() == str(in_gateway_dir / "gateway.toml")
+    assert cli.resolve_config() == str(in_gateway_dir / "gateway.toml")
 
 
 def test_resolve_config_missing_returns_none(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)  # gateway.toml の無いディレクトリ
-    assert tui.resolve_config() is None
+    assert cli.resolve_config() is None
 
 
-def test_gw_opens_tui(in_gateway_dir, monkeypatch):
-    seen = {}
-    monkeypatch.setattr(tui, "run_tui", lambda cfg: seen.update(port=cfg.port) or 0)
-    assert tui.main([]) == 0
-    assert seen["port"] == 8799
-
-
-def test_gw_errors_without_gateway_toml(tmp_path, monkeypatch, capsys):
+def test_bare_gw_shows_help(tmp_path, monkeypatch, capsys):
+    # 引数なし `gw` はコマンド一覧を表示する（Ollama 流。起動の入口は `gw start` の 1 つだけ）。
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(tui, "run_tui", lambda cfg: pytest.fail("must not open TUI"))
-    assert tui.main([]) == 2
-    assert "gateway.toml" in capsys.readouterr().err
+    monkeypatch.setattr(cli, "start_gateway_background",
+                        lambda *a, **k: pytest.fail("bare gw must not start the daemon"))
+    assert cli.main([]) == 0
+    out = capsys.readouterr().out
+    assert "start" in out and "stop" in out and "status" in out
 
 
 def test_worker_runs_gateway_headless(in_gateway_dir, monkeypatch):

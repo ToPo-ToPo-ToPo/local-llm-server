@@ -1,9 +1,9 @@
-"""`python -m local_llm_server` — ゲートウェイ本体をヘッドレスで実行する内部ワーカー。
+"""`python -m local_llm_server` — ゲートウェイ本体（常駐デーモン）。
 
-TUI（既定の `gw` 起動）が裏で常駐させる実体。`server.start_gateway_background` が
-このモジュールを新セッション（POSIX）/ DETACHED_PROCESS（Windows）の別プロセスとして
-spawn し、出力はログへ逃がす。ターミナルを持たない前提なので TUI は出さず、CWD の
-`./gateway.toml` のゲートウェイをフォアグラウンドで実行する。
+`gw start`（cli）が裏で常駐させる実体。`server.start_gateway_background` がこのモジュールを
+新セッション（POSIX）/ DETACHED_PROCESS（Windows）の別プロセスとして spawn し、出力は
+ログへ逃がす。端末を持たず、CWD の `./gateway.toml` のゲートウェイをフォアグラウンドで実行する。
+自動更新（PyPI 新版を git で追従）が適用されると、このプロセスを新コードで execv し直す。
 
 kill / ターミナルを閉じる（SIGTERM・SIGHUP）でも下流の finally（gateway の
 manager.shutdown）を必ず通し、配下のモデルサーバーを孫プロセスとして残さない。
@@ -13,9 +13,9 @@ from __future__ import annotations
 import sys
 import tomllib
 
+from .cli import resolve_config
 from .daemon import load_gateway_config, run_gateway
 from .server import install_shutdown_handlers
-from .tui import resolve_config
 
 
 def main() -> int:

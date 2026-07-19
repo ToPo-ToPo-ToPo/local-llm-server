@@ -1,9 +1,10 @@
 """local-llm-server — gateway.toml で定義するマルチモデルゲートウェイ（サーバー）。
 
-このパッケージは**ゲートウェイ・サーバー専用**。サポートするコマンドは 1 つ:
+このパッケージは**ゲートウェイ・サーバー専用**。運用は `gw` の CLI サブコマンドで行う:
 
-  - `gw`      … ./gateway.toml のゲートウェイを TUI ダッシュボードで起動（tui:main）。
-              裏で常駐するゲートウェイ本体は `python -m local_llm_server`（__main__）。
+  - `gw start/stop/status/ps/list/log/max/mtp/update` … ./gateway.toml のゲートウェイを
+              裏で常駐起動し、状態確認・停止などを行う（cli:main）。裏で常駐するゲートウェイ
+              本体は `python -m local_llm_server`（__main__）。
 
 **クライアント（接続する側）は別パッケージ `local-llm-client`** に切り出した。エージェントは
 そちらの `LLMClient` / `connect` を使う（または素の `openai` SDK で base_url を指す）。本パッケージは

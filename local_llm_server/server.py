@@ -1219,6 +1219,72 @@ def gateway_lock_path() -> str:
     return os.path.join(tempfile.gettempdir(), "local-llm-server-gateway.lock")
 
 
+def gateway_runtime_path() -> str:
+    """稼働中ゲートウェイの接続先（host/port/pid/cwd）を書く固定パス（cwd 非依存）。
+
+    単一起動（`GatewayLock`）でマシンに 1 ゲートウェイなので、この 1 ファイルを読めば
+    **どのディレクトリからでも**「いま動いているゲートウェイ」の host/port を特定できる
+    （`gw status` / `gw stop` を gateway.toml の無い場所から打つため）。ロックの隣に置く。
+    """
+    return os.path.join(tempfile.gettempdir(), "local-llm-server-gateway.json")
+
+
+def write_gateway_runtime(host: str, port: int, pid: int, cwd: str, started_at: str) -> None:
+    """稼働中ゲートウェイの接続先をランタイム記録に書く（デーモンが起動時に呼ぶ）。
+
+    書き込みは best-effort（失敗しても稼働は妨げない）。単一起動なので上書きで良い。
+    """
+    rec = {"host": host, "port": port, "pid": pid, "cwd": cwd, "started_at": started_at}
+    try:
+        path = gateway_runtime_path()
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(rec, fh)
+    except OSError:
+        pass
+
+
+def read_gateway_runtime() -> dict | None:
+    """ランタイム記録を読む（無い・壊れている・PID が生きていなければ None）。
+
+    クラッシュで残った stale 記録を掴まないよう、記録の PID が生存しているときだけ返す
+    （PID 生存は下限の健全性チェック。最終的な疎通は呼び出し側が /admin/status で確認する）。
+    """
+    try:
+        with open(gateway_runtime_path(), encoding="utf-8") as fh:
+            rec = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(rec, dict) or "host" not in rec or "port" not in rec:
+        return None
+    pid = rec.get("pid")
+    if isinstance(pid, int) and not pid_is_alive(pid):
+        return None  # クラッシュで残った stale 記録（保持者が居ない）
+    return rec
+
+
+def pid_is_alive(pid: int) -> bool:
+    """PID が生存しているか（cross-platform・非破壊）。
+
+    `os.kill(pid, 0)` は POSIX の生存確認だが、**Windows では sig 0 でも TerminateProcess を
+    呼んで対象を kill してしまう**ため使えない。core 依存の psutil で判定する（psutil が無い等で
+    判定不能なら、保守的に「生きている」＝ True を返す —— 生きている記録を誤って捨てない）。
+    """
+    try:
+        import psutil
+        return psutil.pid_exists(pid)
+    except Exception:  # noqa: BLE001 - psutil 不在・判定不能は「生きている可能性」に倒す
+        return True
+
+
+def clear_gateway_runtime() -> None:
+    """ランタイム記録を消す（デーモンの正常終了時に呼ぶ。best-effort）。"""
+    try:
+        os.remove(gateway_runtime_path())
+    except OSError:
+        pass
+
+
 def _read_lock_pid(path: str) -> int | None:
     """ロックファイルに保持者が書き込んだ PID を読む（読めなければ None）。"""
     try:
@@ -1480,12 +1546,17 @@ def gateway_drain(
     return data if isinstance(data, dict) else None
 
 
-def gateway_log_path(port: int) -> str:
+def gateway_log_path(port: int, base: str | None = None) -> str:
     """バックグラウンド起動したゲートウェイ本体（公開ポート）の出力ログ保存先。
 
     モデルサーバーの daemon_log_path（server-<port>.log）と別に、ゲートウェイ自身の
-    起動ログを gateway-<port>.log に逃がす（TUI のログ表示から参照できる固定パス）。
+    起動ログを gateway-<port>.log に逃がす（`gw log` が参照する）。`base` に**デーモンの
+    作業ディレクトリ**（設定のある場所）を渡すと、そこ基準の `.local-llm-server/` を使う
+    —— CLI は任意のディレクトリから実行されるため、CLI の CWD 基準（既定）では
+    デーモンが実際に書く場所とずれる。省略時は従来どおり CWD 基準。
     """
+    if base:
+        return os.path.join(base, ".local-llm-server", f"gateway-{port}.log")
     return os.path.join(project_cache_dir(), f"gateway-{port}.log")
 
 
@@ -1519,7 +1590,9 @@ def start_gateway_background(
             f"respond as a gateway; stop it or change `port` in gateway.toml"
         )
 
-    log_path = gateway_log_path(port)
+    # ログはデーモンの作業ディレクトリ（cwd 引数＝設定のある場所）基準に置く。CLI がどこから
+    # 実行されても、デーモン側の daemon_log_path（cwd 基準）と同じ場所に揃う。
+    log_path = gateway_log_path(port, base=cwd)
     os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
     log_file = open(log_path, "a", encoding="utf-8")
     popen_kwargs: dict = {
@@ -1527,9 +1600,9 @@ def start_gateway_background(
         "stdin": subprocess.DEVNULL,
         "stdout": log_file,
         "stderr": subprocess.STDOUT,
-        # /admin/status の launcher 表示用マーク。この関数経由（TUI の裏起動）で立った
-        # ゲートウェイは "tui"、直接の `python -m local_llm_server` は無印で "headless" になる。
-        "env": {**os.environ, "LOCAL_LLM_GW_LAUNCHER": "tui"},
+        # /admin/status の launcher 表示用マーク。この関数経由（`gw start` の裏起動）で立った
+        # ゲートウェイは "cli"、直接の `python -m local_llm_server` は無印で "headless" になる。
+        "env": {**os.environ, "LOCAL_LLM_GW_LAUNCHER": "cli"},
     }
     if os.name == "nt":
         # 端末から切り離し、新プロセスグループにする（stop の taskkill /T と対）。

@@ -1,6 +1,6 @@
 [project]
 name = "local-llm-server"
-version = "0.33.0"
+version = "0.34.0"
 description = "ローカルLLM（mlx / mlx-vlm / llama.cpp / vLLM / SGLang）を OpenAI 互換 API で束ねるマルチモデルゲートウェイ（サーバー）。gateway.toml のカタログを 1 ポートで配信し、model で振り分け・遅延起動・LRU 退避・MTP 高速化（Ollama 流の共有デーモン）。接続用クライアントは別パッケージ local-llm-client。"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -17,14 +17,12 @@ classifiers = [
     "Topic :: Software Development",
     "Operating System :: OS Independent",
 ]
-# ゲートウェイ本体は標準ライブラリのみで動く（純粋な HTTP 転送＋プロセス管理）。コア依存は
-# 既定起動の TUI ダッシュボード（tui_app.py）に使う textual（ターミナル運用前提のため core に置く。
-# headless では遅延 import されず読み込まれない）と、メモリガード用の psutil。
+# ゲートウェイ本体も CLI（gw start/stop/status/ps/...）も標準ライブラリのみで動く（純粋な
+# HTTP 転送＋プロセス管理＋argparse）。コア依存はメモリガード用の psutil のみ。
 # mlx 系バックエンドは環境マーカーで **Apple Silicon (macOS arm64) のときだけ自動インストール**する
 # （他 OS / Intel Mac では入らず、llama.cpp を各自で用意）。なので `uv sync` だけでよく、extra 指定は不要。
 # 接続用クライアントは別パッケージ local-llm-client。
 dependencies = [
-    "textual>=8.2.7",
     # メモリガード（max_memory_fraction）で総RAM/空き容量を取得する。クロスプラットフォーム。
     "psutil>=5.9",
     # mlx 系バックエンド（テキスト/vision/STT）。Apple Silicon でのみ解決・インストールされる。
@@ -71,7 +69,7 @@ dev = [
 Repository = "https://github.com/ToPo-ToPo-ToPo/local-llm-server"
 
 [project.scripts]
-gw = "local_llm_server.tui:main"
+gw = "local_llm_server.cli:main"
 
 [build-system]
 requires = ["setuptools>=77"]
