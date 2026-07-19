@@ -57,3 +57,37 @@ def test_context_manager(tmp_path):
             GatewayLock(lock_path).acquire()
     # 抜けたら取り直せる。
     GatewayLock(lock_path).acquire().release()
+
+
+# --- ランタイム記録（gw status / gw stop を任意ディレクトリから叩くための接続先） ---
+def test_runtime_record_roundtrip_and_stale(tmp_path, monkeypatch):
+    """記録を書けば読め、正常終了で消える。死んだ PID の記録は stale として None。"""
+    from local_llm_server import server
+
+    monkeypatch.setattr(server.tempfile, "gettempdir", lambda: str(tmp_path))
+    # 生きている PID（自分）で書けば読める。
+    server.write_gateway_runtime("127.0.0.1", 8799, os.getpid(), str(tmp_path), "now")
+    rec = server.read_gateway_runtime()
+    assert rec and rec["host"] == "127.0.0.1" and rec["port"] == 8799
+    # 使われていない（＝死んだ）PID の記録は None（クラッシュで残った記録を掴まない）。
+    dead = _find_free_pid()
+    server.write_gateway_runtime("127.0.0.1", 8799, dead, str(tmp_path), "now")
+    assert server.read_gateway_runtime() is None
+    # 正常終了時の clear で消える。
+    server.write_gateway_runtime("127.0.0.1", 8799, os.getpid(), str(tmp_path), "now")
+    server.clear_gateway_runtime()
+    assert server.read_gateway_runtime() is None
+
+
+def _find_free_pid() -> int:
+    """存在しない PID を1つ返す（生存確認テスト用）。"""
+    pid = 999_000
+    while pid > 1:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return pid
+        except OSError:
+            pass
+        pid -= 1
+    return 999_999

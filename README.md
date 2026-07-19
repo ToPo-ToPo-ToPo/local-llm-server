@@ -9,7 +9,7 @@
 - **vLLM / SGLang も選べる**（Linux/NVIDIA・Windows は WSL2）。`backend = "vllm"` または `"sglang"` で高スループット生成。重量級なので隔離 venv へ**起動時に自動導入**（明示 opt-in。SGLang は RadixAttention でエージェント用途に強い → [docs/vllm.md](docs/vllm.md)）。
 - **音声認識（STT）も同じポートで**。`/v1/audio/transcriptions` に音声を投げれば mlx-whisper が遅延起動して文字起こしする。エージェント側に mlx 依存は要らない（→ [音声認識（STT / whisper）](docs/gateway.md#音声認識stt--whisper)）。
 - 1 つの公開ポートで複数モデルを配信し、リクエストの `model` で振り分ける。
-- **デーモンは裏で常駐、運用は `gw` の CLI サブコマンド**（Ollama 流）。`gw start` で常駐起動、`gw status`/`gw ps` で稼働確認、`gw stop` で停止。端末を占有しない（→ [起動・運用](docs/operation.md)）。
+- **デーモンは裏で常駐、運用は `gw` の CLI サブコマンド**（Ollama 流）。`gw start` で常駐起動、`gw status`/`gw ps` で稼働確認、`gw stop` で停止。端末を占有しない。`status`/`stop` 等は **`gateway.toml` の無い場所からでも**唯一のデーモンを見つけて叩ける（→ [起動・運用](docs/operation.md)）。
 - **`gw list` が使えるモデルを自動一覧**。カタログに加え HF キャッシュの DL 済みモデルも未ロード候補として並ぶので、どれを指定すればよいか一目で分かる。
 - モデルは**初回リクエスト時に遅延起動**、`max_resident`（数）/ `max_memory_fraction`（メモリ量）超過で LRU 退避、`idle_timeout` で自動アンロード。
 - エージェントが「使い終わった」と通知すれば、在席が 0 になった瞬間に**待たず即アンロード**してメモリ解放（→ [在席ベースの即時アンロード](docs/gateway.md#在席ベースの即時アンロード)）。

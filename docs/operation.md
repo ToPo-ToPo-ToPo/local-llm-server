@@ -31,7 +31,13 @@ uv run gw ps         # ロード中モデルの状態（処理中数・在席・
 | `gw update` | PyPI 新版があれば `git pull` で追従し、稼働中なら再起動 |
 | `gw help` | サブコマンド一覧を表示（`gw -h` と同じ。`gateway.toml` 不要） |
 
-- CWD の `./gateway.toml` を読む。ログは `./.local-llm-server/gateway-<port>.log`。
+- **どこからでも状態確認・停止できる**: `start`/`restart` は「何を配信するか」を知るため CWD の
+  `./gateway.toml` が要るが、`status`/`stop`/`ps`/`list`/`log`/`max`/`update` は
+  **`gateway.toml` の無いディレクトリからでも動く**。起動時にデーモンが接続先（host/port/PID）を
+  固定パスのランタイム記録（temp ディレクトリの `local-llm-server-gateway.json`）に残すので、
+  マシンに 1 つのデーモンをそこから特定して叩く（単一起動＝`GatewayLock` の裏返し）。記録は正常
+  停止で消え、クラッシュで残っても PID 生存チェックで stale を掴まない。
+- `start`/`restart` は CWD の `./gateway.toml` を読む。ログは `./.local-llm-server/gateway-<port>.log`。
 - `gw list` の一覧には**ロード中だけでなく、HF キャッシュにある DL 済みモデルも未ロード候補**として並ぶ。
 - **自動更新**は稼働中デーモンが裏で行う。PyPI 新版を検知し、作業ツリーがクリーン（git クローン運用）
   かつ処理中/在席が 0 の瞬間に `git pull` で追従して自分を新コードで再起動する

@@ -1,6 +1,8 @@
 """CLI（`gw` サブコマンド）の純ロジック（catalog × ライブ状態のマージ・時間整形・ログ末尾・
 描画）と、argparse ディスパッチ（start/stop/status/ps を mock で）を検証する。TUI は廃止済み。
 """
+import pytest
+
 from local_llm_server import cli
 from local_llm_server.daemon import load_gateway_config
 
@@ -128,6 +130,56 @@ def test_stop_dispatch_only_kills_our_pids(tmp_path, monkeypatch):
 def test_missing_config_returns_2(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)            # gateway.toml が無い
     assert cli.main(["status"]) == 2
+
+
+def test_status_from_anywhere_uses_runtime_record(tmp_path, monkeypatch):
+    # ./gateway.toml が無いディレクトリでも、稼働中デーモンのランタイム記録から接続先を
+    # 引いて status が動く。
+    monkeypatch.chdir(tmp_path)  # gateway.toml 無し
+    monkeypatch.setattr(cli, "mtp_status", lambda m: None)
+    monkeypatch.setattr(cli, "read_gateway_runtime",
+                        lambda: {"host": "127.0.0.1", "port": 8799, "pid": 4242})
+    monkeypatch.setattr(cli, "gateway_admin_status",
+                        lambda h, p: {"uptime": 3.0, "requests": 5, "max_resident": 1,
+                                      "pid": 4242, "models": [], "available": []})
+    monkeypatch.setattr(cli, "is_ready", lambda url, **k: True)
+    assert cli.main(["status"]) == 0
+
+
+def test_remote_cmd_without_record_or_config_errors(tmp_path, monkeypatch, capsys):
+    # 稼働中デーモンも ./gateway.toml も無ければ、status は分かりやすいエラーで終わる。
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "read_gateway_runtime", lambda: None)
+    assert cli.main(["status"]) == 2
+    assert "no running gateway" in capsys.readouterr().err
+
+
+def test_start_still_requires_cwd_config(tmp_path, monkeypatch, capsys):
+    # start は「何を配信するか」が要るので、記録があっても ./gateway.toml が無ければエラー。
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "read_gateway_runtime",
+                        lambda: {"host": "127.0.0.1", "port": 8799, "pid": 1})
+    monkeypatch.setattr(cli, "start_gateway_background",
+                        lambda *a, **k: pytest.fail("must not start without config"))
+    assert cli.main(["start"]) == 2
+    assert "gateway.toml" in capsys.readouterr().err
+
+
+def test_stop_collects_pids_from_admin_and_record(tmp_path, monkeypatch):
+    # stop は /admin/status の daemon pid＋各ワーカー pids と、ポート走査、記録の pid を
+    # まとめて（このパッケージ由来だけ）停止する。
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "read_gateway_runtime",
+                        lambda: {"host": "127.0.0.1", "port": 8799, "pid": 100})
+    monkeypatch.setattr(cli, "gateway_admin_status",
+                        lambda h, p: {"pid": 100,
+                                      "models": [{"model": "m", "pids": [201, 202]}]})
+    monkeypatch.setattr(cli, "find_pids_on_port", lambda p: [])
+    monkeypatch.setattr(cli, "pid_looks_like_ours", lambda pid: True)
+    killed = []
+    monkeypatch.setattr(cli, "stop_pid", lambda pid, **k: killed.append(pid))
+    assert cli.main(["stop"]) == 0
+    assert sorted(killed) == [100, 201, 202]
 
 
 def test_help_lists_commands_without_config(tmp_path, monkeypatch, capsys):

@@ -42,6 +42,7 @@ from .server import (
     mtp_status,
     pid_looks_like_ours,
     primary_lan_ip,
+    read_gateway_runtime,
     start_gateway_background,
     stop_pid,
 )
@@ -56,6 +57,30 @@ def resolve_config() -> str | None:
     """
     path = os.path.join(os.getcwd(), "gateway.toml")
     return path if os.path.isfile(path) else None
+
+
+class _RuntimeConfig:
+    """ランタイム記録（稼働中デーモンの host/port）から作る最小の設定シム。
+
+    `./gateway.toml` の無いディレクトリから `gw status` / `gw stop` 等を打ったとき用。
+    事前登録カタログ（`models`）は記録に無いので空。表示に必要な値は `/admin/status` の
+    ライブ状態から得る（`merge_status` は admin があればそちらを優先する）。
+    """
+
+    def __init__(self, rec: dict) -> None:
+        self.host = rec.get("host", "127.0.0.1")
+        self.port = int(rec.get("port", 8799))
+        self.models: list = []          # 事前登録は記録に無い（動的ロード分は admin から見える）
+        self.idle_timeout = 0           # アイドル残りは記録だけでは出せない（admin にも idle_for はある）
+        self.max_resident = None        # 実値は admin の max_resident を使う
+
+
+def load_cwd_config():
+    """CWD の `./gateway.toml` を読む（無ければ None、壊れていれば ValueError を送出）。"""
+    path = resolve_config()
+    if path is None:
+        return None
+    return load_gateway_config(path)
 
 
 # --- 純データ層（状態のマージ・整形。端末なしでテストできる） --------------------
@@ -307,18 +332,41 @@ def _endpoint(gcfg) -> tuple[str, int, list[int]]:
     return host, port, all_ports
 
 
-def _stop_ports(all_ports: list[int]) -> list[int]:
-    """このパッケージ由来に見えるプロセスだけ、指定ポート群から止める（並列）。"""
+def _collect_gateway_pids(host: str, port: int, all_ports: list[int]) -> list[int]:
+    """停止対象（ゲートウェイ＋全モデルワーカー）の PID を、複数経路から重複なく集める。
+
+    - `/admin/status`: 稼働中なら daemon pid（`pid`）と各モデルワーカーの pids を直接得る
+      （モデルワーカーは別セッションなので、port 走査だけでは取りこぼしうる。これが主経路）。
+    - 既知ポート走査: 公開ポート＋事前登録モデルポート（gateway.toml がある場合）。孤児対策。
+    - ランタイム記録: `./gateway.toml` の無い場所からでも daemon pid を拾える。
+    このパッケージ由来に見える PID だけに絞る（無関係プロセスを巻き添えにしない）。
+    """
+    pids: set[int] = set()
+    admin = gateway_admin_status(host, port)
+    if admin:
+        if isinstance(admin.get("pid"), int):
+            pids.add(admin["pid"])
+        for m in admin.get("models", []):
+            for p in (m.get("pids") or []):
+                if isinstance(p, int):
+                    pids.add(p)
+    for p in all_ports:
+        pids.update(find_pids_on_port(p))
+    rec = read_gateway_runtime()
+    if rec and isinstance(rec.get("pid"), int):
+        pids.add(rec["pid"])
+    return [pid for pid in pids if pid_looks_like_ours(pid)]
+
+
+def _stop_pids(pids: list[int]) -> None:
+    """指定 PID 群を並列に停止する（stop_pid は 1 件あたり最長 ~10s 待つため）。"""
     import threading
 
-    pids = {pid for p in all_ports for pid in find_pids_on_port(p)}
-    pids = [pid for pid in pids if pid_looks_like_ours(pid)]
     threads = [threading.Thread(target=stop_pid, args=(pid,)) for pid in pids]
     for t in threads:
         t.start()
     for t in threads:
         t.join()
-    return pids
 
 
 # --- 各サブコマンドの実装 ---------------------------------------------------
@@ -336,18 +384,19 @@ def cmd_start(gcfg, args) -> int:
 
 
 def cmd_stop(gcfg, args) -> int:
-    _, _, all_ports = _endpoint(gcfg)
-    stopped = _stop_ports(all_ports)
-    if stopped:
-        print(f"gateway: stopped ({len(stopped)} process(es))")
+    host, port, all_ports = _endpoint(gcfg)
+    pids = _collect_gateway_pids(host, port, all_ports)
+    _stop_pids(pids)
+    if pids:
+        print(f"gateway: stopped ({len(pids)} process(es))")
     else:
         print("gateway: not running")
     return 0
 
 
 def cmd_restart(gcfg, args) -> int:
-    _, _, all_ports = _endpoint(gcfg)
-    _stop_ports(all_ports)
+    host, port, all_ports = _endpoint(gcfg)
+    _stop_pids(_collect_gateway_pids(host, port, all_ports))
     return cmd_start(gcfg, args)
 
 
@@ -456,7 +505,7 @@ def cmd_update(gcfg, args) -> int:
     # 稼働中なら新コードで再起動（stop → start）。
     host, port, all_ports = _endpoint(gcfg)
     if is_ready(f"http://{host}:{port}/v1"):
-        _stop_ports(all_ports)
+        _stop_pids(_collect_gateway_pids(host, port, all_ports))
         return cmd_start(gcfg, args)
     return 0
 
@@ -515,29 +564,67 @@ _COMMANDS = {
     "max": cmd_max, "mtp": cmd_mtp, "update": cmd_update, "help": cmd_help,
 }
 
+# `./gateway.toml` を **必須** とするコマンド（何を配信するか＝models を知る必要がある）。
+# それ以外（status/stop/ps/list/log/max/update）は、CWD 設定が無ければ稼働中デーモンの
+# ランタイム記録から接続先を得て**どこからでも**動く（引数なし＝start なので必須側）。
+_NEEDS_CONFIG = {"start", "restart", None}
+_NO_CONFIG = {"help", "mtp"}  # 設定にまったく依存しない
+
+
+def _resolve_gcfg(cmd: str | None):
+    """コマンドに応じて設定（gcfg）を解決する。戻り値: (gcfg, error_code)。
+
+    - CWD に `./gateway.toml` があればそれを使う（最優先）。
+    - 無く、かつ launch 系でないコマンドなら、稼働中デーモンのランタイム記録から
+      最小シム（host/port だけ）を作って返す —— gateway.toml の無い場所からでも
+      `gw status` / `gw stop` 等が「唯一動いているデーモン」を叩ける。
+    - どちらも無ければエラー（適切な終了コード）。
+    """
+    try:
+        gcfg = load_cwd_config()
+    except (OSError, ValueError, tomllib.TOMLDecodeError) as exc:
+        print(f"Failed to load ./gateway.toml: {exc}", file=sys.stderr)
+        return None, 2
+    if gcfg is not None:
+        return gcfg, 0
+    # CWD に設定が無い。launch 系は「何を配信するか」が要るので設定必須。
+    if cmd in _NEEDS_CONFIG:
+        print(
+            "./gateway.toml not found in the current directory. `gw start`/`restart` need it "
+            "(run from the directory that has your gateway.toml).",
+            file=sys.stderr,
+        )
+        return None, 2
+    # それ以外は稼働中デーモンをランタイム記録から探す。
+    rec = read_gateway_runtime()
+    if rec is None:
+        print(
+            "no running gateway found, and no ./gateway.toml in the current directory. "
+            "Start one with `gw start` from your gateway.toml directory.",
+            file=sys.stderr,
+        )
+        return None, 2
+    return _RuntimeConfig(rec), 0
+
 
 def main(argv: list[str] | None = None) -> int:
-    """`gw` コマンド本体。サブコマンドで運用する（引数なしは start + status）。"""
+    """`gw` コマンド本体。サブコマンドで運用する（引数なしは start + status）。
+
+    `status`/`stop`/`ps`/`list`/`log`/`max`/`update` は、`./gateway.toml` の無い
+    ディレクトリからでも、稼働中デーモンのランタイム記録を辿って実行できる。
+    """
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    # help は gateway.toml が無くても表示できる（`gw -h` と同じく設定に依らない）。
+    # 設定にまったく依存しないコマンド（help / mtp）は先に処理する。
     if args.cmd == "help":
         return cmd_help(None, args)
+    if args.cmd == "mtp":
+        return cmd_mtp(None, args)
 
-    config_path = resolve_config()
-    if config_path is None:
-        print(
-            "./gateway.toml not found in the current directory. Create one here "
-            "(see the gateway.toml example in the repo), then run again from that directory.",
-            file=sys.stderr,
-        )
-        return 2
-    try:
-        gcfg = load_gateway_config(config_path)
-    except (OSError, ValueError, tomllib.TOMLDecodeError) as exc:
-        print(f"Failed to load ./gateway.toml: {exc}", file=sys.stderr)
-        return 2
+    gcfg, code = _resolve_gcfg(args.cmd)
+    if gcfg is None:
+        return code
 
     handler = _COMMANDS.get(args.cmd, cmd_default)
     return handler(gcfg, args)

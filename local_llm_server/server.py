@@ -1219,6 +1219,63 @@ def gateway_lock_path() -> str:
     return os.path.join(tempfile.gettempdir(), "local-llm-server-gateway.lock")
 
 
+def gateway_runtime_path() -> str:
+    """稼働中ゲートウェイの接続先（host/port/pid/cwd）を書く固定パス（cwd 非依存）。
+
+    単一起動（`GatewayLock`）でマシンに 1 ゲートウェイなので、この 1 ファイルを読めば
+    **どのディレクトリからでも**「いま動いているゲートウェイ」の host/port を特定できる
+    （`gw status` / `gw stop` を gateway.toml の無い場所から打つため）。ロックの隣に置く。
+    """
+    return os.path.join(tempfile.gettempdir(), "local-llm-server-gateway.json")
+
+
+def write_gateway_runtime(host: str, port: int, pid: int, cwd: str, started_at: str) -> None:
+    """稼働中ゲートウェイの接続先をランタイム記録に書く（デーモンが起動時に呼ぶ）。
+
+    書き込みは best-effort（失敗しても稼働は妨げない）。単一起動なので上書きで良い。
+    """
+    rec = {"host": host, "port": port, "pid": pid, "cwd": cwd, "started_at": started_at}
+    try:
+        path = gateway_runtime_path()
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(rec, fh)
+    except OSError:
+        pass
+
+
+def read_gateway_runtime() -> dict | None:
+    """ランタイム記録を読む（無い・壊れている・PID が生きていなければ None）。
+
+    クラッシュで残った stale 記録を掴まないよう、記録の PID が生存しているときだけ返す
+    （PID 生存は下限の健全性チェック。最終的な疎通は呼び出し側が /admin/status で確認する）。
+    """
+    try:
+        with open(gateway_runtime_path(), encoding="utf-8") as fh:
+            rec = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(rec, dict) or "host" not in rec or "port" not in rec:
+        return None
+    pid = rec.get("pid")
+    if isinstance(pid, int):
+        try:
+            os.kill(pid, 0)  # 生存確認（シグナルは送らない）。死んでいれば ProcessLookupError
+        except ProcessLookupError:
+            return None
+        except OSError:
+            pass  # 権限エラー等は「生きている可能性」として通す
+    return rec
+
+
+def clear_gateway_runtime() -> None:
+    """ランタイム記録を消す（デーモンの正常終了時に呼ぶ。best-effort）。"""
+    try:
+        os.remove(gateway_runtime_path())
+    except OSError:
+        pass
+
+
 def _read_lock_pid(path: str) -> int | None:
     """ロックファイルに保持者が書き込んだ PID を読む（読めなければ None）。"""
     try:

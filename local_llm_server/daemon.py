@@ -46,6 +46,7 @@ from .server import (
     GatewayLock,
     LocalServer,
     ServerConfig,
+    clear_gateway_runtime,
     daemon_log_path,
     discover_cached_models,
     estimate_model_bytes,
@@ -61,6 +62,7 @@ from .server import (
     set_vllm_python,
     sglang_provision_info,
     vllm_provision_info,
+    write_gateway_runtime,
 )
 
 # 複製インスタンス起動前の猶予秒数。ストリーミングのクライアントは [DONE] を受けた
@@ -2298,6 +2300,10 @@ def _run_gateway_locked(cfg: GatewayConfig, config_path: str | None = None) -> i
         file=sys.stderr,
     )
 
+    # ランタイム記録: 稼働中ゲートウェイの接続先を固定パスに残す。gateway.toml の無い
+    # ディレクトリからでも `gw status` / `gw stop` がこの 1 ファイルで唯一のデーモンを見つける。
+    write_gateway_runtime(cfg.host, cfg.port, server.pid, server.start_cwd, server.started_at)
+
     # 掃除スレッド: ①クラッシュした内部ワーカーの健全性チェック（常時）②idle TTL 超過モデルの
     # アンロード ③在席ハートビート途絶の掃除。健全性チェックは常に走らせる（死んだワーカーへ
     # 流し続けて 502 を返す事態を防ぐ）。チェック間隔は有効な閾値と健全性チェック周期の短い方。
@@ -2373,4 +2379,9 @@ def _run_gateway_locked(cfg: GatewayConfig, config_path: str | None = None) -> i
         server.shutdown()
         server.server_close()
         manager.shutdown()
+        # 正常停止のときだけランタイム記録を消す。自動更新の再起動（execv）では消さない
+        # ——同じ pid/port で立ち直す新イメージが上書きするので、その隙に `gw status` が
+        # 「ゲートウェイ無し」と誤認しないため。
+        if not restart:
+            clear_gateway_runtime()
     return _RESTART_CODE if restart else 0
