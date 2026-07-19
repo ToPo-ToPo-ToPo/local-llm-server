@@ -1,12 +1,12 @@
-"""起動口の検証: `gw`（tui.main）と裏の常駐ワーカー（__main__.main）。
+"""起動口の検証: `gw`（cli.main）と裏の常駐ワーカー（__main__.main）。
 
-CLI の運用フラグは廃止し、運用はすべて TUI 内で行う。ここでは 2 つの入口が
-`./gateway.toml` を正しく解決し、それぞれ TUI 起動 / ヘッドレスのゲートウェイ実行へ
-振り分けることを、重い依存（textual / run_gateway）を差し替えて検証する。
+運用は `gw` の CLI サブコマンドで行う。ここでは 2 つの入口が `./gateway.toml` を正しく解決し、
+それぞれ「デーモンの裏起動」/「ヘッドレスのゲートウェイ実行」へ振り分けることを、重い依存
+（start_gateway_background / run_gateway）を差し替えて検証する。
 """
 import pytest
 
-from local_llm_server import tui
+from local_llm_server import cli
 from local_llm_server import __main__ as worker
 
 
@@ -22,25 +22,31 @@ def in_gateway_dir(tmp_path, monkeypatch):
 
 
 def test_resolve_config_finds_cwd_toml(in_gateway_dir):
-    assert tui.resolve_config() == str(in_gateway_dir / "gateway.toml")
+    assert cli.resolve_config() == str(in_gateway_dir / "gateway.toml")
 
 
 def test_resolve_config_missing_returns_none(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)  # gateway.toml の無いディレクトリ
-    assert tui.resolve_config() is None
+    assert cli.resolve_config() is None
 
 
-def test_gw_opens_tui(in_gateway_dir, monkeypatch):
+def test_bare_gw_starts_daemon(in_gateway_dir, monkeypatch):
+    # 引数なし `gw` はデーモンを裏起動して状態を表示する（従来の `uv run gw` 相当）。
     seen = {}
-    monkeypatch.setattr(tui, "run_tui", lambda cfg: seen.update(port=cfg.port) or 0)
-    assert tui.main([]) == 0
+    monkeypatch.setattr(cli, "start_gateway_background",
+                        lambda cwd, host, port: seen.update(port=port) or 123)
+    monkeypatch.setattr(cli, "gateway_admin_status", lambda h, p: None)
+    monkeypatch.setattr(cli, "is_ready", lambda url, **k: True)
+    monkeypatch.setattr(cli, "mtp_status", lambda m: None)
+    assert cli.main([]) == 0
     assert seen["port"] == 8799
 
 
 def test_gw_errors_without_gateway_toml(tmp_path, monkeypatch, capsys):
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(tui, "run_tui", lambda cfg: pytest.fail("must not open TUI"))
-    assert tui.main([]) == 2
+    monkeypatch.setattr(cli, "start_gateway_background",
+                        lambda *a, **k: pytest.fail("must not start"))
+    assert cli.main([]) == 2
     assert "gateway.toml" in capsys.readouterr().err
 
 

@@ -55,7 +55,7 @@ provision = "system"   # 既定。現在の環境の vllm を使う（uv sync --
   （extras で両方を1環境に入れると壊れる）。
 - どちらも、導入に失敗（GPU 非検出・pip 失敗・CUDA 不整合）してもゲートウェイは起動を続け、
   vllm モデルの要求時に分かりやすいエラーになる（他バックエンドは動く）。
-- 導入した vLLM の素性は `GET /admin/status` の `vllm` フィールドと TUI に出る。
+- 導入した vLLM の素性は `GET /admin/status` の `vllm` フィールドに出る。
 
 > **まとめ**: 1 つだけ使う → `uv sync --extra vllm` ＋ 既定（system）。vLLM と SGLang を
 > 両方使う → 各 backend で `provision = "auto"`（別々の隔離 venv・自動導入）。

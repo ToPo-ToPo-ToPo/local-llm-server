@@ -3,7 +3,8 @@
 このリポジトリは PyPI に公開しつつ、実運用は **GitHub から clone して `uv run gw`** で
 動かす。そのためバージョンアップが手作業になりがち。ここでは「PyPI に新版が出たら検知し、
 作業ツリーがクリーンなら `git pull --ff-only` で追従する」ための小さな道具を提供する。
-TUI（tui_app.py）が起動時・実行中に使い、適用後は tui.run_tui が再 exec して新コードで立ち上げ直す。
+常駐デーモン（daemon._run_gateway_locked の更新ウォッチャー）が idle 時にこれを使い、適用後は
+run_gateway が reexec_daemon で自分自身を新コードに置き換える（手動なら `gw update`）。
 
 方針（安全側）:
   - **git クローン & upstream 追跡ブランチ & 作業ツリーがクリーンな時だけ**適用する
@@ -150,7 +151,7 @@ def apply_update(root: Path | None = None, timeout: float = 120.0) -> tuple[bool
     """`git pull --ff-only`（＋可能なら `uv sync`）でソースを最新へ更新する。
 
     成功したら (True, メッセージ)。呼び出し側は**プロセスを再起動**して新コードを読み込むこと
-    （実行中の Python は古いコードを保持したままなので、reexec_tui で入れ替える）。
+    （実行中の Python は古いコードを保持したままなので、reexec_daemon で入れ替える）。
     直前に作業ツリーを再確認し、汚れていれば適用しない（チェック〜適用間の変更に対する保険）。
     """
     root = root or repo_root()
@@ -175,12 +176,15 @@ def apply_update(root: Path | None = None, timeout: float = 120.0) -> tuple[bool
     return True, (pull.stdout or "").strip()[:200] or "更新しました"
 
 
-def reexec_tui() -> None:
-    """現在の Python で TUI を再起動する（更新後、新コードを読み込むための再 exec）。
+def reexec_daemon() -> None:
+    """現在の Python でゲートウェイ本体を再 exec する（更新後、新コードを読み込むため）。
 
-    CWD を保つ（./gateway.toml の解決が変わらない）。同一 venv の python を使うので、
+    デーモン（`python -m local_llm_server`）が idle 時に自動更新を適用したあと、自分自身を
+    新コードで置き換えるために呼ぶ。呼ぶ前に **単一起動ロックの解放とポートの解放（server_close）
+    を済ませておくこと**（execv は開いた fd を引き継ぐため、握ったままだと再取得で自分自身と
+    衝突する）。CWD を保つ（./gateway.toml の解決が変わらない）。同一 venv の python を使うので、
     git pull 済みの新ソースと uv sync 済みの依存で立ち上がる。呼ぶと戻らない。
     """
     import os
 
-    os.execv(sys.executable, [sys.executable, "-m", "local_llm_server.tui"])
+    os.execv(sys.executable, [sys.executable, "-m", "local_llm_server"])

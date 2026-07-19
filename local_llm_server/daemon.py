@@ -1082,7 +1082,7 @@ class GatewayServer(ThreadingHTTPServer):
         self.session_ttl = session_ttl
         # 起動元情報（provenance）。「いつ・どこから・どの経路で立ったゲートウェイか」を
         # /admin/status で見えるようにする——コーディングエージェント等が裏でヘッドレス起動
-        # した場合でも、TUI attach や curl 一発で出所を特定できる。経路は TUI の裏起動
+        # した場合でも、`gw status` や curl 一発で出所を特定できる。経路は `gw start` の裏起動
         # （start_gateway_background）が環境変数でマークし、無印は "headless"（直接起動）。
         self.pid = os.getpid()
         self.started_at = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -1205,7 +1205,7 @@ class _GatewayHandler(BaseHTTPRequestHandler):
                 "vision_model": srv.vision_model,
                 "uptime": round(srv.manager.uptime(), 1),
                 "requests": sum(m.get("requests", 0) for m in models),
-                # 起動元情報: いつ・どこから・どの経路（tui の裏起動 / headless 直接起動）で
+                # 起動元情報: いつ・どこから・どの経路（cli の裏起動 / headless 直接起動）で
                 # 立ったゲートウェイかを示す。出所不明のサーバーの特定用。
                 "pid": srv.pid,
                 "started_at": srv.started_at,
@@ -1516,7 +1516,7 @@ class GatewayConfig:
     max_memory_fraction: float | None = None  # 常駐モデルの推定占有量の合計を総RAMのこの割合に制限（None で無効）
     internal_base_port: int = 9001     # 内部サーバーの割当開始ポート（動的モデルもこの続きから割り当て）
     api_key: str | None = None         # ネットワーク公開時の API キー（None/空 で認証なし）。chat と在席セッションに要求
-    auto_update: bool = True           # TUI が PyPI 新版を検知したら git pull で自動追従する（既定 true。false で無効）
+    auto_update: bool = True           # 常駐デーモンが PyPI 新版を検知したら git pull で自動追従する（既定 true。false で無効）
     vision_model: str | None = None    # 画像入りリクエストの振り分け先モデル（None で無効）。画像が壊れている
                                        # vision モデルを避け、画像だけを確実に動くモデル（gemma-4 系等）へ流す
     # --- llama.cpp（llama-server）バイナリの自動導入。[llama_cpp] テーブルで設定 ---
@@ -2018,6 +2018,72 @@ def watch_config_file(
             print("Config reloaded: no effective change.", file=sys.stderr)
 
 
+# 自動更新を適用したので新コードで再起動したい、を表す内部終了コード（run_gateway が execv）。
+# 通常終了(0)・既に起動済み(3)と衝突しない値。
+_RESTART_CODE = 7
+
+# 自動更新ウォッチャーの周期（秒）。モジュール定数にして差し替え可能にする。
+_UPDATE_WARMUP_INTERVAL = 60.0     # 起動直後は 1 分だけ待ってから初回チェック（起動処理と競合させない）
+_UPDATE_CHECK_INTERVAL = 3600.0    # 以降、新版が未検知のあいだの確認周期
+_UPDATE_DRAIN_POLL_INTERVAL = 30.0  # 取得済み・再起動待ちのあいだ、空くのを待つ周期
+
+
+def _update_watcher(
+    manager: "ModelManager",
+    stop: threading.Event,
+    restart_requested: threading.Event,
+) -> None:
+    """PyPI 新版を検知し、作業ツリーがクリーンなら git pull で追従する常駐スレッド。
+
+    旧 TUI が担っていた自動更新（clone 運用で PyPI 新版を git で追従）をデーモン本体へ移したもの。
+    安全側の 2 段構え —— ①**取得は稼働中に先に済ませる**（`git pull`＋`uv sync`。プロセスには
+    触れず、この間も通常どおりリクエストを受ける）②**再起動は drain が通ったときだけ**行う。
+    `manager.begin_drain()` が「処理中 0・在席 0」の確認と新規受付停止を**原子的に**行うので、
+    確認と再起動の隙に生成が滑り込んで強制終了される余地が無い。busy なら何も止めずに保留し、
+    空いた瞬間に再起動する。ネットワーク I/O・git は失敗しても握りつぶす（稼働は妨げない）。
+
+    未検知のあいだは 1 時間おき、取得済みで再起動待ちのあいだは 30 秒おきに drain を再試行する。
+    """
+    from . import update
+
+    fetched = False  # ソースは新版へ追従済みで、あとは drain が通れば再起動するだけ
+    first = True
+    while not stop.wait(
+        _UPDATE_WARMUP_INTERVAL if first
+        else (_UPDATE_DRAIN_POLL_INTERVAL if fetched else _UPDATE_CHECK_INTERVAL)
+    ):
+        first = False
+        if not fetched:
+            try:
+                st = update.check(timeout=3.0)
+            except Exception:  # noqa: BLE001 - 監視スレッドは落とさない
+                continue
+            if not (st.available and st.can_apply):
+                continue  # オフライン・dirty（開発中 PC の WIP を守る）・not-a-clone・最新
+            # 取得は稼働中に先に済ませる（プロセスには触れない。ここでは再起動しない）。
+            try:
+                ok, msg = update.apply_update()
+            except Exception as exc:  # noqa: BLE001
+                print(f"Auto-update: fetch skipped ({exc}).", file=sys.stderr)
+                continue
+            if not ok:
+                print(f"Auto-update: not applied ({msg}).", file=sys.stderr)
+                continue
+            fetched = True
+            print(
+                f"Auto-update: fetched ({msg}); will restart on new code when idle.",
+                file=sys.stderr,
+            )
+        # ソース追従済み。処理中/在席が 0 を原子的に確認できた（drain 成功）ときだけ再起動する。
+        # 成功後は新規受付が止まる（503→クライアントが新プロセスへリトライ）ので、下の
+        # メインループが finally でクリーン停止 → run_gateway が execv で新コードに置き換える。
+        if manager.begin_drain()["ok"]:
+            print("Auto-update: idle; restarting the gateway on new code...", file=sys.stderr)
+            restart_requested.set()
+            return
+        # busy → 何も止めずに保留（次周期で再試行）。
+
+
 def run_gateway(cfg: GatewayConfig, config_path: str | None = None) -> int:
     """ゲートウェイを起動し、割り込み（Ctrl+C / SIGTERM）まで動かす。
 
@@ -2039,9 +2105,16 @@ def run_gateway(cfg: GatewayConfig, config_path: str | None = None) -> int:
         print(f"Refusing to start: {exc}", file=sys.stderr)
         return 3
     try:
-        return _run_gateway_locked(cfg, config_path)
+        rc = _run_gateway_locked(cfg, config_path)
     finally:
         lock.release()
+    # 自動更新を idle 時に適用したら、ロックとポートを解放し切った **後** で自分自身を
+    # 新コードに置き換える（execv は fd を引き継ぐので、ロック保持中に再取得すると自分と
+    # 衝突する。必ず lock.release() を通してから exec する）。exec は戻らない。
+    if rc == _RESTART_CODE:
+        from . import update
+        update.reexec_daemon()
+    return rc
 
 
 def _llama_cpp_in_use(cfg: GatewayConfig) -> bool:
@@ -2270,10 +2343,25 @@ def _run_gateway_locked(cfg: GatewayConfig, config_path: str | None = None) -> i
             daemon=True,
         ).start()
 
+    # 自動更新監視: PyPI 新版を検知し、作業ツリーがクリーンかつ処理中/在席が 0（idle）の
+    # 瞬間に git pull で追従する。適用できたら restart_requested を立てて下のメインループを
+    # 抜け、finally でクリーン停止 → run_gateway が execv で新コードに置き換える。
+    # TUI 廃止に伴い、旧 TUI が担っていた「PyPI 新版を git で追従」をデーモン本体へ移した。
+    # gateway.toml の auto_update=false で無効化できる（手動なら `gw update`）。
+    restart_requested = threading.Event()
+    if cfg.auto_update:
+        threading.Thread(
+            target=_update_watcher,
+            args=(manager, stop_reaper, restart_requested),
+            daemon=True,
+        ).start()
+
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
+    restart = False
     try:
-        threading.Event().wait()  # 割り込みまでブロック（メインスレッドで受ける）
+        # 割り込み（Ctrl+C / SIGTERM）または自動更新の再起動要求までブロックする。
+        restart = restart_requested.wait()
     except KeyboardInterrupt:
         pass
     finally:
@@ -2285,4 +2373,4 @@ def _run_gateway_locked(cfg: GatewayConfig, config_path: str | None = None) -> i
         server.shutdown()
         server.server_close()
         manager.shutdown()
-    return 0
+    return _RESTART_CODE if restart else 0
