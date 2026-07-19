@@ -44,6 +44,7 @@ def test_bare_gw_starts_daemon(in_gateway_dir, monkeypatch):
 
 def test_gw_errors_without_gateway_toml(tmp_path, monkeypatch, capsys):
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "find_config_path", lambda: None)  # CWD・~/.config・クローンも無い
     monkeypatch.setattr(cli, "start_gateway_background",
                         lambda *a, **k: pytest.fail("must not start"))
     assert cli.main([]) == 2

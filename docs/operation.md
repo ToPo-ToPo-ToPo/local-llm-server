@@ -1,19 +1,32 @@
 # 起動・運用・アンインストール
 
-ゲートウェイは `./gateway.toml` のあるディレクトリで、`gw` の **CLI サブコマンド**で運用する。
-デーモン本体は端末を持たず裏で常駐し、`gw` は「そのデーモンを起動・停止・監視する薄い CLI」。
-マシンに 1 ゲートウェイだけ（`GatewayLock`）なので、`gw` を何度打ってもデーモンは 0 個か 1 個。
+運用は `gw` の **CLI サブコマンド**で行う。デーモン本体は端末を持たず裏で常駐し、`gw` は
+「そのデーモンを起動・停止・監視する薄い CLI」。マシンに 1 ゲートウェイだけ（`GatewayLock`）なので、
+`gw` を何度打ってもデーモンは 0 個か 1 個。
 
-## 起動と状態確認
+## インストール（一度だけ）
 
 ```bash
-uv run gw start      # デーモンを裏で常駐起動（既に起動していれば何もしない）
-uv run gw status     # 稼働/停止・PID・URL・起動経過・累計リクエストを 1 行表示
-uv run gw ps         # ロード中モデルの状態（処理中数・在席・アイドル残り）
+git clone https://github.com/ToPo-ToPo-ToPo/local-llm-server
+cd local-llm-server
+uv tool install --editable .     # `gw` を PATH に導入（Ollama 流。以後どこでも `gw`）
 ```
 
-引数なしの `uv run gw` は `start` してから状態を表示する（従来の手触り）。
-`uv tool install local-llm-server` で入れた場合は `uv run` も要らず、どこでも `gw start` で動く。
+`--editable` なのでソースはこのクローンを指す（`gw update` / 自動更新の `git pull` がそのまま効く）。
+`~/.local/bin` が PATH に無いと言われたら `uv tool update-shell` を一度実行する。
+
+## 起動と状態確認（どのディレクトリからでも）
+
+```bash
+gw start      # デーモンを裏で常駐起動（既に起動していれば何もしない）
+gw status     # 稼働/停止・PID・URL・起動経過・累計リクエストを 1 行表示
+gw ps         # ロード中モデルの状態（処理中数・在席・アイドル残り）
+```
+
+引数なしの `gw` は `start` してから状態を表示する。`gw start` は設定を
+**CWD の `./gateway.toml` → `~/.config/local-llm-server/gateway.toml` → クローンの `gateway.toml`**
+の順で探すので、どこから打っても設定が見つかる（`--editable` インストールならクローンの gateway.toml が
+自動発見される）。`status`/`stop` 等はさらに、稼働中デーモンのランタイム記録を辿って**設定が無くても**動く。
 
 ## サブコマンド一覧
 
@@ -31,20 +44,16 @@ uv run gw ps         # ロード中モデルの状態（処理中数・在席・
 | `gw update` | PyPI 新版があれば `git pull` で追従し、稼働中なら再起動 |
 | `gw help` | サブコマンド一覧を表示（`gw -h` と同じ。`gateway.toml` 不要） |
 
-- **どこからでも状態確認・停止できる**: `start`/`restart` は「何を配信するか」を知るため CWD の
-  `./gateway.toml` が要るが、`status`/`stop`/`ps`/`list`/`log`/`max`/`update` は
-  **`gateway.toml` の無いディレクトリからでも動く**。起動時にデーモンが接続先（host/port/PID）を
-  固定パスのランタイム記録（temp ディレクトリの `local-llm-server-gateway.json`）に残すので、
-  マシンに 1 つのデーモンをそこから特定して叩く（単一起動＝`GatewayLock` の裏返し）。記録は正常
-  停止で消え、クラッシュで残っても PID 生存チェックで stale を掴まない。
-
-  > **注意**: 「どこからでも」は `gw` コマンド自体が PATH にある前提。`uv run gw` は**プロジェクト
-  > 内でしか動かない**（`uv run` は CWD のプロジェクトから `gw` を探すため、ホーム等では
-  > `Failed to spawn: gw` になる）。プロジェクト外から打ちたいなら、次のいずれかにする:
-  > - `uv tool install --from /path/to/local-llm-server local-llm-server` → 以後どこでも素の `gw`
-  > - もしくは `uv run --project /path/to/local-llm-server gw status` のように `--project` を付ける
-  > - もしくは alias を張る（例: `alias gw='uv run --project /path/to/local-llm-server gw'`）
-- `start`/`restart` は CWD の `./gateway.toml` を読む。ログは `./.local-llm-server/gateway-<port>.log`。
+- **どこからでも動く**: 上のとおり `uv tool install` で `gw` を PATH に入れれば、どのディレクトリ
+  からでも同じ 1 つのデーモンを操作できる。`start`/`restart` は設定を CWD → `~/.config` → クローンの
+  順で探し、`status`/`stop`/`ps`/`list`/`log`/`max`/`update` はさらに**稼働中デーモンのランタイム
+  記録**（temp の `local-llm-server-gateway.json`：host/port/PID）を辿るので、設定が無い場所でも
+  実際に動いているデーモンを特定して叩ける（単一起動＝`GatewayLock` の裏返し）。記録は正常停止で
+  消え、クラッシュで残っても PID 生存チェックで stale を掴まない。接続先の優先度は
+  **CWD の明示設定 → 稼働中デーモンの記録 → `~/.config`/クローン設定**（別ポートの設定を掴んで実際の
+  デーモンを見失わないよう、記録＝実物を優先する）。
+- ログは `./.local-llm-server/gateway-<port>.log`（デーモンを起動したディレクトリ基準）。
+  `gw log` で末尾を表示できる。
 - `gw list` の一覧には**ロード中だけでなく、HF キャッシュにある DL 済みモデルも未ロード候補**として並ぶ。
 - **自動更新**は稼働中デーモンが裏で行う。PyPI 新版を検知し、作業ツリーがクリーン（git クローン運用）
   かつ処理中/在席が 0 の瞬間に `git pull` で追従して自分を新コードで再起動する

@@ -129,13 +129,15 @@ def test_stop_dispatch_only_kills_our_pids(tmp_path, monkeypatch):
 
 def test_missing_config_returns_2(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)            # gateway.toml が無い
+    monkeypatch.setattr(cli, "_fallback_config_path", lambda: None)
+    monkeypatch.setattr(cli, "read_gateway_runtime", lambda: None)
     assert cli.main(["status"]) == 2
 
 
 def test_status_from_anywhere_uses_runtime_record(tmp_path, monkeypatch):
-    # ./gateway.toml が無いディレクトリでも、稼働中デーモンのランタイム記録から接続先を
-    # 引いて status が動く。
+    # どこにも gateway.toml が無くても、稼働中デーモンのランタイム記録から接続先を引いて動く。
     monkeypatch.chdir(tmp_path)  # gateway.toml 無し
+    monkeypatch.setattr(cli, "_fallback_config_path", lambda: None)  # ~/.config・クローンも無い想定
     monkeypatch.setattr(cli, "mtp_status", lambda m: None)
     monkeypatch.setattr(cli, "read_gateway_runtime",
                         lambda: {"host": "127.0.0.1", "port": 8799, "pid": 4242})
@@ -147,22 +149,43 @@ def test_status_from_anywhere_uses_runtime_record(tmp_path, monkeypatch):
 
 
 def test_remote_cmd_without_record_or_config_errors(tmp_path, monkeypatch, capsys):
-    # 稼働中デーモンも ./gateway.toml も無ければ、status は分かりやすいエラーで終わる。
+    # 稼働中デーモンも gateway.toml もどこにも無ければ、status は分かりやすいエラーで終わる。
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "_fallback_config_path", lambda: None)
     monkeypatch.setattr(cli, "read_gateway_runtime", lambda: None)
     assert cli.main(["status"]) == 2
     assert "no running gateway" in capsys.readouterr().err
 
 
-def test_start_still_requires_cwd_config(tmp_path, monkeypatch, capsys):
-    # start は「何を配信するか」が要るので、記録があっても ./gateway.toml が無ければエラー。
+def test_start_requires_config_somewhere(tmp_path, monkeypatch, capsys):
+    # start は「何を配信するか」が要るので、どこにも gateway.toml が無ければエラー
+    # （記録があっても start はしない）。
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "find_config_path", lambda: None)
     monkeypatch.setattr(cli, "read_gateway_runtime",
                         lambda: {"host": "127.0.0.1", "port": 8799, "pid": 1})
     monkeypatch.setattr(cli, "start_gateway_background",
                         lambda *a, **k: pytest.fail("must not start without config"))
     assert cli.main(["start"]) == 2
     assert "gateway.toml" in capsys.readouterr().err
+
+
+def test_start_finds_config_from_anywhere(tmp_path, monkeypatch):
+    # gateway.toml が別ディレクトリにあっても find_config_path が見つければ、そのディレクトリを
+    # cwd にしてデーモンを起動する（どこからでも `gw start`）。
+    cfgdir = tmp_path / "proj"
+    cfgdir.mkdir()
+    _write_cfg(cfgdir, "port = 8799\n")
+    monkeypatch.chdir(tmp_path)  # 設定の無い場所から実行
+    monkeypatch.setattr(cli, "find_config_path", lambda: str(cfgdir / "gateway.toml"))
+    monkeypatch.setattr(cli, "mtp_status", lambda m: None)
+    monkeypatch.setattr(cli, "gateway_admin_status", lambda h, p: None)
+    monkeypatch.setattr(cli, "is_ready", lambda url, **k: True)
+    seen = {}
+    monkeypatch.setattr(cli, "start_gateway_background",
+                        lambda cwd, host, port: seen.update(cwd=cwd) or 1)
+    assert cli.main(["start"]) == 0
+    assert seen["cwd"] == str(cfgdir)   # 設定のあるディレクトリで起動している
 
 
 def test_stop_collects_pids_from_admin_and_record(tmp_path, monkeypatch):

@@ -59,6 +59,49 @@ def resolve_config() -> str | None:
     return path if os.path.isfile(path) else None
 
 
+def user_config_path() -> str:
+    """ユーザー既定の gateway.toml パス（`~/.config/local-llm-server/gateway.toml`）。
+
+    `gw` を PATH に入れて**どこからでも起動**するとき用の常設置き場（Ollama 流）。
+    `XDG_CONFIG_HOME` があれば尊重する。ファイルの有無は問わずパスだけ返す。
+    """
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(base, "local-llm-server", "gateway.toml")
+
+
+def _fallback_config_path() -> str | None:
+    """CWD 以外の既定の gateway.toml を探す（ユーザー既定 → editable クローン）。
+
+    - **ユーザー既定**（`~/.config/local-llm-server/gateway.toml`）—— `gw` を PATH に入れた
+      常設運用の置き場。
+    - **editable インストール元のクローンの `gateway.toml`** —— `uv tool install --editable`
+      で入れた場合、リポジトリの gateway.toml を自動発見する（何も移動せず動く）。
+    """
+    user = user_config_path()
+    if os.path.isfile(user):
+        return user
+    try:
+        from . import update
+        root = update.repo_root()
+        if root is not None:
+            clone = os.path.join(str(root), "gateway.toml")
+            if os.path.isfile(clone):
+                return clone
+    except Exception:  # noqa: BLE001 - 発見は best-effort（失敗は「無し」扱い）
+        pass
+    return None
+
+
+def find_config_path() -> str | None:
+    """`gw start` が使う gateway.toml を優先順位つきで探す（どこからでも起動できるように）。
+
+    CWD の `./gateway.toml`（最優先）→ ユーザー既定 → editable クローンの gateway.toml。
+    見つからなければ None。デーモン本体（__main__）は spawn 時の cwd で `./gateway.toml` を
+    読むので、CLI はここで決めた**設定のあるディレクトリ**を cwd として渡す。
+    """
+    return resolve_config() or _fallback_config_path()
+
+
 class _RuntimeConfig:
     """ランタイム記録（稼働中デーモンの host/port）から作る最小の設定シム。
 
@@ -75,12 +118,16 @@ class _RuntimeConfig:
         self.max_resident = None        # 実値は admin の max_resident を使う
 
 
-def load_cwd_config():
-    """CWD の `./gateway.toml` を読む（無ければ None、壊れていれば ValueError を送出）。"""
-    path = resolve_config()
-    if path is None:
-        return None
-    return load_gateway_config(path)
+def load_config(path: str):
+    """指定パスの gateway.toml を読む（壊れていれば例外を送出）。読んだ設定に
+    `_config_dir`（そのファイルのあるディレクトリ）を付けて返す —— `gw start` はそこを
+    デーモンの cwd にして spawn する（設定・ログの位置が一貫する）。"""
+    gcfg = load_gateway_config(path)
+    try:
+        gcfg._config_dir = os.path.dirname(os.path.abspath(path))
+    except Exception:  # noqa: BLE001 - 付与できなくても致命ではない（cwd フォールバック）
+        pass
+    return gcfg
 
 
 # --- 純データ層（状態のマージ・整形。端末なしでテストできる） --------------------
@@ -370,13 +417,25 @@ def _stop_pids(pids: list[int]) -> None:
 
 
 # --- 各サブコマンドの実装 ---------------------------------------------------
+def _start_cwd(gcfg) -> str:
+    """デーモンを spawn する作業ディレクトリ = 設定ファイルのある場所（無ければ CWD）。
+
+    `gw start` を gateway.toml の無い場所から打っても、発見した設定のディレクトリで
+    デーモンを起動する（その cwd の `./gateway.toml` を読み、ログもそこに置く）。
+    """
+    return getattr(gcfg, "_config_dir", None) or os.getcwd()
+
+
 def cmd_start(gcfg, args) -> int:
     host, port, _ = _endpoint(gcfg)
+    cwd = _start_cwd(gcfg)
     try:
-        pid = start_gateway_background(os.getcwd(), host, port)
+        pid = start_gateway_background(cwd, host, port)
     except (RuntimeError, TimeoutError, OSError) as exc:
         print(f"start failed: {exc}", file=sys.stderr)
         return 1
+    if cwd != os.getcwd():
+        print(f"(using {os.path.join(cwd, 'gateway.toml')})")
     admin = gateway_admin_status(host, port)
     ready = admin is not None or is_ready(f"http://{host}:{port}/v1")
     print(render_status(gcfg, admin, ready))
@@ -520,7 +579,7 @@ def cmd_default(gcfg, args) -> int:
     """引数なし `gw`: start してから status/ps を表示する（従来の `uv run gw` 相当）。"""
     host, port, _ = _endpoint(gcfg)
     try:
-        start_gateway_background(os.getcwd(), host, port)
+        start_gateway_background(_start_cwd(gcfg), host, port)
     except (RuntimeError, TimeoutError, OSError) as exc:
         print(f"start failed: {exc}", file=sys.stderr)
         return 1
@@ -574,37 +633,52 @@ _NO_CONFIG = {"help", "mtp"}  # 設定にまったく依存しない
 def _resolve_gcfg(cmd: str | None):
     """コマンドに応じて設定（gcfg）を解決する。戻り値: (gcfg, error_code)。
 
-    - CWD に `./gateway.toml` があればそれを使う（最優先）。
-    - 無く、かつ launch 系でないコマンドなら、稼働中デーモンのランタイム記録から
-      最小シム（host/port だけ）を作って返す —— gateway.toml の無い場所からでも
-      `gw status` / `gw stop` 等が「唯一動いているデーモン」を叩ける。
-    - どちらも無ければエラー（適切な終了コード）。
+    **launch 系（start/restart/引数なし）**: `find_config_path`（CWD → `~/.config` →
+    editable クローン）で gateway.toml を探し、その設定のあるディレクトリでデーモンを
+    起動する（どこからでも `gw start`）。見つからなければエラー。
+
+    **query/control 系（status/stop/ps/list/log/max/update）**: マシンに 1 つのデーモンが
+    真実なので、**CWD の明示設定 → 稼働中デーモンのランタイム記録 → ユーザー/クローン設定**
+    の順で接続先を決める。これで別ディレクトリの設定（別ポート）を掴んで実際の稼働デーモンを
+    見失う事故を防ぐ（記録＝実際に動いているデーモンを優先）。
     """
-    try:
-        gcfg = load_cwd_config()
-    except (OSError, ValueError, tomllib.TOMLDecodeError) as exc:
-        print(f"Failed to load ./gateway.toml: {exc}", file=sys.stderr)
-        return None, 2
-    if gcfg is not None:
-        return gcfg, 0
-    # CWD に設定が無い。launch 系は「何を配信するか」が要るので設定必須。
-    if cmd in _NEEDS_CONFIG:
-        print(
-            "./gateway.toml not found in the current directory. `gw start`/`restart` need it "
-            "(run from the directory that has your gateway.toml).",
-            file=sys.stderr,
-        )
-        return None, 2
-    # それ以外は稼働中デーモンをランタイム記録から探す。
+    def _load(path):
+        try:
+            return load_config(path), 0
+        except (OSError, ValueError, tomllib.TOMLDecodeError) as exc:
+            print(f"Failed to load {path}: {exc}", file=sys.stderr)
+            return None, 2
+
+    if cmd in _NEEDS_CONFIG:  # launch 系: 設定必須
+        path = find_config_path()
+        if path is None:
+            print(
+                "no gateway.toml found. `gw start` looks in: the current directory, "
+                f"{user_config_path()}, and (for editable installs) the clone. "
+                "Create one in a directory and run `gw start` there, or place it at the path above.",
+                file=sys.stderr,
+            )
+            return None, 2
+        return _load(path)
+
+    # query/control 系: CWD の明示設定が最優先。
+    cwd_path = resolve_config()
+    if cwd_path is not None:
+        return _load(cwd_path)
+    # 次に稼働中デーモン（ランタイム記録）—— 実際に動いているものを優先する。
     rec = read_gateway_runtime()
-    if rec is None:
-        print(
-            "no running gateway found, and no ./gateway.toml in the current directory. "
-            "Start one with `gw start` from your gateway.toml directory.",
-            file=sys.stderr,
-        )
-        return None, 2
-    return _RuntimeConfig(rec), 0
+    if rec is not None:
+        return _RuntimeConfig(rec), 0
+    # 最後にユーザー/クローン設定（未起動時に「そのURLで停止中」や list を出すため）。
+    path = _fallback_config_path()
+    if path is not None:
+        return _load(path)
+    print(
+        "no running gateway found, and no gateway.toml in the current directory / "
+        f"{user_config_path()}. Start one with `gw start`.",
+        file=sys.stderr,
+    )
+    return None, 2
 
 
 def main(argv: list[str] | None = None) -> int:

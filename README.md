@@ -19,36 +19,39 @@
 
 ## インストール
 
-[uv](https://docs.astral.sh/uv/) を使う。このリポジトリをクローンして、ソースから動かすのが基本。
+[uv](https://docs.astral.sh/uv/) を使う。クローンして **`gw` コマンドをインストール**する（Ollama 流に、
+一度入れれば**どこからでも `gw`**）。`--editable` なので自動更新（git 追従）もそのまま効く。
 
 ```bash
 git clone https://github.com/ToPo-ToPo-ToPo/local-llm-server
-cd local-llm-server          # クローンしたフォルダの中で実行（uv add ではなく uv sync）
-uv sync
+cd local-llm-server
+uv tool install --editable .     # `gw` を PATH に導入（~/.local/bin/gw）。以後どこでも `gw`
 ```
 
-以降このフォルダで `gateway.toml` を編集し、`uv run gw` で起動する（→ [使い方](#使い方)）。
+以降は `gateway.toml` を編集し、**どのディレクトリからでも** `gw start` で起動する（→ [使い方](#使い方)）。
+`~/.local/bin` が PATH に無いと言われたら `uv tool update-shell` を一度実行する。
 
-> **他 OS（Linux / Windows / Intel Mac）＝ llama.cpp（追加インストール不要）**: `uv sync` は mlx を
-> 入れずに済む。`llama-server` はゲートウェイ起動時に**自動でダウンロード・導入される**（OS・CPU
-> アーキ・GPU を検出し、GPU なら Vulkan・無ければ CPU を選択。PATH は汚さない）。手動導入や PATH
-> 設定は不要で、`uv run gw` して GGUF モデルの ID を投げるだけで動く。挙動の調整・ソースビルド・
-> `system`（PATH の llama-server を使う）は `gateway.toml` の `[llama_cpp]` で
-> （→ [docs/llama-cpp.md](docs/llama-cpp.md)）。
+> **他 OS（Linux / Windows / Intel Mac）＝ llama.cpp（追加インストール不要）**: mlx は入らず、
+> `llama-server` はゲートウェイ起動時に**自動でダウンロード・導入される**（OS・CPU アーキ・GPU を検出し、
+> GPU なら Vulkan・無ければ CPU を選択。PATH は汚さない）。手動導入や PATH 設定は不要で、`gw start`
+> して GGUF モデルの ID を投げるだけで動く。挙動の調整・ソースビルド・`system`（PATH の llama-server
+> を使う）は `gateway.toml` の `[llama_cpp]` で（→ [docs/llama-cpp.md](docs/llama-cpp.md)）。
 
 <details>
-<summary>クローンせず PyPI の公開パッケージを使う場合（任意）</summary>
+<summary>開発する（テストを回す）場合</summary>
 
-- **コマンドとして入れる**: `uv tool install local-llm-server` → どこでも `gw` で起動。
-- **別プロジェクトの依存として入れる**: `gateway.toml` を置く新規フォルダで `uv init` → `uv add local-llm-server` → `uv run gw`。
+リポジトリ内で `uv sync` すると開発用 venv が作られ、`uv run pytest` でテストできる。
+`uv tool install --editable .` と併用してよい（ソースは共有され、`gw` は編集が即反映される）。
 </details>
 
 ## 使い方
 
 ### 1. サーバー設定を置く
 
-カレントディレクトリに `gateway.toml` を置く。リポジトリ直下に例を同梱（→ [gateway.toml](gateway.toml)）。
-モデルは列挙不要 —— 運用方針（ポートや同時常駐数など）だけ書けばよい:
+`gateway.toml` に運用方針（ポートや同時常駐数など）を書く。モデルは列挙不要 —— クライアントが
+指定した `model` をその場でロードする。`gw start` は設定を **CWD の `./gateway.toml` → 
+`~/.config/local-llm-server/gateway.toml` → クローンの `gateway.toml`** の順で探すので、
+**どこから起動しても**設定が見つかる（リポジトリ直下に例を同梱 → [gateway.toml](gateway.toml)）。
 
 ```toml
 host = "127.0.0.1"
@@ -60,14 +63,14 @@ max_resident = 1            # 同時常駐モデル数の上限（超過は LRU 
 
 ### 2. サーバー起動
 
-クローンしたフォルダ（`gateway.toml` のある場所）で、デーモンを裏で常駐起動する。
-端末は占有しない。稼働確認は `gw status` / `gw ps`、停止は `gw stop`（→ [起動・運用](docs/operation.md)）。
+デーモンを裏で常駐起動する（端末は占有しない）。稼働確認は `gw status` / `gw ps`、停止は `gw stop`。
+**どのディレクトリからでも**同じ 1 つのデーモンを操作できる（→ [起動・運用](docs/operation.md)）。
 
 ```bash
-uv run gw start      # 裏で常駐起動（引数なしの `uv run gw` は start + 状態表示）
-uv run gw status     # 稼働/停止・PID・URL・起動経過を表示
-uv run gw ps         # ロード中モデルと処理中数
-uv run gw list       # 使えるモデル一覧（カタログ＋HF キャッシュ）
+gw start      # 裏で常駐起動（引数なしの `gw` は start + 状態表示）
+gw status     # 稼働/停止・PID・URL・起動経過を表示
+gw ps         # ロード中モデルと処理中数
+gw list       # 使えるモデル一覧（カタログ＋HF キャッシュ）
 ```
 
 ### 3. このサーバーとの接続　（使用先で実施）
