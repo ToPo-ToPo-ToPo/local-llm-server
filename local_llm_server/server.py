@@ -1258,14 +1258,23 @@ def read_gateway_runtime() -> dict | None:
     if not isinstance(rec, dict) or "host" not in rec or "port" not in rec:
         return None
     pid = rec.get("pid")
-    if isinstance(pid, int):
-        try:
-            os.kill(pid, 0)  # 生存確認（シグナルは送らない）。死んでいれば ProcessLookupError
-        except ProcessLookupError:
-            return None
-        except OSError:
-            pass  # 権限エラー等は「生きている可能性」として通す
+    if isinstance(pid, int) and not pid_is_alive(pid):
+        return None  # クラッシュで残った stale 記録（保持者が居ない）
     return rec
+
+
+def pid_is_alive(pid: int) -> bool:
+    """PID が生存しているか（cross-platform・非破壊）。
+
+    `os.kill(pid, 0)` は POSIX の生存確認だが、**Windows では sig 0 でも TerminateProcess を
+    呼んで対象を kill してしまう**ため使えない。core 依存の psutil で判定する（psutil が無い等で
+    判定不能なら、保守的に「生きている」＝ True を返す —— 生きている記録を誤って捨てない）。
+    """
+    try:
+        import psutil
+        return psutil.pid_exists(pid)
+    except Exception:  # noqa: BLE001 - psutil 不在・判定不能は「生きている可能性」に倒す
+        return True
 
 
 def clear_gateway_runtime() -> None:

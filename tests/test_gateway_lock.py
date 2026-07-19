@@ -80,14 +80,10 @@ def test_runtime_record_roundtrip_and_stale(tmp_path, monkeypatch):
 
 
 def _find_free_pid() -> int:
-    """存在しない PID を1つ返す（生存確認テスト用）。"""
-    pid = 999_000
-    while pid > 1:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
+    """存在しない PID を1つ返す（生存確認テスト用。cross-platform に psutil で判定）。"""
+    import psutil
+
+    for pid in range(999_000, 1, -1):
+        if not psutil.pid_exists(pid):
             return pid
-        except OSError:
-            pass
-        pid -= 1
     return 999_999
