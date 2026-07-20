@@ -12,12 +12,16 @@
 ```bash
 git clone https://github.com/ToPo-ToPo-ToPo/local-llm-server
 cd local-llm-server
-make install       # `gw` を PATH に導入（~/.local/bin/gw）
-source ~/.zshrc    # PATH を今のシェルに反映（または新しいターミナルを開く）
+make install            # `gw` を PATH に導入（~/.local/bin/gw）
+uv tool update-shell    # 初回のみ。~/.local/bin を PATH に追記する
+exec $SHELL -l          # 今のシェルに反映（または新しいターミナルを開く）
 ```
 
-`~/.local/bin` が PATH に無いと警告されたら `uv tool update-shell` を一度実行してから
-`source ~/.zshrc` する。アンインストールは `make uninstall`（→ [docs/operation.md](docs/operation.md)）。
+`make install` が「`~/.local/bin` is not on your PATH」と警告するのは、`uv tool install` が
+シェル設定を変更しないため。`uv tool update-shell` がその追記を行う（zsh なら `~/.zshrc` では
+なく **`~/.zshenv`**）。書き込み先はシェルによって違うので、反映は特定ファイルの `source` では
+なく `exec $SHELL -l` か新しいターミナルで行う。アンインストールは `make uninstall`
+（→ [docs/operation.md](docs/operation.md)）。
 
 ## 使い方
 
