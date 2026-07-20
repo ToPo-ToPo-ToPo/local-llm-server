@@ -43,7 +43,6 @@ def _vllm_importable(py: str, run) -> bool:
 
 def ensure_vllm(
     *,
-    provision: str = "auto",
     require_gpu: bool = True,
     run=subprocess.run,
     create_venv=None,
@@ -53,6 +52,6 @@ def ensure_vllm(
     return _venv_backend.ensure_backend(
         package="vllm", import_name="vllm", venv_dir=vllm_venv_dir(),
         human_name="vLLM", unavailable=VllmUnavailable,
-        gpu_check=gpu_available, provision=provision, require_gpu=require_gpu,
+        gpu_check=gpu_available, require_gpu=require_gpu,
         run=run, create_venv=create_venv, importable=importable,
     )

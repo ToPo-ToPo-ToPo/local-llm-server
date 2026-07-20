@@ -17,7 +17,7 @@ extra `local-llm-server[mlx]` で導入する。
 from __future__ import annotations
 
 # --- 既定値・定数 -----------------------------------------------------------
-from .constants import BACKENDS, DEFAULT_MODEL, DEFAULT_VISION_MODEL, project_cache_dir
+from .constants import BACKENDS, DEFAULT_MODEL, DEFAULT_VISION_MODEL, log_dir
 
 # --- サーバー本体（LLM 実行） ----------------------------------------------
 from .server import (

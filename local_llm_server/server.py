@@ -15,7 +15,7 @@ import urllib.request
 from dataclasses import dataclass, field
 
 # 起動可能なバックエンド一覧は同梱の constants から取得（OpenAI互換APIの公開値）。
-from .constants import BACKENDS, project_cache_dir  # noqa: F401
+from .constants import BACKENDS, log_dir  # noqa: F401
 
 
 def default_backend() -> str:
@@ -36,21 +36,20 @@ DEFAULT_BACKEND = default_backend()
 
 
 # llama-server 実行ファイルのパス。ゲートウェイ起動時にプロビジョナ（provisioner）が解決して
-# set_llama_server_binary() で差し込む。未設定なら PATH の "llama-server"（従来挙動 / system）。
+# set_llama_server_binary() で差し込む。未設定なら PATH の "llama-server"（単体テスト等の素通し）。
 _LLAMA_SERVER_BIN: str | None = None
-# 導入した llama.cpp の素性（build/accel/binary/provision）。/admin/status・TUI 表示用。
+# 導入した llama.cpp の素性（build/accel/binary）。/admin/status 表示用。
 _LLAMA_INFO: dict | None = None
 
 
 def set_llama_server_binary(
     path: str | None, *, build: str | None = None, accel: str | None = None,
-    provision: str | None = None,
 ) -> None:
     """起動時にプロビジョナが解決した llama-server の絶対パス（と素性）を登録する。"""
     global _LLAMA_SERVER_BIN, _LLAMA_INFO
     _LLAMA_SERVER_BIN = path
     _LLAMA_INFO = None if path is None else {
-        "binary": path, "build": build, "accel": accel, "provision": provision,
+        "binary": path, "build": build, "accel": accel,
     }
 
 
@@ -64,17 +63,17 @@ def llama_provision_info() -> dict | None:
     return _LLAMA_INFO
 
 
-# vLLM を起動する python（隔離 venv）のパス。起動時に vllm_provisioner が解決して差し込む。
-# 未設定なら sys.executable（provision=system 相当）。build_command の vllm 分岐が使う。
+# vLLM を起動する python のパス。起動時に vllm_provisioner が解決して差し込む
+# （現在の環境に有ればそれ、無ければ隔離 venv）。未設定なら sys.executable。
 _VLLM_PYTHON: str | None = None
 _VLLM_INFO: dict | None = None
 
 
-def set_vllm_python(path: str | None, *, provision: str | None = None) -> None:
-    """起動時にプロビジョナが解決した vLLM 用 python のパス（と素性）を登録する。"""
+def set_vllm_python(path: str | None) -> None:
+    """起動時にプロビジョナが解決した vLLM 用 python のパスを登録する。"""
     global _VLLM_PYTHON, _VLLM_INFO
     _VLLM_PYTHON = path
-    _VLLM_INFO = None if path is None else {"python": path, "provision": provision}
+    _VLLM_INFO = None if path is None else {"python": path}
 
 
 def vllm_python() -> str:
@@ -92,11 +91,11 @@ _SGLANG_PYTHON: str | None = None
 _SGLANG_INFO: dict | None = None
 
 
-def set_sglang_python(path: str | None, *, provision: str | None = None) -> None:
-    """起動時にプロビジョナが解決した SGLang 用 python のパス（と素性）を登録する。"""
+def set_sglang_python(path: str | None) -> None:
+    """起動時にプロビジョナが解決した SGLang 用 python のパスを登録する。"""
     global _SGLANG_PYTHON, _SGLANG_INFO
     _SGLANG_PYTHON = path
-    _SGLANG_INFO = None if path is None else {"python": path, "provision": provision}
+    _SGLANG_INFO = None if path is None else {"python": path}
 
 
 def sglang_python() -> str:
@@ -131,15 +130,13 @@ def auto_llama_flags(config: "ServerConfig") -> list[str]:
 
     - GPU（accel が cpu 以外）: `-ngl 999`（全層 GPU オフロード。llama.cpp が実層数に丸める）。
     - CPU（accel == cpu）: `--threads <物理コア数>`（既定の論理コア数より CPU 推論で速いことが多い）。
-    自動導入していない（provision=system 等で素性不明）ときは何もしない
-    （利用者が自分でフラグ管理している前提。既存挙動を壊さない）。
+    自動導入していない（プロビジョナ未実行＝素性不明）ときは何もしない。
     """
     info = llama_provision_info()
     if not info:
         return []
     accel = info.get("accel")
     if not accel:
-        # provision=system（素性不明のユーザー管理バイナリ）は accel=None → 何も足さない。
         return []
     extra = config.extra_args
     if accel != "cpu":
@@ -1022,12 +1019,14 @@ def parse_host_port(base_url: str, default_port: int = 8080) -> tuple[str, int]:
 class LocalServer:
     """ローカルLLMサーバーをサブプロセスとして管理する。"""
 
-    def __init__(self, config: ServerConfig, log_path: str | None = None) -> None:
+    def __init__(self, config: ServerConfig, log_path: str) -> None:
         self.config = config
         self._proc: subprocess.Popen | None = None
         self._log_file = None
         # サーバーの大量ログ（INFO/Stream finished 等）で対話画面が乱れないよう、
         # 標準出力・標準エラーはこのログファイルへ逃がす（端末には流さない）。
+        # 必須引数——省略時に一時ファイルへ逃がすフォールバックは、誰にも掃除されない
+        # ゴミを temp に落とすだけなので廃止した（実運用は常に daemon_log_path を渡す）。
         self.log_path = log_path
 
     @property
@@ -1050,15 +1049,9 @@ class LocalServer:
     def start(self) -> None:
         if self._proc is not None:
             raise RuntimeError("server already started")
-        if self.log_path is None:
-            fd, self.log_path = tempfile.mkstemp(
-                prefix="local-llm-server-", suffix=".log"
-            )
-            os.close(fd)
-        else:
-            # 明示ログパス（ゲートウェイの daemon_log_path 等）は親ディレクトリが
-            # 無いことがあるので作る（project_cache_dir は呼び出し側が作る設計）。
-            os.makedirs(os.path.dirname(self.log_path) or ".", exist_ok=True)
+        # ログパス（ゲートウェイの daemon_log_path 等）は親ディレクトリが
+        # 無いことがあるので作る（log_dir は呼び出し側が作る設計）。
+        os.makedirs(os.path.dirname(self.log_path) or ".", exist_ok=True)
         try:
             self._log_file = open(self.log_path, "a", encoding="utf-8")
             # 自動ダウンロードを完全に無効化する hard guard。バックエンド（mlx_lm / mlx_vlm /
@@ -1184,11 +1177,11 @@ def ignore_shutdown_signals() -> None:
 def daemon_log_path(port: int) -> str:
     """ゲートウェイが起動するモデルサーバーのログ保存先（ポート別の固定パス）。
 
-    TUI やログ表示から参照できるよう、ランダムな tempfile ではなくポートで決まる固定パスにする。
-    プロジェクト内（`./.local-llm-server/`、カレントディレクトリ相対）に置き、ホーム等の外部には
-    書かない。同じポートのサーバーは同じログに追記する。
+    ログ表示から参照できるよう、ランダムな tempfile ではなくポートで決まる固定パスにする。
+    場所は `log_dir()`（cwd 非依存）——起動したディレクトリに `./.local-llm-server` を
+    作らない。同じポートのサーバーは同じログに追記する。
     """
-    return os.path.join(project_cache_dir(), f"server-{port}.log")
+    return os.path.join(log_dir(), f"server-{port}.log")
 
 
 class GatewayAlreadyRunning(RuntimeError):
@@ -1211,8 +1204,8 @@ class GatewayAlreadyRunning(RuntimeError):
 def gateway_lock_path() -> str:
     """マシン内で 1 つだけゲートウェイを許すロックファイルのパス（cwd 非依存の固定パス）。
 
-    モデルサーバーのログ（`project_cache_dir()` = cwd 相対）と違い、**どのディレクトリから
-    起動しても同じ 1 個**のロックを見るよう、temp ディレクトリ配下の固定名にする。これで
+    **どのディレクトリから起動しても同じ 1 個**のロックを見るよう、temp ディレクトリ配下の
+    固定名にする（ログの `log_dir()` と同じく cwd 非依存）。これで
     「別ディレクトリから（開発ツール等が）勝手に 2 個目を起動する」ケースも 1 本に束ねられる。
     ポートに依存しないので、port を変えても二重には立たない（＝マシンにつき 1 ゲートウェイ）。
     """
@@ -1546,18 +1539,64 @@ def gateway_drain(
     return data if isinstance(data, dict) else None
 
 
-def gateway_log_path(port: int, base: str | None = None) -> str:
+def gateway_log_path(port: int) -> str:
     """バックグラウンド起動したゲートウェイ本体（公開ポート）の出力ログ保存先。
 
     モデルサーバーの daemon_log_path（server-<port>.log）と別に、ゲートウェイ自身の
-    起動ログを gateway-<port>.log に逃がす（`gw log` が参照する）。`base` に**デーモンの
-    作業ディレクトリ**（設定のある場所）を渡すと、そこ基準の `.local-llm-server/` を使う
-    —— CLI は任意のディレクトリから実行されるため、CLI の CWD 基準（既定）では
-    デーモンが実際に書く場所とずれる。省略時は従来どおり CWD 基準。
+    起動ログを gateway-<port>.log に逃がす（`gw log` が参照する）。場所は `log_dir()` の
+    固定パス —— cwd 非依存なので、CLI がどこから実行されてもデーモンが書く場所と一致する。
     """
-    if base:
-        return os.path.join(base, ".local-llm-server", f"gateway-{port}.log")
-    return os.path.join(project_cache_dir(), f"gateway-{port}.log")
+    return os.path.join(log_dir(), f"gateway-{port}.log")
+
+
+# ログを残す世代数（Ollama の LogRotationCount と同じ 5）。
+LOG_ROTATION_COUNT = 5
+
+
+def rotate_log(path: str, keep: int = LOG_ROTATION_COUNT) -> None:
+    """`x.log` を `x-1.log` へ押し出し、keep 世代を超えた分を捨てる（Ollama 方式）。
+
+    追記のみだと際限なく伸びるので、**起動のたびに**世代を繰り上げる。サイズ監視はしない
+    ——書かれるのは起動・停止・モデルのロード/破棄といったイベント行だけで、リクエスト
+    ごとには書かないため、世代数の上限だけで十分に頭打ちになる。
+    ローテーションに失敗しても起動は止めない（そのまま追記に落ちるだけ）。
+    """
+    if keep < 1 or not os.path.exists(path):
+        return
+    root, ext = os.path.splitext(path)
+    try:
+        oldest = f"{root}-{keep}{ext}"
+        if os.path.exists(oldest):
+            os.remove(oldest)
+        for i in range(keep - 1, 0, -1):
+            src = f"{root}-{i}{ext}"
+            if os.path.exists(src):
+                os.replace(src, f"{root}-{i + 1}{ext}")
+        os.replace(path, f"{root}-1{ext}")
+    except OSError:
+        pass
+
+
+def prune_server_logs(directory: str | None = None, keep: int = LOG_ROTATION_COUNT) -> None:
+    """古い `server-<port>.log` を新しい順に keep 個だけ残して削除する。
+
+    モデルサーバーのログはポート番号がファイル名に入る（`daemon_log_path`）ので、
+    ゲートウェイ本体のように世代を押し出せない——ポートが変わるたびに**別ファイルが増える**。
+    そこで世代管理ではなく「新しい順に keep 個」で頭打ちにする。呼ぶのは**ゲートウェイ起動時
+    だけ**：この時点ではモデルサーバーは 1 つも走っておらず、書き込み中のログを消す危険がない。
+    """
+    directory = directory or log_dir()
+    try:
+        logs = [
+            os.path.join(directory, n)
+            for n in os.listdir(directory)
+            if n.startswith("server-") and n.endswith(".log")
+        ]
+        # mtime の新しい順。keep 個より後ろ（古い方）を落とす。
+        for stale in sorted(logs, key=os.path.getmtime, reverse=True)[keep:]:
+            os.remove(stale)
+    except OSError:
+        pass
 
 
 def start_gateway_background(
@@ -1590,18 +1629,22 @@ def start_gateway_background(
             f"respond as a gateway; stop it or change `port` in gateway.toml"
         )
 
-    # ログはデーモンの作業ディレクトリ（cwd 引数＝設定のある場所）基準に置く。CLI がどこから
-    # 実行されても、デーモン側の daemon_log_path（cwd 基準）と同じ場所に揃う。
-    log_path = gateway_log_path(port, base=cwd)
+    # ログは log_dir() の固定パス（cwd 非依存）。デーモンの cwd（設定のある場所）が
+    # どこでも同じ場所に書く——起動したディレクトリに ./.local-llm-server を作らない。
+    log_path = gateway_log_path(port)
     os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
+    # 起動のたびに世代を繰り上げ、併せて古いモデルサーバーのログも刈る（ここが唯一の
+    # 「モデルサーバーが 1 つも走っていない」と言える地点）。
+    rotate_log(log_path)
+    prune_server_logs()
     log_file = open(log_path, "a", encoding="utf-8")
     popen_kwargs: dict = {
         "cwd": cwd,
         "stdin": subprocess.DEVNULL,
         "stdout": log_file,
         "stderr": subprocess.STDOUT,
-        # /admin/status の launcher 表示用マーク。この関数経由（`gw start` の裏起動）で立った
-        # ゲートウェイは "cli"、直接の `python -m local_llm_server` は無印で "headless" になる。
+        # 正規 spawn の内部マーク。__main__ はこれが無い直接の `python -m local_llm_server`
+        # を拒否する（起動の入口を `gw start` の 1 本に固定する）。
         "env": {**os.environ, "LOCAL_LLM_GW_LAUNCHER": "cli"},
     }
     if os.name == "nt":

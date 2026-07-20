@@ -22,11 +22,20 @@ DEFAULT_VISION_MODEL = DEFAULT_MODEL
 BACKENDS = ("mlx", "mlx-vlm", "llama-cpp", "whisper", "vllm", "sglang")
 
 
-def project_cache_dir() -> str:
-    """プロジェクト内（カレントディレクトリ）のキャッシュ/ログ用ディレクトリ `./.local-llm-server`。
+def log_dir() -> str:
+    """ログ置き場（`~/.cache/local-llm-server/logs`、Ollama の `~/.ollama/logs` 相当）。
 
-    ゲートウェイが起動するモデルサーバーのログ等を、ホーム（`~/.cache`）ではなく起動した
-    ディレクトリの中に置く。ディレクトリは呼び出し側が必要時に作る。モデル本体は HF/mlx の
-    共有キャッシュ（`~/.cache/huggingface`）に置かれ、これには含めない。
+    **cwd 非依存の固定パス**。かつては cwd 相対（`./.local-llm-server`）だったが、起動した
+    ディレクトリごとにログが散らばりアンインストールで拾い切れないためやめた。場所は
+    provisioner の managed_root と同じ規則（Windows は %LOCALAPPDATA%、他は XDG）で、
+    `make uninstall` が消す `~/.cache/local-llm-server` の中に収まる。ディレクトリは
+    呼び出し側が必要時に作る。モデル本体は HF/mlx の共有キャッシュ
+    （`~/.cache/huggingface`）に置かれ、これには含めない。
     """
-    return os.path.join(os.getcwd(), ".local-llm-server")
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    else:
+        base = os.environ.get("XDG_CACHE_HOME") or os.path.join(
+            os.path.expanduser("~"), ".cache"
+        )
+    return os.path.join(base, "local-llm-server", "logs")

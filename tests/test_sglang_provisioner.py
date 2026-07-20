@@ -24,28 +24,21 @@ def test_requires_gpu(monkeypatch):
     monkeypatch.setattr(sp, "gpu_available", lambda: False)
     monkeypatch.setattr(sp.provisioner, "detect_os", lambda: "linux")
     with pytest.raises(sp.SglangUnavailable):
-        sp.ensure_sglang(provision="auto")
+        sp.ensure_sglang()
 
 
 def test_refuses_macos(monkeypatch):
     monkeypatch.setattr(sp, "gpu_available", lambda: True)
     monkeypatch.setattr(sp.provisioner, "detect_os", lambda: "macos")
     with pytest.raises(sp.SglangUnavailable):
-        sp.ensure_sglang(provision="auto")
+        sp.ensure_sglang()
 
 
-def test_system_uses_current_python_if_importable(monkeypatch):
+def test_current_env_preferred_when_importable(monkeypatch):
     monkeypatch.setattr(sp, "gpu_available", lambda: True)
     monkeypatch.setattr(sp.provisioner, "detect_os", lambda: "linux")
-    py = sp.ensure_sglang(provision="system", importable=lambda p, run: True)
+    py = sp.ensure_sglang(importable=lambda p, run: True)
     assert py == sp.sys.executable
-
-
-def test_system_missing_raises(monkeypatch):
-    monkeypatch.setattr(sp, "gpu_available", lambda: True)
-    monkeypatch.setattr(sp.provisioner, "detect_os", lambda: "linux")
-    with pytest.raises(sp.SglangUnavailable):
-        sp.ensure_sglang(provision="system", importable=lambda p, run: False)
 
 
 def test_auto_creates_venv_and_installs(tmp_path, monkeypatch):
@@ -66,7 +59,7 @@ def test_auto_creates_venv_and_installs(tmp_path, monkeypatch):
             installed.append(cmd)
         return _ok(0)
 
-    py = sp.ensure_sglang(provision="auto", create_venv=fake_create, run=marking_run,
+    py = sp.ensure_sglang(create_venv=fake_create, run=marking_run,
                           importable=lambda p, run: state["installed"])
     assert created["dir"].endswith("sglang-venv")
     assert any("sglang" in c for c in installed)
@@ -85,8 +78,8 @@ def test_auto_reuses_existing_venv(tmp_path, monkeypatch):
     def boom(*a, **k):
         raise AssertionError("must not create venv when already installed")
 
-    got = sp.ensure_sglang(provision="auto", create_venv=boom,
-                           run=lambda *a, **k: _ok(0), importable=lambda p, run: True)
+    got = sp.ensure_sglang(create_venv=boom, run=lambda *a, **k: _ok(0),
+                           importable=lambda p, run: p != sp.sys.executable)
     assert got == py
 
 
@@ -101,5 +94,5 @@ def test_pip_install_failure_raises(tmp_path, monkeypatch):
         return _ok(0)
 
     with pytest.raises(sp.SglangUnavailable):
-        sp.ensure_sglang(provision="auto", create_venv=lambda d: None,
+        sp.ensure_sglang(create_venv=lambda d: None,
                          run=fail_run, importable=lambda p, run: False)

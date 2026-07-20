@@ -186,7 +186,7 @@ def installed_builds(os_name: str, arch: str, accel: str) -> list[str]:
     return sorted(builds, key=lambda b: int(b[1:]), reverse=True)
 
 
-# 直近に ensure_llama_server が解決した素性（build/accel/provision）。TUI・/admin/status の
+# 直近に ensure_llama_server が解決した素性（build/accel）。/admin/status の
 # 表示用に、呼び出し側（daemon）が last_info() で取得する。
 _LAST_INFO: dict | None = None
 
@@ -244,66 +244,8 @@ class ProvisionError(RuntimeError):
     """llama-server の自動導入に失敗した（ダウンロード・展開・検証のいずれか）。"""
 
 
-class BuildUnavailable(RuntimeError):
-    """ソースビルドができない/失敗した（ツールチェーン不在・ビルド失敗など）。
-
-    provision='build' でこれが起きたときは、プリビルト自動導入（auto）へフォールバックする。
-    """
-
-
-# accel → cmake のアクセラレータ有効化フラグ。metal は macOS 既定で有効なので追加不要。
-def accel_cmake_flags(accel: str) -> list[str]:
-    return {
-        "cuda": ["-DGGML_CUDA=ON"],
-        "vulkan": ["-DGGML_VULKAN=ON"],
-        "hip": ["-DGGML_HIP=ON"],
-    }.get(accel, [])
-
-
-def _build_toolchain_ok() -> bool:
-    """ソースビルドに必要な最低限（cmake・git）が揃っているか。"""
-    return bool(shutil.which("cmake") and shutil.which("git"))
-
-
-def build_from_source(
-    build: str, os_name: str, arch: str, accel: str, dest: str,
-    *, run=subprocess.run, verify=_verify,
-) -> str:
-    """llama.cpp を指定ビルドタグからソースビルドし、成果物を dest へ入れてパスを返す。
-
-    cmake/git が要る。ビルドは共有ライブラリごと必要なので bin ディレクトリ一式を dest/bin へ
-    コピーする。ツールチェーン不在・cmake/ビルド失敗・検証失敗は BuildUnavailable（呼び出し側で
-    プリビルトへフォールバックする）。
-    """
-    if not _build_toolchain_ok():
-        raise BuildUnavailable("cmake / git が見つからない（プリビルトへフォールバック）")
-    src = os.path.join(managed_root(), f"src-{build}")
-    bdir = os.path.join(src, "build")
-    try:
-        if not os.path.isdir(os.path.join(src, ".git")):
-            run(["git", "clone", "--depth", "1", "--branch", build,
-                 f"https://github.com/{_REPO}", src], check=True)
-        run(["cmake", "-S", src, "-B", bdir, "-DCMAKE_BUILD_TYPE=Release",
-             *accel_cmake_flags(accel)], check=True)
-        run(["cmake", "--build", bdir, "--config", "Release",
-             "--target", "llama-server", "-j"], check=True)
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise BuildUnavailable(f"ソースビルドに失敗: {exc}") from exc
-    binary = _find_llama_server(bdir)
-    if not binary:
-        raise BuildUnavailable("ビルドしたが llama-server が見つからない")
-    # 共有ライブラリごと dest/bin へ配置（binary 単体だと実行時に .so/.dll が欠ける）。
-    out_bin = os.path.join(dest, "bin")
-    shutil.copytree(os.path.dirname(binary), out_bin, dirs_exist_ok=True)
-    out = os.path.join(out_bin, _EXE)
-    if not verify(out):
-        raise BuildUnavailable("ビルドした llama-server の --version 検証に失敗")
-    return out
-
-
 def ensure_llama_server(
     *,
-    provision: str = "auto",
     accel: str = "auto",
     build: str | None = None,
     download=_download,
@@ -311,27 +253,14 @@ def ensure_llama_server(
 ) -> str:
     """起動に使う llama-server の絶対パスを返す（必要なら自動導入する）。
 
-    - provision="system": PATH の llama-server を使う（無ければ ProvisionError）。
-    - provision="auto"  : 管理ディレクトリに導入済みならそれを、無ければ Releases から
-                          プリビルトを取得して展開・検証する。
-    - provision="build" : ソースから cmake ビルドする。ツールチェーン不在・失敗時は
-                          プリビルト自動導入（auto）へフォールバックする（ゲートウェイを
-                          立たなくしない）。
+    ルートは 1 つだけ（Ollama 流に導入方法をユーザーに選ばせない）:
+    管理ディレクトリに導入済みならそれを再利用し、無ければ GitHub Releases から
+    プリビルトを取得して展開・検証する。PATH のバイナリやソースビルドは使わない
+    ——出所の分からないバイナリを掴まず、素性（build/accel）を常に把握できる。
 
     download/verify は差し替え可能（テスト用）。
     """
     global _LAST_INFO
-    if provision == "system":
-        found = shutil.which("llama-server")
-        if not found:
-            raise ProvisionError(
-                "provision='system' だが PATH に llama-server が見つからない。"
-                "provision='auto'（自動導入）にするか、llama-server を PATH に置く。"
-            )
-        # system はユーザー管理のバイナリ（accel 等の素性は不明）。auto フラグ付与の対象外。
-        _LAST_INFO = {"provision": "system", "build": None, "accel": None}
-        return found
-
     os_name = detect_os()
     arch = detect_arch()
     accel = detect_accelerator(os_name) if accel == "auto" else accel
@@ -342,34 +271,21 @@ def ensure_llama_server(
         for installed in installed_builds(os_name, arch, accel):
             binary = _find_llama_server(install_dir(installed, os_name, arch, accel))
             if binary and verify(binary):
-                _LAST_INFO = {"provision": provision, "build": installed,
-                              "accel": accel}
+                _LAST_INFO = {"build": installed, "accel": accel}
                 return binary
         try:
             build = latest_build()
         except (OSError, ValueError, KeyError) as exc:  # URLError も OSError の subclass
             raise ProvisionError(
                 f"llama.cpp の最新ビルド番号を取得できない（オフライン?）: {exc}. "
-                f"[llama_cpp] pin でビルド番号を固定するか、provision='system' で "
-                f"手動導入の llama-server を使う。"
+                f"[llama_cpp] pin でビルド番号を固定すると照会せずに起動できる。"
             ) from exc
 
     target = install_dir(build, os_name, arch, accel)
     existing = _find_llama_server(target)
     if existing and verify(existing):
-        _LAST_INFO = {"provision": provision, "build": build, "accel": accel}
+        _LAST_INFO = {"build": build, "accel": accel}
         return existing
-
-    if provision == "build":
-        try:
-            built = build_from_source(build, os_name, arch, accel, target,
-                                      verify=verify)
-            _LAST_INFO = {"provision": "build", "build": build, "accel": accel}
-            return built
-        except BuildUnavailable as exc:
-            print(f"llama.cpp source build unavailable, falling back to prebuilt: "
-                  f"{exc}", file=sys.stderr)
-            # プリビルト導入へフォールバック（下へ続く）。
 
     name = asset_name(build, os_name, arch, accel)
     url = asset_url(build, name)
@@ -380,8 +296,8 @@ def ensure_llama_server(
     except Exception as exc:  # noqa: BLE001 - まとめて ProvisionError に包む
         raise ProvisionError(
             f"llama.cpp の自動導入に失敗（{name}）: {exc}. "
-            f"手動導入は docs/llama-cpp.md を参照、または gateway.toml で "
-            f"[llama_cpp] provision='system' / accel を指定する。URL: {url}"
+            f"ネットワークを確認して再試行するか、gateway.toml の [llama_cpp] accel を"
+            f"変える（→ docs/llama-cpp.md）。URL: {url}"
         ) from exc
     finally:
         try:
@@ -397,5 +313,5 @@ def ensure_llama_server(
             f"llama-server を導入したが --version に失敗（{binary}）。"
             f"accel={accel} が環境に合っていない可能性（accel を cpu 等に変えて再試行）"
         )
-    _LAST_INFO = {"provision": provision, "build": build, "accel": accel}
+    _LAST_INFO = {"build": build, "accel": accel}
     return binary

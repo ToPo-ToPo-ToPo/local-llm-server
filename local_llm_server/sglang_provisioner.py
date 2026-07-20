@@ -43,7 +43,6 @@ def _sglang_importable(py: str, run) -> bool:
 
 def ensure_sglang(
     *,
-    provision: str = "auto",
     require_gpu: bool = True,
     run=subprocess.run,
     create_venv=None,
@@ -53,6 +52,6 @@ def ensure_sglang(
     return _venv_backend.ensure_backend(
         package="sglang", import_name="sglang", venv_dir=sglang_venv_dir(),
         human_name="SGLang", unavailable=SglangUnavailable,
-        gpu_check=gpu_available, provision=provision, require_gpu=require_gpu,
+        gpu_check=gpu_available, require_gpu=require_gpu,
         run=run, create_venv=create_venv, importable=importable,
     )

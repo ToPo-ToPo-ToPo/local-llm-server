@@ -1082,14 +1082,12 @@ class GatewayServer(ThreadingHTTPServer):
         self.idle_timeout = idle_timeout
         self.load_timeout = load_timeout
         self.session_ttl = session_ttl
-        # 起動元情報（provenance）。「いつ・どこから・どの経路で立ったゲートウェイか」を
-        # /admin/status で見えるようにする——コーディングエージェント等が裏でヘッドレス起動
-        # した場合でも、`gw status` や curl 一発で出所を特定できる。経路は `gw start` の裏起動
-        # （start_gateway_background）が環境変数でマークし、無印は "headless"（直接起動）。
+        # 起動元情報（provenance）。「いつ・どこから立ったゲートウェイか」を /admin/status で
+        # 見えるようにする。起動経路は `gw start` の 1 本だけ（__main__ が spawn マークの無い
+        # 直接起動を拒否する）ので、経路の識別（旧 launcher フィールド）は無い。
         self.pid = os.getpid()
         self.started_at = time.strftime("%Y-%m-%d %H:%M:%S")
         self.start_cwd = os.getcwd()
-        self.launcher = os.environ.get("LOCAL_LLM_GW_LAUNCHER", "headless")
 
 
 # 受け付けるリクエストボディの上限（バイト）。vision の base64 画像を見込んでも十分大きく、
@@ -1207,12 +1205,11 @@ class _GatewayHandler(BaseHTTPRequestHandler):
                 "vision_model": srv.vision_model,
                 "uptime": round(srv.manager.uptime(), 1),
                 "requests": sum(m.get("requests", 0) for m in models),
-                # 起動元情報: いつ・どこから・どの経路（cli の裏起動 / headless 直接起動）で
-                # 立ったゲートウェイかを示す。出所不明のサーバーの特定用。
+                # 起動元情報: いつ・どこから立ったゲートウェイかを示す（起動経路は
+                # gw start の 1 本だけなので経路の識別は無い）。
                 "pid": srv.pid,
                 "started_at": srv.started_at,
                 "cwd": srv.start_cwd,
-                "launcher": srv.launcher,
                 # 導入した llama.cpp / vLLM / SGLang の素性。未導入は None。
                 "llama": llama_provision_info(),
                 "vllm": vllm_provision_info(),
@@ -1522,14 +1519,11 @@ class GatewayConfig:
     vision_model: str | None = None    # 画像入りリクエストの振り分け先モデル（None で無効）。画像が壊れている
                                        # vision モデルを避け、画像だけを確実に動くモデル（gemma-4 系等）へ流す
     # --- llama.cpp（llama-server）バイナリの自動導入。[llama_cpp] テーブルで設定 ---
-    llama_provision: str = "auto"      # auto=管理dirへ自動DL / system=PATH の llama-server / build=ソースビルド（Phase 3）
+    # 導入方法は選ばせない（管理dirの導入済みを再利用→無ければプリビルト自動DL の一本道）。
     llama_accel: str = "auto"          # auto=検出（GPU なら vulkan、mac は metal、無ければ cpu）/ cuda / vulkan / metal / cpu
     llama_build: str | None = None     # ビルド番号の固定（例 "b9946"）。省略で最新を取得し導入済みを使い続ける
-    # --- vLLM / SGLang（Linux/NVIDIA・Windows は WSL2）。[vllm]/[sglang] で設定。明示 opt-in 時のみ ---
-    # 既定は system（勝手に数GB を自動DLしない）。extras で入れて使う: pip install ...[vllm]。
-    # 隔離 venv へ自動導入させたいなら provision='auto'（両立したいときはこちら＝別環境）。
-    vllm_provision: str = "system"     # system=現在の環境の vllm を使う（既定）/ auto=隔離 venv へ自動 pip install
-    sglang_provision: str = "system"   # system=現在の環境の sglang を使う（既定）/ auto=隔離 venv へ自動 pip install
+    # vLLM / SGLang（Linux/NVIDIA・Windows は WSL2）も一本道: 現在の環境に有ればそれを、
+    # 無ければ隔離 venv へ自動導入（backend='vllm'/'sglang' のモデルを使ったときだけ動く）。
     # --- 動画入力: ゲートウェイが video_url をフレーム画像列へ展開して上流へ渡す ---
     video_frames: int = 8              # 1 本の動画から等間隔で抜くフレーム数
     video_max_edge: int = 768          # 各フレームの縮小サイズ（長辺ピクセル）
@@ -1722,34 +1716,16 @@ def load_gateway_config(path: str) -> GatewayConfig:
     repetition_penalty_skip_structured = bool(data.get("repetition_penalty_skip_structured", False))
 
     # [llama_cpp] テーブル: llama-server バイナリの自動導入設定（すべて省略可＝全自動）。
+    # 導入方法の選択肢（旧 provision）は無い——一本道なので accel / pin だけ。
     llama = data.get("llama_cpp") or {}
     if not isinstance(llama, dict):
         raise ValueError("[llama_cpp] must be a table")
-    llama_provision = str(llama.get("provision", "auto"))
-    if llama_provision not in ("auto", "system", "build"):
-        raise ValueError("llama_cpp.provision must be auto / system / build")
     llama_accel = str(llama.get("accel", "auto"))
     if llama_accel not in ("auto", "cuda", "vulkan", "metal", "cpu"):
         raise ValueError("llama_cpp.accel must be auto / cuda / vulkan / metal / cpu")
     llama_build = llama.get("pin")
     if llama_build is not None:
         llama_build = str(llama_build).strip() or None
-
-    # [vllm] テーブル: vLLM の導入設定（backend="vllm" のモデルがあるときだけ効く）。
-    vllm = data.get("vllm") or {}
-    if not isinstance(vllm, dict):
-        raise ValueError("[vllm] must be a table")
-    vllm_provision = str(vllm.get("provision", "system"))
-    if vllm_provision not in ("auto", "system"):
-        raise ValueError("vllm.provision must be auto / system")
-
-    # [sglang] テーブル: SGLang の導入設定（backend="sglang" のモデルがあるときだけ効く）。
-    sglang = data.get("sglang") or {}
-    if not isinstance(sglang, dict):
-        raise ValueError("[sglang] must be a table")
-    sglang_provision = str(sglang.get("provision", "system"))
-    if sglang_provision not in ("auto", "system"):
-        raise ValueError("sglang.provision must be auto / system")
 
     # 動画入力のフレーム展開設定。省略で 8 フレーム / 長辺 768px。
     video_frames = int(data.get("video_frames", 8))
@@ -1819,11 +1795,8 @@ def load_gateway_config(path: str) -> GatewayConfig:
         api_key=api_key,
         auto_update=auto_update,
         vision_model=vision_model,
-        llama_provision=llama_provision,
         llama_accel=llama_accel,
         llama_build=llama_build,
-        vllm_provision=vllm_provision,
-        sglang_provision=sglang_provision,
         video_frames=video_frames,
         video_max_edge=video_max_edge,
         repetition_penalty=repetition_penalty,
@@ -1839,7 +1812,7 @@ _CONFIG_POLL_INTERVAL = 1.0
 _RESTART_ONLY_FIELDS = (
     "host", "port", "internal_base_port", "models",
     # llama-server バイナリ・vLLM/SGLang venv は起動時に導入・解決するため、変更は再起動が要る。
-    "llama_provision", "llama_accel", "llama_build", "vllm_provision", "sglang_provision",
+    "llama_accel", "llama_build",
 )
 
 
@@ -2144,7 +2117,6 @@ def provision_llama_if_needed(cfg: GatewayConfig) -> None:
         return
     try:
         binary = provisioner.ensure_llama_server(
-            provision=cfg.llama_provision,
             accel=cfg.llama_accel,
             build=cfg.llama_build,
         )
@@ -2153,13 +2125,10 @@ def provision_llama_if_needed(cfg: GatewayConfig) -> None:
               file=sys.stderr)
         return
     # 実際に解決された素性（実ビルド番号・accel）はプロビジョナが記録している。
-    # system はユーザー管理バイナリで素性不明（accel=None）→ auto フラグ付与の対象外になる。
     info = provisioner.last_info() or {}
-    set_llama_server_binary(
-        binary, build=info.get("build"), accel=info.get("accel"),
-        provision=info.get("provision", cfg.llama_provision))
-    print(f"llama.cpp ready: {binary} (provision={cfg.llama_provision}, "
-          f"build={info.get('build') or '-'}, accel={info.get('accel') or '-'})",
+    set_llama_server_binary(binary, build=info.get("build"), accel=info.get("accel"))
+    print(f"llama.cpp ready: {binary} "
+          f"(build={info.get('build') or '-'}, accel={info.get('accel') or '-'})",
           file=sys.stderr)
 
 
@@ -2177,13 +2146,13 @@ def provision_vllm_if_needed(cfg: GatewayConfig) -> None:
     if not _vllm_in_use(cfg):
         return
     try:
-        py = vllm_provisioner.ensure_vllm(provision=cfg.vllm_provision)
+        py = vllm_provisioner.ensure_vllm()
     except Exception as exc:  # noqa: BLE001 - 導入失敗で起動を止めない（GPU 非検出・pip 失敗等）
         print(f"vLLM provisioning failed (continuing without it): {exc}",
               file=sys.stderr)
         return
-    set_vllm_python(py, provision=cfg.vllm_provision)
-    print(f"vLLM ready: {py} (provision={cfg.vllm_provision})", file=sys.stderr)
+    set_vllm_python(py)
+    print(f"vLLM ready: {py}", file=sys.stderr)
 
 
 def _sglang_in_use(cfg: GatewayConfig) -> bool:
@@ -2200,13 +2169,13 @@ def provision_sglang_if_needed(cfg: GatewayConfig) -> None:
     if not _sglang_in_use(cfg):
         return
     try:
-        py = sglang_provisioner.ensure_sglang(provision=cfg.sglang_provision)
+        py = sglang_provisioner.ensure_sglang()
     except Exception as exc:  # noqa: BLE001 - 導入失敗で起動を止めない（GPU 非検出・pip 失敗等）
         print(f"SGLang provisioning failed (continuing without it): {exc}",
               file=sys.stderr)
         return
-    set_sglang_python(py, provision=cfg.sglang_provision)
-    print(f"SGLang ready: {py} (provision={cfg.sglang_provision})", file=sys.stderr)
+    set_sglang_python(py)
+    print(f"SGLang ready: {py}", file=sys.stderr)
 
 
 def _run_gateway_locked(cfg: GatewayConfig, config_path: str | None = None) -> int:

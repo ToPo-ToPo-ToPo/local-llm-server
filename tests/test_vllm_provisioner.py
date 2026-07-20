@@ -29,28 +29,21 @@ def test_requires_gpu(monkeypatch):
     monkeypatch.setattr(vp, "gpu_available", lambda: False)
     monkeypatch.setattr(vp.provisioner, "detect_os", lambda: "linux")
     with pytest.raises(vp.VllmUnavailable):
-        vp.ensure_vllm(provision="auto")
+        vp.ensure_vllm()
 
 
 def test_refuses_macos(monkeypatch):
     monkeypatch.setattr(vp, "gpu_available", lambda: True)
     monkeypatch.setattr(vp.provisioner, "detect_os", lambda: "macos")
     with pytest.raises(vp.VllmUnavailable):
-        vp.ensure_vllm(provision="auto")
+        vp.ensure_vllm()
 
 
-def test_system_uses_current_python_if_importable(monkeypatch):
+def test_current_env_preferred_when_importable(monkeypatch):
     monkeypatch.setattr(vp, "gpu_available", lambda: True)
     monkeypatch.setattr(vp.provisioner, "detect_os", lambda: "linux")
-    py = vp.ensure_vllm(provision="system", importable=lambda p, run: True)
+    py = vp.ensure_vllm(importable=lambda p, run: True)
     assert py == vp.sys.executable
-
-
-def test_system_missing_raises(monkeypatch):
-    monkeypatch.setattr(vp, "gpu_available", lambda: True)
-    monkeypatch.setattr(vp.provisioner, "detect_os", lambda: "linux")
-    with pytest.raises(vp.VllmUnavailable):
-        vp.ensure_vllm(provision="system", importable=lambda p, run: False)
 
 
 def test_auto_creates_venv_and_installs(tmp_path, monkeypatch):
@@ -81,7 +74,7 @@ def test_auto_creates_venv_and_installs(tmp_path, monkeypatch):
             installed.append(cmd)
         return _ok(0)
 
-    py = vp.ensure_vllm(provision="auto", create_venv=fake_create, run=marking_run,
+    py = vp.ensure_vllm(create_venv=fake_create, run=marking_run,
                         importable=fake_importable)
     assert created["dir"].endswith("vllm-venv")
     assert any("vllm" in c for c in installed)
@@ -101,8 +94,8 @@ def test_auto_reuses_existing_venv(tmp_path, monkeypatch):
     def boom(*a, **k):
         raise AssertionError("must not create venv when already installed")
 
-    got = vp.ensure_vllm(provision="auto", create_venv=boom,
-                         run=lambda *a, **k: _ok(0), importable=lambda p, run: True)
+    got = vp.ensure_vllm(create_venv=boom, run=lambda *a, **k: _ok(0),
+                         importable=lambda p, run: p != vp.sys.executable)
     assert got == py
 
 
@@ -117,5 +110,5 @@ def test_pip_install_failure_raises(tmp_path, monkeypatch):
         return _ok(0)
 
     with pytest.raises(vp.VllmUnavailable):
-        vp.ensure_vllm(provision="auto", create_venv=lambda d: None,
+        vp.ensure_vllm(create_venv=lambda d: None,
                        run=fail_run, importable=lambda p, run: False)
