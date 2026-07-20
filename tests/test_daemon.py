@@ -1530,8 +1530,7 @@ def test_watch_config_file_applies_on_save(tmp_path):
 # --- 起動元情報（provenance: いつ・どこから・どの経路で立ったか） -------------------
 # 裏でヘッドレス起動されたゲートウェイでも、/admin/status 一発で出所を特定できるようにする。
 
-def test_admin_status_includes_provenance(tmp_path, monkeypatch):
-    monkeypatch.setenv("LOCAL_LLM_GW_LAUNCHER", "tui")  # TUI の裏起動が付けるマーク
+def test_admin_status_includes_provenance(tmp_path):
     cfg = gw.load_gateway_config(_write(tmp_path, "port = 8799\n"))
     server, mgr = _live_server(cfg)
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -1539,29 +1538,16 @@ def test_admin_status_includes_provenance(tmp_path, monkeypatch):
         st, obj = _get(server.server_address[1], "/admin/status")
         assert st == 200
         assert obj["pid"] == os.getpid()
-        assert obj["launcher"] == "tui"
         assert obj["cwd"] == os.getcwd()
         assert obj["started_at"]  # "YYYY-MM-DD HH:MM:SS"
     finally:
         server.shutdown(); server.server_close(); mgr.shutdown()
 
 
-def test_launcher_defaults_to_headless(tmp_path, monkeypatch):
-    # マーク無し（直接の python -m local_llm_server や run_gateway 直呼び）は headless 扱い。
-    monkeypatch.delenv("LOCAL_LLM_GW_LAUNCHER", raising=False)
-    cfg = gw.load_gateway_config(_write(tmp_path, "port = 8799\n"))
-    server, mgr = _live_server(cfg)
-    try:
-        assert server.launcher == "headless"
-    finally:
-        server.server_close(); mgr.shutdown()
-
-
 # --- llama.cpp 自動導入（provisioner）の配線 --------------------------------------
 
 def test_load_gateway_config_parses_llama_cpp_defaults(tmp_path):
     cfg = gw.load_gateway_config(_write(tmp_path, "port = 8799\n"))
-    assert cfg.llama_provision == "auto"
     assert cfg.llama_accel == "auto"
     assert cfg.llama_build is None
 
@@ -1569,15 +1555,12 @@ def test_load_gateway_config_parses_llama_cpp_defaults(tmp_path):
 def test_load_gateway_config_parses_llama_cpp_table(tmp_path):
     cfg = gw.load_gateway_config(_write(
         tmp_path,
-        '[llama_cpp]\nprovision = "system"\naccel = "cuda"\npin = "b9946"\n'))
-    assert cfg.llama_provision == "system"
+        '[llama_cpp]\naccel = "cuda"\npin = "b9946"\n'))
     assert cfg.llama_accel == "cuda"
     assert cfg.llama_build == "b9946"
 
 
 def test_load_gateway_config_rejects_bad_llama_values(tmp_path):
-    with pytest.raises(ValueError):
-        gw.load_gateway_config(_write(tmp_path, '[llama_cpp]\nprovision = "nope"\n'))
     with pytest.raises(ValueError):
         gw.load_gateway_config(_write(tmp_path, '[llama_cpp]\naccel = "opencl"\n'))
 
@@ -1646,8 +1629,7 @@ def test_admin_status_includes_llama_info(tmp_path, monkeypatch):
     threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
         srv_mod.set_llama_server_binary(
-            "/managed/b9946/bin/llama-server", build="b9946", accel="vulkan",
-            provision="auto")
+            "/managed/b9946/bin/llama-server", build="b9946", accel="vulkan")
         st, obj = _get(server.server_address[1], "/admin/status")
         assert obj["llama"]["build"] == "b9946"
         assert obj["llama"]["accel"] == "vulkan"
@@ -1815,21 +1797,6 @@ def test_admin_drain_refused_while_busy(monkeypatch):
 
 # --- vLLM バックエンドの配線 --------------------------------------------------------
 
-def test_load_gateway_config_parses_vllm_defaults(tmp_path):
-    cfg = gw.load_gateway_config(_write(tmp_path, "port = 8799\n"))
-    # 既定は system（勝手に自動DLしない。extras で入れて使う）。auto で隔離 venv 自動導入。
-    assert cfg.vllm_provision == "system"
-    assert gw.load_gateway_config(
-        _write(tmp_path, '[vllm]\nprovision = "auto"\n')).vllm_provision == "auto"
-
-
-def test_load_gateway_config_parses_vllm_table(tmp_path):
-    cfg = gw.load_gateway_config(_write(tmp_path, '[vllm]\nprovision = "system"\n'))
-    assert cfg.vllm_provision == "system"
-    with pytest.raises(ValueError):
-        gw.load_gateway_config(_write(tmp_path, '[vllm]\nprovision = "nope"\n'))
-
-
 def test_vllm_in_use_only_when_registered(tmp_path):
     cfg = gw.load_gateway_config(_write(
         tmp_path,
@@ -1877,14 +1844,6 @@ def test_provision_vllm_continues_on_failure(tmp_path, monkeypatch):
 
 
 # --- SGLang バックエンドの配線 ------------------------------------------------------
-
-def test_load_gateway_config_parses_sglang(tmp_path):
-    assert gw.load_gateway_config(_write(tmp_path, "port = 8799\n")).sglang_provision == "system"
-    cfg = gw.load_gateway_config(_write(tmp_path, '[sglang]\nprovision = "system"\n'))
-    assert cfg.sglang_provision == "system"
-    with pytest.raises(ValueError):
-        gw.load_gateway_config(_write(tmp_path, '[sglang]\nprovision = "nope"\n'))
-
 
 def test_sglang_in_use_only_when_registered(tmp_path):
     cfg = gw.load_gateway_config(_write(

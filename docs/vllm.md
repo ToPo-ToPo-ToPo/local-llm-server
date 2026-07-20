@@ -25,36 +25,23 @@ backend = "vllm"
 画像入力・ゲートウェイの動画フレーム展開・動的ロード・LRU・在席即時解放・drain 再起動も
 そのまま効く。
 
-## 導入（extras が既定）
+## 導入（全自動・設定不要）
 
-vLLM は torch+CUDA を含む**重量級パッケージ（数 GB）**なので base 依存には入れない。使う人だけ
-**extras で明示的に入れる**（既定 `provision = "system"`＝勝手に数 GB を自動DLしない）。**uv だけで完結**する:
+vLLM は torch+CUDA を含む**重量級パッケージ（数 GB）**なので base 依存には入れない。
+`backend = "vllm"` のモデルを登録して起動すると、ゲートウェイが自動で解決する。
+導入方法の設定項目は無い（一本道）。解決順は決定的:
 
-```bash
-# 通常導入（clone + `uv tool install --editable .`）に vLLM extra を足す:
-uv tool install --editable ".[vllm]"      # Linux/NVIDIA。以後どこでも gw
+1. **現在の python 環境に vllm が有ればそれを使う**——extras（`uv tool install --editable
+   ".[vllm]"` / `uv add "local-llm-server[vllm]"`）で導入済みなら数 GB の再ダウンロードをしない。
+2. 無ければ **隔離 venv（`~/.cache/local-llm-server/vllm-venv`）へ起動時に自動導入**する
+   （初回のみ・要ネットワーク & GPU）。導入済み venv は再利用。本体環境を汚さない。
 
-# local-llm-server を別の uv プロジェクトの依存にしている場合:
-uv add "local-llm-server[vllm]"
-```
-
-```toml
-[vllm]
-provision = "system"   # 既定。現在の環境の vllm を使う（[vllm] extra で入れる）
-# provision = "auto"   # 隔離 venv へ起動時に自動導入（下記）
-```
-
-- **`provision = "auto"`（隔離 venv・自動導入）**: `~/.cache/local-llm-server/vllm-venv` へ起動時に
-  自動導入する（初回のみ・要ネットワーク & GPU）。導入済みは再利用。本体環境を汚さない。
-  **vLLM と SGLang を同一マシンで両立**したいときはこちら —— 両者は torch/flashinfer のピンが
-  食い違い**同一環境に共存できないことが多い**ので、別々の隔離 venv に入れる必要がある
-  （extras で両方を1環境に入れると壊れる）。
-- どちらも、導入に失敗（GPU 非検出・pip 失敗・CUDA 不整合）してもゲートウェイは起動を続け、
+- **vLLM と SGLang を同一マシンで両立**するときは extras を使わず自動導入に任せる——両者は
+  torch/flashinfer のピンが食い違い**同一環境に共存できないことが多い**ので、それぞれ別々の
+  隔離 venv に入る自動導入がそのまま解になる（extras で両方を1環境に入れると壊れる）。
+- 導入に失敗（GPU 非検出・pip 失敗・CUDA 不整合）してもゲートウェイは起動を続け、
   vllm モデルの要求時に分かりやすいエラーになる（他バックエンドは動く）。
 - 導入した vLLM の素性は `GET /admin/status` の `vllm` フィールドに出る。
-
-> **まとめ**: 1 つだけ使う → `uv tool install --editable ".[vllm]"` ＋ 既定（system）。vLLM と SGLang を
-> 両方使う → 各 backend で `provision = "auto"`（別々の隔離 venv・自動導入）。
 
 ## Windows（WSL2）
 
@@ -70,8 +57,8 @@ Windows でネイティブに（WSL2 無しで）GPU 生成したい場合は `b
 
 ## SGLang（vLLM の対抗）
 
-`backend = "sglang"` でも高スループット生成ができる。導入・対象環境（Linux/NVIDIA・WSL2）・
-隔離 venv への自動導入（`[sglang] provision`）は vLLM と同じ。違いは **RadixAttention
+`backend = "sglang"` でも高スループット生成ができる。導入（全自動・設定不要）・対象環境
+（Linux/NVIDIA・WSL2）は vLLM と同じ。違いは **RadixAttention
 （プレフィックスキャッシュ）**で、**共有プレフィックスの多い用途に強い**——同じシステムプロンプトや
 ツール定義を毎回送る**エージェント運用**では、共有部分のプレフィルを一度で済ませて後続を
 スキップするので、高同時実行での TTFT（初回トークンまでの時間）が下がる。

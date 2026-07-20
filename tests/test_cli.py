@@ -20,12 +20,12 @@ def _write_cfg(tmp_path, body):
 def test_read_log_tail(tmp_path, monkeypatch):
     log = tmp_path / "gw.log"
     log.write_text("\n".join(f"line {i}" for i in range(1, 2001)) + "\n", encoding="utf-8")
-    monkeypatch.setattr(cli, "gateway_log_path", lambda port, base=None: str(log))
+    monkeypatch.setattr(cli, "gateway_log_path", lambda port: str(log))
     out = cli.read_log_tail(123, max_lines=10)
     lines = out.strip().splitlines()
     assert lines[-1] == "line 2000" and len(lines) == 10
     # ファイルが無いときは案内文
-    monkeypatch.setattr(cli, "gateway_log_path", lambda port, base=None: str(tmp_path / "nope.log"))
+    monkeypatch.setattr(cli, "gateway_log_path", lambda port: str(tmp_path / "nope.log"))
     assert cli.read_log_tail(123).startswith("(ログはまだ")
 
 
@@ -60,7 +60,7 @@ def test_render_status_running_and_stopped(tmp_path, monkeypatch):
     stopped = cli.render_status(gcfg, None, ready=False)
     assert "stopped" in stopped and "gw start" in stopped
     admin = {"uptime": 5.0, "requests": 7, "max_resident": 1, "pid": 4242,
-             "launcher": "cli", "models": [], "available": []}
+             "models": [], "available": []}
     running = cli.render_status(gcfg, admin, ready=True)
     assert "running" in running and "pid 4242" in running and "requests 7" in running
 

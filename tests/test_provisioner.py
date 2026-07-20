@@ -135,7 +135,7 @@ def test_ensure_downloads_extracts_and_returns_path(tmp_path, monkeypatch):
         _fake_tarball(dest)
 
     path = pv.ensure_llama_server(
-        provision="auto", accel="cpu", build="b9946",
+        accel="cpu", build="b9946",
         download=fake_download, verify=lambda p, **k: True,
     )
     assert path.endswith(os.path.join("bin", pv._EXE))
@@ -154,23 +154,12 @@ def test_ensure_reuses_existing_install(tmp_path, monkeypatch):
         calls["n"] += 1
         _fake_tarball(dest)
 
-    kw = dict(provision="auto", accel="cpu", build="b9946",
+    kw = dict(accel="cpu", build="b9946",
               download=fake_download, verify=lambda p, **k: True)
     p1 = pv.ensure_llama_server(**kw)
     p2 = pv.ensure_llama_server(**kw)  # 2 回目はダウンロードしない
     assert p1 == p2
     assert calls["n"] == 1
-
-
-def test_ensure_system_uses_path(monkeypatch):
-    monkeypatch.setattr(pv.shutil, "which", lambda name: "/usr/local/bin/llama-server")
-    assert pv.ensure_llama_server(provision="system") == "/usr/local/bin/llama-server"
-
-
-def test_ensure_system_missing_raises(monkeypatch):
-    monkeypatch.setattr(pv.shutil, "which", lambda name: None)
-    with pytest.raises(pv.ProvisionError):
-        pv.ensure_llama_server(provision="system")
 
 
 def test_ensure_verify_failure_raises(tmp_path, monkeypatch):
@@ -181,7 +170,7 @@ def test_ensure_verify_failure_raises(tmp_path, monkeypatch):
     monkeypatch.setattr(pv, "detect_arch", lambda: "x64")
     with pytest.raises(pv.ProvisionError):
         pv.ensure_llama_server(
-            provision="auto", accel="vulkan", build="b9946",
+            accel="vulkan", build="b9946",
             download=lambda url, dest, timeout=300.0: _fake_tarball(dest),
             verify=lambda p, **k: False,
         )
@@ -197,7 +186,7 @@ def test_ensure_download_failure_raises(tmp_path, monkeypatch):
         raise OSError("network down")
 
     with pytest.raises(pv.ProvisionError):
-        pv.ensure_llama_server(provision="auto", accel="cpu", build="b9946",
+        pv.ensure_llama_server(accel="cpu", build="b9946",
                                download=boom, verify=lambda p, **k: True)
 
 
@@ -208,69 +197,6 @@ def test_extract_zip(tmp_path):
         zf.writestr("bin/llama-server.exe", "x")
     pv._extract(str(archive), str(tmp_path / "out"))
     assert (tmp_path / "out" / "bin" / "llama-server.exe").exists()
-
-
-# --- ソースビルド（provision="build"）。実ビルドはせず subprocess を差し替える ------
-
-def test_accel_cmake_flags():
-    assert pv.accel_cmake_flags("cuda") == ["-DGGML_CUDA=ON"]
-    assert pv.accel_cmake_flags("vulkan") == ["-DGGML_VULKAN=ON"]
-    assert pv.accel_cmake_flags("metal") == []   # macOS 既定で有効
-    assert pv.accel_cmake_flags("cpu") == []
-
-
-def test_build_from_source_runs_cmake_and_returns_binary(tmp_path, monkeypatch):
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
-    monkeypatch.setattr(pv.os, "name", "posix")
-    monkeypatch.setattr(pv.shutil, "which", lambda n: f"/usr/bin/{n}")  # cmake/git あり
-    ran = []
-
-    def fake_run(cmd, check=False):
-        ran.append(cmd)
-        # cmake --build のときにビルド成果物（bin/llama-server）を作る。
-        if cmd[:2] == ["cmake", "--build"]:
-            binroot = os.path.join(cmd[2], "bin")
-            os.makedirs(binroot, exist_ok=True)
-            with open(os.path.join(binroot, pv._EXE), "w") as fh:
-                fh.write("x")
-
-    dest = pv.install_dir("b9946", "linux", "x64", "vulkan")
-    out = pv.build_from_source("b9946", "linux", "x64", "vulkan", dest,
-                               run=fake_run, verify=lambda p, **k: True)
-    assert out.endswith(os.path.join("bin", pv._EXE)) and os.path.exists(out)
-    # clone → configure（vulkan フラグ）→ build の順で走った。
-    assert ran[0][0] == "git" and "--branch" in ran[0] and "b9946" in ran[0]
-    assert "-DGGML_VULKAN=ON" in ran[1]
-    assert ran[2][:2] == ["cmake", "--build"]
-
-
-def test_build_from_source_without_toolchain_raises(monkeypatch):
-    monkeypatch.setattr(pv.shutil, "which", lambda n: None)  # cmake/git 無し
-    with pytest.raises(pv.BuildUnavailable):
-        pv.build_from_source("b9946", "linux", "x64", "cpu", "/tmp/x",
-                             run=lambda *a, **k: None)
-
-
-def test_ensure_build_falls_back_to_prebuilt(tmp_path, monkeypatch):
-    # provision="build" でビルド不可 → プリビルト自動導入にフォールバックする。
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
-    monkeypatch.setattr(pv.os, "name", "posix")
-    monkeypatch.setattr(pv, "detect_os", lambda: "linux")
-    monkeypatch.setattr(pv, "detect_arch", lambda: "x64")
-
-    def no_build(*a, **k):
-        raise pv.BuildUnavailable("no cmake")
-
-    monkeypatch.setattr(pv, "build_from_source", no_build)
-    downloaded = {}
-    path = pv.ensure_llama_server(
-        provision="build", accel="cpu", build="b9946",
-        download=lambda url, dest, timeout=300.0: (
-            downloaded.setdefault("url", url), _fake_tarball(dest)),
-        verify=lambda p, **k: True,
-    )
-    assert os.path.exists(path)                      # プリビルトで導入できた
-    assert "ubuntu-x64.tar.gz" in downloaded["url"]  # プリビルト経路を通った
 
 
 # --- 総点検で見つかった不具合の回帰テスト ------------------------------------------
@@ -285,7 +211,7 @@ def test_ensure_reuses_installed_build_without_network(tmp_path, monkeypatch):
 
     # 1 回目: latest=b9946 を導入。
     monkeypatch.setattr(pv, "latest_build", lambda timeout=5.0: "b9946")
-    kw = dict(provision="auto", accel="cpu",
+    kw = dict(accel="cpu",
               download=lambda url, dest, timeout=300.0: _fake_tarball(dest),
               verify=lambda p, **k: True)
     p1 = pv.ensure_llama_server(build=None, **kw)
@@ -312,7 +238,7 @@ def test_ensure_offline_without_install_raises_provision_error(tmp_path, monkeyp
 
     monkeypatch.setattr(pv, "latest_build", offline)
     with pytest.raises(pv.ProvisionError):
-        pv.ensure_llama_server(provision="auto", accel="cpu", build=None,
+        pv.ensure_llama_server(accel="cpu", build=None,
                                download=lambda *a, **k: None,
                                verify=lambda p, **k: True)
 
@@ -326,11 +252,3 @@ def test_installed_builds_sorted_newest_first(tmp_path, monkeypatch):
                  "src-b9946", "junk"):        # 形式外は無視
         os.makedirs(os.path.join(root, name), exist_ok=True)
     assert pv.installed_builds("linux", "x64", "cpu") == ["b10002", "b9946", "b9900"]
-
-
-def test_last_info_records_system_without_accel(monkeypatch):
-    # system はユーザー管理バイナリ＝素性不明。accel を None にして auto フラグの対象外にする。
-    monkeypatch.setattr(pv.shutil, "which", lambda name: "/usr/bin/llama-server")
-    pv.ensure_llama_server(provision="system")
-    info = pv.last_info()
-    assert info["provision"] == "system" and info["accel"] is None

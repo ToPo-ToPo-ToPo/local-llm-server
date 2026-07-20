@@ -1,3 +1,4 @@
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -634,14 +635,14 @@ def test_is_ready_false_when_down():
     assert srv.is_ready("http://127.0.0.1:9/v1", timeout=0.3) is False
 
 
-def test_start_gateway_background_marks_launcher_env(tmp_path, monkeypatch):
-    # `gw start` の裏起動（この関数経由）で立つゲートウェイには launcher=cli マークが付き、
-    # /admin/status で「CLI が立てたのか、誰かが直接ヘッドレスで立てたのか」を区別できる。
+def test_start_gateway_background_marks_spawn_env(tmp_path, monkeypatch):
+    # `gw start` の裏起動（この関数経由）には spawn マークが付く。__main__ はこのマークの
+    # 無い直接起動を拒否するので、これが唯一の正規起動経路になる。
     calls = {}
     ready = iter([False, True])  # Popen 前は未起動 → 起動後 ready
     monkeypatch.setattr(srv, "is_ready", lambda url, **k: next(ready))
     monkeypatch.setattr(srv, "find_pids_on_port", lambda port: [])
-    monkeypatch.setattr(srv, "gateway_log_path", lambda port, base=None: str(tmp_path / "gw.log"))
+    monkeypatch.setattr(srv, "gateway_log_path", lambda port: str(tmp_path / "gw.log"))
 
     class _Proc:
         pid = 4242
@@ -831,3 +832,55 @@ def test_user_override_of_thinking_markers_is_respected(monkeypatch, tmp_path):
     env = _capture_start_env(monkeypatch, tmp_path, "mlx-vlm",
                              preset_env={"MLX_VLM_THINKING_START_TOKEN": "<custom>"})
     assert env["MLX_VLM_THINKING_START_TOKEN"] == "<custom>"
+
+
+def test_rotate_log_pushes_generations_and_drops_oldest(tmp_path):
+    # 起動のたびに x.log → x-1.log と押し出し、keep 世代を超えた分は捨てる（Ollama 方式）。
+    log = tmp_path / "gateway-8799.log"
+    for gen in range(1, srv.LOG_ROTATION_COUNT + 1):
+        (tmp_path / f"gateway-8799-{gen}.log").write_text(f"gen{gen}")
+    log.write_text("current")
+
+    srv.rotate_log(str(log))
+
+    assert not log.exists()                                        # 現行は押し出された
+    assert (tmp_path / "gateway-8799-1.log").read_text() == "current"
+    assert (tmp_path / "gateway-8799-2.log").read_text() == "gen1"  # 1 つずつ繰り上がる
+    # keep 世代で頭打ち。あふれた最古（旧 gen5）は消えている。
+    assert (tmp_path / f"gateway-8799-{srv.LOG_ROTATION_COUNT}.log").read_text() == "gen4"
+    assert not (tmp_path / f"gateway-8799-{srv.LOG_ROTATION_COUNT + 1}.log").exists()
+
+
+def test_rotate_log_noop_when_absent(tmp_path):
+    # 初回起動（ログがまだ無い）で失敗しない。
+    srv.rotate_log(str(tmp_path / "nope.log"))
+    assert not (tmp_path / "nope-1.log").exists()
+
+
+def test_prune_server_logs_keeps_newest(tmp_path):
+    # モデルサーバーのログはポート別にファイルが増えるので、新しい順に keep 個だけ残す。
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    for i in range(8):
+        p = logs / f"server-{9000 + i}.log"
+        p.write_text("x")
+        os.utime(p, (1_700_000_000 + i, 1_700_000_000 + i))  # 古い→新しい順
+    (logs / "gateway-8799.log").write_text("keep me")
+
+    srv.prune_server_logs(directory=str(logs), keep=3)
+
+    remaining = sorted(p.name for p in logs.glob("server-*.log"))
+    assert remaining == ["server-9005.log", "server-9006.log", "server-9007.log"]
+    assert (logs / "gateway-8799.log").exists()  # ゲートウェイ本体のログは対象外
+
+
+def test_log_dir_is_cwd_independent(tmp_path, monkeypatch):
+    # どこから起動してもログの行き先は同じ固定パス —— 起動したディレクトリに
+    # ./.local-llm-server を作らない（旧仕様からの回帰防止）。
+    from local_llm_server.constants import log_dir
+    monkeypatch.chdir(tmp_path)
+    path = log_dir()
+    assert not path.startswith(str(tmp_path))
+    assert ".local-llm-server" not in path
+    assert srv.daemon_log_path(9001).startswith(path)
+    assert srv.gateway_log_path(8799).startswith(path)

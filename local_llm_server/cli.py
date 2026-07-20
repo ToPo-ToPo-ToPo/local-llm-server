@@ -123,14 +123,15 @@ class _RuntimeConfig:
         self.models: list = []          # 事前登録は記録に無い（動的ロード分は admin から見える）
         self.idle_timeout = 0           # アイドル残りは記録だけでは出せない（admin にも idle_for はある）
         self.max_resident = None        # 実値は admin の max_resident を使う
-        # デーモンの作業ディレクトリ（＝ログの基準）。記録の cwd から引く（gw log 用）。
+        # デーモンの作業ディレクトリ（＝設定 ./gateway.toml の基準）。記録の cwd から引く
+        # （restart で同じ設定の場所から再起動するため。ログは log_dir() 固定で cwd 非依存）。
         self._config_dir = rec.get("cwd")
 
 
 def load_config(path: str):
     """指定パスの gateway.toml を読む（壊れていれば例外を送出）。読んだ設定に
     `_config_dir`（そのファイルのあるディレクトリ）を付けて返す —— `gw start` はそこを
-    デーモンの cwd にして spawn する（設定・ログの位置が一貫する）。"""
+    デーモンの cwd にして spawn する（デーモンから見て設定が常に `./gateway.toml` になる）。"""
     gcfg = load_gateway_config(path)
     try:
         gcfg._config_dir = os.path.dirname(os.path.abspath(path))
@@ -211,7 +212,6 @@ def merge_status(gcfg, admin: dict | None, ready: bool | None = None) -> dict:
         "max_resident": live_max,
         "idle_timeout": idle_timeout,
         "pid": (admin or {}).get("pid"),
-        "launcher": (admin or {}).get("launcher"),
         "started_at": (admin or {}).get("started_at"),
         "models": rows,
     }
@@ -267,15 +267,14 @@ def _fmt_hms(seconds) -> str:
     return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
 
 
-def read_log_tail(port: int, max_lines: int = 1000, max_bytes: int = 512 * 1024,
-                  base: str | None = None) -> str:
+def read_log_tail(port: int, max_lines: int = 1000, max_bytes: int = 512 * 1024) -> str:
     """ゲートウェイログの末尾（最大 max_lines 行）を返す（`gw log` 表示用）。
 
-    `base` はデーモンの作業ディレクトリ（設定のある場所）。CLI がどこから実行されても
-    デーモンが実際に書いている場所を読むために渡す。ログはローテーションされず肥大化しうる
-    ので、末尾 max_bytes だけ読む（全読みを避ける）。ログがまだ無い／空のときは案内文を返す。
+    ログは `log_dir()` の固定パス（cwd 非依存）なので、CLI がどこから実行されても
+    デーモンが実際に書いている場所を読める。末尾 max_bytes だけ読む（全読みを避ける）。
+    ログがまだ無い／空のときは案内文を返す。
     """
-    path = gateway_log_path(port, base=base)
+    path = gateway_log_path(port)
     try:
         with open(path, "rb") as fh:
             fh.seek(0, 2)  # 末尾へ
@@ -337,8 +336,6 @@ def render_status(gcfg, admin: dict | None, ready: bool) -> str:
         f"loaded {loaded}/{cap}" + (f" ({busy} busy)" if busy else ""),
     ]
     line = "  ".join(p for p in parts if p)
-    if view.get("launcher"):
-        line += f"\n  launcher {view['launcher']}"
     return line
 
 
@@ -432,7 +429,7 @@ def _start_cwd(gcfg) -> str:
     """デーモンを spawn する作業ディレクトリ = 設定ファイルのある場所（無ければ CWD）。
 
     `gw start` を gateway.toml の無い場所から打っても、発見した設定のディレクトリで
-    デーモンを起動する（その cwd の `./gateway.toml` を読み、ログもそこに置く）。
+    デーモンを起動する（その cwd の `./gateway.toml` を読む。ログは log_dir() 固定）。
     """
     return getattr(gcfg, "_config_dir", None) or os.getcwd()
 
@@ -493,17 +490,16 @@ def cmd_list(gcfg, args) -> int:
 
 def cmd_log(gcfg, args) -> int:
     _, port, _ = _endpoint(gcfg)
-    base = getattr(gcfg, "_config_dir", None)  # デーモンの作業ディレクトリ基準でログを読む
     if getattr(args, "follow", False):
-        return _follow_log(port, base)
-    print(read_log_tail(port, max_lines=args.lines, base=base))
+        return _follow_log(port)
+    print(read_log_tail(port, max_lines=args.lines))
     return 0
 
 
-def _follow_log(port: int, base: str | None = None) -> int:
+def _follow_log(port: int) -> int:
     """`gw log -f`: ログの新規行を追従表示する（Ctrl-C で終了）。"""
-    path = gateway_log_path(port, base=base)
-    print(read_log_tail(port, base=base), end="")
+    path = gateway_log_path(port)
+    print(read_log_tail(port), end="")
     try:
         with open(path, "rb") as fh:
             fh.seek(0, 2)

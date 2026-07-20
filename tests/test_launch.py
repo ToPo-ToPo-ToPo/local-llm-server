@@ -40,8 +40,9 @@ def test_bare_gw_shows_help(tmp_path, monkeypatch, capsys):
     assert "start" in out and "stop" in out and "status" in out
 
 
-def test_worker_runs_gateway_headless(in_gateway_dir, monkeypatch):
-    # __main__ は TUI を出さず、シャットダウンハンドラを張ってゲートウェイ本体を回す。
+def test_worker_runs_gateway_when_spawned_by_gw_start(in_gateway_dir, monkeypatch):
+    # gw start の spawn マーク付きなら、シャットダウンハンドラを張ってゲートウェイ本体を回す。
+    monkeypatch.setenv("LOCAL_LLM_GW_LAUNCHER", "cli")
     called = {}
     monkeypatch.setattr(worker, "install_shutdown_handlers", lambda: called.update(sig=True))
     monkeypatch.setattr(
@@ -53,8 +54,18 @@ def test_worker_runs_gateway_headless(in_gateway_dir, monkeypatch):
     assert called["cfg_path"] and called["cfg_path"].endswith("gateway.toml")
 
 
+def test_worker_refuses_direct_invocation(in_gateway_dir, monkeypatch, capsys):
+    # spawn マーク無しの直接 `python -m local_llm_server` は拒否する（入口は gw start の 1 本）。
+    monkeypatch.delenv("LOCAL_LLM_GW_LAUNCHER", raising=False)
+    monkeypatch.setattr(worker, "run_gateway",
+                        lambda *a, **k: pytest.fail("must not start"))
+    assert worker.main() == 2
+    assert "gw start" in capsys.readouterr().err
+
+
 def test_worker_errors_without_gateway_toml(tmp_path, monkeypatch, capsys):
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("LOCAL_LLM_GW_LAUNCHER", "cli")
     monkeypatch.setattr(worker, "run_gateway", lambda cfg: pytest.fail("must not start"))
     assert worker.main() == 2
     assert "gateway.toml" in capsys.readouterr().err

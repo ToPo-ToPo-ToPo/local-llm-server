@@ -50,7 +50,6 @@ def ensure_backend(
     human_name: str,
     unavailable: type[RuntimeError],
     gpu_check,
-    provision: str = "auto",
     require_gpu: bool = True,
     run=subprocess.run,
     create_venv=None,
@@ -58,8 +57,10 @@ def ensure_backend(
 ) -> str:
     """隔離 venv バックエンドを起動できる python の絶対パスを返す（必要なら導入する）。
 
-    - provision="system": 現在の python 環境に package があればそれを使う（無ければ `unavailable`）。
-    - provision="auto"  : venv_dir に導入済みならそれを、無ければ venv 作成＋pip install する。
+    ルートは 1 つだけ（導入方法をユーザーに選ばせない）。解決順は決定的:
+    1. 現在の python 環境に package があればそれを使う（extras で導入済みなら数 GB の
+       再ダウンロードをしない）。
+    2. 無ければ隔離 venv（venv_dir）を再利用、それも無ければ venv 作成＋pip install。
     GPU 非検出・macOS は `unavailable`（require_gpu=False で GPU ガードを外せる＝テスト用）。
     `unavailable` は各バックエンドの例外型（VllmUnavailable / SglangUnavailable）。
     """
@@ -74,15 +75,8 @@ def ensure_backend(
             f"{human_name} は macOS では非対応です（Apple Silicon は backend='mlx-vlm' を使用）。"
         )
 
-    if provision == "system":
-        if importable(sys.executable, run):
-            return sys.executable
-        raise unavailable(
-            f"provision='system'（既定）だが現在の環境に {package} が無い。"
-            f"`uv sync --extra {package}`（clone 運用）/ `uv tool install "
-            f"local-llm-server[{package}]` などで導入してから使う。隔離 venv へ自動導入"
-            f"させたいなら [{package}] provision='auto'。"
-        )
+    if importable(sys.executable, run):
+        return sys.executable
 
     vdir = os.path.normpath(venv_dir)
     py = venv_python(vdir)

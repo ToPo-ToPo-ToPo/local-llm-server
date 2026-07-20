@@ -39,15 +39,15 @@ def test_macos_refused(monkeypatch):
         vb.ensure_backend(**_base())
 
 
-def test_system_mode(monkeypatch):
+def test_current_env_preferred_when_importable(monkeypatch):
+    # 解決順 1: 現在の環境に package が有ればそれを使う（venv には触れない）。
     monkeypatch.setattr(vb.provisioner, "detect_os", lambda: "linux")
-    py = vb.ensure_backend(**_base(provision="system", importable=lambda p, run: True))
+    py = vb.ensure_backend(**_base(importable=lambda p, run: True))
     assert py == vb.sys.executable
-    with pytest.raises(_Exc):
-        vb.ensure_backend(**_base(provision="system", importable=lambda p, run: False))
 
 
 def test_auto_install_and_reuse(tmp_path, monkeypatch):
+    # 解決順 2: 現在の環境に無ければ隔離 venv へ導入し、2 回目は再利用する。
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
     monkeypatch.setattr(vb.provisioner, "detect_os", lambda: "linux")
     vdir = str(tmp_path / "pkg-venv")
@@ -63,8 +63,12 @@ def test_auto_install_and_reuse(tmp_path, monkeypatch):
             state["installed"] = True
         return _ok(0)
 
+    def importable(p, r):
+        # 現在の環境には無い（venv 側の python でのみ導入状態を反映する）。
+        return p != vb.sys.executable and state["installed"]
+
     py = vb.ensure_backend(**_base(venv_dir=vdir, create_venv=create, run=run,
-                                   importable=lambda p, r: state["installed"]))
+                                   importable=importable))
     assert py == vb.venv_python(os.path.normpath(vdir))
 
     # 2 回目: 導入済み → create を呼ばない。
@@ -73,7 +77,7 @@ def test_auto_install_and_reuse(tmp_path, monkeypatch):
 
     again = vb.ensure_backend(**_base(venv_dir=vdir, create_venv=boom,
                                       run=lambda *a, **k: _ok(0),
-                                      importable=lambda p, r: True))
+                                      importable=lambda p, r: p != vb.sys.executable))
     assert again == py
 
 
