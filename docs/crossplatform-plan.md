@@ -1,5 +1,9 @@
 # Linux / Windows 対応 ✕ llama.cpp 自動導入 — 開発方針と計画
 
+> **注記（0.34.0時点）**: これは策定当時の開発計画・進捗の記録です。文中の TUI ダッシュボードや
+> `uv run gw` は **0.34.0 で廃止**され、`make install` による導入と `gw` サブコマンド運用に
+> 置き換わりました（現行の使い方は [operation.md](operation.md) を参照）。
+
 対象ブランチ: `feat/crossplatform-llamacpp`（作業は全フェーズこの系列のブランチで行い、
 フェーズ単位で main へマージ・リリースする）
 

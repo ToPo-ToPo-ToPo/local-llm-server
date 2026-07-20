@@ -96,7 +96,7 @@ print(llm.respond("ローカルLLMの利点を3つ。"))
 
 - [docs/gateway.md](docs/gateway.md) — `gateway.toml` の全フィールドと振る舞い
 - [docs/llama-cpp.md](docs/llama-cpp.md) — llama.cpp（`llama-server`）の OS 別導入・最新モデル追従
-- [docs/operation.md](docs/operation.md) — 起動・停止・監視（ターミナル）・アンインストール
+- [docs/operation.md](docs/operation.md) — `gw` サブコマンドでの起動・停止・状態確認・アンインストール
 - [docs/mtp.md](docs/mtp.md) — MTPによる高速化
 
 ## ライセンス
