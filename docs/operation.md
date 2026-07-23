@@ -9,27 +9,21 @@
 ```bash
 git clone https://github.com/ToPo-ToPo-ToPo/local-llm-server
 cd local-llm-server
-make install                     # `gw` を PATH に導入し、自動起動を登録（Ollama 流）
-uv tool update-shell             # 初回のみ。~/.local/bin を PATH に追記する
-exec $SHELL -l                   # 今のシェルに反映（または新しいターミナルを開く）
+make install                     # `gw` の導入・PATH 設定・自動起動の登録まで全部やる
+exec $SHELL -l                   # 初回のみ: 今のシェルに反映（新しいターミナルなら不要）
 ```
 
-`make install` は `uv tool install --editable . --reinstall` を実行し、続けて **`gw enable`
-（自動起動の登録）** を行う（editable は確定なので畳んである。再実行で入れ直しにもなる）。
+`make install` は `uv tool install --editable . --reinstall` を実行し、続けて
+**PATH 設定（`uv tool update-shell`。既に通っていれば何もしない）** と **`gw enable`
+（自動起動の登録）** まで行う（editable は確定なので畳んである。再実行で入れ直しにもなる）。
 **editable** なのでソースはこのクローンを指し、`gw update` / 自動更新の `git pull` がそのまま効く。
 
 ### 導入直後に `gw: command not found` になるとき
 
-実体（`~/.local/bin/gw`）は入っていて、PATH だけの問題。原因は 2 段階ある。
-
-**1. PATH への追記がまだ無い。** `uv tool install` は「`~/.local/bin` is not on your PATH」と
-警告するだけで、**シェル設定を一切変更しない**。追記を行うのは `uv tool update-shell` で、
-これを一度実行する必要がある。
-
-**2. 追記先は `.zshrc` とは限らない。** zsh では `uv tool update-shell` が書くのは
-**`~/.zshenv`**（`~/.zshrc` ではない）。そのため `source ~/.zshrc` を打っても、書き込まれて
-いない別のファイルを読み直すだけで反映されない。書き込み先はシェルによって違うので、
-特定ファイルを `source` するのではなく **`exec $SHELL -l`** か新しいターミナルで反映する。
+実体（`~/.local/bin/gw`）は入っていて、**今のシェルに PATH がまだ反映されていない**だけ
+（環境変数は起動済みのシェルへ外から注入できない——これはどのツールでも同じ）。
+`make install` が追記する先は zsh では **`~/.zshenv`**（`~/.zshrc` ではない）なので、
+`source ~/.zshrc` では反映されない。**`exec $SHELL -l`** か新しいターミナルで反映する。
 
 > `~/.zshrc` に `. "$HOME/.local/bin/env"` がある環境では、そちら経由でも PATH が通る。これは
 > uv を**スタンドアロンインストーラ**で入れたときに作られる行で、Homebrew 版の uv では作られない

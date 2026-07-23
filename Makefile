@@ -10,14 +10,18 @@ help:
 
 # editable 固定（クローンのソースを直接指す＝自動更新が効く）＋ --reinstall で
 # 「初回導入」も「依存が変わったときの入れ直し」も同じ 1 コマンドで済ませる。
-# 導入後に自動起動（launchd / systemd user unit）を登録する——Ollama と同じく
+# 導入後に PATH 設定（uv tool update-shell。既に通っていれば何もしない）と
+# 自動起動（launchd / systemd user unit）の登録まで一気に行う——Ollama と同じく
 # 「サーバーを意識しない」がデフォルト。戻したい場合は `gw disable`（手動 gw start 運用）。
-# gw はこのシェルの PATH にまだ無いことがある（uv tool update-shell 前）ので、
+# gw はこのシェルの PATH にまだ無いことがある（PATH 反映は次のシェルから）ので、
 # uv tool の既定 bin（~/.local/bin）を直接叩く。未対応 OS（Windows）では案内だけ出して続行。
 install:
 	uv tool install --editable . --reinstall
+	-@uv tool update-shell 2>/dev/null || true
 	@GW="$$HOME/.local/bin/gw"; command -v gw >/dev/null 2>&1 && GW="$$(command -v gw)"; \
 	"$$GW" enable || echo "自動起動は未登録です（後から gw enable で登録できます）"
+	@command -v gw >/dev/null 2>&1 || \
+	echo "PATH は設定済み。今のシェルに反映するには: exec $$SHELL -l（新しいターミナルなら不要）"
 
 # 設定・キャッシュの置き場所（cli.py / provisioner.py と同じ XDG 規則で解決する）。
 CONFIG_DIR := $(if $(XDG_CONFIG_HOME),$(XDG_CONFIG_HOME),$(HOME)/.config)/local-llm-server
