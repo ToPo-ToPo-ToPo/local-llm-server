@@ -1195,6 +1195,11 @@ class _GatewayHandler(BaseHTTPRequestHandler):
         if path.endswith("/admin/status"):
             if not self._require_loopback():
                 return
+            # 更新チェックをオンデマンドで温める。トレイがメニューを開くたびにここへ来るので、
+            # **リスタート無しで**「更新の有無」を最新化できる（Ollama と同じく、確認は
+            # 動いたまま・適用のときだけ再起動）。適用はしない（それは watcher と手動更新の
+            # 役目）。PyPI を叩きすぎないよう _UPDATE_ONDEMAND_THROTTLE 秒のスロットル付き。
+            maybe_refresh_update_state(srv)
             host, port = srv.server_address[0], srv.server_address[1]
             models = srv.manager.status()
             data = {
@@ -2060,6 +2065,55 @@ _RESTART_CODE = 7
 _UPDATE_WARMUP_INTERVAL = 60.0     # 起動直後は 1 分だけ待ってから初回チェック（起動処理と競合させない）
 _UPDATE_CHECK_INTERVAL = 3600.0    # 以降、新版が未検知のあいだの確認周期
 _UPDATE_DRAIN_POLL_INTERVAL = 30.0  # 取得済み・再起動待ちのあいだ、空くのを待つ周期
+# オンデマンド確認（トレイのメニューを開くたび = /admin/status GET）のスロットル。
+# PyPI を叩きすぎないための最短間隔。定期チェック（1時間）より短く、確認をほぼ即時にする。
+_UPDATE_ONDEMAND_THROTTLE = 30.0
+
+
+def refresh_update_state(state: dict) -> None:
+    """update.check() を 1 回だけ実行して update_state を更新する（**適用はしない**）。
+
+    「更新の有無」を最新化する純粋な確認。オンデマンド（トレイのメニューを開いたとき）に
+    リスタート無しで呼ぶための小片。取得や再起動は一切しない——それは _update_watcher と
+    手動更新（/admin/update）の役目。ネットワーク I/O は失敗しても握りつぶす。
+    fetched（取得済み・再起動待ち）フラグは watcher が立てたものを消さない（触らない）。
+    """
+    from . import update
+    try:
+        st = update.check(timeout=3.0)
+    except Exception:  # noqa: BLE001 - 確認失敗（オフライン等）は状態を変えず黙って戻る
+        return
+    state["available"] = bool(st.available)
+    state["current"] = st.current
+    state["latest"] = st.latest
+    state["reason"] = st.reason
+
+
+def maybe_refresh_update_state(srv) -> None:
+    """スロットル付きで、バックグラウンドに 1 本だけオンデマンド確認を走らせる。
+
+    /admin/status GET のたびに呼ばれる（トレイがメニューを開くたび）。前回から
+    _UPDATE_ONDEMAND_THROTTLE 秒未満・確認中・状態が無いときは何もしない。レスポンスは
+    ブロックしない（結果は次回の GET で反映される＝トレイは次に開いたとき最新になる）。
+    """
+    state = getattr(srv, "update_state", None)
+    if state is None:
+        return
+    now = time.monotonic()
+    if getattr(srv, "_update_check_inflight", False):
+        return
+    if now - getattr(srv, "_last_update_check", 0.0) < _UPDATE_ONDEMAND_THROTTLE:
+        return
+    srv._last_update_check = now
+    srv._update_check_inflight = True
+
+    def _work() -> None:
+        try:
+            refresh_update_state(state)
+        finally:
+            srv._update_check_inflight = False
+
+    threading.Thread(target=_work, daemon=True).start()
 
 
 def _update_watcher(
@@ -2504,6 +2558,10 @@ def _run_gateway_locked(cfg: GatewayConfig, config_path: str | None = None) -> i
     server.update_state = {"available": False, "current": None, "latest": None,
                            "fetched": False, "reason": None}
     server.request_restart = restart_requested.set
+    # オンデマンド確認（/admin/status GET から）のスロットル用。0.0 = 未確認なので、
+    # 最初のメニューオープンで即チェックが走る（起動直後から「更新の有無」が正しく出る）。
+    server._last_update_check = 0.0
+    server._update_check_inflight = False
     threading.Thread(
         target=_update_watcher,
         args=(manager, stop_reaper, restart_requested),

@@ -44,6 +44,48 @@ def test_admin_status_includes_update_state():
         server.shutdown(); server.server_close(); mgr.shutdown()
 
 
+def test_refresh_update_state_updates_without_apply(monkeypatch):
+    """refresh_update_state は check() の結果を state に反映するが、適用はしない。"""
+    from local_llm_server import update as upd_mod
+
+    monkeypatch.setattr(upd_mod, "check", lambda timeout=3.0: types.SimpleNamespace(
+        available=True, current="0.36.1", latest="0.37.0", reason="ok"))
+    # apply_update が呼ばれたら失敗させる（確認だけのはず）。
+    monkeypatch.setattr(upd_mod, "apply_update",
+                        lambda: (_ for _ in ()).throw(AssertionError("must not apply")))
+    state = {"available": False, "current": None, "latest": None,
+             "fetched": True, "reason": None}
+    gw.refresh_update_state(state)
+    assert state["available"] is True
+    assert state["current"] == "0.36.1" and state["latest"] == "0.37.0"
+    assert state["fetched"] is True  # watcher が立てたフラグは触らない
+
+
+def test_admin_status_triggers_ondemand_check(monkeypatch):
+    """/admin/status GET が（リスタート無しで）オンデマンド確認を1本走らせる。"""
+    calls = []
+    monkeypatch.setattr(gw, "refresh_update_state", lambda state: calls.append(state))
+    server, mgr = _start_bare_gateway()
+    try:
+        server.update_state = {"available": False, "current": "0.36.1",
+                               "latest": None, "fetched": False, "reason": None}
+        server._last_update_check = 0.0
+        server._update_check_inflight = False
+        _req(server.server_address[1], "GET", "/admin/status")
+        # 背景スレッドの完了を少し待つ
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline and not calls:
+            time.sleep(0.02)
+        assert calls, "オンデマンド確認が走らなかった"
+        # 直後の 2 回目はスロットルで走らない（PyPI を叩きすぎない）。
+        calls.clear()
+        _req(server.server_address[1], "GET", "/admin/status")
+        time.sleep(0.2)
+        assert calls == []
+    finally:
+        server.shutdown(); server.server_close(); mgr.shutdown()
+
+
 def test_update_now_when_up_to_date(monkeypatch):
     """新版が無ければ up-to-date を返して何もしない（再起動しない）。"""
     from local_llm_server import update as upd_mod
