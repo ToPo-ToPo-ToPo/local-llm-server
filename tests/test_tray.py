@@ -29,13 +29,58 @@ def test_icon_is_static_with_no_periodic_work():
     assert "setTemplate_(True)" in src  # ライト/ダーク自動追従のテンプレート画像
     assert "status.button()" in src or ".button()" in src  # 現行 API（button 経由）を使う
     # メニューは即座に開く: menuWillOpen で同期取得（ブロック）に戻したら落ちる。
-    # 取得は裏スレッド（_refresh_async）→ applyStatus: での差し替えだけが正。
-    assert "_refresh_async" in src and "applyStatus_" in src
+    # 取得は裏スレッド（_refresh_cache）でキャッシュ更新のみ。
+    assert "_refresh_cache" in src
     import re
     open_body = re.search(r"def menuWillOpen_.*?(?=\n        def )", src, re.S).group(0)
     assert "gateway_admin_status" not in open_body  # 開く動作は取得を待たない
+    # 開いているメニューは触らない: 開いたメニューを作り直すとクリックを飲み込む（実測）。
+    # 非同期からメニューを差し替える applyStatus: 経路が復活したら落ちる。
+    assert "applyStatus" not in src
+    assert "performSelectorOnMainThread" in src  # showUpdateMark（ボタン題字）だけには使う
+    # 自動有効化を切る（既定 True だとアクション項目まで無効化されクリック無反応・実測）。
+    # 情報行は明示 disabled。これらが欠けたらクリックが死ぬので回帰ガードにする。
+    assert "setAutoenablesItems_(False)" in src
+    assert "setEnabled_(False)" in src
     # いつでもアイコンから更新できる: 新版未検知でも「更新を確認」を常設する。
     assert "更新を確認" in src
+
+
+def test_menu_action_items_are_enabled_and_wired():
+    """実コードと同じ構成で、アクション項目が enabled かつ target/action 配線済みで、
+    情報行は disabled になることを検証する（autoenables=False の管理が正しいか）。
+
+    自動有効化（既定 True）はアクション項目まで無効化してクリックを殺すため、
+    ここで「アクション項目 enabled・情報行 disabled」を実 AppKit で確かめる。"""
+    try:
+        import AppKit
+        from Foundation import NSObject
+    except ImportError:
+        import pytest
+        pytest.skip("pyobjc 不在（macOS 以外）")
+
+    class _D(NSObject):
+        def openLog_(self, s): pass
+        def updateNow_(self, s): pass
+        def stopGateway_(self, s): pass
+
+    d = _D.alloc().init()
+    menu = AppKit.NSMenu.alloc().init()
+    menu.setAutoenablesItems_(False)
+    info = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("info", None, "")
+    info.setEnabled_(False)
+    menu.addItem_(info)
+    for title, sel in (("更新を確認", "updateNow:"), ("ログを開く", "openLog:"),
+                       ("ゲートウェイを停止", "stopGateway:")):
+        it = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, sel, "")
+        it.setTarget_(d)
+        menu.addItem_(it)
+    menu.update()
+    assert menu.itemAtIndex_(0).isEnabled() is False  # 情報行はグレー
+    for i in (1, 2, 3):  # アクション項目はすべて有効・配線済み
+        it = menu.itemAtIndex_(i)
+        assert it.isEnabled() is True, f"{it.title()} が無効（クリック不可）"
+        assert it.target() is not None and it.action() is not None
 
 
 def test_rows_show_url_and_loaded_models():
