@@ -49,6 +49,9 @@ def test_icon_is_static_with_no_periodic_work():
     assert "setEnabled_(False)" in src
     # いつでもアイコンから更新できる: 新版未検知でも「更新を確認」を常設する。
     assert "更新を確認" in src
+    # 更新を押したら即フィードバック: アイコン横に「更新中…」を出す（通知に依らない）。
+    assert tray_mod._UPDATING_TITLE == "更新中…"
+    assert "setTitle_(_UPDATING_TITLE)" in src and "resetTitle_" in src
 
 
 def test_menu_action_items_are_enabled_and_wired():
