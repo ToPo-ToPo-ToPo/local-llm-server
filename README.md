@@ -12,9 +12,12 @@
 ```bash
 git clone https://github.com/ToPo-ToPo-ToPo/local-llm-server
 cd local-llm-server
-make install            # `gw` の導入・PATH 設定・自動起動の登録まで全部やる
-exec $SHELL -l          # 初回のみ: 今のシェルに PATH を反映（新しいターミナルなら不要）
+make install    # これだけ。導入・PATH 設定・自動起動の登録まで全部やる
 ```
+
+途中で管理者パスワードを 1 回聞かれる（Ollama と同じく、最初から PATH に入っている
+`/usr/local/bin` へ `gw` を置くため。**そのままこのシェルで `gw` が使える**）。
+入れずにスキップしても壊れない——その場合は新しいターミナルから使える。
 
 導入後は Ollama と同じく**サーバーを意識しなくてよい**——ログイン時に自動起動し、異常終了時は
 自動復活する（`gw disable` で従来の手動 `gw start` 運用に戻せる → [docs/operation.md](docs/operation.md)）。

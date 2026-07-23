@@ -18,10 +18,22 @@ help:
 install:
 	uv tool install --editable . --reinstall
 	-@uv tool update-shell 2>/dev/null || true
+	@# Ollama 流: 最初から PATH に入っている /usr/local/bin へ gw を設置する（要管理者権限）。
+	@# これで exec や新ターミナルなしに、今のシェルから即 `gw` が使える。書けない・
+	@# パスワードを入れない場合はスキップし、上の update-shell（新しいシェルから有効）に任せる。
+	@GW_SRC="$$HOME/.local/bin/gw"; DEST=/usr/local/bin/gw; \
+	if [ "$$(readlink "$$DEST" 2>/dev/null)" = "$$GW_SRC" ]; then \
+	  echo "gw: $$DEST 設置済み"; \
+	elif ln -sf "$$GW_SRC" "$$DEST" 2>/dev/null; then \
+	  echo "gw: $$DEST に設置しました（今のシェルからそのまま使えます）"; \
+	elif sudo -p "[sudo] gw を /usr/local/bin へ設置するため管理者パスワード（Ctrl-C でスキップ可）: " \
+	  sh -c "mkdir -p /usr/local/bin && ln -sf '$$GW_SRC' '$$DEST'" 2>/dev/null; then \
+	  echo "gw: $$DEST に設置しました（今のシェルからそのまま使えます）"; \
+	else \
+	  echo "gw: /usr/local/bin への設置はスキップ（新しいターミナルからは PATH 経由で使えます）"; \
+	fi
 	@GW="$$HOME/.local/bin/gw"; command -v gw >/dev/null 2>&1 && GW="$$(command -v gw)"; \
 	"$$GW" enable || echo "自動起動は未登録です（後から gw enable で登録できます）"
-	@command -v gw >/dev/null 2>&1 || \
-	echo "PATH は設定済み。今のシェルに反映するには: exec $$SHELL -l（新しいターミナルなら不要）"
 
 # 設定・キャッシュの置き場所（cli.py / provisioner.py と同じ XDG 規則で解決する）。
 CONFIG_DIR := $(if $(XDG_CONFIG_HOME),$(XDG_CONFIG_HOME),$(HOME)/.config)/local-llm-server
@@ -43,6 +55,13 @@ uninstall:
 	  rm -f "$$HOME/Library/LaunchAgents/com.local-llm-server.gw.plist"; \
 	  pkill -f "python[3]* -m local_llm_server" 2>/dev/null; \
 	fi; true
+	@# /usr/local/bin の gw（install が置いた symlink）を除去する。自分が置いたもの
+	@# （リンク先が ~/.local/bin/gw）だけを対象にし、無関係な同名バイナリには触れない。
+	-@DEST=/usr/local/bin/gw; \
+	if [ "$$(readlink "$$DEST" 2>/dev/null)" = "$$HOME/.local/bin/gw" ]; then \
+	  rm -f "$$DEST" 2>/dev/null || \
+	  sudo -p "[sudo] /usr/local/bin/gw を削除するため管理者パスワード: " rm -f "$$DEST"; \
+	fi
 	-uv tool uninstall local-llm-server
 	rm -rf "$(CONFIG_DIR)" "$(CACHE_DIR)" .local-llm-server
 	@echo "削除: $(CONFIG_DIR)（設定）"

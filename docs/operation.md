@@ -9,21 +9,28 @@
 ```bash
 git clone https://github.com/ToPo-ToPo-ToPo/local-llm-server
 cd local-llm-server
-make install                     # `gw` の導入・PATH 設定・自動起動の登録まで全部やる
-exec $SHELL -l                   # 初回のみ: 今のシェルに反映（新しいターミナルなら不要）
+make install                     # これだけ。導入・PATH 設定・自動起動の登録まで全部やる
 ```
 
-`make install` は `uv tool install --editable . --reinstall` を実行し、続けて
-**PATH 設定（`uv tool update-shell`。既に通っていれば何もしない）** と **`gw enable`
-（自動起動の登録）** まで行う（editable は確定なので畳んである。再実行で入れ直しにもなる）。
+`make install` は `uv tool install --editable . --reinstall` に続けて次を全部行う
+（editable は確定なので畳んである。再実行で入れ直しにもなる）:
+
+1. **`/usr/local/bin/gw` の設置（要・管理者パスワード 1 回）** — Ollama と同じく、最初から
+   PATH に入っている場所へ symlink を置く。これで **今のシェルからそのまま `gw` が使える**
+   （exec や新ターミナル不要）。パスワードを入れずスキップしても壊れない（下記 2 が受け皿）
+2. **PATH 設定（`uv tool update-shell`）** — `~/.local/bin` をシェル設定に追記
+   （既に通っていれば何もしない）。1 をスキップした場合は新しいターミナルから有効
+3. **`gw enable`（自動起動の登録）**
+
 **editable** なのでソースはこのクローンを指し、`gw update` / 自動更新の `git pull` がそのまま効く。
 
 ### 導入直後に `gw: command not found` になるとき
 
-実体（`~/.local/bin/gw`）は入っていて、**今のシェルに PATH がまだ反映されていない**だけ
+`/usr/local/bin` への設置をスキップした場合に、**今のシェルに PATH がまだ反映されていない**だけ
 （環境変数は起動済みのシェルへ外から注入できない——これはどのツールでも同じ）。
-`make install` が追記する先は zsh では **`~/.zshenv`**（`~/.zshrc` ではない）なので、
-`source ~/.zshrc` では反映されない。**`exec $SHELL -l`** か新しいターミナルで反映する。
+新しいターミナルを開くか **`exec $SHELL -l`** で反映する（追記先は zsh では `~/.zshenv` なので
+`source ~/.zshrc` では反映されない）。いつでも `make install` を再実行すれば
+`/usr/local/bin` への設置からやり直せる。
 
 > `~/.zshrc` に `. "$HOME/.local/bin/env"` がある環境では、そちら経由でも PATH が通る。これは
 > uv を**スタンドアロンインストーラ**で入れたときに作られる行で、Homebrew 版の uv では作られない
@@ -127,6 +134,7 @@ make uninstall   # gw disable → gw stop → uv tool uninstall → 設定・ロ
 | `~/.config/local-llm-server/` | `gateway.toml` |
 | `~/.cache/local-llm-server/` | ログ（`logs/`）と自動ダウンロードした `llama.cpp` バイナリ |
 | `~/Library/LaunchAgents/com.local-llm-server.gw.plist` ほか | 自動起動の登録（`gw disable` が削除。Linux は `~/.config/systemd/user/local-llm-server.service`） |
+| `/usr/local/bin/gw` | install が置いた symlink（リンク先が自分のときだけ削除。要・管理者パスワード） |
 
 ログもキャッシュも **cwd 非依存の固定パス**に書くので、どのディレクトリから `gw start` しても
 この 2 つの外には何も残らない。
