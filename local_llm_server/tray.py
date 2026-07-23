@@ -152,7 +152,9 @@ def run_app(host: str, port: int, fd: int | None) -> int:
         from Foundation import NSObject
         from PyObjCTools import AppHelper
     except ImportError:
-        print("tray: pyobjc が無いためアイコンは出しません", file=sys.stderr)
+        print("tray: pyobjc が無いためアイコンは出しません"
+              "（依存が古い導入のままです。クローンで `make install` を再実行してください）",
+              file=sys.stderr)
         return 0
 
     nsapp = AppKit.NSApplication.sharedApplication()
