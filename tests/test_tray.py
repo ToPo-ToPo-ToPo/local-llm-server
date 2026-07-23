@@ -27,6 +27,12 @@ def test_icon_is_static_with_no_periodic_work():
     assert "menuWillOpen_" in src
     assert "setTemplate_(True)" in src  # ライト/ダーク自動追従のテンプレート画像
     assert "status.button()" in src or ".button()" in src  # 現行 API（button 経由）を使う
+    # メニューは即座に開く: menuWillOpen で同期取得（ブロック）に戻したら落ちる。
+    # 取得は裏スレッド（_refresh_async）→ applyStatus: での差し替えだけが正。
+    assert "_refresh_async" in src and "applyStatus_" in src
+    import re
+    open_body = re.search(r"def menuWillOpen_.*?(?=\n        def )", src, re.S).group(0)
+    assert "gateway_admin_status" not in open_body  # 開く動作は取得を待たない
 
 
 def test_rows_show_url_and_loaded_models():
