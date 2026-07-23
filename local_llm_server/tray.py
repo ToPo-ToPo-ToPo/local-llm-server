@@ -109,6 +109,28 @@ def merge_update_info(info: dict, admin: dict | None) -> dict:
     return merged
 
 
+def update_menu_item(merged: dict, admin: dict | None) -> tuple[str, bool]:
+    """更新メニュー項目の (ラベル, クリック可能か) を決める（純粋関数・テスト可能）。
+
+    更新の有無はデーモンの定期チェックで分かっているので、状態で出し分ける:
+    - 新版あり           → ("今すぐ更新して再起動（vX）", True)   クリックで適用・再起動
+    - 最新（確認済み）    → ("最新です（vX）", False)             グレー・選べない
+    - 未確認/オフライン  → ("更新を確認", True)                  クリックで確認を促す
+
+    「最新」と断言するのは PyPI 版まで引けた（latest がある）ときだけ。まだ一度も
+    確認できていない・オフライン（latest が無い）のときは断言せず「更新を確認」を残す。
+    """
+    if merged.get("kind"):
+        latest = merged.get("latest")
+        return (f"今すぐ更新して再起動（v{latest}）" if latest
+                else "今すぐ更新して再起動", True)
+    upd = (admin or {}).get("update") or {}
+    if upd.get("latest") and not upd.get("available"):
+        cur = upd.get("current")
+        return (f"最新です（v{cur}）" if cur else "最新です", False)
+    return ("更新を確認", True)
+
+
 def _watch_pipe(fd: int, on_event) -> None:
     """トレイ専用パイプを読む: 行 = 更新通知、EOF = デーモンの死（アイコンごと消える）。"""
     buf = b""
@@ -307,17 +329,16 @@ def run_app(host: str, port: int, fd: int | None) -> int:
             for row in format_rows(admin, host, port):
                 _add_info(menu, row)
         menu.addItem_(AppKit.NSMenuItem.separatorItem())
-        # 更新項目は**常に**出す（いつでもアイコンから更新できる）。新版が検知済みなら
-        # 「今すぐ更新して再起動」、そうでなければ「更新を確認」——どちらも同じ
-        # /admin/update を叩き、デーモンが確認→（あれば）適用→再起動する。
+        # 更新項目は状態で出し分ける（update_menu_item）。新版あり／未確認はクリック可
+        # （updateNow: で確認→適用→再起動）、最新（確認済み）はグレーの情報行にして
+        # 選べないようにする——押しても「最新です」と言うだけの空クリックを無くす。
         if merged.get("kind"):
             button.setTitle_(_UPDATE_MARK)  # ここはメインスレッドなので直接更新してよい
-            latest = merged.get("latest")
-            label = (f"今すぐ更新して再起動（v{latest}）" if latest
-                     else "今すぐ更新して再起動")
+        label, clickable = update_menu_item(merged, admin)
+        if clickable:
             _add_action(menu, label, "updateNow:")
         else:
-            _add_action(menu, "更新を確認", "updateNow:")
+            _add_info(menu, label)  # 「最新です（vX）」＝グレー・非クリック
         _add_action(menu, "ログを開く", "openLog:")
         _add_action(menu, "ゲートウェイを停止", "stopGateway:")
 
