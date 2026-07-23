@@ -1,0 +1,270 @@
+"""メニューバー常駐アイコン（macOS 専用・デーモンの随伴プロセス）。
+
+Ollama がメニューバーのアイコンで「動いている」を伝えるのと同じく、ゲートウェイの
+稼働中だけメニューバーにアイコンを表示する。デーモン（_run_gateway_locked）が子プロセス
+として起動し、トレイ専用パイプ（--fd）を継承する——**アイコンの存在＝デーモンの生存**。
+デーモンがどんな死に方をしてもパイプ EOF で自分から消えるので、「死んでいるのに
+アイコンだけ残る」嘘をつかない。gateway.toml の `tray = false` で無効化できる。
+
+運用は Ollama と同じ「静的アイコン・定期処理なし」:
+  - アイコンは同梱のモノクロ図形（assets/tray-icon.png。テンプレート画像なので
+    メニューバーのライト/ダークに自動追従）。ロード数などのライブ表示はしない
+  - 状態（接続先 URL・ロード中モデル）は**メニューを開いた瞬間にだけ**取得する
+    （NSMenuDelegate の menuWillOpen: でその場で組み立てる。常駐中のポーリングは無い
+    ——CPU を使うのはパイプからイベントが届いたときだけ）
+  - できる操作は ログを開く / ゲートウェイを停止（gw stop 相当）の 2 つだけ。
+    「アイコンだけ隠す」は置かない——**アイコンの有無＝デーモンの生死**という対応を
+    例外なく保つ（隠せると「動いているのに出ていない」状態が生まれ、対応が崩れる）
+
+更新も Ollama と同じ体験（更新マーク → ワンクリックで閉じて更新して再起動）:
+  - デーモンの update watcher が新版を検知すると、専用パイプに `update-ready <ver>`
+    （取得済み・再起動待ち）/ `update-available <ver>`（未取得。auto_update=false や
+    dirty tree）を書く。トレイはそれを受けてアイコンの隣に「⬆」を出す
+    ——**プッシュ通知なのでここでもポーリングは増えない**
+  - メニューの「今すぐ更新して再起動」→ デーモンの POST /admin/update。デーモンが
+    （必要なら取得してから）自分を execv で新コードに置き換える。旧トレイはパイプ EOF で
+    消え、新デーモンが素のアイコンのトレイを出し直す——「一度閉じて更新して再起動」
+
+GUI は **pyobjc（AppKit）で直接**実装する。rumps は使わない——rumps 0.4 は 10.10 で
+非推奨になった `NSStatusItem.setTitle_/setImage_` に依存しており、最新 macOS
+（Darwin 25 系）ではステータスアイテムが一切表示されない（実測）。現行 API の
+`NSStatusItem.button()` を使う。macOS 以外・pyobjc 不在では何もせず終了する
+（デーモンは起動失敗を無視する——アイコンは飾りで、ゲートウェイの本体機能ではない）。
+"""
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import threading
+import urllib.request
+
+from .server import (
+    gateway_admin_status,
+    gateway_log_path,
+    read_gateway_runtime,
+    stop_pid,
+)
+
+# メニューバーのアイコン（静的。Ollama と同じく状態でチカチカさせない）。
+# テンプレート画像（黒＋透過）なので、ライト/ダークメニューバーに OS が自動で合わせる。
+_ICON_PATH = os.path.join(os.path.dirname(__file__), "assets", "tray-icon.png")
+# アイコンが読めないときの予備の題字と、更新検知時にアイコンの隣へ出す印。
+_FALLBACK_TITLE = "gw"
+_UPDATE_MARK = "⬆"
+
+# メニューを開いた瞬間の取得なので短めに切る（ハングした上流でメニューを固めない）。
+_STATUS_TIMEOUT_S = 1.0
+# 「今すぐ更新」は未取得なら git pull + 依存同期が走る（数十秒〜数分）ので長めに待つ。
+_UPDATE_TIMEOUT_S = 600.0
+
+
+def format_rows(admin: dict | None, host: str, port: int) -> list[str]:
+    """メニューの情報行（クリック不可の表示専用）を作る（純粋関数・テスト可能）。"""
+    rows = [f"http://{host}:{port}/v1"]
+    models = (admin or {}).get("models", [])
+    loaded = [m for m in models if m.get("loaded")]
+    if not loaded:
+        rows.append("モデル未ロード（初回リクエストでロード）")
+    for m in loaded:
+        busy = int(m.get("inflight", 0))
+        state = f"処理中 {busy}" if busy else "待機"
+        rows.append(f"{m.get('model', '?')} — {state}")
+    return rows
+
+
+def parse_update_event(line: str) -> tuple[str, str] | None:
+    """デーモンからの通知行を解釈する（純粋関数・テスト可能）。
+
+    `update-ready <ver>`（取得済み・再起動だけ）/ `update-available <ver>`（未取得）の
+    2 種だけを認識し、他は None（将来の行を黙って読み飛ばす前方互換）。
+    """
+    parts = line.strip().split()
+    if len(parts) == 2 and parts[0] in ("update-ready", "update-available"):
+        return parts[0], parts[1]
+    return None
+
+
+def merge_update_info(info: dict, admin: dict | None) -> dict:
+    """パイプ通知（info）と /admin/status の update 欄を統合する（純粋関数・テスト可能）。
+
+    どちらか一方しか届いていなくても更新マークを出せるようにする（通知はプッシュ、
+    admin はメニューを開いた瞬間の確認、の 2 経路）。fetched（取得済み）が最優先。
+    """
+    upd = (admin or {}).get("update") or {}
+    merged = dict(info)
+    if upd.get("fetched"):
+        merged["kind"] = "update-ready"
+        merged["latest"] = upd.get("latest") or merged.get("latest")
+    elif upd.get("available") and not merged.get("kind"):
+        merged["kind"] = "update-available"
+        merged["latest"] = upd.get("latest") or merged.get("latest")
+    return merged
+
+
+def _watch_pipe(fd: int, on_event) -> None:
+    """トレイ専用パイプを読む: 行 = 更新通知、EOF = デーモンの死（アイコンごと消える）。"""
+    buf = b""
+    while True:
+        try:
+            data = os.read(fd, 4096)
+        except InterruptedError:
+            continue
+        except OSError:
+            break
+        if not data:
+            break
+        buf += data
+        while b"\n" in buf:
+            raw, buf = buf.split(b"\n", 1)
+            event = parse_update_event(raw.decode("utf-8", errors="replace"))
+            if event is not None:
+                on_event(event)
+    os._exit(0)
+
+
+def _stop_gateway() -> None:
+    """ゲートウェイを停止する（gw stop 相当。自分もパイプ EOF で道連れに消える）。"""
+    rec = read_gateway_runtime()
+    pid = rec.get("pid") if rec else None
+    if isinstance(pid, int):
+        threading.Thread(target=stop_pid, args=(pid,), daemon=True).start()
+
+
+def _post_update_now(host: str, port: int) -> None:
+    """POST /admin/update（今すぐ更新して再起動）。完了すればデーモンごと生まれ変わる。"""
+    req = urllib.request.Request(
+        f"http://{host}:{port}/admin/update",
+        data=b"{}", headers={"Content-Type": "application/json"}, method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=_UPDATE_TIMEOUT_S) as resp:
+            print(f"tray: update requested -> {json.loads(resp.read() or b'{}')}",
+                  file=sys.stderr)
+    except OSError as exc:
+        print(f"tray: update request failed: {exc}", file=sys.stderr)
+
+
+def run_app(host: str, port: int, fd: int | None) -> int:
+    try:
+        import AppKit
+        from Foundation import NSObject
+        from PyObjCTools import AppHelper
+    except ImportError:
+        print("tray: pyobjc が無いためアイコンは出しません", file=sys.stderr)
+        return 0
+
+    nsapp = AppKit.NSApplication.sharedApplication()
+    # Dock にもアプリスイッチャーにも出さない、メニューバーだけの常駐（Ollama と同じ）。
+    nsapp.setActivationPolicy_(AppKit.NSApplicationActivationPolicyAccessory)
+
+    update_info: dict = {"kind": None, "latest": None}
+
+    # ステータスアイテム（現行 API: button() 経由で画像とタイトルを設定する）。
+    # NSStatusBar はアイテムを retain しない——この関数フレームが生きている限り
+    # ローカル変数が強参照になる（runEventLoop がここでブロックし続ける）。
+    status = AppKit.NSStatusBar.systemStatusBar().statusItemWithLength_(
+        AppKit.NSVariableStatusItemLength
+    )
+    button = status.button()
+    icon = (
+        AppKit.NSImage.alloc().initWithContentsOfFile_(_ICON_PATH)
+        if os.path.isfile(_ICON_PATH) else None
+    )
+    if icon is not None:
+        icon.setSize_((18, 18))
+        icon.setTemplate_(True)  # ライト/ダークメニューバーに OS が自動で合わせる
+        button.setImage_(icon)
+        button.setImagePosition_(AppKit.NSImageLeft)  # 更新マーク（title）を隣に出せる配置
+    else:  # アセット欠落でもアイコン無しにはしない（文字で出す）
+        button.setTitle_(_FALLBACK_TITLE)
+
+    class _TrayDelegate(NSObject):
+        """メニューの delegate 兼、メニュー項目のターゲット（ObjC セレクタの受け口）。"""
+
+        def menuWillOpen_(self, menu) -> None:  # noqa: N815 - ObjC セレクタ命名
+            _rebuild_menu(menu)
+
+        def openLog_(self, _sender) -> None:  # noqa: N815
+            subprocess.Popen(["open", gateway_log_path(port)])
+
+        def stopGateway_(self, _sender) -> None:  # noqa: N815
+            _stop_gateway()
+
+        def updateNow_(self, _sender) -> None:  # noqa: N815
+            threading.Thread(target=_post_update_now, args=(host, port),
+                             daemon=True).start()
+
+        def showUpdateMark_(self, _arg) -> None:  # noqa: N815
+            button.setTitle_(_UPDATE_MARK)  # アイコンの隣に ⬆ を添える
+
+    delegate = _TrayDelegate.alloc().init()
+
+    def _add_info(menu, text: str) -> None:
+        # action 無し＝自動で無効（グレー表示）。情報行として使う。
+        menu.addItem_(
+            AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(text, None, "")
+        )
+
+    def _add_action(menu, text: str, selector: str) -> None:
+        item = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            text, selector, ""
+        )
+        item.setTarget_(delegate)
+        menu.addItem_(item)
+
+    def _rebuild_menu(menu) -> None:
+        admin = gateway_admin_status(host, port, timeout=_STATUS_TIMEOUT_S)
+        merged = merge_update_info(update_info, admin)
+        update_info.update(merged)
+        menu.removeAllItems()
+        for row in format_rows(admin, host, port):
+            _add_info(menu, row)
+        menu.addItem_(AppKit.NSMenuItem.separatorItem())
+        if merged.get("kind"):
+            button.setTitle_(_UPDATE_MARK)  # menuWillOpen はメインスレッドなので直接更新してよい
+            latest = merged.get("latest")
+            label = (f"今すぐ更新して再起動（v{latest}）" if latest
+                     else "今すぐ更新して再起動")
+            _add_action(menu, label, "updateNow:")
+        _add_action(menu, "ログを開く", "openLog:")
+        _add_action(menu, "ゲートウェイを停止", "stopGateway:")
+
+    # メニューを開く瞬間に状態を取りに行く（Ollama 流: 常駐中の定期処理を持たない）。
+    menu = AppKit.NSMenu.alloc().init()
+    menu.setDelegate_(delegate)
+    _rebuild_menu(menu)  # 初期メニュー（delegate 不発時でも空メニューにはしない保険）
+    status.setMenu_(menu)
+
+    # パイプ読みスレッドからの更新マーク表示はメインスレッドへ橋渡しする（AppKit の掟）。
+    def _on_pipe_event(event: tuple[str, str]) -> None:
+        kind, latest = event
+        update_info["kind"], update_info["latest"] = kind, latest
+        delegate.performSelectorOnMainThread_withObject_waitUntilDone_(
+            "showUpdateMark:", None, False
+        )
+
+    if fd is not None:
+        threading.Thread(target=_watch_pipe, args=(fd, _on_pipe_event),
+                         daemon=True).start()
+
+    AppHelper.runEventLoop()
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    import argparse
+
+    p = argparse.ArgumentParser(prog="local_llm_server.tray", add_help=False)
+    p.add_argument("--host", default="127.0.0.1")
+    p.add_argument("--port", type=int, default=8799)
+    p.add_argument("--fd", type=int, default=None)
+    args = p.parse_args(sys.argv[1:] if argv is None else argv)
+    if sys.platform != "darwin":
+        return 0
+    return run_app(args.host, args.port, args.fd)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

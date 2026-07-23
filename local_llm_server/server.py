@@ -8,6 +8,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -1073,15 +1074,29 @@ class LocalServer:
             if self.config.backend == "mlx-vlm":
                 env.setdefault("MLX_VLM_THINKING_START_TOKEN", "<|channel>thought")
                 env.setdefault("MLX_VLM_THINKING_END_TOKEN", "<channel|>")
+            cmd = build_command(self.config)
+            extra: dict = {}
+            # 繋留が有効（デーモン内）なら、ワーカーを tether ラッパー越しに起動する。
+            # ラッパーはデーモンの死（パイプ EOF）を検知して自分のグループごと終了する
+            # ので、デーモンが kill -9 で死んでもモデルサーバーが孤児として残らない。
+            if _POSIX and _TETHER_READ_FD is not None:
+                cmd = [
+                    sys.executable, "-m", "local_llm_server.tether",
+                    "--fd", str(_TETHER_READ_FD), "--", *cmd,
+                ]
+                extra["pass_fds"] = (_TETHER_READ_FD,)
             self._proc = subprocess.Popen(
-                build_command(self.config),
+                cmd,
                 stdout=self._log_file,
                 stderr=subprocess.STDOUT,
                 env=env,
                 # 子を独立したプロセスグループにして、停止時に孫まで一括終了できるようにする
                 # （POSIX のみ。Windows では無視される）。stop() の killpg と対になる。
                 start_new_session=_POSIX,
+                **extra,
             )
+            # ワーカー台帳へ記録（デーモンごと死んだときの、次回起動時の孤児掃除の手掛かり）。
+            register_worker(self._proc.pid, self.config.port, self.config.model)
         except FileNotFoundError as exc:
             self._close_log()
             raise RuntimeError(
@@ -1145,6 +1160,7 @@ class LocalServer:
             pass
         self._proc = None
         self._close_log()
+        unregister_worker(proc.pid)  # 正常に停止できた分は台帳から消す
 
     def __enter__(self) -> "LocalServer":
         self.start()
@@ -1276,6 +1292,116 @@ def clear_gateway_runtime() -> None:
         os.remove(gateway_runtime_path())
     except OSError:
         pass
+
+
+# --- ワーカー台帳と孤児掃除（startup reconciliation） --------------------------
+def workers_state_path() -> str:
+    """起動中モデルサーバー（ワーカー）の PID 台帳のパス（cwd 非依存の固定パス）。
+
+    LocalServer が起動時に {pid, port, model} を記録し、正常停止時に消す。デーモンが
+    `kill -9` 等で死ぬと消されないまま残り、それが**次回起動時の孤児掃除
+    （reap_orphan_workers）の手掛かり**になる。ロック・ランタイム記録の隣に置く。
+    """
+    return os.path.join(tempfile.gettempdir(), "local-llm-server-workers.json")
+
+
+_WORKERS_FILE_LOCK = threading.Lock()  # 複数スレッドの同時ロード/退避から台帳を守る
+
+
+def _load_workers_unlocked() -> list[dict]:
+    """台帳を読む（無い・壊れているは空扱い。_WORKERS_FILE_LOCK 保持下で呼ぶ）。"""
+    try:
+        with open(workers_state_path(), encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return []
+    entries = data.get("workers") if isinstance(data, dict) else None
+    if not isinstance(entries, list):
+        return []
+    return [e for e in entries if isinstance(e, dict)]
+
+
+def _save_workers_unlocked(entries: list[dict]) -> None:
+    """台帳を書く（tmp → rename の原子的置換。best-effort・失敗しても稼働は妨げない）。"""
+    path = workers_state_path()
+    tmp = f"{path}.tmp-{os.getpid()}"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"workers": entries}, fh)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
+def register_worker(pid: int, port: int, model: str) -> None:
+    """起動したワーカーを台帳に記録する（LocalServer.start が呼ぶ）。"""
+    with _WORKERS_FILE_LOCK:
+        entries = [e for e in _load_workers_unlocked() if e.get("pid") != pid]
+        entries.append({"pid": pid, "port": port, "model": model})
+        _save_workers_unlocked(entries)
+
+
+def unregister_worker(pid: int) -> None:
+    """停止したワーカーを台帳から消す（LocalServer.stop が呼ぶ）。"""
+    with _WORKERS_FILE_LOCK:
+        _save_workers_unlocked(
+            [e for e in _load_workers_unlocked() if e.get("pid") != pid]
+        )
+
+
+def reap_orphan_workers() -> list[int]:
+    """前回のゲートウェイが残した孤児ワーカーを回収する（デーモン起動時に呼ぶ）。
+
+    crash-only 設計の要: **起動処理 = 復旧処理**。前回が `kill -9` やクラッシュで死ぬと
+    台帳が残るので、記録された PID のうち「まだ生きていて、かつこのパッケージ由来に見える
+    （pid_looks_like_ours）」ものだけをプロセスグループごと止める。無関係なプロセス
+    （PID 再利用等）には手を出さない。処理後は台帳を空にし、停止した PID の一覧を返す。
+    ポート単位の後追い回収（reclaim_stale_workers）はこれの backstop として残る。
+    """
+    with _WORKERS_FILE_LOCK:
+        entries = _load_workers_unlocked()
+        _save_workers_unlocked([])
+    victims = [
+        e["pid"] for e in entries
+        if isinstance(e.get("pid"), int) and pid_looks_like_ours(e["pid"])
+    ]
+    # stop_pid は 1 件あたり最長 ~10s 待つため並列に止める。
+    threads = [threading.Thread(target=stop_pid, args=(pid,)) for pid in victims]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return victims
+
+
+# --- 子プロセスの親への繋留（tether） -----------------------------------------
+# デーモンだけが書き込み端を握るパイプ。ワーカーは読み取り端を継承し、EOF（＝デーモンの
+# 死。kill -9 でも OS が確実に閉じる）を検知したら自分のグループごと終了する（tether.py）。
+_TETHER_READ_FD: int | None = None
+_TETHER_WRITE_FD: int | None = None
+
+
+def enable_child_tethering() -> None:
+    """以後の LocalServer.start が起動するワーカーをこのプロセスへ繋留する（POSIX のみ）。
+
+    デーモン（run_gateway）が起動時に 1 回呼ぶ。書き込み端はこのプロセスが生きている間
+    ずっと握り続ける——閉じることが「死の通知」なので、明示的な close はどこにも要らない
+    （プロセス終了時に OS が閉じる。os.pipe は CLOEXEC なので自動更新の execv でも閉じるが、
+    その時点でワーカーは全て停止済み）。Windows は対象外（0a の起動時掃除が受け皿）。
+    """
+    global _TETHER_READ_FD, _TETHER_WRITE_FD
+    if not _POSIX or _TETHER_READ_FD is not None:
+        return
+    _TETHER_READ_FD, _TETHER_WRITE_FD = os.pipe()
+
+
+def tether_read_fd() -> int | None:
+    """繋留パイプの読み取り端（未有効なら None）。ワーカー以外の随伴プロセス
+    （メニューバーアイコン等）も、この fd の EOF で「デーモンの死」を知る。"""
+    return _TETHER_READ_FD
 
 
 def _read_lock_pid(path: str) -> int | None:

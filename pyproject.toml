@@ -38,6 +38,9 @@ dependencies = [
     # ① STT の音声デコード（Apple Silicon）② 動画入力のフレーム抽出（全 OS。video.py）。
     # 動画入力は llama-cpp / mlx-vlm どちらでも効くので、全 OS に入れる。
     "imageio-ffmpeg>=0.4.9",
+    # メニューバー常駐アイコン（tray.py。Ollama 流の「動いていることが見える」）。macOS のみ。
+    # rumps は使わない——非推奨 API 依存で最新 macOS では表示されない。AppKit を直接使う。
+    "pyobjc-framework-Cocoa>=10 ; sys_platform == 'darwin'",
 ]
 
 # 高スループット生成バックエンド（明示 opt-in の extras）。torch+CUDA を含む重量級で、
@@ -77,6 +80,10 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["local_llm_server*"]
+
+# メニューバーアイコン（tray.py が読む同梱アセット）。
+[tool.setuptools.package-data]
+local_llm_server = ["assets/*.png"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

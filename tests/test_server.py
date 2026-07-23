@@ -802,6 +802,7 @@ def _capture_start_env(monkeypatch, tmp_path, backend, preset_env=None):
     captured = {}
 
     class _FakePopen:
+        pid = 4242  # start() がワーカー台帳へ記録するのに使う（台帳は conftest で隔離済み）
         def __init__(self, *a, **k):
             captured["env"] = k.get("env")
         def poll(self):
