@@ -9,7 +9,12 @@ import json
 import sys
 
 from local_llm_server import tray as tray_mod
-from local_llm_server.tray import format_rows, merge_update_info, parse_update_event
+from local_llm_server.tray import (
+    format_rows,
+    merge_update_info,
+    parse_update_event,
+    update_menu_item,
+)
 
 
 def test_icon_is_static_with_no_periodic_work():
@@ -128,6 +133,25 @@ def test_merge_update_info_prefers_fetched():
     assert m["kind"] == "update-ready"
     # どちらも無ければマークなし
     assert merge_update_info({"kind": None, "latest": None}, {"update": {}})["kind"] is None
+
+
+def test_update_menu_item_states():
+    """更新項目の出し分け: 新版あり=クリック可 / 最新=非クリック / 未確認=クリック可。"""
+    # 新版あり（パイプ通知）→ 「今すぐ更新して再起動（vX）」・クリック可
+    label, clickable = update_menu_item({"kind": "update-ready", "latest": "0.37.0"}, None)
+    assert clickable is True and "0.37.0" in label and "今すぐ更新" in label
+    # 最新（PyPI 版まで確認できて available=False）→ 「最新です（vX）」・**選べない**
+    label, clickable = update_menu_item(
+        {"kind": None}, {"update": {"available": False, "latest": "0.36.1",
+                                    "current": "0.36.1"}})
+    assert clickable is False and label == "最新です（v0.36.1）"
+    # 未確認/オフライン（latest を引けていない）→ 断言せず「更新を確認」・クリック可
+    label, clickable = update_menu_item({"kind": None}, {"update": {"available": False,
+                                                                    "latest": None}})
+    assert clickable is True and label == "更新を確認"
+    # admin 情報がまだ無い（初回オープン前）→ 「更新を確認」
+    label, clickable = update_menu_item({"kind": None}, None)
+    assert clickable is True and label == "更新を確認"
 
 
 def test_daemon_spawns_tray_before_provisioning():
