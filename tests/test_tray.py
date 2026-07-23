@@ -5,6 +5,7 @@ GUI（rumps）は起動しない——メニュー行の整形（純粋関数）
 """
 from __future__ import annotations
 
+import json
 import sys
 
 from local_llm_server import tray as tray_mod
@@ -33,6 +34,8 @@ def test_icon_is_static_with_no_periodic_work():
     import re
     open_body = re.search(r"def menuWillOpen_.*?(?=\n        def )", src, re.S).group(0)
     assert "gateway_admin_status" not in open_body  # 開く動作は取得を待たない
+    # いつでもアイコンから更新できる: 新版未検知でも「更新を確認」を常設する。
+    assert "更新を確認" in src
 
 
 def test_rows_show_url_and_loaded_models():
@@ -126,3 +129,61 @@ def test_tray_config_default_and_override(tmp_path):
     assert load_gateway_config(str(p)).tray is True
     p.write_text('host = "127.0.0.1"\nport = 8799\ntray = false\n', encoding="utf-8")
     assert load_gateway_config(str(p)).tray is False
+
+
+# --- アイコンからの更新（_post_update_now の結果ハンドリング） -----------------
+def _fake_resp(payload: dict):
+    import io
+
+    class _R(io.BytesIO):
+        def __enter__(self): return self
+        def __exit__(self, *a): self.close()
+    return _R(json.dumps(payload).encode())
+
+
+def test_update_now_notifies_up_to_date(monkeypatch):
+    """最新だったら通知で知らせる（メニューは閉じているため）。再起動はしない。"""
+    notes = []
+    monkeypatch.setattr(tray_mod, "_notify", lambda t, m: notes.append((t, m)))
+    monkeypatch.setattr(tray_mod.urllib.request, "urlopen",
+                        lambda req, timeout=0: _fake_resp(
+                            {"status": "up-to-date", "current": "0.35.1"}))
+    tray_mod._post_update_now("127.0.0.1", 8799)
+    assert notes and "最新" in notes[0][1] and "0.35.1" in notes[0][1]
+
+
+def test_update_now_notifies_restarting(monkeypatch):
+    notes = []
+    monkeypatch.setattr(tray_mod, "_notify", lambda t, m: notes.append((t, m)))
+    monkeypatch.setattr(tray_mod.urllib.request, "urlopen",
+                        lambda req, timeout=0: _fake_resp(
+                            {"status": "restarting", "latest": "0.36.0"}))
+    tray_mod._post_update_now("127.0.0.1", 8799)
+    assert notes and "0.36.0" in notes[0][1]
+
+
+def test_update_now_notifies_http_error(monkeypatch):
+    """409（dirty tree 等）はエラー本文を通知に載せる。"""
+    import io
+
+    notes = []
+    monkeypatch.setattr(tray_mod, "_notify", lambda t, m: notes.append((t, m)))
+
+    def _raise(req, timeout=0):
+        raise tray_mod.urllib.error.HTTPError(
+            "u", 409, "Conflict", {}, io.BytesIO(json.dumps(
+                {"error": "作業ツリーに未コミットの変更があります"}).encode()))
+    monkeypatch.setattr(tray_mod.urllib.request, "urlopen", _raise)
+    tray_mod._post_update_now("127.0.0.1", 8799)
+    assert notes and "未コミット" in notes[0][1]
+
+
+def test_update_now_notifies_connection_failure(monkeypatch):
+    notes = []
+    monkeypatch.setattr(tray_mod, "_notify", lambda t, m: notes.append((t, m)))
+
+    def _raise(req, timeout=0):
+        raise OSError("connection refused")
+    monkeypatch.setattr(tray_mod.urllib.request, "urlopen", _raise)
+    tray_mod._post_update_now("127.0.0.1", 8799)
+    assert notes and "接続" in notes[0][1]
