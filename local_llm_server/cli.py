@@ -16,6 +16,9 @@
   - `gw status`         … 稼働/停止・PID・URL・起動経過・累計リクエストを 1 行表示
   - `gw ps`             … ロード中モデルの状態（処理中数・在席・アイドル残り）を表示
   - `gw list`           … 使えるモデル（カタログ＋HF キャッシュ）を一覧
+  - `gw pull <model>`   … モデルを事前ダウンロード（進捗付き。GGUF は本体+mmproj のみ）
+  - `gw rm <model>`     … モデルを HF キャッシュから削除（確認あり・ロード中は拒否）
+  - `gw show <model>`   … モデルの素性（量子化・コンテキスト長・サイズ・MTP）を表示
   - `gw log [-f]`       … ゲートウェイログの末尾を表示（-f で追従）
   - `gw max <n|off>`    … max_resident を無停止で変更
   - `gw mtp [model]`    … MTP ドラフターの取得状況を確認（ダウンロードはしない）
@@ -35,11 +38,14 @@ import tomllib
 from .daemon import load_gateway_config
 from .server import (
     MTP_DRAFTERS,
+    _hf_hub_cache,
     discover_cached_models,
+    ensure_cached,
     find_pids_on_port,
     gateway_admin_status,
     gateway_log_path,
     gateway_set_max_resident,
+    infer_backend,
     install_shutdown_handlers,
     is_ready,
     local_connect_host,
@@ -47,6 +53,7 @@ from .server import (
     pid_looks_like_ours,
     primary_lan_ip,
     read_gateway_runtime,
+    resolve_gguf,
     start_gateway_background,
     stop_pid,
 )
@@ -640,6 +647,274 @@ def cmd_mtp(gcfg, args) -> int:
     return code
 
 
+# --- モデルファイル管理（pull / rm / show。Ollama の pull / rm / show 相当） ----
+def _split_model_spec(model: str) -> tuple[str, str]:
+    """`org/repo[:セレクタ]` を検証して (repo, selector) に分ける（resolve_gguf と同じ規約）。"""
+    spec = model.strip()
+    repo, _sep, selector = spec.partition(":")
+    if (repo.startswith(("/", "./", "../", "~"))
+            or repo.count("/") != 1 or not all(repo.split("/"))):
+        raise ValueError(
+            f"model は HF repo-id（org/repo[:セレクタ]）で指定してください: {model!r}"
+        )
+    return repo, selector
+
+
+def _model_cache_dir(repo: str) -> str:
+    """repo の HF キャッシュディレクトリ（models--org--name）。"""
+    org, name = repo.split("/", 1)
+    return os.path.join(_hf_hub_cache(), f"models--{org}--{name}")
+
+
+def _dir_size(path: str) -> int:
+    """ディレクトリの実消費バイト数。シンボリックリンクは辿らない（blob の二重計上を防ぐ）。"""
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for f in files:
+            p = os.path.join(root, f)
+            if not os.path.islink(p):
+                try:
+                    total += os.stat(p).st_size
+                except OSError:
+                    pass
+    return total
+
+
+def _human_size(nbytes: int) -> str:
+    size = float(nbytes)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024 or unit == "TB":
+            return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} B"
+        size /= 1024
+    return f"{size:.1f} TB"
+
+
+_GGUF_SHARD_RE = r"-\d{5}-of-\d{5}(?=\.gguf$)"
+
+
+def plan_gguf_pull(files: list[str], selector: str) -> list[str]:
+    """GGUF repo の取得対象ファイルを決める（純粋関数・テスト可能）。
+
+    GGUF repo は量子化ごとに別ファイルを持ち、全部落とすと数百 GB になり得るので
+    **本体 1 種 + mmproj（画像入力用）だけ**を選ぶ。resolve_gguf と同じ規約:
+    セレクタでファイル名を絞り、本体が複数種（シャード分割は 1 種と数える）なら
+    候補を並べて ValueError（`repo:<量子化名>` で絞ってもらう）。
+    """
+    import re
+
+    ggufs = [f for f in files if f.lower().endswith(".gguf")]
+    mmproj = [f for f in ggufs if "mmproj" in os.path.basename(f).lower()]
+    bodies = [
+        f for f in ggufs
+        if "mmproj" not in os.path.basename(f).lower()
+        and "mtp" not in os.path.basename(f).lower()
+    ]
+    if selector:
+        bodies = [f for f in bodies if selector.lower() in os.path.basename(f).lower()]
+    if not bodies:
+        hint = f"（セレクタ '{selector}' に一致なし）" if selector else ""
+        raise ValueError(f"取得対象の GGUF が見つかりません{hint}")
+    # シャード（-00001-of-00002）は同一本体として束ねる。
+    stems = sorted({re.sub(_GGUF_SHARD_RE, "", f) for f in bodies})
+    if len(stems) > 1:
+        names = [os.path.splitext(os.path.basename(s))[0] for s in stems]
+        raise ValueError(
+            "量子化が複数あります。'org/repo:<量子化名>' で 1 つに絞ってください: "
+            + ", ".join(names)
+        )
+    return sorted(bodies) + sorted(mmproj)
+
+
+def cmd_pull(gcfg, args) -> int:
+    """`gw pull`: モデルを事前ダウンロードする（進捗表示付き）。
+
+    本サーバーは「事前 DL 必須」ポリシー（ensure_cached / resolve_gguf）——これはその
+    正規の取得口。GGUF repo は本体 1 種 + mmproj だけを選んで落とす（全量子化を
+    巻き込まない）。mlx 系は repo 全体（重み + config + tokenizer）。進捗バーは
+    huggingface_hub（tqdm）がそのまま端末に出す。
+    """
+    try:
+        repo, selector = _split_model_spec(args.model)
+    except ValueError as exc:
+        print(exc, file=sys.stderr)
+        return 2
+    backend = infer_backend(args.model)
+    try:
+        from huggingface_hub import snapshot_download
+        if backend == "llama-cpp":
+            from huggingface_hub import HfApi
+            targets = plan_gguf_pull(HfApi().list_repo_files(repo), selector)
+            print(f"取得: {repo}  {len(targets)} ファイル "
+                  f"({', '.join(os.path.basename(t) for t in targets[:4])}"
+                  f"{' …' if len(targets) > 4 else ''})")
+            snapshot_download(repo, allow_patterns=targets)
+        else:
+            print(f"取得: {repo}（repo 全体）")
+            snapshot_download(repo)
+    except ValueError as exc:
+        print(exc, file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print("\n中断しました（続きから再開できます: 同じ gw pull をもう一度）",
+              file=sys.stderr)
+        return 130
+    except Exception as exc:  # noqa: BLE001 - ネットワーク・認証等はメッセージで案内
+        print(f"pull failed: {exc}", file=sys.stderr)
+        return 1
+    # 取得結果をサーバーと同じ基準で検証してから完了を名乗る。
+    try:
+        if backend == "llama-cpp":
+            resolve_gguf(args.model)
+        else:
+            ensure_cached(repo)
+    except ValueError as exc:
+        print(f"取得は終わりましたが検証で問題が見つかりました: {exc}", file=sys.stderr)
+        return 1
+    print(f"done: {args.model}（キャッシュ {_human_size(_dir_size(_model_cache_dir(repo)))}）")
+    if mtp_status(repo) == "available":
+        drafter = MTP_DRAFTERS.get(repo)
+        print(f"ヒント: MTP（~2倍速）に対応しています。`gw pull {drafter}` で有効化できます。")
+    return 0
+
+
+def cmd_rm(gcfg, args) -> int:
+    """`gw rm`: モデルを HF キャッシュから削除する（確認プロンプト付き）。
+
+    削除単位は repo（models--org--name ディレクトリ全体 = その repo の全ファイル）。
+    ロード中のモデルは拒否する（gw stop するかアンロードを待ってから）。自動では
+    決して走らない——ユーザーが名指しで明示的に消す道具（モデルキャッシュを勝手に
+    消さない方針はそのまま）。
+    """
+    try:
+        repo, _selector = _split_model_spec(args.model)
+    except ValueError as exc:
+        print(exc, file=sys.stderr)
+        return 2
+    cache = _model_cache_dir(repo)
+    if not os.path.isdir(cache):
+        print(f"'{repo}' はキャッシュにありません（何もしませんでした）")
+        return 1
+    # ロード中なら拒否（稼働中デーモンがあるときだけ確認できる。best-effort）。
+    rec = read_gateway_runtime()
+    if rec is not None:
+        admin = gateway_admin_status(rec.get("host", "127.0.0.1"),
+                                     int(rec.get("port", 8799)))
+        loaded = [
+            m["model"] for m in (admin or {}).get("models", [])
+            if m.get("loaded") and str(m.get("model", "")).split(":", 1)[0] == repo
+        ]
+        if loaded:
+            print(f"'{loaded[0]}' はロード中です。アンロードを待つか gw stop してから "
+                  "やり直してください。", file=sys.stderr)
+            return 1
+    size = _human_size(_dir_size(cache))
+    if not getattr(args, "yes", False):
+        print(f"削除: {repo}（{size}。この repo の全ファイル——量子化違い・mmproj も含む）")
+        try:
+            answer = input("よろしいですか? [y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            answer = ""
+        if answer not in ("y", "yes"):
+            print("中止しました")
+            return 1
+    import shutil
+    shutil.rmtree(cache)
+    print(f"deleted: {repo}（{size} 解放）")
+    return 0
+
+
+def _find_config_json(cache: str) -> dict | None:
+    """キャッシュのスナップショットから config.json を読む（無ければ None）。"""
+    snap_root = os.path.join(cache, "snapshots")
+    for root, _dirs, files in os.walk(snap_root):
+        if "config.json" in files:
+            try:
+                import json
+                with open(os.path.join(root, "config.json"), encoding="utf-8") as fh:
+                    return json.load(fh)
+            except (OSError, ValueError):
+                return None
+    return None
+
+
+def build_show_rows(model: str) -> list[tuple[str, str]]:
+    """`gw show` の表示行を組み立てる（描画なし・テスト可能）。"""
+    import re
+
+    repo, _selector = _split_model_spec(model)
+    backend = infer_backend(model)
+    rows: list[tuple[str, str]] = [("モデル", model), ("バックエンド", backend)]
+    m = re.search(r"(\d+(?:\.\d+)?)\s*[bB](?![a-zA-Z0-9])", repo.split("/", 1)[1])
+    if m:
+        rows.append(("パラメータ数", f"{m.group(1)}B（名前から推定）"))
+    cache = _model_cache_dir(repo)
+    if not os.path.isdir(os.path.join(cache, "snapshots")):
+        rows.append(("キャッシュ", f"未取得（gw pull {model} で取得）"))
+        return rows
+    rows.append(("ディスクサイズ", _human_size(_dir_size(cache))))
+    if backend == "llama-cpp":
+        try:
+            path = resolve_gguf(model)
+            name = os.path.basename(path)
+            rows.append(("GGUF", name))
+            q = re.search(r"(?i)\b(i?q\d[a-z0-9_]*|f16|bf16|f32)\b", name)
+            if q:
+                rows.append(("量子化", q.group(1)))
+            rows.append(("ファイルサイズ", _human_size(os.stat(os.path.realpath(path)).st_size)))
+            mmproj = any(
+                "mmproj" in f.lower()
+                for _r, _d, fs in os.walk(os.path.join(cache, "snapshots")) for f in fs
+            )
+            rows.append(("画像入力", "対応（mmproj あり）" if mmproj else "-"))
+        except ValueError as exc:
+            rows.append(("GGUF", str(exc)))
+    else:
+        cfg = _find_config_json(cache) or {}
+        if cfg.get("model_type"):
+            rows.append(("アーキテクチャ", str(cfg["model_type"])))
+        ctx = (cfg.get("max_position_embeddings")
+               or (cfg.get("text_config") or {}).get("max_position_embeddings"))
+        if ctx:
+            rows.append(("コンテキスト長", f"{int(ctx):,}"))
+        bits = (cfg.get("quantization") or {}).get("bits")
+        if bits:
+            rows.append(("量子化", f"{bits}bit（mlx）"))
+        if "vision_config" in cfg:
+            rows.append(("画像入力", "対応（vision モデル）"))
+    mtp = mtp_status(repo)
+    if mtp == "ready":
+        rows.append(("MTP", "対応（ドラフター取得済み・そのまま効く）"))
+    elif mtp == "available":
+        rows.append(("MTP", f"対応（未取得。gw pull {MTP_DRAFTERS.get(repo)} で有効化）"))
+    # 稼働中デーモンがあればロード状態も出す（best-effort）。
+    rec = read_gateway_runtime()
+    if rec is not None:
+        admin = gateway_admin_status(rec.get("host", "127.0.0.1"),
+                                     int(rec.get("port", 8799)))
+        live = [
+            m for m in (admin or {}).get("models", [])
+            if str(m.get("model", "")).split(":", 1)[0] == repo
+        ]
+        if live and live[0].get("loaded"):
+            rows.append(("状態", f"ロード中（処理中 {int(live[0].get('inflight', 0))}）"))
+        else:
+            rows.append(("状態", "未ロード（初回リクエストでロード）"))
+    return rows
+
+
+def cmd_show(gcfg, args) -> int:
+    """`gw show`: モデルの素性（量子化・コンテキスト長・サイズ・MTP 等）を表示する。"""
+    try:
+        rows = build_show_rows(args.model)
+    except ValueError as exc:
+        print(exc, file=sys.stderr)
+        return 2
+    width = max(len(label) for label, _v in rows)
+    for label, value in rows:
+        print(f"  {label.ljust(width)}  {value}")
+    return 0
+
+
 def cmd_update(gcfg, args) -> int:
     """PyPI 新版があれば git pull で追従し、稼働中デーモンを再起動する（手動トリガ）。
 
@@ -703,6 +978,13 @@ def build_parser() -> argparse.ArgumentParser:
     mx.add_argument("value", help="常駐上限（1 以上の整数、または off で無制限）")
     mtp = sub.add_parser("mtp", help="MTP ドラフターの取得状況を確認する")
     mtp.add_argument("model", nargs="?", help="調べるモデル ID（省略で対応表を全件）")
+    pull = sub.add_parser("pull", help="モデルを事前ダウンロードする（進捗表示付き）")
+    pull.add_argument("model", help="HF repo-id（org/repo[:量子化名]。GGUF は本体+mmprojのみ取得）")
+    rm = sub.add_parser("rm", help="モデルを HF キャッシュから削除する（確認あり）")
+    rm.add_argument("model", help="HF repo-id（org/repo。repo の全ファイルが対象）")
+    rm.add_argument("-y", "--yes", action="store_true", help="確認プロンプトを省略する")
+    show = sub.add_parser("show", help="モデルの素性（量子化・コンテキスト長・サイズ等）を表示する")
+    show.add_argument("model", help="HF repo-id（org/repo[:量子化名]）")
     sub.add_parser("update", help="PyPI 新版があれば git pull で追従して再起動する")
     sub.add_parser("help", help="このコマンド一覧を表示する")
     return p
@@ -713,6 +995,7 @@ _COMMANDS = {
     "serve": cmd_serve, "enable": cmd_enable, "disable": cmd_disable,
     "status": cmd_status, "ps": cmd_ps, "list": cmd_list, "log": cmd_log,
     "max": cmd_max, "mtp": cmd_mtp, "update": cmd_update, "help": cmd_help,
+    "pull": cmd_pull, "rm": cmd_rm, "show": cmd_show,
 }
 
 
@@ -771,8 +1054,10 @@ def main(argv: list[str] | None = None) -> int:
     # （起動の入口は `gw start` の 1 つだけにする）。
     if args.cmd in (None, "help"):
         return cmd_help(None, args)
-    if args.cmd == "mtp":
-        return cmd_mtp(None, args)
+    # モデルファイル管理は設定に依存しない（HF キャッシュ直接 + 稼働中デーモンは
+    # ランタイム記録から best-effort で参照）。
+    if args.cmd in ("mtp", "pull", "rm", "show"):
+        return _COMMANDS[args.cmd](None, args)
 
     gcfg, code = _resolve_gcfg(args.cmd)
     if gcfg is None:
