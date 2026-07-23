@@ -82,6 +82,17 @@ def test_merge_update_info_prefers_fetched():
     assert merge_update_info({"kind": None, "latest": None}, {"update": {}})["kind"] is None
 
 
+def test_daemon_spawns_tray_before_provisioning():
+    """アイコンはデーモン起動の最初に出す——llama.cpp 等の自動導入（初回は数分）を
+    待たせない。spawn を導入処理の後ろへ動かしたらこのテストが落ちる。"""
+    import inspect
+
+    from local_llm_server import daemon as daemon_mod
+
+    src = inspect.getsource(daemon_mod._run_gateway_locked)
+    assert src.index("_maybe_spawn_tray") < src.index("provision_llama_if_needed")
+
+
 def test_daemon_spawns_tray_only_when_enabled(monkeypatch):
     """spawn 条件: macOS かつ tray=true。false なら起動しない。"""
     import types

@@ -2341,6 +2341,23 @@ def _run_gateway_locked(cfg: GatewayConfig, config_path: str | None = None) -> i
     `config_path` が渡されれば、gateway.toml を保存した瞬間に設定を無停止で反映する
     ホットリロード監視スレッドを起動する（→ apply_live_config）。
     """
+    # メニューバーアイコン（macOS・tray=true）は**最初に**出す——この後の自動導入
+    # （llama.cpp 等のダウンロード。初回は数十秒〜数分）を待たせない。アイコンは
+    # 「デーモンが生きている」の表示であり、準備完了の表示ではない（メニューは
+    # ゲートウェイが応答するまで「状態を取得中…」を出す）。専用パイプの EOF で消える
+    # 「アイコンの存在＝デーモンの生存」はそのまま。書き込み端（tray_fd）は
+    # update watcher が更新通知を流すのに使う。
+    tray_proc, tray_fd = _maybe_spawn_tray(cfg)
+
+    def _tray_notify(line: str) -> None:
+        """トレイへ 1 行通知する（トレイ無し・死亡済みは黙って無視）。"""
+        if tray_fd is None:
+            return
+        try:
+            os.write(tray_fd, (line + "\n").encode("utf-8"))
+        except OSError:
+            pass
+
     provision_llama_if_needed(cfg)
     provision_vllm_if_needed(cfg)
     provision_sglang_if_needed(cfg)
@@ -2429,20 +2446,6 @@ def _run_gateway_locked(cfg: GatewayConfig, config_path: str | None = None) -> i
     # ランタイム記録: 稼働中ゲートウェイの接続先を固定パスに残す。gateway.toml の無い
     # ディレクトリからでも `gw status` / `gw stop` がこの 1 ファイルで唯一のデーモンを見つける。
     write_gateway_runtime(cfg.host, cfg.port, server.pid, server.start_cwd, server.started_at)
-
-    # メニューバーアイコン（macOS・tray=true）。専用パイプの EOF で消える
-    # 「アイコンの存在＝デーモンの生存」——kill -9 でもアイコンだけ残ることはない。
-    # 書き込み端（tray_fd）は update watcher が更新通知を流すのに使う。
-    tray_proc, tray_fd = _maybe_spawn_tray(cfg)
-
-    def _tray_notify(line: str) -> None:
-        """トレイへ 1 行通知する（トレイ無し・死亡済みは黙って無視）。"""
-        if tray_fd is None:
-            return
-        try:
-            os.write(tray_fd, (line + "\n").encode("utf-8"))
-        except OSError:
-            pass
 
     # 掃除スレッド: ①クラッシュした内部ワーカーの健全性チェック（常時）②idle TTL 超過モデルの
     # アンロード ③在席ハートビート途絶の掃除。健全性チェックは常に走らせる（死んだワーカーへ

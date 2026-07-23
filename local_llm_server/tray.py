@@ -227,7 +227,11 @@ def run_app(host: str, port: int, fd: int | None) -> int:
             try:
                 admin = gateway_admin_status(host, port, timeout=_STATUS_TIMEOUT_S)
                 fetch_state["admin"] = admin
-                fetch_state["fetched_once"] = True
+                # 成功した取得だけを「一度取得できた」と数える。デーモン起動直後は
+                # トレイが先に出ていてゲートウェイはまだ準備中（自動導入など）のことが
+                # あり、失敗を既成事実にすると「未ロード」と嘘の断言をしてしまう。
+                if admin is not None:
+                    fetch_state["fetched_once"] = True
             finally:
                 fetch_state["inflight"] = False
             delegate.performSelectorOnMainThread_withObject_waitUntilDone_(
