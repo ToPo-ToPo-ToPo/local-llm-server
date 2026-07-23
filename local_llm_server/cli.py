@@ -10,6 +10,9 @@
   - `gw start`          … デーモンを裏で常駐起動（既に居れば何もしない）
   - `gw stop`           … このパッケージ由来のゲートウェイ/モデルサーバーを停止
   - `gw restart`        … stop → start
+  - `gw serve`          … フォアグラウンドで実行（サービスの実行口。Ollama の serve 相当）
+  - `gw enable`         … ログイン時自動起動＋異常終了時自動復活を OS に登録
+  - `gw disable`        … 自動起動を解除して手動運用（gw start）に戻す
   - `gw status`         … 稼働/停止・PID・URL・起動経過・累計リクエストを 1 行表示
   - `gw ps`             … ロード中モデルの状態（処理中数・在席・アイドル残り）を表示
   - `gw list`           … 使えるモデル（カタログ＋HF キャッシュ）を一覧
@@ -37,6 +40,7 @@ from .server import (
     gateway_admin_status,
     gateway_log_path,
     gateway_set_max_resident,
+    install_shutdown_handlers,
     is_ready,
     local_connect_host,
     mtp_status,
@@ -465,6 +469,95 @@ def cmd_restart(gcfg, args) -> int:
     return cmd_start(gcfg, args)
 
 
+def cmd_serve(gcfg, args) -> int:
+    """`gw serve`: ゲートウェイをフォアグラウンドで実行する（Ollama の `ollama serve` 相当）。
+
+    通常運用は `gw start`（裏で常駐）。これは自動起動サービス（gw enable）が使う実行口で、
+    端末で直接回してデバッグしたいときにも使える。単一起動は従来どおり GatewayLock が保証。
+
+    `--managed` はサービスマネージャ（launchd / systemd）から起動されたことを示す内部
+    フラグ。「既に別のゲートウェイが稼働中」（終了コード 3）を成功（0）として静かに退く——
+    手動 `gw start` のデーモンが居るとき、KeepAlive/Restart が失敗と誤認して再起動ループに
+    入らないため。
+    """
+    from .daemon import run_gateway
+
+    cwd = _start_cwd(gcfg)
+    config_path = os.path.join(cwd, "gateway.toml")
+    try:
+        # デーモンの規約に合わせる: 設定は常に「cwd の ./gateway.toml」（__main__ と同じ視点）。
+        os.chdir(cwd)
+    except OSError as exc:
+        print(f"serve failed: {exc}", file=sys.stderr)
+        return 1
+    install_shutdown_handlers()
+    rc = run_gateway(gcfg, config_path=config_path)
+    if rc == 3 and getattr(args, "managed", False):
+        print("gateway already running; managed serve exits successfully.", file=sys.stderr)
+        return 0
+    return rc
+
+
+def cmd_enable(gcfg, args) -> int:
+    """`gw enable`: ログイン時自動起動＋異常終了時自動復活を OS に登録する。
+
+    「ユーザー専管」の原則はそのまま——世話をユーザーの手動操作から **OS** へ委任する
+    （エージェントや corp がライフサイクルに触らないルールは不変）。手動起動のデーモンが
+    居れば止めてから切り替え、管理者を OS の 1 者に固定する（二重管理にしない）。
+    """
+    from . import service
+
+    if service.service_kind() is None:
+        print(
+            "この OS では自動起動の登録に未対応です（Windows は従来どおり手動 `gw start`）。",
+            file=sys.stderr,
+        )
+        return 1
+    host, port, all_ports = _endpoint(gcfg)
+    pids = _collect_gateway_pids(host, port, all_ports)
+    if pids:
+        print(f"稼働中のゲートウェイ（pid {pids}）を停止し、以後はサービス管理へ切り替えます…")
+        _stop_pids(pids)
+    try:
+        service.enable()
+    except RuntimeError as exc:
+        print(f"enable failed: {exc}", file=sys.stderr)
+        return 1
+    kind = "launchd" if service.service_kind() == "launchd" else "systemd --user"
+    print(f"自動起動を登録しました（{kind}）。ログイン時に自動起動し、異常終了時は自動復活します。")
+    print("解除は gw disable（以後は手動 gw start）。停止だけなら従来どおり gw stop。")
+    # サービスが立ち上がるのを軽く待って現況を見せる（初回はモデル導入等で遅いことも
+    # あるので best-effort。間に合わなくても裏で起動は進む）。
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        if is_ready(f"http://{host}:{port}/v1"):
+            break
+        time.sleep(0.5)
+    admin = gateway_admin_status(host, port)
+    ready = admin is not None or is_ready(f"http://{host}:{port}/v1")
+    print(render_status(gcfg, admin, ready))
+    return 0
+
+
+def cmd_disable(gcfg, args) -> int:
+    """`gw disable`: 自動起動を解除して手動運用（gw start / gw stop）へ完全に戻す。"""
+    from . import service
+
+    if service.service_kind() is None:
+        print("この OS に自動起動の登録はありません（何もしませんでした）。")
+        return 0
+    try:
+        removed = service.disable()
+    except RuntimeError as exc:
+        print(f"disable failed: {exc}", file=sys.stderr)
+        return 1
+    if removed:
+        print("自動起動を解除しました。ゲートウェイは停止し、以後は手動 `gw start` で運用します。")
+    else:
+        print("自動起動は登録されていません（手動運用のままです）。")
+    return 0
+
+
 def cmd_status(gcfg, args) -> int:
     host, port, _ = _endpoint(gcfg)
     admin = gateway_admin_status(host, port)
@@ -593,6 +686,13 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("start", help="デーモンを裏で常駐起動する")
     sub.add_parser("stop", help="ゲートウェイとモデルサーバーを停止する")
     sub.add_parser("restart", help="stop してから start する")
+    serve = sub.add_parser("serve", help="フォアグラウンドで実行する（自動起動サービスの実行口）")
+    serve.add_argument(
+        "--managed", action="store_true",
+        help=argparse.SUPPRESS,  # サービスマネージャ専用の内部フラグ（既稼働を成功として退く）
+    )
+    sub.add_parser("enable", help="ログイン時自動起動＋異常終了時自動復活を OS に登録する")
+    sub.add_parser("disable", help="自動起動を解除して手動運用（gw start）に戻す")
     sub.add_parser("status", help="稼働状態を 1 行で表示する")
     sub.add_parser("ps", help="ロード中モデルの状態を表示する")
     sub.add_parser("list", help="使えるモデル一覧を表示する")
@@ -610,6 +710,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 _COMMANDS = {
     "start": cmd_start, "stop": cmd_stop, "restart": cmd_restart,
+    "serve": cmd_serve, "enable": cmd_enable, "disable": cmd_disable,
     "status": cmd_status, "ps": cmd_ps, "list": cmd_list, "log": cmd_log,
     "max": cmd_max, "mtp": cmd_mtp, "update": cmd_update, "help": cmd_help,
 }
@@ -632,7 +733,9 @@ def _resolve_gcfg(cmd: str | None):
             print(f"Failed to load {path}: {exc}", file=sys.stderr)
             return None, 2
 
-    if cmd in ("start", "restart"):  # launch 系: 設定を用意して読む（無ければ自動生成）
+    # launch 系: 設定を用意して読む（無ければ自動生成）。serve はデーモンそのもの、
+    # enable/disable はサービス登録（serve が読む設定を先に確定させる）なので同類。
+    if cmd in ("start", "restart", "serve", "enable", "disable"):
         try:
             return _load(ensure_user_config())
         except OSError as exc:

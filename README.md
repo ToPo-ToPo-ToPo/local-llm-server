@@ -12,10 +12,13 @@
 ```bash
 git clone https://github.com/ToPo-ToPo-ToPo/local-llm-server
 cd local-llm-server
-make install            # `gw` を PATH に導入（~/.local/bin/gw）
+make install            # `gw` を PATH に導入し、自動起動を登録（~/.local/bin/gw）
 uv tool update-shell    # 初回のみ。~/.local/bin を PATH に追記する
 exec $SHELL -l          # 今のシェルに反映（または新しいターミナルを開く）
 ```
+
+導入後は Ollama と同じく**サーバーを意識しなくてよい**——ログイン時に自動起動し、異常終了時は
+自動復活する（`gw disable` で従来の手動 `gw start` 運用に戻せる → [docs/operation.md](docs/operation.md)）。
 
 `make install` が「`~/.local/bin` is not on your PATH」と警告するのは、`uv tool install` が
 シェル設定を変更しないため。`uv tool update-shell` がその追記を行う（zsh なら `~/.zshrc` では
@@ -26,10 +29,10 @@ exec $SHELL -l          # 今のシェルに反映（または新しいターミ
 ## 使い方
 
 ```bash
-gw start      # 裏で常駐起動（初回は設定を自動生成）
-gw status     # 稼働/停止・PID・URL・起動経過を表示
+gw status     # 稼働/停止・PID・URL・起動経過を表示（自動起動済みなら常に稼働）
 gw list       # 使えるモデル一覧（カタログ＋HF キャッシュ）
-gw stop       # 停止
+gw stop       # 停止（再開は gw start か次回ログイン）
+gw start      # 手動起動（初回は設定を自動生成。自動起動を無効にした場合の入口）
 ```
 
 設定は **`~/.config/local-llm-server/gateway.toml` の 1 箇所**（初回の `gw start` が自動生成。

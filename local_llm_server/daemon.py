@@ -29,6 +29,7 @@ from __future__ import annotations
 import hmac
 import json
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -49,12 +50,15 @@ from .server import (
     clear_gateway_runtime,
     daemon_log_path,
     discover_cached_models,
+    enable_child_tethering,
     estimate_model_bytes,
     ignore_shutdown_signals,
     infer_backend,
     llama_provision_info,
+    local_connect_host,
     parallel_supported,
     primary_lan_ip,
+    reap_orphan_workers,
     reclaim_stale_workers,
     resolve_drafter,
     set_llama_server_binary,
@@ -1217,6 +1221,9 @@ class _GatewayHandler(BaseHTTPRequestHandler):
                 "models": models,
                 # キャッシュにある DL 済みモデル（TUI が未ロード候補として一覧する）。
                 "available": discover_cached_models(),
+                # 新版の検知状態（update watcher が更新。トレイの更新マーク・gw status 用）。
+                # fetched=true はソース追従済みで再起動待ちだけが残っている状態。
+                "update": dict(getattr(srv, "update_state", None) or {}),
             }
             send_json(self, 200, data)
             return
@@ -1269,6 +1276,13 @@ class _GatewayHandler(BaseHTTPRequestHandler):
                 send_json(self, 200, {"object": "gateway.drain",
                                       "draining": False, "ok": True})
             return
+        # 「今すぐ更新して再起動」（トレイの更新メニュー / Ollama の Restart to update 相当）。
+        # ローカルの管理操作なので loopback 限定。
+        if path.endswith("/admin/update"):
+            if not self._require_loopback():
+                return
+            self._handle_update_now(srv)
+            return
         if path.endswith("/admin/sessions/register"):
             self._handle_session_register(srv, payload)
             return
@@ -1310,6 +1324,48 @@ class _GatewayHandler(BaseHTTPRequestHandler):
         if path.endswith(("/chat/completions", "/completions")):
             body = self._maybe_inject_repetition(srv, model, payload, body)
         self._acquire_and_forward(srv, model, body)
+
+    def _handle_update_now(self, srv) -> None:
+        """POST /admin/update: 新版を適用して再起動する（Ollama の「再起動して更新」相当）。
+
+        自動更新が既にソースを追従済み（update_state.fetched）なら再起動だけを要求する。
+        未取得なら、その場で check → apply（git pull + 依存同期。数十秒かかることがある）
+        してから再起動を要求する。drain（アイドル待ち）は**しない**——ユーザーが明示的に
+        「今すぐ」を選んだ操作なので、処理中のリクエストより更新を優先する。
+        応答を返し切ってから再起動する（応答が途中で切れないよう少しだけ遅らせる）。
+        """
+        request_restart = getattr(srv, "request_restart", None)
+        if request_restart is None:
+            send_error(self, 503, "restart is not available (gateway not fully started)")
+            return
+        state = getattr(srv, "update_state", None)
+        if not (state and state.get("fetched")):
+            from . import update
+            try:
+                st = update.check(timeout=5.0)
+            except Exception as exc:  # noqa: BLE001 - ネットワーク不調は 502 で返す
+                send_error(self, 502, f"update check failed: {exc}")
+                return
+            if not st.available:
+                send_json(self, 200, {"object": "gateway.update", "status": "up-to-date",
+                                      "current": st.current, "latest": st.latest})
+                return
+            if not st.can_apply:
+                send_error(self, 409,
+                           f"update available but cannot auto-apply: {st.reason}")
+                return
+            try:
+                ok, msg = update.apply_update()
+            except Exception as exc:  # noqa: BLE001
+                ok, msg = False, str(exc)
+            if not ok:
+                send_error(self, 500, f"update failed: {msg}")
+                return
+            if state is not None:
+                state.update({"fetched": True, "latest": st.latest})
+        send_json(self, 200, {"object": "gateway.update", "status": "restarting",
+                              "latest": (state or {}).get("latest")})
+        threading.Timer(0.5, request_restart).start()
 
     def _maybe_inject_repetition(self, srv, model, payload: dict, body: bytes) -> bytes:
         """mlx / mlx-vlm 宛のリクエストに repetition_penalty（+任意で context_size）を付与する。
@@ -1516,6 +1572,7 @@ class GatewayConfig:
     internal_base_port: int = 9001     # 内部サーバーの割当開始ポート（動的モデルもこの続きから割り当て）
     api_key: str | None = None         # ネットワーク公開時の API キー（None/空 で認証なし）。chat と在席セッションに要求
     auto_update: bool = True           # 常駐デーモンが PyPI 新版を検知したら git pull で自動追従する（既定 true。false で無効）
+    tray: bool = True                  # 稼働中メニューバーにアイコンを出す（macOS のみ。false で非表示 → tray.py）
     vision_model: str | None = None    # 画像入りリクエストの振り分け先モデル（None で無効）。画像が壊れている
                                        # vision モデルを避け、画像だけを確実に動くモデル（gemma-4 系等）へ流す
     # --- llama.cpp（llama-server）バイナリの自動導入。[llama_cpp] テーブルで設定 ---
@@ -1670,6 +1727,7 @@ def load_gateway_config(path: str) -> GatewayConfig:
             session_ttl = None
     # TUI が PyPI 新版を検知したら git pull で自動追従するか（既定 true。false で無効）。
     auto_update = bool(data.get("auto_update", True))
+    tray = bool(data.get("tray", True))
     # 未登録モデルを ID 推論で動的ロードするか（既定 true）。false なら事前登録のみ（旧挙動）。
     dynamic = bool(data.get("dynamic", True))
     # 動的ロード時の既定 disable_thinking（事前登録の [[models]] は各自の値が優先）。
@@ -1794,6 +1852,7 @@ def load_gateway_config(path: str) -> GatewayConfig:
         internal_base_port=internal_base,
         api_key=api_key,
         auto_update=auto_update,
+        tray=tray,
         vision_model=vision_model,
         llama_accel=llama_accel,
         llama_build=llama_build,
@@ -2007,8 +2066,12 @@ def _update_watcher(
     manager: "ModelManager",
     stop: threading.Event,
     restart_requested: threading.Event,
+    *,
+    auto_apply: bool = True,
+    state: dict | None = None,
+    notify=None,
 ) -> None:
-    """PyPI 新版を検知し、作業ツリーがクリーンなら git pull で追従する常駐スレッド。
+    """PyPI 新版を検知し、（auto_apply なら）作業ツリーがクリーンな時 git pull で追従する常駐スレッド。
 
     旧 TUI が担っていた自動更新（clone 運用で PyPI 新版を git で追従）をデーモン本体へ移したもの。
     安全側の 2 段構え —— ①**取得は稼働中に先に済ませる**（`git pull`＋`uv sync`。プロセスには
@@ -2018,11 +2081,28 @@ def _update_watcher(
     空いた瞬間に再起動する。ネットワーク I/O・git は失敗しても握りつぶす（稼働は妨げない）。
 
     未検知のあいだは 1 時間おき、取得済みで再起動待ちのあいだは 30 秒おきに drain を再試行する。
+
+    **チェック自体は auto_apply=false でも行う**（適用はしない）——Ollama と同じく
+    「更新がある」ことをトレイの更新マークで見せるため。検知状態は `state`
+    （server.update_state。/admin/status に載る）へ書き、`notify`（トレイへの通知線）に
+    `update-available <ver>` / `update-ready <ver>` を 1 版につき 1 回だけ流す。
     """
     from . import update
 
     fetched = False  # ソースは新版へ追従済みで、あとは drain が通れば再起動するだけ
+    notified: str | None = None  # この版は通知済み（毎時間チカチカ再通知しない）
     first = True
+
+    def _tell(kind: str, latest: str) -> None:
+        nonlocal notified
+        if notify is None or notified == f"{kind}:{latest}":
+            return
+        notified = f"{kind}:{latest}"
+        try:
+            notify(f"{kind} {latest}")
+        except Exception:  # noqa: BLE001 - 通知はおまけ（トレイ不在等で失敗しても続行）
+            pass
+
     while not stop.wait(
         _UPDATE_WARMUP_INTERVAL if first
         else (_UPDATE_DRAIN_POLL_INTERVAL if fetched else _UPDATE_CHECK_INTERVAL)
@@ -2033,8 +2113,18 @@ def _update_watcher(
                 st = update.check(timeout=3.0)
             except Exception:  # noqa: BLE001 - 監視スレッドは落とさない
                 continue
-            if not (st.available and st.can_apply):
-                continue  # オフライン・dirty（開発中 PC の WIP を守る）・not-a-clone・最新
+            if state is not None:
+                state.update({
+                    "available": bool(st.available), "current": st.current,
+                    "latest": st.latest, "reason": st.reason,
+                })
+            if not st.available:
+                continue  # オフライン・最新
+            if not (auto_apply and st.can_apply):
+                # 自動適用しない（auto_update=false）／できない（dirty で WIP を守る等）。
+                # 更新マークだけ出して、適用はユーザーの「今すぐ更新」（/admin/update）に任せる。
+                _tell("update-available", st.latest)
+                continue
             # 取得は稼働中に先に済ませる（プロセスには触れない。ここでは再起動しない）。
             try:
                 ok, msg = update.apply_update()
@@ -2045,6 +2135,9 @@ def _update_watcher(
                 print(f"Auto-update: not applied ({msg}).", file=sys.stderr)
                 continue
             fetched = True
+            if state is not None:
+                state["fetched"] = True
+            _tell("update-ready", st.latest)
             print(
                 f"Auto-update: fetched ({msg}); will restart on new code when idle.",
                 file=sys.stderr,
@@ -2079,6 +2172,21 @@ def run_gateway(cfg: GatewayConfig, config_path: str | None = None) -> int:
     except GatewayAlreadyRunning as exc:
         print(f"Refusing to start: {exc}", file=sys.stderr)
         return 3
+    # 起動時の孤児掃除（crash-only: 起動処理 = 復旧処理）。前回のゲートウェイが kill -9 や
+    # クラッシュで死んでいた場合、ワーカー台帳に残る「生きていて自分由来の」プロセスだけを
+    # ここで回収する。ロック取得後なので、稼働中ゲートウェイの現役ワーカーを誤射しない。
+    try:
+        orphans = reap_orphan_workers()
+    except Exception:  # noqa: BLE001 - 掃除失敗（psutil 不在等）で起動を止めない
+        orphans = []
+    if orphans:
+        print(
+            f"Startup reconciliation: reclaimed {len(orphans)} orphaned worker(s) "
+            f"{orphans} left behind by a previous gateway.",
+            file=sys.stderr,
+        )
+    # 以後に起動するワーカーをこのプロセスへ繋留する（デーモンが死ねばワーカーも死ぬ）。
+    enable_child_tethering()
     try:
         rc = _run_gateway_locked(cfg, config_path)
     finally:
@@ -2178,6 +2286,47 @@ def provision_sglang_if_needed(cfg: GatewayConfig) -> None:
     print(f"SGLang ready: {py}", file=sys.stderr)
 
 
+def _maybe_spawn_tray(cfg: GatewayConfig) -> tuple[subprocess.Popen | None, int | None]:
+    """メニューバーアイコン（tray.py）を随伴プロセスとして起動する（macOS・tray=true のみ）。
+
+    デーモンと同じプロセスグループに置く（`gw stop` の killpg で一緒に止まる）うえ、
+    トレイ**専用の**パイプを渡す——EOF（デーモンの死。kill -9 でも OS が閉じる）で
+    アイコンが自分から消えるのはワーカーの繋留と同じで、加えてこのパイプは
+    **更新通知の下り線**を兼ねる（update watcher が `update-ready <ver>` 等を書くと
+    トレイが更新マークを出す）。ワーカーの繋留パイプと分けるのは、パイプは放送ではなく
+    早い者勝ちの読み取りなので、通知がワーカー側ラッパーに食われないため。
+    起動失敗（rumps 不在等）は無視する——アイコンは飾りで、ゲートウェイの本体機能ではない。
+    戻り値は (プロセス, 書き込み端 fd)。起動しなかったときは (None, None)。
+    """
+    if sys.platform != "darwin" or not cfg.tray:
+        return None, None
+    try:
+        rfd, wfd = os.pipe()
+    except OSError:
+        return None, None
+    cmd = [
+        sys.executable, "-m", "local_llm_server.tray",
+        "--host", local_connect_host(cfg.host), "--port", str(cfg.port),
+        "--fd", str(rfd),
+    ]
+    try:
+        proc = subprocess.Popen(
+            cmd, stdin=subprocess.DEVNULL, pass_fds=(rfd,),  # stdout/err はデーモンのログへ
+        )
+    except OSError as exc:
+        print(f"tray icon not started (continuing without it): {exc}", file=sys.stderr)
+        os.close(rfd)
+        os.close(wfd)
+        return None, None
+    finally:
+        # 読み取り端は子（トレイ）だけが持つ。親が持ち続けると EOF が永遠に来ない。
+        try:
+            os.close(rfd)
+        except OSError:
+            pass
+    return proc, wfd
+
+
 def _run_gateway_locked(cfg: GatewayConfig, config_path: str | None = None) -> int:
     """単一起動ロック取得済みで実際にゲートウェイを回す本体（run_gateway が呼ぶ）。
 
@@ -2273,6 +2422,20 @@ def _run_gateway_locked(cfg: GatewayConfig, config_path: str | None = None) -> i
     # ディレクトリからでも `gw status` / `gw stop` がこの 1 ファイルで唯一のデーモンを見つける。
     write_gateway_runtime(cfg.host, cfg.port, server.pid, server.start_cwd, server.started_at)
 
+    # メニューバーアイコン（macOS・tray=true）。専用パイプの EOF で消える
+    # 「アイコンの存在＝デーモンの生存」——kill -9 でもアイコンだけ残ることはない。
+    # 書き込み端（tray_fd）は update watcher が更新通知を流すのに使う。
+    tray_proc, tray_fd = _maybe_spawn_tray(cfg)
+
+    def _tray_notify(line: str) -> None:
+        """トレイへ 1 行通知する（トレイ無し・死亡済みは黙って無視）。"""
+        if tray_fd is None:
+            return
+        try:
+            os.write(tray_fd, (line + "\n").encode("utf-8"))
+        except OSError:
+            pass
+
     # 掃除スレッド: ①クラッシュした内部ワーカーの健全性チェック（常時）②idle TTL 超過モデルの
     # アンロード ③在席ハートビート途絶の掃除。健全性チェックは常に走らせる（死んだワーカーへ
     # 流し続けて 502 を返す事態を防ぐ）。チェック間隔は有効な閾値と健全性チェック周期の短い方。
@@ -2322,14 +2485,21 @@ def _run_gateway_locked(cfg: GatewayConfig, config_path: str | None = None) -> i
     # 瞬間に git pull で追従する。適用できたら restart_requested を立てて下のメインループを
     # 抜け、finally でクリーン停止 → run_gateway が execv で新コードに置き換える。
     # TUI 廃止に伴い、旧 TUI が担っていた「PyPI 新版を git で追従」をデーモン本体へ移した。
-    # gateway.toml の auto_update=false で無効化できる（手動なら `gw update`）。
+    # gateway.toml の auto_update=false で**適用**は無効化できるが、**チェックは常に行う**
+    # ——Ollama と同じく、更新があることをトレイの更新マークで見せるため（適用はユーザーの
+    # 「今すぐ更新」= /admin/update か `gw update` に任せる）。
     restart_requested = threading.Event()
-    if cfg.auto_update:
-        threading.Thread(
-            target=_update_watcher,
-            args=(manager, stop_reaper, restart_requested),
-            daemon=True,
-        ).start()
+    # 検知状態と再起動要求を HTTP ハンドラ（/admin/status・/admin/update）から使えるようにする。
+    server.update_state = {"available": False, "current": None, "latest": None,
+                           "fetched": False, "reason": None}
+    server.request_restart = restart_requested.set
+    threading.Thread(
+        target=_update_watcher,
+        args=(manager, stop_reaper, restart_requested),
+        kwargs={"auto_apply": cfg.auto_update, "state": server.update_state,
+                "notify": _tray_notify},
+        daemon=True,
+    ).start()
 
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -2348,6 +2518,9 @@ def _run_gateway_locked(cfg: GatewayConfig, config_path: str | None = None) -> i
         server.shutdown()
         server.server_close()
         manager.shutdown()
+        # メニューバーアイコンを畳む（パイプ EOF でも消えるが、明示終了の方が即時）。
+        if tray_proc is not None and tray_proc.poll() is None:
+            tray_proc.terminate()
         # 正常停止のときだけランタイム記録を消す。自動更新の再起動（execv）では消さない
         # ——同じ pid/port で立ち直す新イメージが上書きするので、その隙に `gw status` が
         # 「ゲートウェイ無し」と誤認しないため。

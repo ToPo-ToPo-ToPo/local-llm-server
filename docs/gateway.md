@@ -21,6 +21,8 @@ draft_model = "off"         # MTP（speculative decoding）の既定。省略時
 dynamic = true              # 未登録モデルを ID 推論で動的ロード（省略時 true。false で事前登録のみ）
 disable_thinking = false    # 動的ロード時の既定（思考抑制）。事前登録は各 [[models]] が優先
 auto_update = true          # 常駐デーモンが PyPI 新版を検知して git pull で自動追従（省略時 true。→ 下記「自動更新」）
+                            # false でも新版チェックは行い、メニューバーの更新マークで知らせる（適用だけ止まる）
+tray = true                 # 稼働中メニューバーに「gw」アイコンを表示（macOS のみ。省略時 true。false で非表示）
 
 # [[models]] は任意（dynamic = true なら省略可）。mlx-vlm の MTP と画像入力は動的ロードでも自動で
 # 効くので、それ目的の事前登録は不要。parallel・llama.cpp の MTP・llama-server への個別フラグ等、
