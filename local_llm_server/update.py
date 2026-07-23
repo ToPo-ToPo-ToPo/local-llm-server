@@ -95,6 +95,75 @@ def repo_root() -> Path | None:
     return None
 
 
+def _find_uv() -> str | None:
+    """uv 実行ファイルを探す（PATH → 標準の導入先の順。無ければ None）。
+
+    launchd / systemd 配下のデーモンは PATH が最小（/usr/bin:/bin 等）で、`uv` が
+    PATH に居ないことがある。その環境でも自動更新の依存同期が黙って失敗しないよう、
+    標準の導入先を直接当たる。
+    """
+    import os
+    import shutil
+
+    found = shutil.which("uv")
+    if found:
+        return found
+    for cand in (
+        os.path.expanduser("~/.local/bin/uv"),   # スタンドアロンインストーラ既定
+        "/opt/homebrew/bin/uv",                   # Homebrew（Apple Silicon）
+        "/usr/local/bin/uv",                      # Homebrew（Intel）等
+    ):
+        if os.access(cand, os.X_OK):
+            return cand
+    return None
+
+
+def tool_env_root() -> Path | None:
+    """uv tool の隔離 venv（`uv tool install` 導入）から動いていれば、その venv ルート。
+
+    `make install` の標準導入では gw は `~/.local/share/uv/tools/local-llm-server/` の
+    venv で動く。この venv の依存は `uv sync`（プロジェクト venv 用）では更新されず、
+    `uv tool install --reinstall` でしか入れ直せない——自動更新が依存の追加を
+    取りこぼさないための判定に使う。`uv run gw`（プロジェクト venv）なら None。
+    """
+    exe = Path(sys.executable).resolve()
+    for parent in exe.parents:
+        if parent.name == _PKG and parent.parent.name == "tools" \
+                and parent.parent.parent.name == "uv":
+            return parent
+    return None
+
+
+def refresh_tool_env(root: Path | None, timeout: float = 600.0) -> tuple[bool, str]:
+    """gw が動いている uv tool venv の依存を、更新後の pyproject に合わせて入れ直す。
+
+    editable 導入はコード変更こそ即反映されるが、**依存の追加は再インストールしないと
+    入らない**（例: メニューバーアイコンの pyobjc 追加が旧環境では欠けて、トレイが
+    静かに機能を落とした）。tool venv で動いていないとき（`uv run gw`）は何もしない
+    ——そちらは `uv sync` / 次回 `uv run` が同期する。
+
+    呼ぶタイミングは**再起動の直前**（モデルサーバー停止後）。venv を入れ直した後に
+    古いプロセスが新規 import をする時間を最小にするため。
+    """
+    if tool_env_root() is None:
+        return True, "tool venv ではない（uv sync が受け持つ）"
+    if root is None:
+        return False, "git クローン運用ではない"
+    uv = _find_uv()
+    if uv is None:
+        return False, "uv が見つからない（PATH と ~/.local/bin を確認）"
+    try:
+        res = subprocess.run(
+            [uv, "tool", "install", "--editable", str(root), "--reinstall", "--quiet"],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, f"uv tool install を実行できませんでした: {exc}"
+    if res.returncode != 0:
+        return False, (res.stderr or res.stdout).strip()[:200] or "uv tool install 失敗"
+    return True, "tool venv の依存を入れ直しました"
+
+
 def _git(root: Path, *args: str, timeout: float = 30.0) -> subprocess.CompletedProcess:
     return subprocess.run(
         ["git", "-C", str(root), *args],
@@ -229,14 +298,18 @@ def apply_update(root: Path | None = None, timeout: float = 120.0) -> tuple[bool
         return False, f"git pull を実行できませんでした: {exc}"
     if pull.returncode != 0:
         return False, f"git pull 失敗: {(pull.stderr or pull.stdout).strip()[:200]}"
-    # 依存が変わっている可能性があるので uv sync を試みる（無ければ次回 `uv run gw` が同期する）。
-    try:
-        subprocess.run(
-            ["uv", "sync", "--quiet"], cwd=str(root),
-            capture_output=True, text=True, timeout=timeout,
-        )
-    except (OSError, subprocess.SubprocessError):
-        pass  # uv 不在等。致命ではない（再起動側の uv run が拾う）
+    # 依存が変わっている可能性があるので uv sync を試みる（プロジェクト venv 用。
+    # tool venv の依存入れ直しは refresh_tool_env が再起動直前に行う）。uv は launchd
+    # 配下だと PATH に居ないことがあるので _find_uv で標準の導入先まで探す。
+    uv = _find_uv()
+    if uv is not None:
+        try:
+            subprocess.run(
+                [uv, "sync", "--quiet"], cwd=str(root),
+                capture_output=True, text=True, timeout=timeout,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass  # 致命ではない（再起動側の uv run が拾う）
     return True, (pull.stdout or "").strip()[:200] or "更新しました"
 
 

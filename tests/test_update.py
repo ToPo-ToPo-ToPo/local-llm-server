@@ -139,9 +139,11 @@ def test_apply_update_runs_pull_and_sync(monkeypatch, tmp_path):
     monkeypatch.setattr(update.subprocess, "run", fake_run)
     ok, msg = update.apply_update(root=tmp_path)
     assert ok is True
-    # git pull --ff-only が呼ばれ、続いて uv sync が試行される。
+    # git pull --ff-only が呼ばれ、続いて uv sync が試行される（uv は絶対パス解決あり）。
     assert ("git", ("pull", "--ff-only")) in calls
-    assert any(c[0] == "run" and c[1][:2] == ("uv", "sync") for c in calls)
+    assert any(
+        c[0] == "run" and c[1][0].endswith("uv") and c[1][1] == "sync" for c in calls
+    )
 
 
 def test_apply_update_reports_pull_failure(monkeypatch, tmp_path):
@@ -161,3 +163,61 @@ def test_apply_update_no_repo(monkeypatch):
     monkeypatch.setattr(update, "repo_root", lambda: None)
     ok, msg = update.apply_update()
     assert ok is False and "git" in msg
+
+
+# --- tool venv の依存入れ直し（refresh_tool_env） -----------------------------
+# make install（uv tool install --editable）導入では、コードは git pull で即反映される
+# 一方、依存の追加は tool venv に入らない。自動更新がこれを取りこぼすと
+# 「コードだけ新しく依存が古い」静かな機能欠けになる（実例: pyobjc 不在でトレイ不表示）。
+def test_tool_env_root_detects_uv_tools_python(monkeypatch):
+    monkeypatch.setattr(
+        update.sys, "executable",
+        "/Users/x/.local/share/uv/tools/local-llm-server/bin/python3",
+    )
+    root = update.tool_env_root()
+    assert root is not None and root.name == "local-llm-server"
+
+
+def test_tool_env_root_none_for_project_venv(monkeypatch):
+    monkeypatch.setattr(
+        update.sys, "executable",
+        "/Users/x/my_program/local-llm-server/.venv/bin/python3",
+    )
+    assert update.tool_env_root() is None
+
+
+def test_refresh_tool_env_runs_reinstall(monkeypatch, tmp_path):
+    """tool venv 稼働時は uv tool install --editable <root> --reinstall を実行する。"""
+    calls = []
+
+    class _R:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr(
+        update, "tool_env_root", lambda: update.Path("/x/uv/tools/local-llm-server"))
+    monkeypatch.setattr(update, "_find_uv", lambda: "/opt/homebrew/bin/uv")
+    monkeypatch.setattr(update.subprocess, "run",
+                        lambda cmd, **kw: calls.append(tuple(cmd)) or _R())
+    ok, _msg = update.refresh_tool_env(tmp_path)
+    assert ok is True
+    assert calls and calls[0][:3] == ("/opt/homebrew/bin/uv", "tool", "install")
+    assert "--reinstall" in calls[0] and "--editable" in calls[0]
+
+
+def test_refresh_tool_env_noop_outside_tool_venv(monkeypatch, tmp_path):
+    """uv run（プロジェクト venv）稼働時は何もしない（uv sync が受け持つ）。"""
+    monkeypatch.setattr(update, "tool_env_root", lambda: None)
+    monkeypatch.setattr(update.subprocess, "run",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not run")))
+    ok, msg = update.refresh_tool_env(tmp_path)
+    assert ok is True and "uv sync" in msg
+
+
+def test_refresh_tool_env_reports_missing_uv(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        update, "tool_env_root", lambda: update.Path("/x/uv/tools/local-llm-server"))
+    monkeypatch.setattr(update, "_find_uv", lambda: None)
+    ok, msg = update.refresh_tool_env(tmp_path)
+    assert ok is False and "uv" in msg

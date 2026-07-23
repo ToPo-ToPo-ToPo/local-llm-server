@@ -2196,6 +2196,14 @@ def run_gateway(cfg: GatewayConfig, config_path: str | None = None) -> int:
     # 衝突する。必ず lock.release() を通してから exec する）。exec は戻らない。
     if rc == _RESTART_CODE:
         from . import update
+        # 依存の入れ直しは再起動の直前（全ワーカー停止済み・自分は exec 目前）に行う——
+        # tool venv（make install 導入）は uv sync では更新されず、これを怠るとコードだけ
+        # 新しく依存が古い「静かな機能欠け」になる（例: pyobjc 不在でトレイが出ない）。
+        ok, msg = update.refresh_tool_env(update.repo_root())
+        print(f"Auto-update: dependencies — {msg}", file=sys.stderr)
+        if not ok:
+            print("Auto-update: 依存の入れ直しに失敗しました。挙動がおかしい場合は "
+                  "`make install` を実行してください。", file=sys.stderr)
         update.reexec_daemon()
     return rc
 

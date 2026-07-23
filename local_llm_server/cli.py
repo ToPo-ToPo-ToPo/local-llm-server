@@ -936,6 +936,12 @@ def cmd_update(gcfg, args) -> int:
         print(f"update failed: {msg}", file=sys.stderr)
         return 1
     print(f"updated: {msg}")
+    # tool venv（make install 導入）の依存も新しい pyproject に合わせて入れ直す
+    # （editable はコードのみ即反映で、依存の追加はこれをしないと欠ける）。
+    ok, msg = update.refresh_tool_env(update.repo_root())
+    if not ok:
+        print(f"依存の入れ直しに失敗しました（{msg}）。`make install` を実行してください。",
+              file=sys.stderr)
     # 稼働中なら新コードで再起動（stop → start）。
     host, port, all_ports = _endpoint(gcfg)
     if is_ready(f"http://{host}:{port}/v1"):
