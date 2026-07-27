@@ -140,9 +140,11 @@ def test_apply_update_runs_pull_and_sync(monkeypatch, tmp_path):
     ok, msg = update.apply_update(root=tmp_path)
     assert ok is True
     # git pull --ff-only が呼ばれ、続いて uv sync が試行される（uv は絶対パス解決あり）。
+    # Windows では which("uv") が uv.exe を返すため、拡張子を除いた名前で判定する。
     assert ("git", ("pull", "--ff-only")) in calls
     assert any(
-        c[0] == "run" and c[1][0].endswith("uv") and c[1][1] == "sync" for c in calls
+        c[0] == "run" and Path(c[1][0]).stem == "uv" and c[1][1] == "sync"
+        for c in calls
     )
 
 
