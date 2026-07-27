@@ -1457,9 +1457,17 @@ def test_apply_live_config_api_key_not_logged(tmp_path):
 
 
 def _resave(path, text, mtime):
-    """内容を書き換え、mtime を明示的に進める（ファイルシステムの mtime 粒度に依存しない）。"""
-    with open(path, "w", encoding="utf-8") as fh:
+    """内容を書き換え、mtime を明示的に進める（ファイルシステムの mtime 粒度に依存しない）。
+
+    書き込みは一時ファイル + os.replace で**原子的**に行う。`open(path, "w")` は開いた瞬間に
+    ファイルを切り詰めるので、監視スレッドが空ファイルを読む窓ができる。空文字列は妥当な TOML
+    として通ってしまい、全設定が既定値に戻って「旧値のまま」の検証が落ちる（実測で macOS の
+    CI が間欠的に失敗した）。実際のエディタの保存も rename 方式なので、こちらが実態に近い。
+    """
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
         fh.write(text)
+    os.replace(tmp, path)
     os.utime(path, (mtime, mtime))
 
 
