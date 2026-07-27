@@ -327,3 +327,53 @@ def test_start_migrates_config_before_launch(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "start_gateway_background", lambda *a, **k: 4242)
     assert cli.main(["start"]) == 0
     assert "vision_model" not in p.read_text(encoding="utf-8")
+
+
+# --- gw update: 取ってくるものが無くても、古いプロセスなら再起動する ------------
+def test_update_restarts_when_daemon_runs_stale_code(tmp_path, monkeypatch, capsys):
+    # editable 運用の穴: pull 済みでソースは最新だが、デーモンは古いコードを保持したまま。
+    from local_llm_server import update as upd
+    _use_cfg(tmp_path, monkeypatch)
+    monkeypatch.setattr(cli, "read_gateway_runtime", lambda: None)
+    monkeypatch.setattr(
+        upd, "check",
+        lambda *a, **k: upd.UpdateStatus("0.37.1", "0.37.1", False, True, "ok", True))
+    monkeypatch.setattr(cli, "gateway_admin_status", lambda h, p, **k: {
+        "update": {"restart_required": True, "running": "0.37.0"}})
+    stopped, started = [], []
+    monkeypatch.setattr(cli, "_collect_gateway_pids", lambda *a, **k: [4242])
+    monkeypatch.setattr(cli, "_stop_pids", lambda pids, **k: stopped.extend(pids))
+    monkeypatch.setattr(cli, "cmd_start", lambda gcfg, args: started.append(True) or 0)
+    assert cli.main(["update"]) == 0
+    assert stopped == [4242] and started == [True]     # 止めて start し直した
+    out = capsys.readouterr().out
+    assert "0.37.0" in out and "restarting" in out     # 理由を説明している
+
+
+def test_update_says_up_to_date_when_daemon_is_current(tmp_path, monkeypatch, capsys):
+    from local_llm_server import update as upd
+    _use_cfg(tmp_path, monkeypatch)
+    monkeypatch.setattr(cli, "read_gateway_runtime", lambda: None)
+    monkeypatch.setattr(
+        upd, "check",
+        lambda *a, **k: upd.UpdateStatus("0.37.1", "0.37.1", False, True, "ok", False))
+    monkeypatch.setattr(cli, "gateway_admin_status", lambda h, p, **k: {
+        "update": {"restart_required": False, "running": "0.37.1"}})
+    called = []
+    monkeypatch.setattr(cli, "_stop_pids", lambda pids, **k: called.append(pids))
+    assert cli.main(["update"]) == 0
+    assert called == []                                # 余計な再起動をしない
+    assert "already up to date" in capsys.readouterr().out
+
+
+def test_update_handles_stopped_gateway(tmp_path, monkeypatch, capsys):
+    # デーモンが止まっていれば admin/status は None。再起動もせず素直に「最新」と言う。
+    from local_llm_server import update as upd
+    _use_cfg(tmp_path, monkeypatch)
+    monkeypatch.setattr(cli, "read_gateway_runtime", lambda: None)
+    monkeypatch.setattr(
+        upd, "check",
+        lambda *a, **k: upd.UpdateStatus("0.37.1", "0.37.1", False, True, "ok", False))
+    monkeypatch.setattr(cli, "gateway_admin_status", lambda h, p, **k: None)
+    assert cli.main(["update"]) == 0
+    assert "already up to date" in capsys.readouterr().out

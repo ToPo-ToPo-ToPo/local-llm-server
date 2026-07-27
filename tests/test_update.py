@@ -223,3 +223,63 @@ def test_refresh_tool_env_reports_missing_uv(monkeypatch, tmp_path):
     monkeypatch.setattr(update, "_find_uv", lambda: None)
     ok, msg = update.refresh_tool_env(tmp_path)
     assert ok is False and "uv" in msg
+
+
+# --- 走っているコードが古いことの検知（editable 運用の穴） --------------------
+# `git pull` するとディスク上のソース版だけが上がり、稼働中プロセスは古いコードを保持したまま
+# になる。ところが更新判定はソース版を見るので「もう最新」と結論し、誰も再起動を促さなかった。
+# mark_running_source() が「このプロセスが読み込んだ版」を基準点として記録し、その差を見る。
+
+def test_running_source_version_is_none_before_marking(monkeypatch):
+    monkeypatch.setattr(update, "_RUNNING_SOURCE_VERSION", None)
+    assert update.running_source_version() is None
+
+
+def test_mark_running_source_records_the_source_version(monkeypatch, tmp_path):
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "x"\nversion = "1.2.3"\n', encoding="utf-8")
+    monkeypatch.setattr(update, "_RUNNING_SOURCE_VERSION", None)
+    assert update.mark_running_source(tmp_path) == "1.2.3"
+    assert update.running_source_version() == "1.2.3"
+
+
+def _stub_check(monkeypatch, tmp_path, source_version, latest):
+    """pyproject が source_version、PyPI が latest の状況を作る。"""
+    (tmp_path / "pyproject.toml").write_text(
+        f'[project]\nname = "x"\nversion = "{source_version}"\n', encoding="utf-8")
+    monkeypatch.setattr(update, "repo_root", lambda: tmp_path)
+    monkeypatch.setattr(update, "latest_pypi_version", lambda timeout=3.0: latest)
+    monkeypatch.setattr(update, "_on_default_branch", lambda root: True)
+    monkeypatch.setattr(update, "_tracks_upstream", lambda root: True)
+    monkeypatch.setattr(update, "_working_tree_clean", lambda root: True)
+
+
+def test_check_flags_restart_required_when_process_is_stale(monkeypatch, tmp_path):
+    # pull 済み（ソース 0.37.1）だが、プロセスは 0.37.0 を読み込んだまま。
+    _stub_check(monkeypatch, tmp_path, "0.37.1", "0.37.1")
+    monkeypatch.setattr(update, "_RUNNING_SOURCE_VERSION", "0.37.0")
+    st = update.check()
+    assert st.available is False          # 取ってくるものは無い
+    assert st.restart_required is True    # でも再起動は要る
+    assert st.current == "0.37.1"
+
+
+def test_check_no_restart_required_when_process_is_current(monkeypatch, tmp_path):
+    _stub_check(monkeypatch, tmp_path, "0.37.1", "0.37.1")
+    monkeypatch.setattr(update, "_RUNNING_SOURCE_VERSION", "0.37.1")
+    assert update.check().restart_required is False
+
+
+def test_check_no_restart_required_when_unmarked(monkeypatch, tmp_path):
+    # CLI のような短命プロセスは記録していない → 誤検知しない。
+    _stub_check(monkeypatch, tmp_path, "0.37.1", "0.37.1")
+    monkeypatch.setattr(update, "_RUNNING_SOURCE_VERSION", None)
+    assert update.check().restart_required is False
+
+
+def test_check_reports_restart_required_even_when_offline(monkeypatch, tmp_path):
+    # PyPI に届かなくても、プロセスが古いことはローカルだけで分かる。
+    _stub_check(monkeypatch, tmp_path, "0.37.1", None)
+    monkeypatch.setattr(update, "_RUNNING_SOURCE_VERSION", "0.37.0")
+    st = update.check()
+    assert st.reason == "offline" and st.restart_required is True
