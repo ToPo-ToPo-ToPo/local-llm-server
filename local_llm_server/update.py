@@ -197,6 +197,30 @@ def _source_version(root: Path) -> str | None:
     return v if isinstance(v, str) and v else None
 
 
+# この Python プロセスが**実際に読み込んだ**コードの版。デーモン起動時に mark_running_source()
+# が 1 回だけ記録し、以後 `git pull` で pyproject が書き換わっても動かない。
+# ソース版（＝ディスク上の次に動くコードの版）と食い違ったら「プロセスが古い」＝要再起動。
+_RUNNING_SOURCE_VERSION: str | None = None
+
+
+def mark_running_source(root: Path | None = None) -> str | None:
+    """いま読み込まれているコードの版を記録する（デーモン起動時に 1 回だけ呼ぶ）。
+
+    editable インストールでは、`git pull` した瞬間にディスク上のコードだけが新しくなり、
+    走っているプロセスは古いコードを保持したままになる。ところが更新判定はソース版を見るので
+    「もう最新」と結論し、**誰も再起動を促さない**。その穴を塞ぐための基準点がこの記録。
+    """
+    global _RUNNING_SOURCE_VERSION
+    root = root if root is not None else repo_root()
+    _RUNNING_SOURCE_VERSION = (_source_version(root) if root else None) or installed_version()
+    return _RUNNING_SOURCE_VERSION
+
+
+def running_source_version() -> str | None:
+    """mark_running_source() が記録した「走っているコードの版」（未記録なら None）。"""
+    return _RUNNING_SOURCE_VERSION
+
+
 def _current_branch(root: Path) -> str | None:
     try:
         r = _git(root, "rev-parse", "--abbrev-ref", "HEAD")
@@ -253,6 +277,9 @@ class UpdateStatus:
     can_apply: bool           # 既定ブランチ & git クローン & クリーン & upstream 追跡（＝自動適用してよい）
     # "ok" / "not-a-git-clone" / "not-on-default-branch" / "no-upstream" / "dirty" / "offline"
     reason: str
+    # ディスク上のソースが、走っているプロセスが読み込んだコードより新しい（＝再起動すれば
+    # 新版になる）。pull 済みなのにプロセスが古いままの状態を検知する。未記録なら常に False。
+    restart_required: bool = False
 
 
 def check(timeout: float = 3.0) -> UpdateStatus:
@@ -261,23 +288,30 @@ def check(timeout: float = 3.0) -> UpdateStatus:
     現行版はクローンの pyproject.toml（ソース）から取る。editable インストールで固定される
     メタデータ版ではなく、pull で上がる版を見る（→ 再起動ループを防ぐ）。自動適用は**既定
     ブランチ（main）でクリーン & upstream 追跡**のときだけ。機能ブランチや WIP は触らない。
+
+    `restart_required` は「取ってくるものは無いが、走っているプロセスが古い」ケース。
+    mark_running_source() を呼んだプロセス（＝デーモン）でだけ真になりうる。
     """
     latest = latest_pypi_version(timeout)
     root = repo_root()
     # 現行版はソース（pyproject）優先。取れないときだけインストールメタデータへフォールバック。
     cur = (_source_version(root) if root else None) or installed_version()
     available = is_newer(latest, cur)
+    # 走っているコードがディスク上のソースより古いなら、pull ではなく**再起動**が要る。
+    # （PyPI との比較とは独立。オフラインでも判定できる。）
+    running = running_source_version()
+    stale = bool(running and cur and running != cur)
     if latest is None:
-        return UpdateStatus(cur, latest, False, False, "offline")
+        return UpdateStatus(cur, latest, False, False, "offline", stale)
     if root is None:
-        return UpdateStatus(cur, latest, available, False, "not-a-git-clone")
+        return UpdateStatus(cur, latest, available, False, "not-a-git-clone", stale)
     if not _on_default_branch(root):
-        return UpdateStatus(cur, latest, available, False, "not-on-default-branch")
+        return UpdateStatus(cur, latest, available, False, "not-on-default-branch", stale)
     if not _tracks_upstream(root):
-        return UpdateStatus(cur, latest, available, False, "no-upstream")
+        return UpdateStatus(cur, latest, available, False, "no-upstream", stale)
     if not _working_tree_clean(root):
-        return UpdateStatus(cur, latest, available, False, "dirty")
-    return UpdateStatus(cur, latest, available, True, "ok")
+        return UpdateStatus(cur, latest, available, False, "dirty", stale)
+    return UpdateStatus(cur, latest, available, True, "ok", stale)
 
 
 def apply_update(root: Path | None = None, timeout: float = 120.0) -> tuple[bool, str]:

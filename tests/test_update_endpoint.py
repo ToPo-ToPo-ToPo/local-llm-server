@@ -49,7 +49,9 @@ def test_refresh_update_state_updates_without_apply(monkeypatch):
     from local_llm_server import update as upd_mod
 
     monkeypatch.setattr(upd_mod, "check", lambda timeout=3.0: types.SimpleNamespace(
-        available=True, current="0.36.1", latest="0.37.0", reason="ok"))
+        available=True, current="0.36.1", latest="0.37.0", reason="ok",
+        restart_required=False))
+    monkeypatch.setattr(upd_mod, "running_source_version", lambda: "0.36.1")
     # apply_update が呼ばれたら失敗させる（確認だけのはず）。
     monkeypatch.setattr(upd_mod, "apply_update",
                         lambda: (_ for _ in ()).throw(AssertionError("must not apply")))
@@ -59,6 +61,23 @@ def test_refresh_update_state_updates_without_apply(monkeypatch):
     assert state["available"] is True
     assert state["current"] == "0.36.1" and state["latest"] == "0.37.0"
     assert state["fetched"] is True  # watcher が立てたフラグは触らない
+    # 「走っているコードの版」と「要再起動」も公開する（editable 運用の穴の検知用）。
+    assert state["running"] == "0.36.1" and state["restart_required"] is False
+
+
+def test_refresh_update_state_exposes_restart_required(monkeypatch):
+    """pull 済みでプロセスだけ古いとき、state に restart_required が立つ。"""
+    from local_llm_server import update as upd_mod
+
+    monkeypatch.setattr(upd_mod, "check", lambda timeout=3.0: types.SimpleNamespace(
+        available=False, current="0.37.1", latest="0.37.1", reason="ok",
+        restart_required=True))
+    monkeypatch.setattr(upd_mod, "running_source_version", lambda: "0.37.0")
+    state = {}
+    gw.refresh_update_state(state)
+    assert state["available"] is False          # 取ってくるものは無い
+    assert state["restart_required"] is True    # でも再起動は要る
+    assert state["running"] == "0.37.0" and state["current"] == "0.37.1"
 
 
 def test_admin_status_triggers_ondemand_check(monkeypatch):

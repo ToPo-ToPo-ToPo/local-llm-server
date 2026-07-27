@@ -921,12 +921,26 @@ def cmd_update(gcfg, args) -> int:
 
     自動更新は稼働中デーモンが裏で行う（idle 時に自動適用）。このコマンドは「今すぐ確認・適用」
     したいとき用。ソース更新後、稼働中デーモンを止めて start し直す（新コードで立ち上がる）。
+
+    取ってくるものが無くても、**稼働中デーモンが古いコードのまま**なら再起動する。editable
+    運用では `git pull` した瞬間にソース版だけが上がり、更新判定は「もう最新」と結論する一方、
+    プロセスは pull 前のコードを保持し続ける——このとき再起動しないと新版が永久に効かない。
     """
     from . import update
 
     st = update.check()
     print(f"current {st.current}  latest {st.latest}")
     if not st.available:
+        # 稼働中デーモンが読み込んだコードの版を聞く（自分＝CLI は別プロセスなので分からない）。
+        host, port, all_ports = _endpoint(gcfg)
+        admin = gateway_admin_status(host, port) or {}
+        ustate = admin.get("update") or {}
+        if ustate.get("restart_required"):
+            running = ustate.get("running")
+            print(f"no new release, but the running gateway still has {running} loaded "
+                  f"(source is {st.current}) — restarting to pick it up")
+            _stop_pids(_collect_gateway_pids(host, port, all_ports))
+            return cmd_start(gcfg, args)
         print("already up to date" if st.reason == "ok" else f"no update: {st.reason}")
         return 0
     if not st.can_apply:

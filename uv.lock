@@ -1909,7 +1909,7 @@ wheels = [
 
 [[package]]
 name = "local-llm-server"
-version = "0.37.1"
+version = "0.37.2"
 source = { editable = "." }
 dependencies = [
     { name = "imageio-ffmpeg" },

@@ -2056,6 +2056,9 @@ def refresh_update_state(state: dict) -> None:
     state["current"] = st.current
     state["latest"] = st.latest
     state["reason"] = st.reason
+    # 「取ってくるものは無いが、走っているコードが古い」＝再起動だけで新版になる状態。
+    state["restart_required"] = bool(st.restart_required)
+    state["running"] = update.running_source_version()
 
 
 def maybe_refresh_update_state(srv) -> None:
@@ -2364,6 +2367,12 @@ def _run_gateway_locked(cfg: GatewayConfig, config_path: str | None = None) -> i
     `config_path` が渡されれば、gateway.toml を保存した瞬間に設定を無停止で反映する
     ホットリロード監視スレッドを起動する（→ apply_live_config）。
     """
+    # このプロセスが**いま読み込んだ**コードの版を記録する。以降 `git pull` でディスク上の
+    # ソースだけが新しくなっても、この値は動かない。両者の食い違い＝「pull 済みだがプロセスが
+    # 古い」＝要再起動、を検知できるようにする（editable 運用で更新が効かない穴を塞ぐ）。
+    from . import update
+
+    update.mark_running_source()
     # メニューバーアイコン（macOS・tray=true）は**最初に**出す——この後の自動導入
     # （llama.cpp 等のダウンロード。初回は数十秒〜数分）を待たせない。アイコンは
     # 「デーモンが生きている」の表示であり、準備完了の表示ではない（メニューは
