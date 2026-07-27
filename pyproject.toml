@@ -1,6 +1,6 @@
 [project]
 name = "local-llm-server"
-version = "0.36.3"
+version = "0.37.0"
 description = "ローカルLLM（mlx / mlx-vlm / llama.cpp / vLLM / SGLang）を OpenAI 互換 API で束ねるマルチモデルゲートウェイ（サーバー）。gateway.toml のカタログを 1 ポートで配信し、model で振り分け・遅延起動・LRU 退避・MTP 高速化（Ollama 流の共有デーモン）。接続用クライアントは別パッケージ local-llm-client。"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -47,6 +47,10 @@ dependencies = [
     # ① STT の音声デコード（Apple Silicon）② 動画入力のフレーム抽出（全 OS。video.py）。
     # 動画入力は llama-cpp / mlx-vlm どちらでも効くので、全 OS に入れる。
     "imageio-ffmpeg>=0.4.9",
+    # 画像入力の長辺リサイズ（image_max_edge。image.py）。上流へ渡す前に縮めて vision トークンの
+    # 爆発を防ぐ。mlx-vlm は Apple Silicon でこれを間接的に入れるが、llama.cpp 運用（他 OS）でも
+    # 効かせたいので全 OS の直接依存にする。未導入環境では縮小せず素通しする実装にしてある。
+    "pillow>=10",
     # メニューバー常駐アイコン（tray.py。Ollama 流の「動いていることが見える」）。macOS のみ。
     # rumps は使わない——非推奨 API 依存で最新 macOS では表示されない。AppKit を直接使う。
     "pyobjc-framework-Cocoa>=10 ; sys_platform == 'darwin'",

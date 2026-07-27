@@ -58,6 +58,7 @@ backend = "mlx-vlm"
 | `disable_thinking` | `false` | 動的ロード時の既定。事前登録モデルは各 `[[models]]` の値が優先 |
 | `video_frames` | `8` | **動画入力**で 1 本から等間隔に抜くフレーム数。`video_url` をこの枚数の画像に展開して渡す |
 | `video_max_edge` | `768` | 動画フレームの縮小サイズ（長辺 px）。大きいほど精細だがトークン増 |
+| `image_max_edge` | `1568` | **静止画の長辺上限 px**（`0` で無効）。上流へ渡す前に縮小し、vision トークンの膨張を防ぐ。→ [画像入力の縮小](#画像入力の縮小image_max_edge) |
 | `[llama_cpp]` | 全自動 | `llama-server` の自動導入テーブル。`accel`（auto/cuda/vulkan/metal/cpu）・`pin`（ビルド番号）。導入方法の選択肢は無い（常に自動導入）。→ [llama-cpp.md](llama-cpp.md#自動導入llama_cpp) |
 
 `[[models]]` は 1 モデル 1 エントリ。`model`（HuggingFace ID）と `backend`（`mlx` / `mlx-vlm` /
@@ -110,8 +111,12 @@ backend = "mlx-vlm"
   PID をログに出す）。ロックは **cwd 非依存の固定パス**（temp ディレクトリ）なので、別ディレクトリや
   別ポートから起動しても束ねられる（開発ツール等が裏で勝手に起動しても乱立しない）。ロックは
   プロセス生存中だけ握り、クラッシュ・`kill` を含む終了で OS が自動解放するため stale にならない。
+- **画像入力の縮小（`image_max_edge`）**: 長辺がこの px を超える画像は、上流へ渡す前に縮小する
+  （既定 1568px、`0` で無効。拡大はしない）。解像度に比例して vision トークンが増えるモデル
+  （Qwen3.6 等の qwen3_5 系）に巨大画像を渡すと、1 枚が数千トークンになり Dense モデルでは
+  prefill だけで数十秒かかる。→ [画像入力の縮小](#画像入力の縮小image_max_edge)
 - **設定のホットリロード**: `gateway.toml` を**保存した瞬間**にポリシー設定を無停止で反映する
-  （プロセスは動かしたまま。~1 秒以内）。反映されるのは `default_model`・
+  （プロセスは動かしたまま。~1 秒以内）。反映されるのは `default_model`・`image_max_edge`・
   `max_resident`・`request_timeout`・`idle_timeout`・`session_ttl`・`load_timeout`・`api_key`
   と動的ロードの既定（`draft_model`・`parallel`・`disable_thinking`・`max_memory_fraction`・
   `dynamic`・`start_timeout`）。動的ロード既定は**次回ロードから**有効。一方 `host`・`port`・
@@ -154,6 +159,38 @@ curl http://127.0.0.1:8799/v1/audio/transcriptions \
 
 OpenAI SDK からもそのまま使える（`client.audio.transcriptions.create(model=..., file=...)`）。
 `base_url` を公開ポートに向けるだけで、振り分け・遅延起動・アンロードはゲートウェイが行う。
+
+## 画像入力の縮小（`image_max_edge`）
+
+長辺がこの px を超える画像は、**上流へ渡す前にゲートウェイが縮小する**（既定 1568px、`0` で無効。
+拡大はしない）。バックエンド非依存で、mlx-vlm / llama.cpp どちらでも効く。
+
+理由は vision トークンの量がモデルによって根本的に違うから。同じ 1400px の画像で実測:
+
+| モデル | 画像のトークン数 |
+|---|---|
+| gemma-4-31b | 281（**解像度によらず固定**） |
+| Qwen3.6-27B（qwen3_5 系） | 1,960（**解像度に比例**） |
+
+後者に大きい画像を渡すと、1 枚が数千トークンになる。さらに Dense モデルの prefill は MoE より
+桁で遅い（同一 10.6k トークンのプロンプトで Qwen3.6-27B が 101 tok/s、MoE の Ornith-35B が
+911 tok/s）ので、画像 1 枚で数十秒待つことになる。Qwen3.6-27B での実測:
+
+| 長辺 | トークン数 | 応答時間 |
+|---|---|---|
+| 1400px | 1,960 | 49.0s |
+| 1024px | 1,048 | 17.1s |
+| 768px | 599 | 8.8s |
+| 512px | 279 | 4.5s |
+
+- 対象は **data URL**（`data:image/...;base64,...`）と、トップレベル `images=[...]` の base64。
+- **リモート URL（http/https）は対象外** —— 上流が自分で取得するため。ゲートウェイが代理取得すると
+  SSRF やプライバシーの別問題が出るので、あえて触らない。
+- 壊れた画像・未対応形式・Pillow 未導入は**素通し**（縮小が効かないだけで、リクエストは通る）。
+- 動画フレームの展開（`video_max_edge`）の**後**に走るので、抽出済みフレームは既に小さく無変更。
+- ホットリロード対応（保存した瞬間に反映）。
+
+精度が要る用途（細かい文字の OCR 等）で足りなければ上げる。逆に速度優先なら 768〜1024 が快適。
 
 ## 自動更新（PyPI 新版に git で追従）
 
@@ -251,7 +288,7 @@ OpenAI SDK からもそのまま使える（`client.audio.transcriptions.create(
 
 | 種別 | 対象 | 反映 |
 |---|---|---|
-| **即時反映（ポリシー）** | `default_model`, `max_resident`, `request_timeout`, `idle_timeout`, `session_ttl`, `load_timeout`, `api_key` | 保存した瞬間に有効 |
+| **即時反映（ポリシー）** | `default_model`, `image_max_edge`, `max_resident`, `request_timeout`, `idle_timeout`, `session_ttl`, `load_timeout`, `api_key` | 保存した瞬間に有効 |
 | **次回ロードから（動的既定）** | トップレベルの `draft_model`, `parallel`, `disable_thinking`, `max_memory_fraction`, `dynamic`, `start_timeout` | 既にロード済みのモデルは次にロードし直すまで旧設定のまま |
 | **要再起動（構造）** | `host`, `port`, `internal_base_port`, `[[models]]` | 稼働中は変えられない（ソケット bind 済み・内部ポート割当は起動時固定）。変更を検知しても**適用せず「要再起動」をログ警告**し、旧値のまま動き続ける |
 

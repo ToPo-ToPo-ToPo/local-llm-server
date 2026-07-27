@@ -37,7 +37,7 @@ import urllib.parse
 from dataclasses import dataclass, field, fields, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from . import multipart, provisioner, sglang_provisioner, video, vllm_provisioner
+from . import image, multipart, provisioner, sglang_provisioner, video, vllm_provisioner
 from .proxy import forward, send_error, send_json
 from .server import (
     BACKENDS,
@@ -1027,6 +1027,7 @@ class GatewayServer(ThreadingHTTPServer):
         api_key: str | None = None,
         video_frames: int = 8,
         video_max_edge: int = 768,
+        image_max_edge: int = 1568,
         repetition_penalty: float | None = None,
         repetition_context_size: int | None = None,
         repetition_penalty_skip_structured: bool = False,
@@ -1045,6 +1046,9 @@ class GatewayServer(ThreadingHTTPServer):
         # 動画入力: video_url をゲートウェイでフレーム画像列に展開する設定（バックエンド非依存）。
         self.video_frames = video_frames
         self.video_max_edge = video_max_edge
+        # 画像入力: 長辺がこの px を超える画像は上流へ渡す前に縮小する（0 で無効）。解像度上限の
+        # 無い VLM に巨大画像を渡したときの vision トークン爆発（＝異常に遅い）を防ぐ。
+        self.image_max_edge = image_max_edge
         # ネットワーク公開時の API キー（None/空 で認証なし）。chat（/v1/*）と在席セッション
         # （/admin/sessions/*）に Authorization: Bearer <key> を要求する。/admin/status と
         # /admin/config はループバック限定（キーではなく接続元で制限）。
@@ -1279,6 +1283,17 @@ class _GatewayHandler(BaseHTTPRequestHandler):
                 send_error(self, 400, f"video input could not be processed: {exc}")
                 return
             body = json.dumps(payload).encode("utf-8")
+        # 画像縮小: 長辺が image_max_edge を超える画像は上流へ渡す前に縮める。解像度上限の無い
+        # VLM（Qwen3.6 等の qwen3_5 系）に巨大画像を渡すと vision トークンが数千に膨れ、Dense
+        # モデルの prefill 速度がそのまま効いて数十秒かかる（実測: 1400px で 1,960 トークン・
+        # 49 秒 → 768px なら 599 トークン・8.8 秒）。動画フレームの video_max_edge と同じ発想。
+        # 動画展開の**後**に置くので、抽出済みフレーム（≤ video_max_edge）は無変更で素通りする。
+        if getattr(srv, "image_max_edge", 0):
+            try:
+                if image.downscale_image_parts(payload, srv.image_max_edge):
+                    body = json.dumps(payload).encode("utf-8")
+            except Exception:  # noqa: BLE001 - 縮小は最適化。失敗しても原画像のまま続行する
+                pass
         # 繰り返しループ抑制: mlx 系宛の生成リクエストに repetition_penalty を既定注入する
         # （chat/text completions のみ。クライアント明示は尊重。設定で無効化可）。
         if path.endswith(("/chat/completions", "/completions")):
@@ -1542,6 +1557,7 @@ class GatewayConfig:
     # --- 動画入力: ゲートウェイが video_url をフレーム画像列へ展開して上流へ渡す ---
     video_frames: int = 8              # 1 本の動画から等間隔で抜くフレーム数
     video_max_edge: int = 768          # 各フレームの縮小サイズ（長辺ピクセル）
+    image_max_edge: int = 1568         # 静止画の長辺上限。解像度上限の無い VLM の vision トークン爆発を防ぐ（0 で無効）
     # --- 繰り返しループ抑制: mlx 系バックエンド（mlx / mlx-vlm）宛の chat リクエストに
     #     repetition_penalty を既定注入する（mlx-lm/mlx-vlm 拡張パラメータ）。低温・量子化の
     #     ローカル LLM が「同じ内容を繰り返して終わらない」degeneration の緩和。llama-cpp は
@@ -1746,6 +1762,10 @@ def load_gateway_config(path: str) -> GatewayConfig:
     video_max_edge = int(data.get("video_max_edge", 768))
     if video_max_edge < 64:
         raise ValueError("video_max_edge must be 64 or greater")
+    # 静止画の長辺上限（0 で無効）。極端に小さい値は事故なので 64px を下限にする。
+    image_max_edge = int(data.get("image_max_edge", 1568))
+    if image_max_edge != 0 and image_max_edge < 64:
+        raise ValueError("image_max_edge must be 0 (disabled) or 64 or greater")
 
     entries = data.get("models") or []
     if not isinstance(entries, list):
@@ -1811,6 +1831,7 @@ def load_gateway_config(path: str) -> GatewayConfig:
         llama_build=llama_build,
         video_frames=video_frames,
         video_max_edge=video_max_edge,
+        image_max_edge=image_max_edge,
         repetition_penalty=repetition_penalty,
         repetition_context_size=repetition_context_size,
         repetition_penalty_skip_structured=repetition_penalty_skip_structured,
@@ -1869,6 +1890,9 @@ def apply_live_config(
     if cfg.video_max_edge != new.video_max_edge:
         note("video_max_edge", cfg.video_max_edge, new.video_max_edge)
         server.video_max_edge = new.video_max_edge
+    if cfg.image_max_edge != new.image_max_edge:
+        note("image_max_edge", cfg.image_max_edge, new.image_max_edge)
+        server.image_max_edge = new.image_max_edge
     if cfg.repetition_penalty != new.repetition_penalty:
         note("repetition_penalty", cfg.repetition_penalty, new.repetition_penalty)
         server.repetition_penalty = new.repetition_penalty
@@ -2381,6 +2405,7 @@ def _run_gateway_locked(cfg: GatewayConfig, config_path: str | None = None) -> i
         api_key=cfg.api_key,
         video_frames=cfg.video_frames,
         video_max_edge=cfg.video_max_edge,
+        image_max_edge=cfg.image_max_edge,
         repetition_penalty=cfg.repetition_penalty,
         repetition_context_size=cfg.repetition_context_size,
         repetition_penalty_skip_structured=cfg.repetition_penalty_skip_structured,
@@ -2429,6 +2454,12 @@ def _run_gateway_locked(cfg: GatewayConfig, config_path: str | None = None) -> i
         + (f" (heartbeat TTL {cfg.session_ttl:g}s)" if cfg.session_ttl else " (release only)"),
         file=sys.stderr,
     )
+    if cfg.image_max_edge:
+        print(
+            f"  image downscale: longest edge -> {cfg.image_max_edge}px "
+            "(data URLs only; keeps vision tokens from exploding)",
+            file=sys.stderr,
+        )
     print(
         f'Point each agent.toml at base_url = "{public}" and set its own `model`. '
         "Agents only connect; models load on first request.",

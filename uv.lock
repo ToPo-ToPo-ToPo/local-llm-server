@@ -1909,13 +1909,14 @@ wheels = [
 
 [[package]]
 name = "local-llm-server"
-version = "0.36.3"
+version = "0.37.0"
 source = { editable = "." }
 dependencies = [
     { name = "imageio-ffmpeg" },
     { name = "mlx-lm", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine != 'arm64' and extra == 'extra-16-local-llm-server-sglang' and extra == 'extra-16-local-llm-server-vllm') or (sys_platform != 'darwin' and extra == 'extra-16-local-llm-server-sglang' and extra == 'extra-16-local-llm-server-vllm')" },
     { name = "mlx-vlm", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine != 'arm64' and extra == 'extra-16-local-llm-server-sglang' and extra == 'extra-16-local-llm-server-vllm') or (sys_platform != 'darwin' and extra == 'extra-16-local-llm-server-sglang' and extra == 'extra-16-local-llm-server-vllm')" },
     { name = "mlx-whisper", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine != 'arm64' and extra == 'extra-16-local-llm-server-sglang' and extra == 'extra-16-local-llm-server-vllm') or (sys_platform != 'darwin' and extra == 'extra-16-local-llm-server-sglang' and extra == 'extra-16-local-llm-server-vllm')" },
+    { name = "pillow" },
     { name = "psutil" },
     { name = "pyobjc-framework-cocoa", marker = "sys_platform == 'darwin' or (extra == 'extra-16-local-llm-server-sglang' and extra == 'extra-16-local-llm-server-vllm')" },
     { name = "transformers" },
@@ -1941,6 +1942,7 @@ requires-dist = [
     { name = "mlx-lm", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'", specifier = ">=0.31.3" },
     { name = "mlx-vlm", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'", specifier = ">=0.6.7" },
     { name = "mlx-whisper", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'", specifier = ">=0.4.3" },
+    { name = "pillow", specifier = ">=10" },
     { name = "psutil", specifier = ">=5.9" },
     { name = "pyobjc-framework-cocoa", marker = "sys_platform == 'darwin'", specifier = ">=10" },
     { name = "sglang", marker = "sys_platform == 'linux' and extra == 'sglang'" },
