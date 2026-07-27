@@ -4,27 +4,27 @@
 モデルが先読みし、本体がまとめて検証する。Qwen3.6-27B で実測 **~2倍速**（38→75 tok/s、
 採択率 93%）。**`mlx-vlm` バックエンドのみ**有効。
 
-## 画像入力（vision）と現行 mlx_vlm の注意
+## 画像入力（vision）
 
-**MTP は画像入力を壊しません。** 画像入力の可否は**モデルファミリ**次第です（現行 mlx_vlm 0.6.3 実測）:
+**MTP は画像入力を壊しません。** Qwen3.6-27B・gemma-4 系とも、**MTP 有効のまま画像を認識する**
+（mlx-vlm 0.6.7 実測）。
 
-- **gemma-4 系**（`gemma-4-31b` / `26B-A4B` 等）… 画像入力は **MTP 有りでも正常**に動く。
-- **Qwen3.6-27B（qwen3_5 系）**… 画像入力が **MTP の有無に関わらず壊れている**
-  （`mlx_vlm/models/qwen3_5/language.py::get_rope_index` の `attention_mask.tolist()` が
-  バッチ用 GPU スレッドと別スレッドの MLX ストリームをまたいで評価し、`RuntimeError: There is
-  no Stream(gpu, N) in current thread` になる → クライアントには返らずタイムアウト）。これは
-  上流 `mlx_vlm` のバグで、ゲートウェイ側では直せない。
+かつて Qwen3.6-27B（qwen3_5 系）は画像入力が必ず失敗していたが、これは **mlx-vlm 0.6.3 と
+mlx 0.32.0 の組み合わせに固有の上流バグ**で、0.6.4 以降で解消済み:
 
-**対処**: `gateway.toml` に `vision_model` を設定し、**画像入りリクエストを gemma-4 系へ振り分ける**。
-テキストは元モデル（Qwen3.6 の MTP 高速化そのまま）、画像だけを画像が動くモデルへ流せる。
+- 症状: `mlx_vlm/models/qwen3_5/language.py::get_rope_index` の `attention_mask.tolist()` が
+  生成スレッドで `RuntimeError: There is no Stream(gpu, N) in current thread` になり、
+  クライアントには返らずタイムアウトする。**MTP の有無には関係しなかった**（無効でも同じ）。
+- 条件: mlx 0.31.2 では出ず、mlx 0.32.0 で出た（mlx 側の thread-local stream の扱いに依存）。
+- 解消: 0.6.4 の qwen3_5 リファクタ（position_ids をモデルへ stash せず、リクエスト毎に
+  `InputEmbeddingsFeatures` で返す）で発生しなくなった。ただし 0.6.4 自体は Qwen3.6 の
+  garble（テキストも壊れる）があるため、**0.6.5 以降**（`pyproject.toml` は 0.6.7 以上を要求）が必要。
 
-```toml
-vision_model = "ToPo-ToPo/gemma-4-31b-it-mlx-4bit"   # 画像入りリクエストの振り分け先（MTP 有りで可）
-```
-
-- 画像を含むリクエストは、元の `model` が何であってもこの `vision_model` へ流れる（テキストは素通り）。
-- `vision_model` 自身が 1 モデル常駐するので、テキスト用モデルと合わせて `max_resident` に余裕を（2 以上）。
-- gemma-4 の画像入力は MTP 有りで動くので、`vision_model` の MTP を切る必要はない。
+この回避策として在った `vision_model`（画像入りリクエストを gemma-4 系へ自動振り分けする設定）は
+**0.36.3 で削除した**。画像もテキストも同じモデルが受けるので、gemma-4 を画像用に常駐させる必要は
+なくなった（`max_resident` を 2 に上げる理由も 1 つ減る）。既存の `gateway.toml` に残っている
+`vision_model = ...` は、更新後の起動時に**自動で削除される**（→ [operation.md](operation.md)。
+手動なら `gw migrate`、消える内容だけ見るなら `gw migrate --dry-run`）。
 
 ## 設定（`gateway.toml`）
 

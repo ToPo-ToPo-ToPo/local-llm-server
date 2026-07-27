@@ -1121,94 +1121,6 @@ def test_reclaim_stale_workers_kills_only_ours(monkeypatch):
     assert killed == [111, 333]
 
 
-# --- 画像入りリクエストの vision_model への振り分け ----------------------------
-# 一部の vision モデル（Qwen3.6-27B/qwen3_5 等）は現行 mlx_vlm で画像入力が壊れている。
-# vision_model を設定すると、画像を含むリクエストだけをそのモデル（gemma-4 系など、画像が確実に
-# 動くもの）へ振り分ける。テキストは元モデルのまま。
-
-def test_request_has_images_detects_vision_content():
-    assert gw._request_has_images({
-        "messages": [{"role": "user", "content": [
-            {"type": "text", "text": "what is this"},
-            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]}]
-    }) is True
-    assert gw._request_has_images({
-        "messages": [{"role": "user", "content": [{"type": "input_image", "image": "x"}]}]
-    }) is True
-    assert gw._request_has_images({"images": ["data:image/png;base64,AAAA"]}) is True
-
-
-def test_request_has_images_false_for_text_only():
-    assert gw._request_has_images(
-        {"messages": [{"role": "user", "content": "hi"}]}) is False
-    assert gw._request_has_images(
-        {"messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]}) is False
-    assert gw._request_has_images({}) is False
-
-
-def test_load_gateway_config_parses_vision_model(tmp_path):
-    cfg = gw.load_gateway_config(_write(tmp_path, 'vision_model = "org/gemma-vision"\n'))
-    assert cfg.vision_model == "org/gemma-vision"
-    assert gw.load_gateway_config(_write(tmp_path, "port = 8080\n")).vision_model is None
-    # 空文字は None 扱い。
-    assert gw.load_gateway_config(_write(tmp_path, 'vision_model = ""\n')).vision_model is None
-
-
-def _start_routing_gateway(monkeypatch):
-    """text-model（MTP 有り）と vision-model を持ち、vision_model を設定したゲートウェイ。"""
-    up_text = _make_upstream("text-up")
-    up_vision = _make_upstream("vision-up")
-    monkeypatch.setattr(gw, "LocalServer",
-                        lambda config, log_path=None: _FakeServer(config, log_path))
-    configs = [
-        ServerConfig(backend="mlx-vlm", model="text-model", host="127.0.0.1",
-                     port=up_text.server_address[1], draft_model="org/draft"),
-        ServerConfig(backend="mlx-vlm", model="vision-model", host="127.0.0.1",
-                     port=up_vision.server_address[1]),
-    ]
-    mgr = gw.ModelManager(configs, dynamic=False)
-    server = gw.GatewayServer(("127.0.0.1", 0), mgr, catalog=["text-model", "vision-model"],
-                              vision_model="vision-model")
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    return server, mgr, (up_text, up_vision)
-
-
-def test_image_request_routed_to_vision_model(monkeypatch):
-    server, mgr, ups = _start_routing_gateway(monkeypatch)
-    try:
-        port = server.server_address[1]
-        # テキストは元モデルへ（振り分けない）。
-        s, o = _post(port, "/v1/chat/completions",
-                     {"model": "text-model", "messages": [{"role": "user", "content": "hi"}]})
-        assert s == 200 and o["backend"] == "text-up"
-        # 画像入りは vision-model へ振り分け。
-        img = [{"role": "user", "content": [
-            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]}]
-        s, o = _post(port, "/v1/chat/completions", {"model": "text-model", "messages": img})
-        assert s == 200 and o["backend"] == "vision-up"
-        # 実際に vision-model がロードされ、text-model は画像では起動していない。
-        assert mgr._models["vision-model"].instances
-    finally:
-        server.shutdown(); server.server_close(); mgr.shutdown()
-        for u in ups:
-            u.shutdown(); u.server_close()
-
-
-def test_image_request_to_vision_model_itself_not_rerouted(monkeypatch):
-    # 既に vision_model 宛のリクエストは二度振り分けしない（自分自身へループしない）。
-    server, mgr, ups = _start_routing_gateway(monkeypatch)
-    try:
-        port = server.server_address[1]
-        img = [{"role": "user", "content": [
-            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]}]
-        s, o = _post(port, "/v1/chat/completions", {"model": "vision-model", "messages": img})
-        assert s == 200 and o["backend"] == "vision-up"
-    finally:
-        server.shutdown(); server.server_close(); mgr.shutdown()
-        for u in ups:
-            u.shutdown(); u.server_close()
-
-
 def test_load_gateway_config_rejects_unsupported_wildcards(tmp_path):
     # ゲートウェイは IPv4 で bind する。"::" / "*" は bind 時の分かりにくい OSError ではなく
     # 設定読み込みで明確に断る。
@@ -1380,24 +1292,23 @@ def _live_server(cfg):
         default_model=cfg.default_model, timeout_s=cfg.request_timeout,
         max_resident=cfg.max_resident, idle_timeout=cfg.idle_timeout,
         load_timeout=cfg.load_timeout, session_ttl=cfg.session_ttl,
-        api_key=cfg.api_key, vision_model=cfg.vision_model,
+        api_key=cfg.api_key,
     )
     return server, mgr
 
 
 def test_apply_live_config_updates_policy_fields(tmp_path):
-    base = ('vision_model = "org/vis-a"\nidle_timeout = 1200\nrequest_timeout = 600\n'
+    base = ('default_model = "org/dft-a"\nidle_timeout = 1200\nrequest_timeout = 600\n'
             'session_ttl = 90\ndraft_model = "auto"\n')
     cfg = gw.load_gateway_config(_write(tmp_path, base))
     server, mgr = _live_server(cfg)
     try:
         new = gw.load_gateway_config(_write(
             tmp_path,
-            'vision_model = "org/vis-b"\nidle_timeout = 60\nrequest_timeout = 0\n'
+            'idle_timeout = 60\nrequest_timeout = 0\n'
             'session_ttl = 30\ndraft_model = "off"\ndefault_model = "org/dft"\n'))
         changed, restart = gw.apply_live_config(server, mgr, cfg, new)
         # サーバーが per-request で読む値が差し替わる。
-        assert server.vision_model == "org/vis-b"
         assert server.default_model == "org/dft"
         assert server.timeout_s == new.request_timeout   # request_timeout=0 → 無制限
         assert server.idle_timeout == 60
@@ -1405,9 +1316,9 @@ def test_apply_live_config_updates_policy_fields(tmp_path):
         # 動的ロード既定（manager 側）も new 値へ差し替わる（"off" 等の正規化は各ロード時）。
         assert mgr._default_draft == new.draft_model
         # 掃除スレッドが読む cfg 本体も new に揃う。
-        assert cfg.vision_model == "org/vis-b" and cfg.idle_timeout == 60
+        assert cfg.default_model == "org/dft" and cfg.idle_timeout == 60
         assert restart == []
-        assert any("vision_model" in c for c in changed)
+        assert any("default_model" in c for c in changed)
     finally:
         server.server_close(); mgr.shutdown()
 
@@ -1456,7 +1367,7 @@ def test_apply_live_config_models_change_is_restart_only(tmp_path):
 
 
 def test_apply_live_config_no_change_is_noop(tmp_path):
-    text = 'vision_model = "org/x"\nmax_resident = 2\nidle_timeout = 300\n'
+    text = 'default_model = "org/x"\nmax_resident = 2\nidle_timeout = 300\n'
     cfg = gw.load_gateway_config(_write(tmp_path, text))
     server, mgr = _live_server(cfg)
     try:
@@ -1498,7 +1409,7 @@ def _wait_until(pred, timeout=3.0):
 
 def test_watch_config_file_applies_on_save(tmp_path):
     # gateway.toml を保存すると監視スレッドがポリシー設定を無停止で反映する（E2E）。
-    path = _write(tmp_path, 'vision_model = "org/a"\nmax_resident = 2\n')
+    path = _write(tmp_path, 'default_model = "org/a"\nmax_resident = 2\n')
     os.utime(path, (1_000_000, 1_000_000))
     cfg = gw.load_gateway_config(path)
     server, mgr = _live_server(cfg)
@@ -1508,20 +1419,20 @@ def test_watch_config_file_applies_on_save(tmp_path):
         kwargs={"poll_interval": 0.05}, daemon=True)
     t.start()
     try:
-        _resave(path, 'vision_model = "org/b"\nmax_resident = 4\n', 1_000_100)
+        _resave(path, 'default_model = "org/b"\nmax_resident = 4\n', 1_000_100)
         assert _wait_until(
-            lambda: server.vision_model == "org/b" and mgr._max_resident == 4)
-        assert server.vision_model == "org/b"
+            lambda: server.default_model == "org/b" and mgr._max_resident == 4)
+        assert server.default_model == "org/b"
         assert mgr._max_resident == 4
 
         # 不正 TOML を保存しても監視スレッドは落ちず、直前の有効値を保つ。
         _resave(path, "this is = = broken [[[", 1_000_200)
         time.sleep(0.3)
-        assert server.vision_model == "org/b"   # 旧値のまま
+        assert server.default_model == "org/b"   # 旧値のまま
 
         # その後に有効な設定を保存すれば、また反映される（壊れた保存で止まらない）。
-        _resave(path, 'vision_model = "org/c"\nmax_resident = 4\n', 1_000_300)
-        assert _wait_until(lambda: server.vision_model == "org/c")
+        _resave(path, 'default_model = "org/c"\nmax_resident = 4\n', 1_000_300)
+        assert _wait_until(lambda: server.default_model == "org/c")
     finally:
         stop.set(); t.join(timeout=2)
         server.server_close(); mgr.shutdown()

@@ -100,33 +100,6 @@ def _total_ram() -> int | None:
         return None
 
 
-def _request_has_images(payload: dict) -> bool:
-    """chat リクエストに画像入力が含まれるか（OpenAI vision 形式を検出）。
-
-    OpenAI 互換の vision は `messages[].content` が配列で、その要素に `{"type": "image_url", ...}`
-    （mlx_vlm は `image`/`input_image` も受ける）が混ざる。一部クライアントはトップレベル
-    `images=[...]` を渡すのでそれも見る。type に "image" を含むかで緩く判定する。動画等の他
-    モダリティは対象外（画像固有）。`vision_model` への振り分け判定に使う。
-    """
-    if payload.get("images"):
-        return True
-    messages = payload.get("messages")
-    if not isinstance(messages, list):
-        return False
-    for msg in messages:
-        if not isinstance(msg, dict):
-            continue
-        content = msg.get("content")
-        if not isinstance(content, list):
-            continue
-        for part in content:
-            if isinstance(part, dict):
-                t = part.get("type")
-                if isinstance(t, str) and "image" in t:
-                    return True
-    return False
-
-
 class CapacityError(RuntimeError):
     """常駐枠が全て処理中で、待っても空かず新モデルをロードできなかった（→ 503）。"""
 
@@ -1052,7 +1025,6 @@ class GatewayServer(ThreadingHTTPServer):
         load_timeout: float | None = None,
         session_ttl: float | None = None,
         api_key: str | None = None,
-        vision_model: str | None = None,
         video_frames: int = 8,
         video_max_edge: int = 768,
         repetition_penalty: float | None = None,
@@ -1070,9 +1042,6 @@ class GatewayServer(ThreadingHTTPServer):
         self.catalog = catalog            # /v1/models で返すモデル一覧
         self.default_model = default_model
         self.timeout_s = timeout_s        # None なら無制限（長時間生成に備える）
-        # 画像入りリクエストの振り分け先モデル（None で無効）。画像が壊れている vision モデルを
-        # 避け、画像だけを確実に動くモデル（gemma-4 系など）へ流すための任意設定。
-        self.vision_model = vision_model
         # 動画入力: video_url をゲートウェイでフレーム画像列に展開する設定（バックエンド非依存）。
         self.video_frames = video_frames
         self.video_max_edge = video_max_edge
@@ -1211,7 +1180,6 @@ class _GatewayHandler(BaseHTTPRequestHandler):
                 "load_timeout": srv.load_timeout,
                 "session_ttl": srv.session_ttl,
                 "default_model": srv.default_model,
-                "vision_model": srv.vision_model,
                 "uptime": round(srv.manager.uptime(), 1),
                 "requests": sum(m.get("requests", 0) for m in models),
                 # 起動元情報: いつ・どこから立ったゲートウェイかを示す（起動経路は
@@ -1302,7 +1270,7 @@ class _GatewayHandler(BaseHTTPRequestHandler):
             send_error(self, 400, "no 'model' in the request and no default_model is configured")
             return
         # 動画入力: video_url をフレーム画像（image_url）列に展開してから先へ進む。展開した
-        # フレームは以降の画像扱い（vision_model 振り分けの対象にもなる）。抽出失敗は 400。
+        # フレームは以降の画像扱い。抽出失敗は 400。
         if video.request_has_video(payload):
             try:
                 video.expand_video_parts(
@@ -1310,19 +1278,6 @@ class _GatewayHandler(BaseHTTPRequestHandler):
             except video.VideoError as exc:
                 send_error(self, 400, f"video input could not be processed: {exc}")
                 return
-            body = json.dumps(payload).encode("utf-8")
-        # vision_model が設定されていれば、**画像を含むリクエストはそのモデルへ振り分ける**。
-        # 一部の vision モデル（例: Qwen3.6-27B / qwen3_5）は現行 mlx_vlm で画像入力が壊れて
-        # いる（get_rope_index のスレッド/ストリーム不具合。MTP の有無に関係なくハング/エラー）。
-        # 画像だけを「画像が確実に動くモデル」（gemma-4 系など）へ流すことで、テキストは元モデルの
-        # まま・画像は読める、を両立する。既に vision_model 宛ならそのまま。body の model も書き換える。
-        vmodel = getattr(srv, "vision_model", None)
-        if (
-            vmodel and isinstance(model, str) and model != vmodel
-            and _request_has_images(payload)
-        ):
-            model = vmodel
-            payload["model"] = vmodel
             body = json.dumps(payload).encode("utf-8")
         # 繰り返しループ抑制: mlx 系宛の生成リクエストに repetition_penalty を既定注入する
         # （chat/text completions のみ。クライアント明示は尊重。設定で無効化可）。
@@ -1578,8 +1533,6 @@ class GatewayConfig:
     api_key: str | None = None         # ネットワーク公開時の API キー（None/空 で認証なし）。chat と在席セッションに要求
     auto_update: bool = True           # 常駐デーモンが PyPI 新版を検知したら git pull で自動追従する（既定 true。false で無効）
     tray: bool = True                  # 稼働中メニューバーにアイコンを出す（macOS のみ。false で非表示 → tray.py）
-    vision_model: str | None = None    # 画像入りリクエストの振り分け先モデル（None で無効）。画像が壊れている
-                                       # vision モデルを避け、画像だけを確実に動くモデル（gemma-4 系等）へ流す
     # --- llama.cpp（llama-server）バイナリの自動導入。[llama_cpp] テーブルで設定 ---
     # 導入方法は選ばせない（管理dirの導入済みを再利用→無ければプリビルト自動DL の一本道）。
     llama_accel: str = "auto"          # auto=検出（GPU なら vulkan、mac は metal、無ければ cpu）/ cuda / vulkan / metal / cpu
@@ -1690,10 +1643,6 @@ def load_gateway_config(path: str) -> GatewayConfig:
         if max_resident < 1:
             raise ValueError("max_resident must be 1 or greater")
     default_model = data.get("default_model")
-    # 画像入りリクエストの振り分け先モデル（省略で無効）。空文字は None 扱い。
-    vision_model = data.get("vision_model")
-    if vision_model is not None:
-        vision_model = str(vision_model).strip() or None
     # 一定時間使われないモデルを自動アンロードする秒数（idle TTL）。省略時 1200（=20分）、0 で無効。
     idle_timeout = data.get("idle_timeout", 1200)
     if idle_timeout is not None:
@@ -1858,7 +1807,6 @@ def load_gateway_config(path: str) -> GatewayConfig:
         api_key=api_key,
         auto_update=auto_update,
         tray=tray,
-        vision_model=vision_model,
         llama_accel=llama_accel,
         llama_build=llama_build,
         video_frames=video_frames,
@@ -1888,7 +1836,7 @@ def apply_live_config(
 ) -> tuple[list[str], list[str]]:
     """読み直した設定 `new` を稼働中の server / manager / cfg へ無停止で反映する。
 
-    ポリシー設定（vision_model・各 timeout・max_resident・api_key・動的ロード既定）は
+    ポリシー設定（各 timeout・max_resident・api_key・動的ロード既定）は
     その場で差し替える。動的ロード既定（draft_model / parallel / disable_thinking /
     max_memory_fraction / dynamic / start_timeout）は**次回ロードから**有効。
     host / port / internal_base_port / [[models]] は稼働中に変えられない（ソケット bind 済み・
@@ -1915,9 +1863,6 @@ def apply_live_config(
         server.max_resident = new.max_resident
 
     # --- サーバーがリクエスト毎に読むポリシー ---
-    if cfg.vision_model != new.vision_model:
-        note("vision_model", cfg.vision_model, new.vision_model)
-        server.vision_model = new.vision_model
     if cfg.video_frames != new.video_frames:
         note("video_frames", cfg.video_frames, new.video_frames)
         server.video_frames = new.video_frames
@@ -2434,7 +2379,6 @@ def _run_gateway_locked(cfg: GatewayConfig, config_path: str | None = None) -> i
         load_timeout=cfg.load_timeout,
         session_ttl=cfg.session_ttl,
         api_key=cfg.api_key,
-        vision_model=cfg.vision_model,
         video_frames=cfg.video_frames,
         video_max_edge=cfg.video_max_edge,
         repetition_penalty=cfg.repetition_penalty,
@@ -2485,12 +2429,6 @@ def _run_gateway_locked(cfg: GatewayConfig, config_path: str | None = None) -> i
         + (f" (heartbeat TTL {cfg.session_ttl:g}s)" if cfg.session_ttl else " (release only)"),
         file=sys.stderr,
     )
-    if cfg.vision_model:
-        print(
-            f"  vision routing: image requests -> {cfg.vision_model} "
-            "(routes any request that includes an image)",
-            file=sys.stderr,
-        )
     print(
         f'Point each agent.toml at base_url = "{public}" and set its own `model`. '
         "Agents only connect; models load on first request.",
