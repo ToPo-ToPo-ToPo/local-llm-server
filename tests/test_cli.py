@@ -293,3 +293,37 @@ def test_run_gateway_reexecs_on_restart_code(monkeypatch):
     daemon.run_gateway(cfg=object(), config_path=None)
     # ロックを解放し切った **後** に reexec する（execv 前にロック fd を手放す契約）。
     assert events == ["acquire", "release", "reexec"]
+
+
+# --- gw migrate（設定スキーマの移行） -----------------------------------------
+def test_migrate_dispatch_rewrites_config(tmp_path, monkeypatch, capsys):
+    # 廃止キーが入った設定を `gw migrate` が書き換える（稼働中デーモンに依存しない）。
+    p = _use_cfg(tmp_path, monkeypatch,
+                 'vision_model = "org/vis"\nport = 8799\n')
+    assert cli.main(["migrate"]) == 0
+    assert "vision_model" not in p.read_text(encoding="utf-8")
+    assert "vision_model" in capsys.readouterr().out
+
+
+def test_migrate_dispatch_dry_run_keeps_config(tmp_path, monkeypatch, capsys):
+    p = _use_cfg(tmp_path, monkeypatch, 'vision_model = "org/vis"\nport = 8799\n')
+    before = p.read_text(encoding="utf-8")
+    assert cli.main(["migrate", "--dry-run"]) == 0
+    assert p.read_text(encoding="utf-8") == before
+    assert "変更予定" in capsys.readouterr().out
+
+
+def test_migrate_dispatch_reports_up_to_date(tmp_path, monkeypatch, capsys):
+    _use_cfg(tmp_path, monkeypatch)
+    assert cli.main(["migrate"]) == 0
+    assert "変更なし" in capsys.readouterr().out
+
+
+def test_start_migrates_config_before_launch(tmp_path, monkeypatch):
+    # 起動系は設定を読む前に移行する（更新後に `gw start` するだけで新スキーマに揃う）。
+    p = _use_cfg(tmp_path, monkeypatch, 'vision_model = "org/vis"\nport = 8799\n')
+    monkeypatch.setattr(cli, "read_gateway_runtime", lambda: None)
+    monkeypatch.setattr(cli, "is_ready", lambda url, timeout=0.5: True)
+    monkeypatch.setattr(cli, "start_gateway_background", lambda *a, **k: 4242)
+    assert cli.main(["start"]) == 0
+    assert "vision_model" not in p.read_text(encoding="utf-8")

@@ -53,7 +53,6 @@ backend = "mlx-vlm"
 | `session_ttl` | `90` | 在席エージェントのハートビート猶予秒数。途絶で無人扱い（`0` で無効）。→ [在席ベースの即時アンロード](#在席ベースの即時アンロード) |
 | `internal_base_port` | `9001` | 内部モデルサーバーの割当開始ポート |
 | `default_model` | なし | `model` 省略リクエスト時に使うモデル |
-| `vision_model` | なし | **画像を含むリクエストの振り分け先モデル**。設定すると、画像入りリクエストだけをこのモデル（画像が確実に動く gemma-4 系など）へ流す。テキストは元モデルのまま。画像が壊れている vision モデル（Qwen3.6-27B 等）の回避に使う。→ [mtp.md](mtp.md#画像入力vision) |
 | `draft_model` | mlx-vlm は `auto` | 動的ロード時の MTP 既定。省略時は mlx-vlm が対応表から自動選択、`"off"` で無効。各 `[[models]]` で上書き。→ [mtp.md](mtp.md) |
 | `dynamic` | `true` | 未登録モデルを ID 推論で動的ロードする。`false` で事前登録のみ（旧挙動） |
 | `disable_thinking` | `false` | 動的ロード時の既定。事前登録モデルは各 `[[models]]` の値が優先 |
@@ -111,12 +110,8 @@ backend = "mlx-vlm"
   PID をログに出す）。ロックは **cwd 非依存の固定パス**（temp ディレクトリ）なので、別ディレクトリや
   別ポートから起動しても束ねられる（開発ツール等が裏で勝手に起動しても乱立しない）。ロックは
   プロセス生存中だけ握り、クラッシュ・`kill` を含む終了で OS が自動解放するため stale にならない。
-- **画像入りリクエストの振り分け（`vision_model`）**: `vision_model` を設定すると、**画像を含む
-  リクエストだけ**を（元の `model` に関わらず）そのモデルへ流す。テキストは元モデルのまま。
-  現行 `mlx_vlm` では一部の vision モデル（Qwen3.6-27B 等の qwen3_5 系）が画像入力で壊れて
-  いるため、画像だけを「画像が確実に動くモデル」（gemma-4 系など）へ逃がすのに使う。→ [mtp.md](mtp.md#画像入力vision)
 - **設定のホットリロード**: `gateway.toml` を**保存した瞬間**にポリシー設定を無停止で反映する
-  （プロセスは動かしたまま。~1 秒以内）。反映されるのは `vision_model`・`default_model`・
+  （プロセスは動かしたまま。~1 秒以内）。反映されるのは `default_model`・
   `max_resident`・`request_timeout`・`idle_timeout`・`session_ttl`・`load_timeout`・`api_key`
   と動的ロードの既定（`draft_model`・`parallel`・`disable_thinking`・`max_memory_fraction`・
   `dynamic`・`start_timeout`）。動的ロード既定は**次回ロードから**有効。一方 `host`・`port`・
@@ -256,7 +251,7 @@ OpenAI SDK からもそのまま使える（`client.audio.transcriptions.create(
 
 | 種別 | 対象 | 反映 |
 |---|---|---|
-| **即時反映（ポリシー）** | `vision_model`, `default_model`, `max_resident`, `request_timeout`, `idle_timeout`, `session_ttl`, `load_timeout`, `api_key` | 保存した瞬間に有効 |
+| **即時反映（ポリシー）** | `default_model`, `max_resident`, `request_timeout`, `idle_timeout`, `session_ttl`, `load_timeout`, `api_key` | 保存した瞬間に有効 |
 | **次回ロードから（動的既定）** | トップレベルの `draft_model`, `parallel`, `disable_thinking`, `max_memory_fraction`, `dynamic`, `start_timeout` | 既にロード済みのモデルは次にロードし直すまで旧設定のまま |
 | **要再起動（構造）** | `host`, `port`, `internal_base_port`, `[[models]]` | 稼働中は変えられない（ソケット bind 済み・内部ポート割当は起動時固定）。変更を検知しても**適用せず「要再起動」をログ警告**し、旧値のまま動き続ける |
 

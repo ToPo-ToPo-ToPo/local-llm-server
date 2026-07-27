@@ -18,6 +18,7 @@ import os
 import sys
 import tomllib
 
+from . import migrate
 from .cli import resolve_config
 from .daemon import load_gateway_config, run_gateway
 from .server import install_shutdown_handlers
@@ -39,6 +40,9 @@ def main() -> int:
     if config_path is None:
         print("./gateway.toml not found in the current directory.", file=sys.stderr)
         return 2
+    # 更新で廃止・改名されたキーを設定へ反映してから読む。自動更新（execv 再起動）もここを
+    # 通るので、ユーザーが何もしなくても次の起動で設定が新しいスキーマに揃う。
+    migrate.migrate_quietly(config_path, log=lambda m: print(m, file=sys.stderr))
     try:
         gcfg = load_gateway_config(config_path)
     except (OSError, ValueError, tomllib.TOMLDecodeError) as exc:

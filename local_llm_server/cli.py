@@ -35,6 +35,7 @@ import sys
 import time
 import tomllib
 
+from . import migrate
 from .daemon import load_gateway_config
 from .server import (
     MTP_DRAFTERS,
@@ -942,11 +943,39 @@ def cmd_update(gcfg, args) -> int:
     if not ok:
         print(f"依存の入れ直しに失敗しました（{msg}）。`make install` を実行してください。",
               file=sys.stderr)
+    # 新版で廃止・改名されたキーを設定へ反映する（この後の再起動で新スキーマのまま立ち上がる）。
+    migrate.migrate_quietly(user_config_path(), log=print)
     # 稼働中なら新コードで再起動（stop → start）。
     host, port, all_ports = _endpoint(gcfg)
     if is_ready(f"http://{host}:{port}/v1"):
         _stop_pids(_collect_gateway_pids(host, port, all_ports))
         return cmd_start(gcfg, args)
+    return 0
+
+
+def cmd_migrate(gcfg, args) -> int:
+    """`gw migrate`: 設定ファイルを現行スキーマへ移行する（廃止キーの削除・改名の適用）。
+
+    通常は更新後の起動時に自動で走るので、明示的に打つ必要はない。手で確認したいとき
+    （`--dry-run` で「何が変わるか」だけ見る）と、自動移行が権限等で失敗したときの再実行用。
+    """
+    path = user_config_path()
+    if not os.path.isfile(path):
+        print(f"設定がまだありません（{path}）。`gw start` で自動生成されます。")
+        return 0
+    try:
+        notes = migrate.migrate_file(path, dry_run=args.dry_run)
+    except OSError as exc:
+        print(f"移行に失敗しました: {exc}", file=sys.stderr)
+        return 1
+    if not notes:
+        print(f"{path} は最新のスキーマです（変更なし）")
+        return 0
+    print(f"{'変更予定' if args.dry_run else '変更しました'}: {path}")
+    for note in notes:
+        print(f"  - {note}")
+    if not args.dry_run:
+        print(f"元の内容は {path}.bak に残しました")
     return 0
 
 
@@ -992,6 +1021,8 @@ def build_parser() -> argparse.ArgumentParser:
     show = sub.add_parser("show", help="モデルの素性（量子化・コンテキスト長・サイズ等）を表示する")
     show.add_argument("model", help="HF repo-id（org/repo[:量子化名]）")
     sub.add_parser("update", help="PyPI 新版があれば git pull で追従して再起動する")
+    mig = sub.add_parser("migrate", help="設定ファイルを現行スキーマへ移行する（通常は更新時に自動）")
+    mig.add_argument("--dry-run", action="store_true", help="書き換えず、変更内容だけ表示する")
     sub.add_parser("help", help="このコマンド一覧を表示する")
     return p
 
@@ -1001,7 +1032,7 @@ _COMMANDS = {
     "serve": cmd_serve, "enable": cmd_enable, "disable": cmd_disable,
     "status": cmd_status, "ps": cmd_ps, "list": cmd_list, "log": cmd_log,
     "max": cmd_max, "mtp": cmd_mtp, "update": cmd_update, "help": cmd_help,
-    "pull": cmd_pull, "rm": cmd_rm, "show": cmd_show,
+    "pull": cmd_pull, "rm": cmd_rm, "show": cmd_show, "migrate": cmd_migrate,
 }
 
 
@@ -1026,7 +1057,11 @@ def _resolve_gcfg(cmd: str | None):
     # enable/disable はサービス登録（serve が読む設定を先に確定させる）なので同類。
     if cmd in ("start", "restart", "serve", "enable", "disable"):
         try:
-            return _load(ensure_user_config())
+            path = ensure_user_config()
+            # 更新で廃止・改名されたキーを先に設定へ反映する（冪等。gw serve のように
+            # __main__ を通らない経路もあるので、起動系はここでも通す）。
+            migrate.migrate_quietly(path, log=lambda m: print(m, file=sys.stderr))
+            return _load(path)
         except OSError as exc:
             print(f"failed to create {user_config_path()}: {exc}", file=sys.stderr)
             return None, 2
@@ -1061,8 +1096,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd in (None, "help"):
         return cmd_help(None, args)
     # モデルファイル管理は設定に依存しない（HF キャッシュ直接 + 稼働中デーモンは
-    # ランタイム記録から best-effort で参照）。
-    if args.cmd in ("mtp", "pull", "rm", "show"):
+    # ランタイム記録から best-effort で参照）。migrate は設定ファイル**そのもの**を
+    # 書き換えるので、読めない（＝移行が要る）状態でも動く必要があり、同じくここを通す。
+    if args.cmd in ("mtp", "pull", "rm", "show", "migrate"):
         return _COMMANDS[args.cmd](None, args)
 
     gcfg, code = _resolve_gcfg(args.cmd)

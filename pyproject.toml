@@ -1,6 +1,6 @@
 [project]
 name = "local-llm-server"
-version = "0.36.2"
+version = "0.36.3"
 description = "ローカルLLM（mlx / mlx-vlm / llama.cpp / vLLM / SGLang）を OpenAI 互換 API で束ねるマルチモデルゲートウェイ（サーバー）。gateway.toml のカタログを 1 ポートで配信し、model で振り分け・遅延起動・LRU 退避・MTP 高速化（Ollama 流の共有デーモン）。接続用クライアントは別パッケージ local-llm-client。"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -27,10 +27,19 @@ dependencies = [
     "psutil>=5.9",
     # mlx 系バックエンド（テキスト/vision/STT）。Apple Silicon でのみ解決・インストールされる。
     "mlx-lm>=0.31.3 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
-    # mlx-vlm 0.6.4 は Qwen3.6 で変換・推論とも壊れる（garble）ため 0.6.4 未満に固定。
-    # 直ったら上限を上げる（上げた直後は Qwen3.6 で 1+1 の sanity check を必ず行う）。
-    "mlx-vlm>=0.6.3,<0.6.4 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
-    "transformers<5.13",
+    # 0.6.7 以上を要求する。理由は 2 つ:
+    # ① 0.6.4 の Qwen3.6 garble（変換・推論とも壊れる）が 0.6.5 で直った
+    #    （norm の +1.0 シフトを raw-HF レイアウト限定に絞る修正）。
+    # ② 0.6.3 + mlx 0.32.0 では Qwen3.6（qwen3_5 系）の**画像入力**が必ず失敗した
+    #    （get_rope_index の attention_mask.tolist() が生成スレッドで
+    #    `RuntimeError: There is no Stream(gpu, N) in current thread`）。0.6.4 の
+    #    「position_ids を model に stash せずリクエスト毎に返す」リファクタで解消。
+    # ①は上流 release note（#1528 / #1554）による。実機で確認したのは 0.6.7（テキスト・画像とも正常、
+    # MTP 速度も 0.6.3 と同等）。上限は付けない。上げたときは Qwen3.6 で「1+1」（テキスト）と
+    # 画像 1 枚の両方を必ず確認する。
+    "mlx-vlm>=0.6.7 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    # mlx-vlm 0.6.5+ が transformers>=5.14 を要求する（0.6.4 は <5.13 に固定していた）。
+    "transformers>=5.14",
     # STT（音声→テキスト）バックエンド。backend="whisper" が同梱の stt_server 経由で使う。
     # Apple Silicon でのみ解決・インストールされる。
     "mlx-whisper>=0.4.3 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
