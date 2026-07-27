@@ -1125,8 +1125,8 @@ def test_reclaim_stale_workers_kills_only_ours(monkeypatch):
 def test_load_gateway_config_parses_image_max_edge(tmp_path):
     cfg = gw.load_gateway_config(_write(tmp_path, "image_max_edge = 1024\n"))
     assert cfg.image_max_edge == 1024
-    # 既定 1568。
-    assert gw.load_gateway_config(_write(tmp_path, "port = 8799\n")).image_max_edge == 1568
+    # 既定 1024。
+    assert gw.load_gateway_config(_write(tmp_path, "port = 8799\n")).image_max_edge == 1024
     # 0 は無効化として許可。
     assert gw.load_gateway_config(_write(tmp_path, "image_max_edge = 0\n")).image_max_edge == 0
     # 0 以外で 64 未満は拒否。

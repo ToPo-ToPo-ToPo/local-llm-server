@@ -1027,7 +1027,7 @@ class GatewayServer(ThreadingHTTPServer):
         api_key: str | None = None,
         video_frames: int = 8,
         video_max_edge: int = 768,
-        image_max_edge: int = 1568,
+        image_max_edge: int = 1024,
         repetition_penalty: float | None = None,
         repetition_context_size: int | None = None,
         repetition_penalty_skip_structured: bool = False,
@@ -1557,7 +1557,7 @@ class GatewayConfig:
     # --- 動画入力: ゲートウェイが video_url をフレーム画像列へ展開して上流へ渡す ---
     video_frames: int = 8              # 1 本の動画から等間隔で抜くフレーム数
     video_max_edge: int = 768          # 各フレームの縮小サイズ（長辺ピクセル）
-    image_max_edge: int = 1568         # 静止画の長辺上限。解像度上限の無い VLM の vision トークン爆発を防ぐ（0 で無効）
+    image_max_edge: int = 1024         # 静止画の長辺上限。解像度上限の無い VLM の vision トークン爆発を防ぐ（0 で無効）
     # --- 繰り返しループ抑制: mlx 系バックエンド（mlx / mlx-vlm）宛の chat リクエストに
     #     repetition_penalty を既定注入する（mlx-lm/mlx-vlm 拡張パラメータ）。低温・量子化の
     #     ローカル LLM が「同じ内容を繰り返して終わらない」degeneration の緩和。llama-cpp は
@@ -1763,7 +1763,7 @@ def load_gateway_config(path: str) -> GatewayConfig:
     if video_max_edge < 64:
         raise ValueError("video_max_edge must be 64 or greater")
     # 静止画の長辺上限（0 で無効）。極端に小さい値は事故なので 64px を下限にする。
-    image_max_edge = int(data.get("image_max_edge", 1568))
+    image_max_edge = int(data.get("image_max_edge", 1024))
     if image_max_edge != 0 and image_max_edge < 64:
         raise ValueError("image_max_edge must be 0 (disabled) or 64 or greater")
 
