@@ -922,10 +922,10 @@ def _wait_unloaded(mgr, model, timeout=2.0):
 
 
 def test_load_gateway_config_session_ttl(tmp_path):
-    # 明示・既定(90)・無効(0→None)・負数で ValueError。
+    # 明示・既定(600)・無効(0→None)・負数で ValueError。
     base = '[[models]]\nmodel = "x"\nbackend = "mlx"\n'
     assert gw.load_gateway_config(_write(tmp_path, 'session_ttl = 30\n' + base)).session_ttl == 30.0
-    assert gw.load_gateway_config(_write(tmp_path, base)).session_ttl == 90.0
+    assert gw.load_gateway_config(_write(tmp_path, base)).session_ttl == 600.0  # 省略時の既定
     assert gw.load_gateway_config(_write(tmp_path, 'session_ttl = 0\n' + base)).session_ttl is None
     with pytest.raises(ValueError, match="session_ttl"):
         gw.load_gateway_config(_write(tmp_path, 'session_ttl = -1\n' + base))

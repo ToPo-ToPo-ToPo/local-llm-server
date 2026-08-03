@@ -1577,7 +1577,13 @@ class GatewayConfig:
     request_timeout: float | None = 600.0  # 秒。上流との通信が無応答のとき打ち切る（0 で無制限）。ハングした／
                                        # 沈黙した上流が inflight を握ったまま枠を塞ぎ続けるのを防ぐ保険。トークンが
                                        # 流れている限り切れないので、長時間ストリーミング生成は妨げない（既定 600=10分）
-    session_ttl: float | None = 90.0   # 秒。在席エージェントのハートビートがこれだけ途絶えたら無人扱いで掃除（既定 90。None/0 で無効）
+    session_ttl: float | None = 600.0  # 秒。在席エージェントのハートビートがこれだけ途絶えたら無人扱いで掃除
+                                       # （既定 600。None/0 で無効）。これは「release を送れずに落ちた
+                                       # エージェント」への保険であって、遅いエージェントを切るものではない。
+                                       # 旧既定 90 は誤発動した——CAD エージェントで 1 課題に数分かかる巨大
+                                       # モデル（148GB）が、生きているエージェントの足元でアンロードされた
+                                       # （"Session unload: stopped 1 model(s) (agent heartbeat timed out)"）。
+                                       # 再ロードに 21 秒かかり、クライアント側の入口プローブも食い潰した。
     dynamic: bool = True               # 未登録モデルを ID 推論で動的ロードする（false で事前登録のみ）
     disable_thinking: bool = False     # 動的ロード時の既定（思考抑制）。事前登録は各 [[models]] が優先
     draft_model: str | None = None     # 動的ロード時の MTP 既定。None で mlx-vlm は "auto"（対応表から自動）。"off" で無効
@@ -1657,7 +1663,7 @@ def load_gateway_config(path: str) -> GatewayConfig:
         max_resident = 2            # 同時常駐モデル数の上限（ハード。省略時 無制限）
         load_timeout = 300          # 全枠処理中のとき空くのを待つ最大秒数（超過で 503。省略時 300）
         idle_timeout = 1200         # この秒数使われないモデルを自動アンロード（省略時 1200=20分。0 で無効）
-        session_ttl = 90            # 在席エージェントのハートビート猶予秒数（省略時 90。0 で無効）
+        session_ttl = 600           # 在席エージェントのハートビート猶予秒数（省略時 600。0 で無効）
         internal_base_port = 9001   # 内部サーバーの割当開始ポート（省略時 9001）
         default_model = "..."       # model 省略リクエスト時のモデル（省略可）
         draft_model = "auto"        # 全モデルの MTP ドラフター既定（mlx-vlm のみ有効。省略可）
@@ -1727,7 +1733,7 @@ def load_gateway_config(path: str) -> GatewayConfig:
             request_timeout = None
     # 在席エージェントのハートビート猶予秒数。途絶でそのエージェントを無人扱いし、モデルが
     # 無人になれば即アンロード（明示 release を呼べずに落ちたエージェントの保険）。0 で無効。
-    session_ttl = data.get("session_ttl", 90)
+    session_ttl = data.get("session_ttl", 600)
     if session_ttl is not None:
         session_ttl = float(session_ttl)
         if session_ttl < 0:
