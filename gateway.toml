@@ -25,9 +25,17 @@ port = 8799                 # 公開ポート（省略時 8799）。クライア
 max_resident = 2            # 同時常駐モデル数のハード上限。空きが無ければ LRU 退避、全て処理中なら待つ（省略時 無制限）
                             # 2: Ikazuchi-Mal の会話(gemma-4-26B-A4B 4bit ≈15GB)と OS作業/X bot(Qwen3.6-27B 4bit ≈15GB)を
                             # 併用するため。1 だと切替のたびにモデル再ロード＋プロンプトキャッシュ全損が起きる（要 ~30GB+ RAM）
+max_memory_fraction = 0.80  # 常駐モデルの推定占有量の合計を総RAMのこの割合に制限（省略で無効）
+                            # 総RAM 275GB → 上限 220GB。max_resident は「数」の上限でしかなく、
+                            # 150GB 級を 2 つ登録した今の構成（Inkling 4bit 148.5GB /
+                            # DeepSeek-V4-Flash 4bit + MTP 165.1GB）では数の上限だけでは守れない
+                            # （合計 313GB で 275GB を超える）。これを入れると片方をLRU退避してから
+                            # ロードする。15GB 級（Qwen3.6-27B 16.1GB 等）の2本併用には影響しない
 load_timeout = 300          # 全枠処理中のとき空くのを待つ最大秒数（超過で 503。省略時 300）
-# start_timeout = 120       # モデルサーバー1つの起動完了（ready）を待つ最大秒数（省略時 120）。巨大モデルや
-                            # コールドディスクで 120 秒を超えるなら延ばす
+start_timeout = 600         # モデルサーバー1つの起動完了（ready）を待つ最大秒数（省略時 120）。巨大モデルや
+                            # コールドディスクで 120 秒を超えるなら延ばす。
+                            # 600: Inkling-Small（4bit・138GiB）のロードが既定 120 秒に収まらないため。
+                            # 15GB 級のモデルの起動時間は変わらない（あくまで上限）
 # request_timeout = 600     # 上流モデルサーバーとの通信が「無応答」のとき打ち切る秒数（省略時 600=10分。0 で無制限）。
                             # トークンが流れている限り切れないのでストリーミングの長時間生成は妨げない。
                             # ハングした／沈黙したサーバーが処理中扱いのまま枠を塞ぎ続ける事故の保険
@@ -164,6 +172,89 @@ extra_args = ["-c", "32768"]  # コンテキストを32Kに制限してRAM膨張
 disable_thinking = true   # 既定は思考OFF。起動時の --chat-template-kwargs で正しく抑制される
                           # （ゲートウェイ経由の実プロセスで確認済み: 無指定→抑制、明示 true→思考する）。
                           # 思考を効かせたいリクエストだけ chat_template_kwargs={"enable_thinking": true} を送る
+
+# ── Inkling-Small（Thinking Machines。276B total / 12B active の疎 MoE。text+image+audio 入力）──
+# 公式 bf16（thinkingmachines/Inkling-Small・531.9GB）を自前で MLX 4bit へ変換したもの
+# （実測 4.506 bits/weight・138GiB。単体生成の Peak memory 148.7GB）。
+#
+# ⚠ mlx-community/Inkling-Small-mlx-4bit は使わないこと。あちらは独自ローダー inkling_mlx/ を
+#   リポジトリ内に同梱した別実装向けで、mlx-vlm の models/inkling では読めない。加えて本体内蔵の
+#   MTP 重み（model.mtp.*）が量子化時に落とされている（公式 bf16 には 160 キーある）。
+#
+# ⚠ 変換は公式 config.json をそのまま渡すと失敗する。mlx-vlm 0.6.7/0.6.8 の inkling 実装は
+#   「キー名を変換済みの config」を前提にしているため、次の翻訳が要る（変換スクリプトは
+#   scripts/convert_inkling.py）:
+#     model_type            : inkling_mm_model → inkling（MODEL_REMAPPING に別名が無い）
+#     text_config           : dense_intermediate_size → intermediate_size（dense 側 16384）
+#                             intermediate_size       → moe_intermediate_size（expert 側 2048）
+#     vision/audio_config   : decoder_dmodel → text_hidden_size（4096）、n_channels → num_channels
+#   逆に image_token_id / audio_token_id は**触らないこと**（mlx-vlm の既定 200054/200053 が正しい）。
+#   トークナイザ上の名前は <|unused_*|> だが InklingProcessor が画像・音声パッチの
+#   プレースホルダとして再利用している（実測: 640x480 で 200054 が 204 個 = pixel_values 204）。
+#   種別マーカーの <|content_image|>(200005) は 1 個しか出ないので、そちらを指定すると
+#   画像特徴が一切差し込まれず、エラーも出ないまま幻覚だけが返る。
+#
+# ⚠ 上流 mlx-vlm（0.6.7・0.6.8 とも）に Inkling 対応の穴が 3 つあり、モデルサーバー起動時に
+#   local_llm_server/_mlx_vlm_shims.py が補う（build_command はこのシム経由で起動する）:
+#     ① models/inkling/__init__.py が TextConfig/VisionConfig/AudioConfig を再エクスポート
+#        しない → 汎用ローダーが必ず AttributeError（＝素の mlx-vlm では Inkling を読めない）
+#     ② server の content マーカー除去表が固定 → 本文に <|message_model|><|content_text|> が残る
+#     ③ prompt_utils.MODEL_CONFIG に inkling が無い → apply_chat_template が text-only 扱いで
+#        画像・音声パートを黙って捨てる。実測では画像あり/なし/別画像で prompt_tokens が 41 の
+#        まま一致し、同一の幻覚が返っていた。登録後は 248 トークンになり正しく認識する
+#
+# 画像入力: 実測確認済み（青い四角＋赤い丸＋"HELLO"、黒背景の緑三角、いずれも正答）。
+#   音声入力は同じフォーマッタ経路に乗るが未検証。
+#
+# MTP（speculative decoding）: 公式 bf16 に内蔵された model.mtp.* を mlx-vlm 付属の
+#   `python -m mlx_vlm.speculative.drafters.inkling_mtp.split` で切り出せる（bf16・4.2GB。
+#   切り出しは**翻訳済み config を持つステージング**から行うこと。公式 config のままだと
+#   ドラフター側も dense/MoE 幅が入れ替わったままロードに失敗する）。
+#   ただし現状は上流バグで使えないため draft_model = "off" にしてある:
+#     最初の draft block で空のキャッシュ（keys が None）に対して state を読み、
+#     models/cache.py の `if self.offset == self.keys.shape[2]` が AttributeError になる
+#     （mlx_vlm/models/inkling/language.py の _snapshot_cache_state 経由）。
+#   切り出したドラフターは /Users/octopus/mlx_models/Inkling-Small-MTP-bf16 に置いてあるので、
+#   上流が直ったら下のコメント行と入れ替えるだけで有効化できる。
+#
+# 思考（reasoning）: このモデルは chat template が常に "Thinking effort level" を注入する
+#   （既定 0.9＝high）。抑制するにはリクエストに OpenAI 互換の reasoning_effort を渡す
+#   （"none"/"minimal"/"low"/"medium"/"high"/"max" または 0.0〜0.99 の float）。
+#   disable_thinking は mlx-vlm では build_command が参照しないので効かない。
+[[models]]
+model = "/Users/octopus/mlx_models/Inkling-Small-mlx-4bit"   # ~ は subprocess で展開されないので絶対パス
+backend = "mlx-vlm"
+draft_model = "off"         # ← 本来は下の MTP ドラフターを指したいが、上流バグで使えない（後述）
+# draft_model = "/Users/octopus/mlx_models/Inkling-Small-MTP-bf16"
+
+# ── DeepSeek-V4-Flash-0731（DeepSeek の 304B 疎 MoE。テキスト専用・context 1M・MIT）──
+# 公式 FP8（deepseek-ai/DeepSeek-V4-Flash-0731・166.9GB・e4m3 block 128x128）を自前で MLX 4bit へ
+# 変換したもの（実測 4.339 bits/weight・144GiB。単体生成の Peak memory 154.3GB・31 tok/s）。
+#
+# Inkling と違い**回避策が一切要らない**: 公式 config の model_type が mlx-vlm の実装と同じ
+# `deepseek_v4` で、`ModelConfig` に text_config フィールドが無いため汎用ローダーの
+# update_module_configs も素通りする。prompt_utils.MODEL_CONFIG にも TEXT_ONLY で登録済み。
+# 変換は `mlx_vlm.convert -q --q-bits 4 --q-group-size 64` をそのまま実行するだけでよい
+# （公式が FP8 でも、models/deepseek_v4 の sanitize が .weight/.scale の対を解いて再量子化する）。
+#
+# MTP: 公式チェックポイントに内蔵された MTP を mlx-vlm 付属の
+#   `python -m mlx_vlm.speculative.drafters.deepseek_v4_mtp.split` で切り出した bf16（10.9GB）。
+#   Inkling の MTP は上流バグで使えなかったが、こちらは別実装なので有効化して試す。
+#   不調なら draft_model = "off" にする。
+[[models]]
+model = "/Users/octopus/mlx_models/DeepSeek-V4-Flash-0731-mlx-4bit"   # ~ は展開されないので絶対パス
+backend = "mlx-vlm"
+# MTP ドラフター: **旧 DeepSeek-V4-Flash（無印）から切り出した bf16**（3.4GB）。
+#   0731 の内蔵 MTP（mtp.0/1/2・main_proj [4096,12288] の 3 系統連結）は mlx-vlm の
+#   DeepseekV4MTPDraftModel（enorm/hnorm/e_proj/h_proj 構造）と**アーキテクチャ自体が別物**で
+#   使えない。旧 Flash の mtp.0 は上流実装と完全一致し（動作実績のある
+#   inferencerlabs/DeepSeek-V4-Flash-MTP-MLX の出所もこれ）、hidden_size も同じ 4096 なので
+#   0731 本体のドラフターとして組める（投機デコードは lossless。旧型ドラフター故に採択率が
+#   下がる可能性はあり、効果は実測で判断する）。
+#   作成: hf download deepseek-ai/DeepSeek-V4-Flash（mtp は model-00046-of-00046 に隔離）
+#         → python -m mlx_vlm.speculative.drafters.deepseek_v4_mtp.split
+#   ⚠ split.py は get_model_path 経由でリポ全体（149GB）を取得するので注意（切り出し後は削除可）。
+draft_model = "/Users/octopus/mlx_models/DeepSeek-V4-Flash-MTP-bf16"
 
 # vLLM（Linux/NVIDIA。Windows は WSL2 内で）。HF repo-id（safetensors）を指定。高スループット:
 # [[models]]
