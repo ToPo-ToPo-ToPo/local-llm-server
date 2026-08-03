@@ -1944,6 +1944,51 @@ def test_no_inject_when_disabled():
     assert "repetition_penalty" not in got
 
 
+# --- 思考 OFF: reasoning_effort="none" の注入（mlx-vlm の disable_thinking） -------
+
+def _mk_srv_thinking(backends, disabled):
+    from types import SimpleNamespace
+    mgr = SimpleNamespace(backend_for=lambda m: backends[m],
+                          disable_thinking_for=lambda m: disabled.get(m, False))
+    return SimpleNamespace(manager=mgr)
+
+
+def _inject_thinking(srv, model, payload):
+    body = json.dumps(payload).encode("utf-8")
+    out = gw._GatewayHandler._maybe_disable_thinking(None, srv, model, payload, body)
+    return json.loads(out)
+
+
+def test_disable_thinking_injects_reasoning_effort_none():
+    """mlx-vlm には build_command 側で思考を止める手段が無いのでリクエストで落とす。"""
+    srv = _mk_srv_thinking({"x/inkling": "mlx-vlm"}, {"x/inkling": True})
+    got = _inject_thinking(srv, "x/inkling", {"model": "x/inkling", "messages": []})
+    assert got["reasoning_effort"] == "none"
+
+
+def test_no_inject_when_disable_thinking_not_set():
+    srv = _mk_srv_thinking({"x/inkling": "mlx-vlm"}, {"x/inkling": False})
+    got = _inject_thinking(srv, "x/inkling", {"model": "x/inkling", "messages": []})
+    assert "reasoning_effort" not in got
+
+
+def test_no_inject_thinking_for_non_mlx_vlm():
+    """llama-cpp / mlx は build_command が --chat-template-args で止める（従来経路）。"""
+    srv = _mk_srv_thinking({"x/gguf": "llama-cpp"}, {"x/gguf": True})
+    got = _inject_thinking(srv, "x/gguf", {"model": "x/gguf", "messages": []})
+    assert "reasoning_effort" not in got
+
+
+@pytest.mark.parametrize("key,val", [("reasoning_effort", "high"), ("reasoning", {"effort": "high"})])
+def test_client_reasoning_is_respected(key, val):
+    """クライアントが明示していれば尊重する（思考させたいリクエストを潰さない）。"""
+    srv = _mk_srv_thinking({"x/inkling": "mlx-vlm"}, {"x/inkling": True})
+    got = _inject_thinking(srv, "x/inkling", {"model": "x/inkling", "messages": [], key: val})
+    assert got[key] == val
+    if key == "reasoning":
+        assert "reasoning_effort" not in got
+
+
 # --- 構造化リクエストの注入除外（既定オフの機能） ------------------------------
 
 def test_skip_structured_default_off(tmp_path):

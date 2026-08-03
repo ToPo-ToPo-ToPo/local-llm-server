@@ -192,9 +192,11 @@ def test_thinking_markers_default_is_gemma4_style():
 
 
 def test_thinking_markers_inkling():
-    # Inkling は <|content_thinking|>…<|end_message|>。mlx-vlm の内蔵既定に無いので
-    # 明示しないと思考が丸ごと content に漏れる。ローカルパス登録でも引けること。
-    expected = ("<|content_thinking|>", "<|end_message|>")
+    # Inkling は <|content_thinking|>…<|end_message|><|message_model|>。mlx-vlm の内蔵既定に
+    # 無いので明示しないと思考が丸ごと content に漏れる。ローカルパス登録でも引けること。
+    # 終端が <|end_message|> 単体でないのは、それが本文の終端も兼ねており、思考 OFF のとき
+    # 本文全体が思考と誤判定されて content が空になるため。
+    expected = ("<|content_thinking|>", "<|end_message|><|message_model|>")
     assert srv.thinking_markers("/Users/x/mlx_models/Inkling-Small-mlx-4bit") == expected
     assert srv.thinking_markers("mlx-community/inkling-mlx-4bit") == expected
 

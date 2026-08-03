@@ -295,6 +295,15 @@ class ModelManager:
     def model_ids(self) -> list[str]:
         return list(self._models)
 
+    def disable_thinking_for(self, model_id: str) -> bool:
+        """model_id に disable_thinking が指定されているか（未登録は False）。
+
+        do_POST が「mlx-vlm 宛に reasoning_effort=none を注入するか」の判定に使う。
+        """
+        with self._state:
+            mm = self._models.get(model_id)
+        return bool(mm.config.disable_thinking) if mm is not None else False
+
     def backend_for(self, model_id: str) -> str:
         """model_id のバックエンドを返す（登録済みは config 値、未登録は ID から推論）。
 
@@ -1298,6 +1307,7 @@ class _GatewayHandler(BaseHTTPRequestHandler):
         # （chat/text completions のみ。クライアント明示は尊重。設定で無効化可）。
         if path.endswith(("/chat/completions", "/completions")):
             body = self._maybe_inject_repetition(srv, model, payload, body)
+            body = self._maybe_disable_thinking(srv, model, payload, body)
         self._acquire_and_forward(srv, model, body)
 
     def _handle_update_now(self, srv) -> None:
@@ -1372,6 +1382,35 @@ class _GatewayHandler(BaseHTTPRequestHandler):
         rcs = getattr(srv, "repetition_context_size", None)
         if rcs is not None and "repetition_context_size" not in payload:
             payload["repetition_context_size"] = rcs
+        return json.dumps(payload).encode("utf-8")
+
+    def _maybe_disable_thinking(self, srv, model, payload: dict, body: bytes) -> bytes:
+        """mlx-vlm 宛のリクエストに reasoning_effort="none" を注入して思考を止める。
+
+        `disable_thinking = true` を指定した [[models]] のみが対象。mlx-vlm には
+        build_command 側で思考を止める手段が無い（--chat-template-args を渡すのは
+        mlx / llama-cpp 経路だけ）ので、リクエスト側で落とす。
+
+        背景: mlx-vlm サーバの既定は思考 OFF だが、それは chat template が
+        `enable_thinking` を見るモデルに限った話。Inkling は **常に**
+        「Thinking effort level: 0.9」をテンプレートで注入する作りで、
+        enable_thinking では止まらず、OpenAI 互換の reasoning_effort でしか制御できない
+        （"none"/"minimal"/"low"/"medium"/"high"/"max" または 0.0〜0.99 の float）。
+
+        クライアントが自分で reasoning_effort / reasoning を指定していれば尊重する。
+        """
+        if not isinstance(model, str):
+            return body
+        if "reasoning_effort" in payload or "reasoning" in payload:
+            return body
+        try:
+            if srv.manager.backend_for(model) != "mlx-vlm":
+                return body
+            if not srv.manager.disable_thinking_for(model):
+                return body
+        except Exception:  # noqa: BLE001 - 判定不能なら注入しない（安全側）
+            return body
+        payload["reasoning_effort"] = "none"
         return json.dumps(payload).encode("utf-8")
 
     def _handle_audio(self, srv, body: bytes) -> None:

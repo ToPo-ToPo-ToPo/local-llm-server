@@ -422,10 +422,14 @@ def parallel_supported(backend: str) -> bool:
 # 既定は gemma-4-A4B 系の形式。内蔵既定のどれとも違う形式のモデルだけここに書く。
 # 判定はモデル ID の部分一致（小文字化）——ローカルパス登録でも効かせるため。
 _THINKING_MARKERS = (
-    # Inkling（Thinking Machines）: 思考は <|content_thinking|>…<|end_message|> で、
-    # そのあと <|message_model|><|content_text|> で本文が続く。この形式は mlx-vlm の
-    # 内蔵既定に無く、既定のままだと思考が丸ごと content に漏れる（実測確認済み）。
-    ("inkling", ("<|content_thinking|>", "<|end_message|>")),
+    # Inkling（Thinking Machines）: 思考は
+    #   <|content_thinking|>…<|end_message|><|message_model|><|content_text|>本文<|end_message|>
+    # の形で出る。この形式は mlx-vlm の内蔵既定に無く、既定のままだと思考が丸ごと
+    # content に漏れる（実測確認済み）。
+    # 終端に <|end_message|> 単体を使ってはいけない: 本文の終端でもあるため、思考 OFF
+    # （reasoning_effort="none"）のときに**本文全体が思考と誤判定**され content が空になる。
+    # 思考ブロックの直後にだけ現れる 2 トークン列を終端にすると両方で正しく割れる。
+    ("inkling", ("<|content_thinking|>", "<|end_message|><|message_model|>")),
 )
 _DEFAULT_THINKING_MARKERS = ("<|channel>thought", "<channel|>")
 

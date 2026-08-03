@@ -224,6 +224,12 @@ disable_thinking = true   # 既定は思考OFF。起動時の --chat-template-kw
 [[models]]
 model = "/Users/octopus/mlx_models/Inkling-Small-mlx-4bit"   # ~ は subprocess で展開されないので絶対パス
 backend = "mlx-vlm"
+disable_thinking = true     # 思考 OFF（他モデルと揃える）。mlx-vlm には build_command 側で
+                            # 止める手段が無いので、ゲートウェイが reasoning_effort="none" を
+                            # リクエストへ注入する。Inkling のテンプレートは enable_thinking を
+                            # 見ず、指定が無いと必ず「Thinking effort level: 0.9」を入れるため、
+                            # これが無いと毎回ほぼ最大の思考が走る（CAD 1 課題で 3〜8 分）。
+                            # 思考させたいリクエストだけ reasoning_effort を明示すれば尊重される
 draft_model = "off"         # ← 本来は下の MTP ドラフターを指したいが、上流バグで使えない（後述）
 # draft_model = "/Users/octopus/mlx_models/Inkling-Small-MTP-bf16"
 
@@ -244,6 +250,9 @@ draft_model = "off"         # ← 本来は下の MTP ドラフターを指し�
 [[models]]
 model = "/Users/octopus/mlx_models/DeepSeek-V4-Flash-0731-mlx-4bit"   # ~ は展開されないので絶対パス
 backend = "mlx-vlm"
+disable_thinking = true     # 思考 OFF（他モデルと揃える）。reasoning_effort="none" を注入する。
+                            # 未設定だと既定で思考し、CAD 1 課題の生成が Inkling(OFF) の 8〜11 倍の
+                            # 文字数になっていた（enclosure で 45,966 文字 vs 4,054 文字）
 # MTP ドラフター: **旧 DeepSeek-V4-Flash（無印）から切り出した bf16**（3.4GB）。
 #   0731 の内蔵 MTP（mtp.0/1/2・main_proj [4096,12288] の 3 系統連結）は mlx-vlm の
 #   DeepseekV4MTPDraftModel（enorm/hnorm/e_proj/h_proj 構造）と**アーキテクチャ自体が別物**で
@@ -254,7 +263,14 @@ backend = "mlx-vlm"
 #   作成: hf download deepseek-ai/DeepSeek-V4-Flash（mtp は model-00046-of-00046 に隔離）
 #         → python -m mlx_vlm.speculative.drafters.deepseek_v4_mtp.split
 #   ⚠ split.py は get_model_path 経由でリポ全体（149GB）を取得するので注意（切り出し後は削除可）。
-draft_model = "/Users/octopus/mlx_models/DeepSeek-V4-Flash-MTP-bf16"
+draft_model = "off"         # ← 上流バグで実用不能（下記）。短い生成では通るので注意
+# draft_model = "/Users/octopus/mlx_models/DeepSeek-V4-Flash-MTP-bf16"
+#   ⚠ ドラフトが**棄却されたときの巻き戻し**で落ちる:
+#     models/deepseek_v4/language.py の rollback_speculative_cache が
+#     "'list' object has no attribute 'max'" を投げる（CAD 評価で 152 回発生し、
+#     全 7 課題が "no geometry produced" で失敗した）。
+#   数十トークン程度の短い生成では棄却が起きず素通りするため、疎通確認では見抜けない。
+#   実運用の長い生成では確実に踏むので off にしておくこと。
 
 # vLLM（Linux/NVIDIA。Windows は WSL2 内で）。HF repo-id（safetensors）を指定。高スループット:
 # [[models]]
