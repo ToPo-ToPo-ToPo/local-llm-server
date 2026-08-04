@@ -1940,7 +1940,7 @@ dev = [
 requires-dist = [
     { name = "imageio-ffmpeg", specifier = ">=0.4.9" },
     { name = "mlx-lm", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'", specifier = ">=0.31.3" },
-    { name = "mlx-vlm", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'", specifier = ">=0.6.7" },
+    { name = "mlx-vlm", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'", specifier = ">=0.6.9" },
     { name = "mlx-whisper", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'", specifier = ">=0.4.3" },
     { name = "pillow", specifier = ">=10" },
     { name = "psutil", specifier = ">=5.9" },
@@ -2288,7 +2288,7 @@ wheels = [
 
 [[package]]
 name = "mlx-vlm"
-version = "0.6.7"
+version = "0.6.9"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "fastapi", marker = "sys_platform == 'darwin' or (sys_platform != 'emscripten' and sys_platform != 'win32' and extra == 'extra-16-local-llm-server-sglang') or (sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-16-local-llm-server-vllm') or (sys_platform == 'emscripten' and extra == 'extra-16-local-llm-server-sglang' and extra == 'extra-16-local-llm-server-vllm') or (sys_platform == 'win32' and extra == 'extra-16-local-llm-server-sglang' and extra == 'extra-16-local-llm-server-vllm')" },
@@ -2307,9 +2307,9 @@ dependencies = [
     { name = "transformers", marker = "sys_platform == 'darwin' or (sys_platform != 'emscripten' and sys_platform != 'win32' and extra == 'extra-16-local-llm-server-sglang') or (sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-16-local-llm-server-vllm') or (sys_platform == 'emscripten' and extra == 'extra-16-local-llm-server-sglang' and extra == 'extra-16-local-llm-server-vllm') or (sys_platform == 'win32' and extra == 'extra-16-local-llm-server-sglang' and extra == 'extra-16-local-llm-server-vllm')" },
     { name = "uvicorn", marker = "sys_platform == 'darwin' or (sys_platform != 'emscripten' and sys_platform != 'win32' and extra == 'extra-16-local-llm-server-sglang') or (sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-16-local-llm-server-vllm') or (sys_platform == 'emscripten' and extra == 'extra-16-local-llm-server-sglang' and extra == 'extra-16-local-llm-server-vllm') or (sys_platform == 'win32' and extra == 'extra-16-local-llm-server-sglang' and extra == 'extra-16-local-llm-server-vllm')" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/8e/cb/8a6c9c10ee990e6f0735be36a61ce046f945ed49fa884ec29c7468ee81e8/mlx_vlm-0.6.7.tar.gz", hash = "sha256:bde08ab72557b8f60ca6ee7bc88e883e1dbe90c948d035e7db22f0e71d067808", size = 1593239, upload-time = "2026-07-23T15:11:32.254Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/cc/71/737cd19fbc4adb5ffc17a15dac58bc7bfeef3898a48b97aa15eaf0cc612e/mlx_vlm-0.6.9.tar.gz", hash = "sha256:1a1e368cecc4aac64568d1b528f0935d6ab2aab6e38c34d980b0254f65fdde5c", size = 1718054, upload-time = "2026-08-03T19:35:29.431Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/85/66/19d86141af53886e676c8d87d093b475910f8066c375a4681419beccbcde/mlx_vlm-0.6.7-py3-none-any.whl", hash = "sha256:037046f06a3de3d173cb060f0e50b74cff0f666e6951b70eea87c536fb061929", size = 1985414, upload-time = "2026-07-23T15:11:30.51Z" },
+    { url = "https://files.pythonhosted.org/packages/17/a8/b59ec3ed12c76ab5f679737c2f376b382627bf9fb3983eb825aa04ac5bd2/mlx_vlm-0.6.9-py3-none-any.whl", hash = "sha256:179604c551035cb3b001c338f3aa6295bf54c2bd9d583730c89ba1a8de9d1dc1", size = 2170287, upload-time = "2026-08-03T19:35:27.606Z" },
 ]
 
 [[package]]

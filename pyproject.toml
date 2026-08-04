@@ -27,17 +27,20 @@ dependencies = [
     "psutil>=5.9",
     # mlx 系バックエンド（テキスト/vision/STT）。Apple Silicon でのみ解決・インストールされる。
     "mlx-lm>=0.31.3 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
-    # 0.6.7 以上を要求する。理由は 2 つ:
+    # 0.6.9 以上を要求する。理由は 3 つ:
     # ① 0.6.4 の Qwen3.6 garble（変換・推論とも壊れる）が 0.6.5 で直った
     #    （norm の +1.0 シフトを raw-HF レイアウト限定に絞る修正）。
     # ② 0.6.3 + mlx 0.32.0 では Qwen3.6（qwen3_5 系）の**画像入力**が必ず失敗した
     #    （get_rope_index の attention_mask.tolist() が生成スレッドで
     #    `RuntimeError: There is no Stream(gpu, N) in current thread`）。0.6.4 の
     #    「position_ids を model に stash せずリクエスト毎に返す」リファクタで解消。
-    # ①は上流 release note（#1528 / #1554）による。実機で確認したのは 0.6.7（テキスト・画像とも正常、
-    # MTP 速度も 0.6.3 と同等）。上限は付けない。上げたときは Qwen3.6 で「1+1」（テキスト）と
-    # 画像 1 枚の両方を必ず確認する。
-    "mlx-vlm>=0.6.7 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    # ③ 0.6.9 で Inkling 対応が完成した。0.6.7/0.6.8 は公式チェックポイントを
+    #    **公開ローダー経路で一切読めず**（sub-config の再エクスポート漏れ・
+    #    inkling_mm_model の別名未登録・prompt_utils.MODEL_CONFIG 未登録）、加えて
+    #    MoE の global_scale / gate.bias を実装しておらず、当時の変換物はこの重みを
+    #    **黙って落としていた**（＝本来の推論と異なる）。0.6.9 は公式 config を
+    #    そのまま読み、これらの重みも扱う。0.6.9 未満に落とすと Inkling が壊れる。
+    "mlx-vlm>=0.6.9 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
     # mlx-vlm 0.6.5+ が transformers>=5.14 を要求する（0.6.4 は <5.13 に固定していた）。
     "transformers>=5.14",
     # Inkling 系（thinkingmachines/Inkling*）の processor が要求する。transformers の

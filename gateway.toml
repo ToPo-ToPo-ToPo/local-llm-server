@@ -179,52 +179,26 @@ disable_thinking = true   # 既定は思考OFF。起動時の --chat-template-kw
 
 # ── Inkling-Small（Thinking Machines。276B total / 12B active の疎 MoE。text+image+audio 入力）──
 # 公式 bf16（thinkingmachines/Inkling-Small・531.9GB）を自前で MLX 4bit へ変換したもの
-# （実測 4.506 bits/weight・138GiB。単体生成の Peak memory 148.7GB）。
+# （実測 4.506 bits/weight・138GiB。単体生成の Peak memory 148.7GB・53 tok/s）。
+# HF にも公開: ToPo-ToPo/Inkling-Small-mlx-4bit（2bit 版もあり）。
 #
-# ⚠ mlx-community/Inkling-Small-mlx-4bit は使わないこと。あちらは独自ローダー inkling_mlx/ を
-#   リポジトリ内に同梱した別実装向けで、mlx-vlm の models/inkling では読めない。加えて本体内蔵の
-#   MTP 重み（model.mtp.*）が量子化時に落とされている（公式 bf16 には 160 キーある）。
+# ⚠ mlx-vlm 0.6.9 以降が必須（pyproject でピン済み）。0.6.7/0.6.8 は Inkling を
+#   公開ローダー経路で読めず、当時は config のキー名翻訳と起動時シムで回避していた。
+#   さらに深刻なのは、当時の実装が MoE の mlp.global_scale（50件）と mlp.gate.bias（40件）を
+#   持たず、**変換時にこれらの重みを黙って落としていた**こと（形状エラーも出ない）。
+#   0.6.9 はこれらを扱い、公式 config をそのまま読む。翻訳もシムも不要になった。
+#   → 変換は scripts/convert_inkling.py（0.6.9 未満なら実行前に止まる）
 #
-# ⚠ 変換は公式 config.json をそのまま渡すと失敗する。mlx-vlm 0.6.7/0.6.8 の inkling 実装は
-#   「キー名を変換済みの config」を前提にしているため、次の翻訳が要る（変換スクリプトは
-#   scripts/convert_inkling.py）:
-#     model_type            : inkling_mm_model → inkling（MODEL_REMAPPING に別名が無い）
-#     text_config           : dense_intermediate_size → intermediate_size（dense 側 16384）
-#                             intermediate_size       → moe_intermediate_size（expert 側 2048）
-#     vision/audio_config   : decoder_dmodel → text_hidden_size（4096）、n_channels → num_channels
-#   逆に image_token_id / audio_token_id は**触らないこと**（mlx-vlm の既定 200054/200053 が正しい）。
-#   トークナイザ上の名前は <|unused_*|> だが InklingProcessor が画像・音声パッチの
-#   プレースホルダとして再利用している（実測: 640x480 で 200054 が 204 個 = pixel_values 204）。
-#   種別マーカーの <|content_image|>(200005) は 1 個しか出ないので、そちらを指定すると
-#   画像特徴が一切差し込まれず、エラーも出ないまま幻覚だけが返る。
+# 画像入力: 実測確認済み（640x480 の画像が 204 vision トークンに展開され、
+#   青い四角＋赤い丸＋"HELLO" を正確に認識）。
 #
-# ⚠ 上流 mlx-vlm（0.6.7・0.6.8 とも）に Inkling 対応の穴が 3 つあり、モデルサーバー起動時に
-#   local_llm_server/_mlx_vlm_shims.py が補う（build_command はこのシム経由で起動する）:
-#     ① models/inkling/__init__.py が TextConfig/VisionConfig/AudioConfig を再エクスポート
-#        しない → 汎用ローダーが必ず AttributeError（＝素の mlx-vlm では Inkling を読めない）
-#     ② server の content マーカー除去表が固定 → 本文に <|message_model|><|content_text|> が残る
-#     ③ prompt_utils.MODEL_CONFIG に inkling が無い → apply_chat_template が text-only 扱いで
-#        画像・音声パートを黙って捨てる。実測では画像あり/なし/別画像で prompt_tokens が 41 の
-#        まま一致し、同一の幻覚が返っていた。登録後は 248 トークンになり正しく認識する
-#
-# 画像入力: 実測確認済み（青い四角＋赤い丸＋"HELLO"、黒背景の緑三角、いずれも正答）。
-#   音声入力は同じフォーマッタ経路に乗るが未検証。
-#
-# MTP（speculative decoding）: 公式 bf16 に内蔵された model.mtp.* を mlx-vlm 付属の
-#   `python -m mlx_vlm.speculative.drafters.inkling_mtp.split` で切り出せる（bf16・4.2GB。
-#   切り出しは**翻訳済み config を持つステージング**から行うこと。公式 config のままだと
-#   ドラフター側も dense/MoE 幅が入れ替わったままロードに失敗する）。
-#   ただし現状は上流バグで使えないため draft_model = "off" にしてある:
-#     最初の draft block で空のキャッシュ（keys が None）に対して state を読み、
-#     models/cache.py の `if self.offset == self.keys.shape[2]` が AttributeError になる
-#     （mlx_vlm/models/inkling/language.py の _snapshot_cache_state 経由）。
+# MTP（speculative decoding）: 公式 bf16 内蔵の model.mtp.* を mlx-vlm 付属の
+#   `python -m mlx_vlm.speculative.drafters.inkling_mtp.split` で切り出したもの（bf16・4.2GB）。
+#   ただし 0.6.9 時点でも上流バグで使えないため draft_model = "off"。
+#   最初の draft block で空のキャッシュ（keys が None）に state を読み AttributeError
+#   （models/cache.py。models/inkling/language.py の _snapshot_cache_state 経由）。
 #   切り出したドラフターは /Users/octopus/mlx_models/Inkling-Small-MTP-bf16 に置いてあるので、
 #   上流が直ったら下のコメント行と入れ替えるだけで有効化できる。
-#
-# 思考（reasoning）: このモデルは chat template が常に "Thinking effort level" を注入する
-#   （既定 0.9＝high）。抑制するにはリクエストに OpenAI 互換の reasoning_effort を渡す
-#   （"none"/"minimal"/"low"/"medium"/"high"/"max" または 0.0〜0.99 の float）。
-#   disable_thinking は mlx-vlm では build_command が参照しないので効かない。
 [[models]]
 model = "/Users/octopus/mlx_models/Inkling-Small-mlx-4bit"   # ~ は subprocess で展開されないので絶対パス
 backend = "mlx-vlm"
@@ -234,7 +208,7 @@ disable_thinking = true     # 思考 OFF（他モデルと揃える）。mlx-vlm
                             # 見ず、指定が無いと必ず「Thinking effort level: 0.9」を入れるため、
                             # これが無いと毎回ほぼ最大の思考が走る（CAD 1 課題で 3〜8 分）。
                             # 思考させたいリクエストだけ reasoning_effort を明示すれば尊重される
-draft_model = "off"         # ← 本来は下の MTP ドラフターを指したいが、上流バグで使えない（後述）
+draft_model = "off"         # ← 上流バグで MTP が使えない（上記）
 # draft_model = "/Users/octopus/mlx_models/Inkling-Small-MTP-bf16"
 
 # ── DeepSeek-V4-Flash-0731（DeepSeek の 304B 疎 MoE。テキスト専用・context 1M・MIT）──
