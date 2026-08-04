@@ -172,6 +172,8 @@ def test_apply_update_no_repo(monkeypatch):
 # 一方、依存の追加は tool venv に入らない。自動更新がこれを取りこぼすと
 # 「コードだけ新しく依存が古い」静かな機能欠けになる（実例: pyobjc 不在でトレイ不表示）。
 def test_tool_env_root_detects_uv_tools_python(monkeypatch):
+    monkeypatch.setattr(update.sys, "prefix",
+                        "/Users/x/.local/share/uv/tools/local-llm-server")
     monkeypatch.setattr(
         update.sys, "executable",
         "/Users/x/.local/share/uv/tools/local-llm-server/bin/python3",
@@ -180,7 +182,30 @@ def test_tool_env_root_detects_uv_tools_python(monkeypatch):
     assert root is not None and root.name == "local-llm-server"
 
 
+def test_tool_env_root_uses_prefix_not_resolved_executable(monkeypatch, tmp_path):
+    """venv の python がシンボリックリンクでも tool venv を検出できる（実バグの回帰テスト）。
+
+    venv の bin/python は uv 管理の素の CPython への symlink であり、旧実装の
+    `Path(sys.executable).resolve()` は venv の**外**へ解決されて None を返していた。
+    その結果、自動更新の依存入れ直し（refresh_tool_env）が本番で一度も走らず、
+    「コードだけ新しく依存が古い」静かな機能欠けを防ぐ仕組み自体が死んでいた。
+    sys.prefix（稼働中 venv のルート）で判定することを、実 symlink で検証する。
+    """
+    base = tmp_path / "python" / "cpython-3.13" / "bin"; base.mkdir(parents=True)
+    real = base / "python3.13"; real.write_bytes(b"")
+    env = tmp_path / "uv" / "tools" / "local-llm-server"
+    (env / "bin").mkdir(parents=True)
+    link = env / "bin" / "python"
+    link.symlink_to(real)
+    monkeypatch.setattr(update.sys, "prefix", str(env))
+    monkeypatch.setattr(update.sys, "executable", str(link))
+    root = update.tool_env_root()
+    assert root is not None and root == env
+
+
 def test_tool_env_root_none_for_project_venv(monkeypatch):
+    monkeypatch.setattr(update.sys, "prefix",
+                        "/Users/x/my_program/local-llm-server/.venv")
     monkeypatch.setattr(
         update.sys, "executable",
         "/Users/x/my_program/local-llm-server/.venv/bin/python3",
@@ -206,6 +231,64 @@ def test_refresh_tool_env_runs_reinstall(monkeypatch, tmp_path):
     assert ok is True
     assert calls and calls[0][:3] == ("/opt/homebrew/bin/uv", "tool", "install")
     assert "--reinstall" in calls[0] and "--editable" in calls[0]
+
+
+def _repo_with_deps(tmp_path, lock=b"lock-v1", pyproject=b"[project]"):
+    root = tmp_path / "repo"
+    root.mkdir(exist_ok=True)
+    (root / "uv.lock").write_bytes(lock)
+    (root / "pyproject.toml").write_bytes(pyproject)
+    return root
+
+
+def test_refresh_tool_env_skips_when_deps_unchanged(monkeypatch, tmp_path):
+    """依存（uv.lock + pyproject）が前回と同一なら再インストールしない。
+
+    無条件の --reinstall は ~5 秒かかり、zero-drop restart で accept キューに並んだ
+    接続の待ち時間の支配項だった。自動更新の大半はコードだけの変更なので、この
+    スキップで再起動の窓が ~1〜2 秒になる。
+    """
+    env_root = tmp_path / "toolenv"; env_root.mkdir()
+    root = _repo_with_deps(tmp_path)
+    monkeypatch.setattr(update, "tool_env_root", lambda: env_root)
+    monkeypatch.setattr(update, "_find_uv", lambda: "/usr/bin/uv")
+    calls = []
+
+    class _R:
+        returncode = 0; stdout = ""; stderr = ""
+    monkeypatch.setattr(update.subprocess, "run",
+                        lambda cmd, **kw: calls.append(tuple(cmd)) or _R())
+
+    # 1 回目: マーカーが無い → 再インストールし、成功したのでマーカーを書く
+    ok, msg = update.refresh_tool_env(root)
+    assert ok and len(calls) == 1
+    assert (env_root / update._DEPS_FINGERPRINT_NAME).exists()
+
+    # 2 回目: 依存が同一 → スキップ（uv を呼ばない）
+    ok, msg = update.refresh_tool_env(root)
+    assert ok and len(calls) == 1 and "スキップ" in msg
+
+    # 依存が変わったら再インストールし、マーカーも更新される
+    (root / "uv.lock").write_bytes(b"lock-v2")
+    ok, _ = update.refresh_tool_env(root)
+    assert ok and len(calls) == 2
+    ok, msg = update.refresh_tool_env(root)   # 変更後の 2 回目はまたスキップ
+    assert ok and len(calls) == 2 and "スキップ" in msg
+
+
+def test_refresh_tool_env_no_marker_after_failure(monkeypatch, tmp_path):
+    """再インストールが失敗したらマーカーを書かない（次回も安全側＝再試行する）。"""
+    env_root = tmp_path / "toolenv"; env_root.mkdir()
+    root = _repo_with_deps(tmp_path)
+    monkeypatch.setattr(update, "tool_env_root", lambda: env_root)
+    monkeypatch.setattr(update, "_find_uv", lambda: "/usr/bin/uv")
+
+    class _Fail:
+        returncode = 1; stdout = ""; stderr = "boom"
+    monkeypatch.setattr(update.subprocess, "run", lambda cmd, **kw: _Fail())
+    ok, _ = update.refresh_tool_env(root)
+    assert ok is False
+    assert not (env_root / update._DEPS_FINGERPRINT_NAME).exists()
 
 
 def test_refresh_tool_env_noop_outside_tool_venv(monkeypatch, tmp_path):
