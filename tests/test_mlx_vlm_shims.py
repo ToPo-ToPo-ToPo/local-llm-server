@@ -1,8 +1,8 @@
-"""_mlx_vlm_shims が mlx-vlm の Inkling 対応の穴を埋めることを確認する。
+"""_mlx_vlm_shims が mlx-vlm の残る穴（content マーカー）を埋めることを確認する。
 
 mlx-vlm は Apple Silicon でしか入らないので、未導入環境ではスキップする。
-上流が修正を入れたらパッチは no-op になる（setdefault / 既存チェック）ので、
-「パッチ後に期待する状態になっている」ことだけを検証する。
+上流が修正を入れたらパッチは no-op になる（既存チェック）ので、「パッチ後に期待する
+状態になっている」ことだけを検証する。
 """
 
 import pytest
@@ -16,24 +16,6 @@ def test_apply_is_safe_without_mlx_vlm(monkeypatch):
     _mlx_vlm_shims.apply()  # 例外が出ないこと
 
 
-def test_inkling_subconfigs_exported():
-    inkling = pytest.importorskip("mlx_vlm.models.inkling")
-    _mlx_vlm_shims.apply()
-    # 汎用ローダー（utils.update_module_configs）が getattr する名前
-    for name in ("TextConfig", "VisionConfig", "AudioConfig"):
-        assert hasattr(inkling, name), name
-
-
-def test_inkling_registered_in_message_format():
-    prompt_utils = pytest.importorskip("mlx_vlm.prompt_utils")
-    _mlx_vlm_shims.apply()
-    # 未登録だと apply_chat_template が text-only 扱いで画像パートを捨てる
-    assert "inkling" in prompt_utils.MODEL_CONFIG
-    assert prompt_utils.MODEL_CONFIG["inkling"] is (
-        prompt_utils.MessageFormat.LIST_WITH_IMAGE_FIRST
-    )
-
-
 def test_inkling_content_markers_stripped():
     responses_state = pytest.importorskip("mlx_vlm.server.responses_state")
     _mlx_vlm_shims.apply()
@@ -45,11 +27,23 @@ def test_inkling_content_markers_stripped():
 
 
 def test_apply_is_idempotent():
-    prompt_utils = pytest.importorskip("mlx_vlm.prompt_utils")
     responses_state = pytest.importorskip("mlx_vlm.server.responses_state")
     _mlx_vlm_shims.apply()
-    markers_once = responses_state._CONTENT_MARKERS
-    fmt_once = prompt_utils.MODEL_CONFIG["inkling"]
+    once = responses_state._CONTENT_MARKERS
     _mlx_vlm_shims.apply()
-    assert responses_state._CONTENT_MARKERS == markers_once
-    assert prompt_utils.MODEL_CONFIG["inkling"] is fmt_once
+    assert responses_state._CONTENT_MARKERS == once
+
+
+def test_upstream_fixed_gaps_are_not_repatched():
+    """0.6.9 が直した 2 点（sub-config 再エクスポート / MODEL_CONFIG 登録）は上流に在ること。
+
+    ここが落ちたら mlx-vlm が 0.6.9 未満に落ちている（pyproject のピンを確認する）。
+    その状態では Inkling は公開ローダー経路で読めず、変換物の重みも欠ける。
+    """
+    inkling = pytest.importorskip("mlx_vlm.models.inkling")
+    prompt_utils = pytest.importorskip("mlx_vlm.prompt_utils")
+    utils = pytest.importorskip("mlx_vlm.utils")
+    for name in ("TextConfig", "VisionConfig", "AudioConfig"):
+        assert hasattr(inkling, name), f"{name} が未エクスポート（mlx-vlm < 0.6.9？）"
+    assert "inkling" in prompt_utils.MODEL_CONFIG
+    assert utils.MODEL_REMAPPING.get("inkling_mm_model") == "inkling"
