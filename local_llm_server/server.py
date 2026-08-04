@@ -539,7 +539,7 @@ def resolve_gguf(model: str) -> str:
     """
     spec = model.strip()
     repo, _sep, selector = spec.partition(":")
-    if repo.startswith(("/", "./", "../", "~")) or repo.count("/") != 1 or not all(repo.split("/")):
+    if looks_like_local_path(repo) or repo.count("/") != 1 or not all(repo.split("/")):
         raise ValueError(
             f"model は HF repo-id（org/repo[:量子化名]）で指定してください（実パス非対応）: {model!r}"
         )
@@ -600,7 +600,7 @@ def ensure_cached(repo: str, *, what: str = "モデル") -> str:
     """
     spec = repo.strip()
     # 実ファイル/ディレクトリパス指定（repo-id ではない）はそのパスの存在のみ確認する。
-    if spec.startswith(("/", "./", "../", "~")):
+    if looks_like_local_path(spec):
         path = os.path.expanduser(spec)
         if not os.path.exists(path):
             raise ValueError(f"{what}のパスが見つかりません: {repo!r}")
@@ -768,6 +768,21 @@ def discover_cached_models(ttl: float = 10.0) -> list[dict]:
     return list(out)
 
 
+def looks_like_local_path(spec: str) -> bool:
+    """model / draft_model の指定が HF repo-id ではなくローカルパスか。
+
+    POSIX の絶対・相対・チルダに加えて **Windows のドライブレターと逆スラッシュ**も見る
+    （`C:\\models\\x` / `C:/models/x` / `\\\\server\\share`）。ここを POSIX 限定にしていたため、
+    Windows ではローカル変換物の登録がすべて repo-id 扱いになり、メモリ見積もりが
+    None（＝ガード無効）に落ちていた。
+    """
+    spec = spec.strip()
+    if spec.startswith(("/", "./", "../", "~", "\\")):
+        return True
+    # C:\... / C:/...（ドライブレター）
+    return len(spec) >= 3 and spec[1] == ":" and spec[2] in ("\\", "/")
+
+
 def _dir_weight_bytes(directory: str) -> int:
     """ディレクトリ直下の重みファイル（*.safetensors / *.npz）の合計バイト数。
 
@@ -817,11 +832,9 @@ def estimate_model_bytes(config: ServerConfig) -> int | None:
         # 登録する運用（→ gateway.toml の Inkling / DeepSeek）では素通しは危険なので数える。
         # ドラフター（MTP）も常駐するので合算する。
         spec = config.model.strip()
-        if spec.startswith(("/", "./", "../", "~")):
+        if looks_like_local_path(spec):
             total = _dir_weight_bytes(os.path.expanduser(spec))
-            if config.draft_model and config.draft_model.strip().startswith(
-                ("/", "./", "../", "~")
-            ):
+            if config.draft_model and looks_like_local_path(config.draft_model):
                 total += _dir_weight_bytes(os.path.expanduser(config.draft_model.strip()))
             return total or None
         # HF repo-id: models--org--name/snapshots/<hash>/ の合計（blob 実体で重複排除）
