@@ -125,13 +125,41 @@ def tool_env_root() -> Path | None:
     venv で動く。この venv の依存は `uv sync`（プロジェクト venv 用）では更新されず、
     `uv tool install --reinstall` でしか入れ直せない——自動更新が依存の追加を
     取りこぼさないための判定に使う。`uv run gw`（プロジェクト venv）なら None。
+
+    判定は sys.prefix（稼働中 venv のルート）で行う。sys.executable を resolve() すると
+    venv の python は uv 管理の素の CPython への**シンボリックリンクなので venv の外へ
+    解決されてしまい**、tool venv 稼働中でも None を返す（＝依存の入れ直しが本番で
+    一度も走らない）という不具合があった。パスの実在に依存しないよう、resolve はしない。
     """
-    exe = Path(sys.executable).resolve()
-    for parent in exe.parents:
-        if parent.name == _PKG and parent.parent.name == "tools" \
-                and parent.parent.parent.name == "uv":
-            return parent
+    for path in (Path(sys.prefix), Path(sys.executable).absolute()):
+        for parent in [path, *path.parents]:
+            if parent.name == _PKG and parent.parent.name == "tools" \
+                    and parent.parent.parent.name == "uv":
+                return parent
     return None
+
+
+# 依存フィンガープリントの保存先（tool venv 直下）。→ _deps_fingerprint
+_DEPS_FINGERPRINT_NAME = ".gw-deps-fingerprint"
+
+
+def _deps_fingerprint(root: Path) -> str | None:
+    """依存を決めるファイル（uv.lock / pyproject.toml）の内容ハッシュ。
+
+    uv.lock が解決済み依存の全て、pyproject.toml がエントリポイント（console script）等の
+    導入メタデータを表す。この 2 つが前回の再インストール時と同一なら、venv を入れ直しても
+    結果は変わらない。読めなければ None（＝判定不能。呼び出し側は安全側＝再インストール）。
+    """
+    import hashlib
+
+    h = hashlib.sha256()
+    try:
+        for name in ("uv.lock", "pyproject.toml"):
+            h.update(name.encode())
+            h.update((root / name).read_bytes())
+    except OSError:
+        return None
+    return h.hexdigest()
 
 
 def refresh_tool_env(root: Path | None, timeout: float = 600.0) -> tuple[bool, str]:
@@ -144,11 +172,26 @@ def refresh_tool_env(root: Path | None, timeout: float = 600.0) -> tuple[bool, s
 
     呼ぶタイミングは**再起動の直前**（モデルサーバー停止後）。venv を入れ直した後に
     古いプロセスが新規 import をする時間を最小にするため。
+
+    **依存が変わっていなければスキップする**: `uv tool install --reinstall` は無条件だと
+    ~5 秒かかり、zero-drop restart で accept キューに並んだ接続の待ち時間の支配項になる。
+    自動更新の大半はコードだけの変更なので、uv.lock + pyproject.toml のハッシュを venv 内の
+    マーカーと比べ、同一なら入れ直さない（マーカーは成功時にのみ書く。無い・読めない・
+    ハッシュ不能のときは安全側＝従来どおり再インストール）。
     """
-    if tool_env_root() is None:
+    env_root = tool_env_root()
+    if env_root is None:
         return True, "tool venv ではない（uv sync が受け持つ）"
     if root is None:
         return False, "git クローン運用ではない"
+    fingerprint = _deps_fingerprint(root)
+    marker = env_root / _DEPS_FINGERPRINT_NAME
+    if fingerprint is not None:
+        try:
+            if marker.read_text().strip() == fingerprint:
+                return True, "依存に変更なし（再インストールをスキップ）"
+        except OSError:
+            pass  # マーカー無し（初回）や読取失敗 → 再インストールへ
     uv = _find_uv()
     if uv is None:
         return False, "uv が見つからない（PATH と ~/.local/bin を確認）"
@@ -161,6 +204,11 @@ def refresh_tool_env(root: Path | None, timeout: float = 600.0) -> tuple[bool, s
         return False, f"uv tool install を実行できませんでした: {exc}"
     if res.returncode != 0:
         return False, (res.stderr or res.stdout).strip()[:200] or "uv tool install 失敗"
+    if fingerprint is not None:
+        try:
+            marker.write_text(fingerprint + "\n")
+        except OSError:
+            pass  # 書けなくても致命ではない（次回はフル再インストールになるだけ）
     return True, "tool venv の依存を入れ直しました"
 
 
