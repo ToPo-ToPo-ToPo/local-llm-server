@@ -189,15 +189,19 @@ disable_thinking = true   # 既定は思考OFF。起動時の --chat-template-kw
 # 画像入力: 実測確認済み（640x480 の画像が 204 vision トークンに展開され、
 #   青い四角＋赤い丸＋"HELLO" を正確に認識）。
 #
-# MTP（speculative decoding）: 公式 bf16 内蔵の model.mtp.* を mlx-vlm 付属の
-#   `python -m mlx_vlm.speculative.drafters.inkling_mtp.split` で切り出したもの（bf16・4.2GB）。
-#   ただし 0.6.9 時点でも上流バグで使えないため draft_model = "off"。
-#   最初の draft block で空のキャッシュ（keys が None）に state を読み AttributeError
-#   （models/cache.py。models/inkling/language.py の _snapshot_cache_state 経由）。
-#   切り出したドラフターは /Users/octopus/mlx_models/Inkling-Small-MTP-bf16 に置いてあるので、
-#   上流が直ったら下のコメント行と入れ替えるだけで有効化できる。
+# MTP（speculative decoding）: **使えない**（0.6.9 で実測）。
+#   公式 bf16 内蔵の model.mtp.* を mlx-vlm 付属の
+#   `python -m mlx_vlm.speculative.drafters.inkling_mtp.split` で切り出せるが:
+#     ① 0.6.8 までは最初の draft block で空キャッシュ（keys が None）を参照して落ちた。
+#        0.6.9 の _snapshot_cache_state 修正でクラッシュ自体は解消。
+#     ② しかし実測すると **13.2 tok/s（MTP無しは 39.9 tok/s）** で 3 倍遅い（採択率が低く、
+#        ドラフト生成と検証のコストだけが乗る）。
+#     ③ さらに temperature=0 でも **MTP 有無で出力が分岐する**。投機デコードは lossless で
+#        あるべきなので、巻き戻しか受理判定が正しく動いていない。速度以前に品質を保証できない。
+#   以上より切り出したドラフターはローカルからも削除した（必要なら公式 bf16 から作り直せるが、
+#   532GB の再取得が要る）。上流が ②③ を直したら再検討する。
 [[models]]
-model = "/Users/octopus/mlx_models/Inkling-Small-mlx-4bit"   # ~ は subprocess で展開されないので絶対パス
+model = "ToPo-ToPo/Inkling-Small-mlx-4bit"   # 自前変換を HF へ公開したもの（事前に hf download 済み）
 backend = "mlx-vlm"
 disable_thinking = true     # 思考 OFF（他モデルと揃える）。mlx-vlm には build_command 側で
                             # 止める手段が無いので、ゲートウェイが reasoning_effort="none" を
@@ -206,7 +210,6 @@ disable_thinking = true     # 思考 OFF（他モデルと揃える）。mlx-vlm
                             # これが無いと毎回ほぼ最大の思考が走る（CAD 1 課題で 3〜8 分）。
                             # 思考させたいリクエストだけ reasoning_effort を明示すれば尊重される
 draft_model = "off"         # ← 上流バグで MTP が使えない（上記）
-# draft_model = "/Users/octopus/mlx_models/Inkling-Small-MTP-bf16"
 
 # ── DeepSeek-V4-Flash-0731（DeepSeek の 304B 疎 MoE。テキスト専用・context 1M・MIT）──
 # 公式 FP8（deepseek-ai/DeepSeek-V4-Flash-0731・166.9GB・e4m3 block 128x128）を自前で MLX 4bit へ
@@ -223,7 +226,7 @@ draft_model = "off"         # ← 上流バグで MTP が使えない（上記�
 #   Inkling の MTP は上流バグで使えなかったが、こちらは別実装なので有効化して試す。
 #   不調なら draft_model = "off" にする。
 [[models]]
-model = "/Users/octopus/mlx_models/DeepSeek-V4-Flash-0731-mlx-4bit"   # ~ は展開されないので絶対パス
+model = "ToPo-ToPo/DeepSeek-V4-Flash-0731-mlx-4bit"   # 自前変換を HF へ公開したもの（事前に hf download 済み）
 backend = "mlx-vlm"
 disable_thinking = true     # 思考 OFF（他モデルと揃える）。reasoning_effort="none" を注入する。
                             # 未設定だと既定で思考し、CAD 1 課題の生成が Inkling(OFF) の 8〜11 倍の
