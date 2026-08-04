@@ -543,11 +543,26 @@ def test_estimate_model_bytes_llama_cpp(monkeypatch, tmp_path):
     assert srv.estimate_model_bytes(cfg) == 1200  # 本体 1000 ＋ mmproj 200
 
 
+def test_looks_like_local_path_is_cross_platform():
+    """ローカルパス判定は Windows のドライブレター・UNC・逆スラッシュも見る。
+
+    POSIX 限定（"/" "./" "../" "~" だけ）にしていたため、Windows ではローカル変換物の
+    登録が repo-id 扱いになり、estimate_model_bytes が None（＝メモリガード無効）に
+    落ちていた（CI の windows-latest でのみ失敗して発覚）。
+    """
+    for spec in ("/abs/model", "./rel", "../up", "~/models/x",
+                 r"C:\models\x", "C:/models/x", r"\\server\share\x"):
+        assert srv.looks_like_local_path(spec) is True, spec
+    for spec in ("org/repo", "ToPo-ToPo/Inkling-Small-mlx-4bit", "unsloth/x-GGUF:Q4_K_M"):
+        assert srv.looks_like_local_path(spec) is False, spec
+
+
 def test_estimate_model_bytes_mlx_local_dir(tmp_path):
     # ローカル変換物（HF キャッシュではない実ディレクトリ）も見積もれること。
     # repo-id でないためキャッシュ探索には載らず、これが無いとメモリガードが素通しする。
     model = tmp_path / "Some-Model-mlx-4bit"
     model.mkdir()
+    assert srv.looks_like_local_path(str(model)), "この OS でローカルパスと判定されない"
     (model / "model-00001-of-00002.safetensors").write_bytes(b"x" * 1000)
     (model / "model-00002-of-00002.safetensors").write_bytes(b"x" * 500)
     (model / "tokenizer.json").write_bytes(b"y" * 999)  # 重み以外は数えない
