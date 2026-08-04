@@ -236,8 +236,9 @@ class ModelManager:
         # 即アンロードする判定に使う。_state ロック下で操作する。
         self._sessions: dict[str, _Session] = {}
         self._model_sessions: dict[str, set[str]] = {}
-        # release 猶予の期限（model_id → monotonic 期限）。→ _free_model_async
-        self._release_holds: dict[str, float] = {}
+        # release 猶予の世代（model_id → 連番）。→ _free_model_async
+        self._release_holds: dict[str, int] = {}
+        self._release_gen: int = 0
         # drain（再起動準備）の期限。monotonic 時刻がこれ未満の間は新規 acquire を
         # GatewayDraining で拒否する。0.0 で無効。再起動側が死んでも TTL で自動復帰する。
         self._drain_deadline: float = 0.0
@@ -919,23 +920,31 @@ class ModelManager:
         毎回繰り返してしまう。猶予中に再 register されれば _free_idle_model 側の在席チェックで
         解放は自然に取り消される。
 
-        猶予は release ごとに**期限で延長**する（_release_holds）。各タイマーは発火時に
-        「自分より新しい release が猶予を延ばしていないか」を確認し、延びていれば何もしない
-        （最後の release のタイマーだけが実際に解放する）。これが無いと、60 秒以内に
+        猶予は release ごとに**世代で延長**する（_release_holds）。各タイマーは発火時に
+        「自分より新しい release が予約を置き換えていないか」を確認し、置き換わっていれば
+        何もしない（最後の release のタイマーだけが実際に解放する）。これが無いと、60 秒以内に
         release が連続したとき**古いタイマーが後続の猶予を侵食**する:
           T=0 A release（予約T=60）→ T=50 B release（予約T=110）→ T=60 A の古い予約が発火
           → B の release から 10 秒しか経っていないのに解放される。
+
+        担当かどうかの判定に**時刻の比較を使わない**のが要点。以前は「期限 hold_until を
+        置き、起床時に monotonic() < hold_until なら他に譲る」としていたが、time.sleep() と
+        time.monotonic() は必ずしも同じクロックを刻まない（Windows では sleep が待機可能
+        タイマー、monotonic が QueryPerformanceCounter で、最大 15ms 程度ずれる）。sleep が
+        monotonic 換算でわずかでも早く返ると、**唯一のタイマーが自分自身に譲って**永久に
+        解放されず、hold も残り続ける（次の release でしか回収されない）。世代の一致判定なら
+        クロックのずれと無関係に、常にちょうど 1 本が担当する。
         """
-        hold_until = time.monotonic() + _RELEASE_LINGER_S
         with self._state:
-            self._release_holds[model_id] = hold_until
+            self._release_gen += 1
+            gen = self._release_gen
+            self._release_holds[model_id] = gen
 
         def _delayed() -> None:
             time.sleep(_RELEASE_LINGER_S)
             with self._state:
-                hold = self._release_holds.get(model_id, 0.0)
-                if time.monotonic() < hold:
-                    return  # より新しい release が猶予を延長した（そのタイマーが担当する）
+                if self._release_holds.get(model_id) != gen:
+                    return  # より新しい release が予約を置き換えた（そのタイマーが担当する）
                 self._release_holds.pop(model_id, None)
             self._free_idle_model(model_id)
 
@@ -1190,14 +1199,27 @@ class GatewayServer(ThreadingHTTPServer):
         threading.Thread(target=self.serve_forever, daemon=True).start()  # 再開
         return False
 
-    def detach_listen_fd(self) -> int:
+    def detach_listen_fd(self) -> int | None:
         """Listen ソケットの fd を所有権ごと取り出し、execv を生き延びるよう継承可能にする。
 
         detach 後のソケットオブジェクトは fd を閉じない（GC で閉じられると accept キューの
         接続ごと失われるため、所有権を外すことが本質）。
+
+        引き継ぎが成立しないプラットフォーム（Windows のソケットハンドルは CRT の fd では
+        ないため os.set_inheritable が Errno 9 で落ちる）では None を返し、呼び出し側は
+        通常のクローズにフォールバックする。ここで例外を投げると、呼び出し元の finally が
+        途中で抜けて**モデルサーバーを止め切らずにゲートウェイが落ちる**。zero-drop を
+        諦めるだけなら再起動は成立するので、失敗は握って落とさない。
         """
         fd = self.socket.detach()
-        os.set_inheritable(fd, True)
+        try:
+            os.set_inheritable(fd, True)
+        except OSError:
+            try:
+                socket.socket(fileno=fd).close()   # detach した所有権を回収して閉じる
+            except OSError:
+                pass
+            return None
         return fd
 
 
@@ -2755,7 +2777,11 @@ def _run_gateway_locked(cfg: GatewayConfig, config_path: str | None = None) -> i
             # zero-drop restart: Listen ソケットは閉じず、fd を環境変数で新イメージへ渡す。
             # 受け渡し窓に到着した接続は accept キューに並んだまま、新イメージが処理する。
             # （detach するので GC でも閉じられない。execv は環境変数と fd を引き継ぐ。）
-            os.environ[_LISTEN_FD_ENV] = str(server.detach_listen_fd())
+            fd = server.detach_listen_fd()
+            if fd is None:
+                os.environ.pop(_LISTEN_FD_ENV, None)   # 引き継げない環境: 新イメージが bind し直す
+            else:
+                os.environ[_LISTEN_FD_ENV] = str(fd)
         else:
             server.server_close()
         manager.shutdown()

@@ -2126,6 +2126,8 @@ def test_quiesce_handoff_is_lossless(monkeypatch):
 
         # fd を引き継いで新サーバーを立てる（execv 相当。旧サーバーは以後使わない）
         fd = server.detach_listen_fd()
+        if fd is None:
+            pytest.skip("Listen fd の引き継ぎに未対応のプラットフォーム（Windows 等）")
         import os as _os
         assert _os.get_inheritable(fd) is True  # execv を生き延びる印
         server2 = gw.GatewayServer(("127.0.0.1", port), mgr, catalog=["m1", "m2"],
@@ -2204,6 +2206,28 @@ def test_release_linger_not_shortened_by_stale_timer(monkeypatch):
     assert {s.config.model: s.stops for s in created}["m1"] == 0
     time.sleep(0.4)                      # T=0.9: B の猶予が明けた
     assert _wait_unloaded(mgr, "m1")
+
+
+def test_release_linger_frees_even_if_sleep_returns_early(monkeypatch):
+    """time.sleep が monotonic 換算で早く返っても、猶予明けに必ず解放される。
+
+    sleep と monotonic は同じクロックとは限らない（Windows では sleep が待機可能タイマー、
+    monotonic が QueryPerformanceCounter で最大 15ms 程度ずれる）。担当判定を
+    「起床時に monotonic() < 期限なら他に譲る」で書いていた頃は、**唯一のタイマーが
+    自分自身に譲って**モデルが永久に解放されず、hold も残り続けた（実測: windows-latest の
+    CI で在席解放系が 4 件失敗）。世代の一致で判定すればクロックのずれと無関係。
+    """
+    created = _patch_fake(monkeypatch)
+    _short_linger(monkeypatch, 0.2)
+    real_sleep = time.sleep
+    monkeypatch.setattr(gw.time, "sleep",
+                        lambda s: real_sleep(s * 0.5 if s == 0.2 else s))  # 猶予だけ早く返す
+    mgr = gw.ModelManager(_configs())
+    mgr.register_session("A", "m1")
+    _, h = mgr.acquire("m1"); mgr.release(h)
+    mgr.unregister_session("A")
+    assert _wait_unloaded(mgr, "m1"), "sleep が早く返るとモデルが解放されない"
+    assert {s.config.model: s.stops for s in created}["m1"] == 1
 
 
 def test_dead_worker_reap_drops_sessions():
