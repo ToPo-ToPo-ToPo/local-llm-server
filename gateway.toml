@@ -25,14 +25,26 @@ port = 8799                 # 公開ポート（省略時 8799）。クライア
 max_resident = 2            # 同時常駐モデル数のハード上限。空きが無ければ LRU 退避、全て処理中なら待つ（省略時 無制限）
                             # 2: Ikazuchi-Mal の会話(gemma-4-26B-A4B 4bit ≈15GB)と OS作業/X bot(Qwen3.6-27B 4bit ≈15GB)を
                             # 併用するため。1 だと切替のたびにモデル再ロード＋プロンプトキャッシュ全損が起きる（要 ~30GB+ RAM）
+max_memory_fraction = 0.80  # 常駐モデルの推定占有量の合計を総RAMのこの割合に制限（省略で無効）
+                            # 総RAM 275GB → 上限 220GB。max_resident は「数」の上限でしかなく、
+                            # 150GB 級を 2 つ登録した今の構成（Inkling 4bit 148.5GB /
+                            # DeepSeek-V4-Flash 4bit + MTP 165.1GB）では数の上限だけでは守れない
+                            # （合計 313GB で 275GB を超える）。これを入れると片方をLRU退避してから
+                            # ロードする。15GB 級（Qwen3.6-27B 16.1GB 等）の2本併用には影響しない
 load_timeout = 300          # 全枠処理中のとき空くのを待つ最大秒数（超過で 503。省略時 300）
-# start_timeout = 120       # モデルサーバー1つの起動完了（ready）を待つ最大秒数（省略時 120）。巨大モデルや
-                            # コールドディスクで 120 秒を超えるなら延ばす
+start_timeout = 600         # モデルサーバー1つの起動完了（ready）を待つ最大秒数（省略時 120）。巨大モデルや
+                            # コールドディスクで 120 秒を超えるなら延ばす。
+                            # 600: Inkling-Small（4bit・138GiB）のロードが既定 120 秒に収まらないため。
+                            # 15GB 級のモデルの起動時間は変わらない（あくまで上限）
 # request_timeout = 600     # 上流モデルサーバーとの通信が「無応答」のとき打ち切る秒数（省略時 600=10分。0 で無制限）。
                             # トークンが流れている限り切れないのでストリーミングの長時間生成は妨げない。
                             # ハングした／沈黙したサーバーが処理中扱いのまま枠を塞ぎ続ける事故の保険
 idle_timeout = 1200         # この秒数（=20分）使われないモデルは自動アンロードしてメモリ解放（既定 1200。0 で無効）
-session_ttl = 90            # 在席エージェントのハートビート猶予秒数。途絶でそのエージェントを無人扱い（既定 90。0 で無効）
+session_ttl = 600           # 在席エージェントのハートビート猶予秒数。途絶でそのエージェントを無人扱い（既定 600。0 で無効）
+                            # これは「release を送れずに落ちたエージェント」への保険であって、遅いエージェントを
+                            # 切るためのものではない。旧既定 90 では、1 課題に数分かかる巨大モデル（148GB 級）を
+                            # 使う CAD エージェントの足元でモデルがアンロードされ、21 秒の再ロードがクライアントの
+                            # 入口プローブまで食い潰す事故が起きた
 internal_base_port = 9001   # 内部モデルサーバーの割当開始ポート（9001, 9002, ... と連番）
 
 # ── 繰り返しループ抑制（mlx / mlx-vlm 系のみ。既定で有効）──
@@ -164,6 +176,82 @@ extra_args = ["-c", "32768"]  # コンテキストを32Kに制限してRAM膨張
 disable_thinking = true   # 既定は思考OFF。起動時の --chat-template-kwargs で正しく抑制される
                           # （ゲートウェイ経由の実プロセスで確認済み: 無指定→抑制、明示 true→思考する）。
                           # 思考を効かせたいリクエストだけ chat_template_kwargs={"enable_thinking": true} を送る
+
+# ── Inkling-Small（Thinking Machines。276B total / 12B active の疎 MoE。text+image+audio 入力）──
+# 公式 bf16（thinkingmachines/Inkling-Small・531.9GB）を自前で MLX 4bit へ変換したもの
+# （実測 4.506 bits/weight・138GiB。単体生成の Peak memory 148.7GB・53 tok/s）。
+# HF にも公開: ToPo-ToPo/Inkling-Small-mlx-4bit（2bit 版もあり）。
+#
+# ⚠ mlx-vlm 0.6.9 以降が必須（pyproject でピン済み）。0.6.7/0.6.8 は Inkling を
+#   公開ローダー経路で読めず、当時は config のキー名翻訳と起動時シムで回避していた。
+#   さらに深刻なのは、当時の実装が MoE の mlp.global_scale（50件）と mlp.gate.bias（40件）を
+#   持たず、**変換時にこれらの重みを黙って落としていた**こと（形状エラーも出ない）。
+#   0.6.9 はこれらを扱い、公式 config をそのまま読む。翻訳もシムも不要になった。
+#   → 変換は scripts/convert_inkling.py（0.6.9 未満なら実行前に止まる）
+#
+# 画像入力: 実測確認済み（640x480 の画像が 204 vision トークンに展開され、
+#   青い四角＋赤い丸＋"HELLO" を正確に認識）。
+#
+# MTP（speculative decoding）: **使えない**（0.6.9 で実測）。
+#   公式 bf16 内蔵の model.mtp.* を mlx-vlm 付属の
+#   `python -m mlx_vlm.speculative.drafters.inkling_mtp.split` で切り出せるが:
+#     ① 0.6.8 までは最初の draft block で空キャッシュ（keys が None）を参照して落ちた。
+#        0.6.9 の _snapshot_cache_state 修正でクラッシュ自体は解消。
+#     ② しかし実測すると **13.2 tok/s（MTP無しは 39.9 tok/s）** で 3 倍遅い（採択率が低く、
+#        ドラフト生成と検証のコストだけが乗る）。
+#     ③ さらに temperature=0 でも **MTP 有無で出力が分岐する**。投機デコードは lossless で
+#        あるべきなので、巻き戻しか受理判定が正しく動いていない。速度以前に品質を保証できない。
+#   以上より切り出したドラフターはローカルからも削除した（必要なら公式 bf16 から作り直せるが、
+#   532GB の再取得が要る）。上流が ②③ を直したら再検討する。
+[[models]]
+model = "ToPo-ToPo/Inkling-Small-mlx-4bit"   # 自前変換を HF へ公開したもの（事前に hf download 済み）
+backend = "mlx-vlm"
+disable_thinking = true     # 思考 OFF（他モデルと揃える）。mlx-vlm には build_command 側で
+                            # 止める手段が無いので、ゲートウェイが reasoning_effort="none" を
+                            # リクエストへ注入する。Inkling のテンプレートは enable_thinking を
+                            # 見ず、指定が無いと必ず「Thinking effort level: 0.9」を入れるため、
+                            # これが無いと毎回ほぼ最大の思考が走る（CAD 1 課題で 3〜8 分）。
+                            # 思考させたいリクエストだけ reasoning_effort を明示すれば尊重される
+draft_model = "off"         # ← 上流バグで MTP が使えない（上記）
+
+# ── DeepSeek-V4-Flash-0731（DeepSeek の 304B 疎 MoE。テキスト専用・context 1M・MIT）──
+# 公式 FP8（deepseek-ai/DeepSeek-V4-Flash-0731・166.9GB・e4m3 block 128x128）を自前で MLX 4bit へ
+# 変換したもの（実測 4.339 bits/weight・144GiB。単体生成の Peak memory 154.3GB・31 tok/s）。
+#
+# Inkling と違い**回避策が一切要らない**: 公式 config の model_type が mlx-vlm の実装と同じ
+# `deepseek_v4` で、`ModelConfig` に text_config フィールドが無いため汎用ローダーの
+# update_module_configs も素通りする。prompt_utils.MODEL_CONFIG にも TEXT_ONLY で登録済み。
+# 変換は `mlx_vlm.convert -q --q-bits 4 --q-group-size 64` をそのまま実行するだけでよい
+# （公式が FP8 でも、models/deepseek_v4 の sanitize が .weight/.scale の対を解いて再量子化する）。
+#
+# MTP: 公式チェックポイントに内蔵された MTP を mlx-vlm 付属の
+#   `python -m mlx_vlm.speculative.drafters.deepseek_v4_mtp.split` で切り出した bf16（10.9GB）。
+#   Inkling の MTP は上流バグで使えなかったが、こちらは別実装なので有効化して試す。
+#   不調なら draft_model = "off" にする。
+[[models]]
+model = "ToPo-ToPo/DeepSeek-V4-Flash-0731-mlx-4bit"   # 自前変換を HF へ公開したもの（事前に hf download 済み）
+backend = "mlx-vlm"
+disable_thinking = true     # 思考 OFF（他モデルと揃える）。reasoning_effort="none" を注入する。
+                            # 未設定だと既定で思考し、CAD 1 課題の生成が Inkling(OFF) の 8〜11 倍の
+                            # 文字数になっていた（enclosure で 45,966 文字 vs 4,054 文字）
+# MTP ドラフター: **旧 DeepSeek-V4-Flash（無印）から切り出した bf16**（3.4GB）。
+#   0731 の内蔵 MTP（mtp.0/1/2・main_proj [4096,12288] の 3 系統連結）は mlx-vlm の
+#   DeepseekV4MTPDraftModel（enorm/hnorm/e_proj/h_proj 構造）と**アーキテクチャ自体が別物**で
+#   使えない。旧 Flash の mtp.0 は上流実装と完全一致し（動作実績のある
+#   inferencerlabs/DeepSeek-V4-Flash-MTP-MLX の出所もこれ）、hidden_size も同じ 4096 なので
+#   0731 本体のドラフターとして組める（投機デコードは lossless。旧型ドラフター故に採択率が
+#   下がる可能性はあり、効果は実測で判断する）。
+#   作成: hf download deepseek-ai/DeepSeek-V4-Flash（mtp は model-00046-of-00046 に隔離）
+#         → python -m mlx_vlm.speculative.drafters.deepseek_v4_mtp.split
+#   ⚠ split.py は get_model_path 経由でリポ全体（149GB）を取得するので注意（切り出し後は削除可）。
+draft_model = "off"         # ← 上流バグで実用不能（下記）。短い生成では通るので注意
+# draft_model = "/Users/octopus/mlx_models/DeepSeek-V4-Flash-MTP-bf16"
+#   ⚠ ドラフトが**棄却されたときの巻き戻し**で落ちる:
+#     models/deepseek_v4/language.py の rollback_speculative_cache が
+#     "'list' object has no attribute 'max'" を投げる（CAD 評価で 152 回発生し、
+#     全 7 課題が "no geometry produced" で失敗した）。
+#   数十トークン程度の短い生成では棄却が起きず素通りするため、疎通確認では見抜けない。
+#   実運用の長い生成では確実に踏むので off にしておくこと。
 
 # vLLM（Linux/NVIDIA。Windows は WSL2 内で）。HF repo-id（safetensors）を指定。高スループット:
 # [[models]]

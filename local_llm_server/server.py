@@ -417,6 +417,32 @@ def parallel_supported(backend: str) -> bool:
     return backend == "llama-cpp"
 
 
+# 思考チャネルの開始/終了マーカー（mlx-vlm へ env で渡す）。mlx-vlm は env で渡された 1 対を
+# 最優先で試し、続けて内蔵既定（<|channel>thought / <think> / <|START_THINKING|>）を試す。
+# 既定は gemma-4-A4B 系の形式。内蔵既定のどれとも違う形式のモデルだけここに書く。
+# 判定はモデル ID の部分一致（小文字化）——ローカルパス登録でも効かせるため。
+_THINKING_MARKERS = (
+    # Inkling（Thinking Machines）: 思考は
+    #   <|content_thinking|>…<|end_message|><|message_model|><|content_text|>本文<|end_message|>
+    # の形で出る。この形式は mlx-vlm の内蔵既定に無く、既定のままだと思考が丸ごと
+    # content に漏れる（実測確認済み）。
+    # 終端に <|end_message|> 単体を使ってはいけない: 本文の終端でもあるため、思考 OFF
+    # （reasoning_effort="none"）のときに**本文全体が思考と誤判定**され content が空になる。
+    # 思考ブロックの直後にだけ現れる 2 トークン列を終端にすると両方で正しく割れる。
+    ("inkling", ("<|content_thinking|>", "<|end_message|><|message_model|>")),
+)
+_DEFAULT_THINKING_MARKERS = ("<|channel>thought", "<channel|>")
+
+
+def thinking_markers(model: str) -> tuple[str, str]:
+    """モデル ID から思考チャネルのマーカー対を引く（未収載は gemma-4 形式の既定）。"""
+    lowered = model.lower()
+    for needle, markers in _THINKING_MARKERS:
+        if needle in lowered:
+            return markers
+    return _DEFAULT_THINKING_MARKERS
+
+
 # 本体（target）→ 対応する MTP ドラフター（assistant）の内蔵対応表。
 # mlx-community のペアで、いずれも実機で検証済み。draft_model = "auto" のときに
 # 本体名から対応ドラフターを引く（明示指定すればここを介さない）。未収載のモデルを
@@ -513,7 +539,7 @@ def resolve_gguf(model: str) -> str:
     """
     spec = model.strip()
     repo, _sep, selector = spec.partition(":")
-    if repo.startswith(("/", "./", "../", "~")) or repo.count("/") != 1 or not all(repo.split("/")):
+    if looks_like_local_path(repo) or repo.count("/") != 1 or not all(repo.split("/")):
         raise ValueError(
             f"model は HF repo-id（org/repo[:量子化名]）で指定してください（実パス非対応）: {model!r}"
         )
@@ -574,7 +600,7 @@ def ensure_cached(repo: str, *, what: str = "モデル") -> str:
     """
     spec = repo.strip()
     # 実ファイル/ディレクトリパス指定（repo-id ではない）はそのパスの存在のみ確認する。
-    if spec.startswith(("/", "./", "../", "~")):
+    if looks_like_local_path(spec):
         path = os.path.expanduser(spec)
         if not os.path.exists(path):
             raise ValueError(f"{what}のパスが見つかりません: {repo!r}")
@@ -742,6 +768,39 @@ def discover_cached_models(ttl: float = 10.0) -> list[dict]:
     return list(out)
 
 
+def looks_like_local_path(spec: str) -> bool:
+    """model / draft_model の指定が HF repo-id ではなくローカルパスか。
+
+    POSIX の絶対・相対・チルダに加えて **Windows のドライブレターと逆スラッシュ**も見る
+    （`C:\\models\\x` / `C:/models/x` / `\\\\server\\share`）。ここを POSIX 限定にしていたため、
+    Windows ではローカル変換物の登録がすべて repo-id 扱いになり、メモリ見積もりが
+    None（＝ガード無効）に落ちていた。
+    """
+    spec = spec.strip()
+    if spec.startswith(("/", "./", "../", "~", "\\")):
+        return True
+    # C:\... / C:/...（ドライブレター）
+    return len(spec) >= 3 and spec[1] == ":" and spec[2] in ("\\", "/")
+
+
+def _dir_weight_bytes(directory: str) -> int:
+    """ディレクトリ直下の重みファイル（*.safetensors / *.npz）の合計バイト数。
+
+    ローカル変換物（HF キャッシュではない実ディレクトリ）の占有見積もりに使う。
+    tokenizer.json 等の小物は数えない（下限寄りの見積もりという方針は repo-id 側と同じ）。
+    """
+    total = 0
+    if not os.path.isdir(directory):
+        return 0
+    for pattern in ("*.safetensors", "*.npz"):
+        for path in glob.glob(os.path.join(directory, pattern)):
+            try:
+                total += os.path.getsize(path)
+            except OSError:
+                pass
+    return total
+
+
 def estimate_model_bytes(config: ServerConfig) -> int | None:
     """常駐に要するメモリの**概算**（バイト）。重みファイルのサイズを基準にする。
 
@@ -767,8 +826,19 @@ def estimate_model_bytes(config: ServerConfig) -> int | None:
                 except (ValueError, OSError):
                     pass  # ドラフトが解決できなくても本体分は数える
             return total
-        # mlx / mlx-vlm: models--org--name/snapshots/<hash>/ の合計（blob 実体で重複排除）
-        repo = config.model.strip()
+        # mlx / mlx-vlm: ローカルパス指定なら、そのディレクトリの重みサイズ合計。
+        # repo-id ではないので下の HF キャッシュ探索には載らず、そのままだと見積もり不能
+        # （＝メモリガードがそのモデルを素通しする）。138GiB 級をローカル変換物として
+        # 登録する運用（→ gateway.toml の Inkling / DeepSeek）では素通しは危険なので数える。
+        # ドラフター（MTP）も常駐するので合算する。
+        spec = config.model.strip()
+        if looks_like_local_path(spec):
+            total = _dir_weight_bytes(os.path.expanduser(spec))
+            if config.draft_model and looks_like_local_path(config.draft_model):
+                total += _dir_weight_bytes(os.path.expanduser(config.draft_model.strip()))
+            return total or None
+        # HF repo-id: models--org--name/snapshots/<hash>/ の合計（blob 実体で重複排除）
+        repo = spec
         if repo.count("/") != 1:
             return None
         org, name = repo.split("/", 1)
@@ -836,8 +906,11 @@ def build_command(config: ServerConfig) -> list[str]:
         # クライアントがトップレベル enable_thinking で行う（llm.py 参照）。
         # 自動ダウンロードは行わない。本体は事前に `hf download` 済みであることを確認する。
         ensure_cached(config.model)
+        # 直接 mlx_vlm.server を起動せず、シム経由で起動する（_mlx_vlm_shims が上流の
+        # 未修正部分を当ててから同じ引数で mlx_vlm.server を __main__ 実行する）。
+        # site-packages を書き換えると auto_update の `uv sync` で消えるため。
         command = [
-            sys.executable, "-m", "mlx_vlm.server",
+            sys.executable, "-m", "local_llm_server._mlx_vlm_shims",
             "--model", config.model,
             "--host", config.host,
             "--port", str(config.port),
@@ -1072,8 +1145,9 @@ class LocalServer:
             # でも確実に分離させるため env で明示する（未設定時のみ。ユーザー上書きは尊重）。
             # 設定したペアが最優先で試され、既定（<think> 等）も後段で効くので副作用はない。
             if self.config.backend == "mlx-vlm":
-                env.setdefault("MLX_VLM_THINKING_START_TOKEN", "<|channel>thought")
-                env.setdefault("MLX_VLM_THINKING_END_TOKEN", "<channel|>")
+                start_marker, end_marker = thinking_markers(self.config.model)
+                env.setdefault("MLX_VLM_THINKING_START_TOKEN", start_marker)
+                env.setdefault("MLX_VLM_THINKING_END_TOKEN", end_marker)
             cmd = build_command(self.config)
             extra: dict = {}
             # 繋留が有効（デーモン内）なら、ワーカーを tether ラッパー越しに起動する。

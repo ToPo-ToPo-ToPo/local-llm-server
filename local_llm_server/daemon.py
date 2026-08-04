@@ -295,6 +295,15 @@ class ModelManager:
     def model_ids(self) -> list[str]:
         return list(self._models)
 
+    def disable_thinking_for(self, model_id: str) -> bool:
+        """model_id に disable_thinking が指定されているか（未登録は False）。
+
+        do_POST が「mlx-vlm 宛に reasoning_effort=none を注入するか」の判定に使う。
+        """
+        with self._state:
+            mm = self._models.get(model_id)
+        return bool(mm.config.disable_thinking) if mm is not None else False
+
     def backend_for(self, model_id: str) -> str:
         """model_id のバックエンドを返す（登録済みは config 値、未登録は ID から推論）。
 
@@ -1298,6 +1307,7 @@ class _GatewayHandler(BaseHTTPRequestHandler):
         # （chat/text completions のみ。クライアント明示は尊重。設定で無効化可）。
         if path.endswith(("/chat/completions", "/completions")):
             body = self._maybe_inject_repetition(srv, model, payload, body)
+            body = self._maybe_disable_thinking(srv, model, payload, body)
         self._acquire_and_forward(srv, model, body)
 
     def _handle_update_now(self, srv) -> None:
@@ -1372,6 +1382,35 @@ class _GatewayHandler(BaseHTTPRequestHandler):
         rcs = getattr(srv, "repetition_context_size", None)
         if rcs is not None and "repetition_context_size" not in payload:
             payload["repetition_context_size"] = rcs
+        return json.dumps(payload).encode("utf-8")
+
+    def _maybe_disable_thinking(self, srv, model, payload: dict, body: bytes) -> bytes:
+        """mlx-vlm 宛のリクエストに reasoning_effort="none" を注入して思考を止める。
+
+        `disable_thinking = true` を指定した [[models]] のみが対象。mlx-vlm には
+        build_command 側で思考を止める手段が無い（--chat-template-args を渡すのは
+        mlx / llama-cpp 経路だけ）ので、リクエスト側で落とす。
+
+        背景: mlx-vlm サーバの既定は思考 OFF だが、それは chat template が
+        `enable_thinking` を見るモデルに限った話。Inkling は **常に**
+        「Thinking effort level: 0.9」をテンプレートで注入する作りで、
+        enable_thinking では止まらず、OpenAI 互換の reasoning_effort でしか制御できない
+        （"none"/"minimal"/"low"/"medium"/"high"/"max" または 0.0〜0.99 の float）。
+
+        クライアントが自分で reasoning_effort / reasoning を指定していれば尊重する。
+        """
+        if not isinstance(model, str):
+            return body
+        if "reasoning_effort" in payload or "reasoning" in payload:
+            return body
+        try:
+            if srv.manager.backend_for(model) != "mlx-vlm":
+                return body
+            if not srv.manager.disable_thinking_for(model):
+                return body
+        except Exception:  # noqa: BLE001 - 判定不能なら注入しない（安全側）
+            return body
+        payload["reasoning_effort"] = "none"
         return json.dumps(payload).encode("utf-8")
 
     def _handle_audio(self, srv, body: bytes) -> None:
@@ -1538,7 +1577,13 @@ class GatewayConfig:
     request_timeout: float | None = 600.0  # 秒。上流との通信が無応答のとき打ち切る（0 で無制限）。ハングした／
                                        # 沈黙した上流が inflight を握ったまま枠を塞ぎ続けるのを防ぐ保険。トークンが
                                        # 流れている限り切れないので、長時間ストリーミング生成は妨げない（既定 600=10分）
-    session_ttl: float | None = 90.0   # 秒。在席エージェントのハートビートがこれだけ途絶えたら無人扱いで掃除（既定 90。None/0 で無効）
+    session_ttl: float | None = 600.0  # 秒。在席エージェントのハートビートがこれだけ途絶えたら無人扱いで掃除
+                                       # （既定 600。None/0 で無効）。これは「release を送れずに落ちた
+                                       # エージェント」への保険であって、遅いエージェントを切るものではない。
+                                       # 旧既定 90 は誤発動した——CAD エージェントで 1 課題に数分かかる巨大
+                                       # モデル（148GB）が、生きているエージェントの足元でアンロードされた
+                                       # （"Session unload: stopped 1 model(s) (agent heartbeat timed out)"）。
+                                       # 再ロードに 21 秒かかり、クライアント側の入口プローブも食い潰した。
     dynamic: bool = True               # 未登録モデルを ID 推論で動的ロードする（false で事前登録のみ）
     disable_thinking: bool = False     # 動的ロード時の既定（思考抑制）。事前登録は各 [[models]] が優先
     draft_model: str | None = None     # 動的ロード時の MTP 既定。None で mlx-vlm は "auto"（対応表から自動）。"off" で無効
@@ -1618,7 +1663,7 @@ def load_gateway_config(path: str) -> GatewayConfig:
         max_resident = 2            # 同時常駐モデル数の上限（ハード。省略時 無制限）
         load_timeout = 300          # 全枠処理中のとき空くのを待つ最大秒数（超過で 503。省略時 300）
         idle_timeout = 1200         # この秒数使われないモデルを自動アンロード（省略時 1200=20分。0 で無効）
-        session_ttl = 90            # 在席エージェントのハートビート猶予秒数（省略時 90。0 で無効）
+        session_ttl = 600           # 在席エージェントのハートビート猶予秒数（省略時 600。0 で無効）
         internal_base_port = 9001   # 内部サーバーの割当開始ポート（省略時 9001）
         default_model = "..."       # model 省略リクエスト時のモデル（省略可）
         draft_model = "auto"        # 全モデルの MTP ドラフター既定（mlx-vlm のみ有効。省略可）
@@ -1688,7 +1733,7 @@ def load_gateway_config(path: str) -> GatewayConfig:
             request_timeout = None
     # 在席エージェントのハートビート猶予秒数。途絶でそのエージェントを無人扱いし、モデルが
     # 無人になれば即アンロード（明示 release を呼べずに落ちたエージェントの保険）。0 で無効。
-    session_ttl = data.get("session_ttl", 90)
+    session_ttl = data.get("session_ttl", 600)
     if session_ttl is not None:
         session_ttl = float(session_ttl)
         if session_ttl < 0:

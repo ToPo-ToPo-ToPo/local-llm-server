@@ -173,11 +173,32 @@ def test_build_command_mlx_disable_thinking(stub_cache):
 
 def test_build_command_mlx_vlm(stub_cache):
     cmd = build_command(ServerConfig("mlx-vlm", "vision-model", port=8080))
-    # python -m mlx_vlm.server でモデル/ホスト/ポートを渡して起動する
-    assert cmd[1:3] == ["-m", "mlx_vlm.server"]
+    # mlx_vlm.server は直接ではなくシム経由で起動する（上流の未修正部分を当ててから
+    # 同じ引数で mlx_vlm.server を __main__ 実行する。→ _mlx_vlm_shims）
+    assert cmd[1:3] == ["-m", "local_llm_server._mlx_vlm_shims"]
     assert "--model" in cmd and "vision-model" in cmd and "8080" in cmd
     # vision は逐次処理。thinking テンプレート引数は付けない
     assert "--chat-template-args" not in cmd
+
+
+def test_thinking_markers_default_is_gemma4_style():
+    # 未収載のモデルは gemma-4-A4B 系のマーカー（従来の固定値）にフォールバックする
+    assert srv.thinking_markers("ToPo-ToPo/gemma-4-31b-it-mlx-4bit") == (
+        "<|channel>thought", "<channel|>"
+    )
+    assert srv.thinking_markers("ToPo-ToPo/Qwen3.6-27B-mlx-4bit") == (
+        "<|channel>thought", "<channel|>"
+    )
+
+
+def test_thinking_markers_inkling():
+    # Inkling は <|content_thinking|>…<|end_message|><|message_model|>。mlx-vlm の内蔵既定に
+    # 無いので明示しないと思考が丸ごと content に漏れる。ローカルパス登録でも引けること。
+    # 終端が <|end_message|> 単体でないのは、それが本文の終端も兼ねており、思考 OFF のとき
+    # 本文全体が思考と誤判定されて content が空になるため。
+    expected = ("<|content_thinking|>", "<|end_message|><|message_model|>")
+    assert srv.thinking_markers("/Users/x/mlx_models/Inkling-Small-mlx-4bit") == expected
+    assert srv.thinking_markers("mlx-community/inkling-mlx-4bit") == expected
 
 
 def test_build_command_mlx_vlm_mtp_drafter(stub_cache):
@@ -520,6 +541,45 @@ def test_estimate_model_bytes_llama_cpp(monkeypatch, tmp_path):
     monkeypatch.setattr(srv, "resolve_gguf", lambda m: str(gguf))
     cfg = ServerConfig(backend="llama-cpp", model="org/repo:Q4")
     assert srv.estimate_model_bytes(cfg) == 1200  # 本体 1000 ＋ mmproj 200
+
+
+def test_looks_like_local_path_is_cross_platform():
+    """ローカルパス判定は Windows のドライブレター・UNC・逆スラッシュも見る。
+
+    POSIX 限定（"/" "./" "../" "~" だけ）にしていたため、Windows ではローカル変換物の
+    登録が repo-id 扱いになり、estimate_model_bytes が None（＝メモリガード無効）に
+    落ちていた（CI の windows-latest でのみ失敗して発覚）。
+    """
+    for spec in ("/abs/model", "./rel", "../up", "~/models/x",
+                 r"C:\models\x", "C:/models/x", r"\\server\share\x"):
+        assert srv.looks_like_local_path(spec) is True, spec
+    for spec in ("org/repo", "ToPo-ToPo/Inkling-Small-mlx-4bit", "unsloth/x-GGUF:Q4_K_M"):
+        assert srv.looks_like_local_path(spec) is False, spec
+
+
+def test_estimate_model_bytes_mlx_local_dir(tmp_path):
+    # ローカル変換物（HF キャッシュではない実ディレクトリ）も見積もれること。
+    # repo-id でないためキャッシュ探索には載らず、これが無いとメモリガードが素通しする。
+    model = tmp_path / "Some-Model-mlx-4bit"
+    model.mkdir()
+    assert srv.looks_like_local_path(str(model)), "この OS でローカルパスと判定されない"
+    (model / "model-00001-of-00002.safetensors").write_bytes(b"x" * 1000)
+    (model / "model-00002-of-00002.safetensors").write_bytes(b"x" * 500)
+    (model / "tokenizer.json").write_bytes(b"y" * 999)  # 重み以外は数えない
+    cfg = ServerConfig(backend="mlx-vlm", model=str(model))
+    assert srv.estimate_model_bytes(cfg) == 1500
+
+    # ドラフター（MTP）も常駐するので合算する。
+    draft = tmp_path / "Some-Model-MTP-bf16"
+    draft.mkdir()
+    (draft / "model.safetensors").write_bytes(b"z" * 300)
+    cfg_mtp = ServerConfig(backend="mlx-vlm", model=str(model), draft_model=str(draft))
+    assert srv.estimate_model_bytes(cfg_mtp) == 1800
+
+    # 空ディレクトリ（重み未配置）は見積もり不能扱い。
+    empty = tmp_path / "Empty-Model"
+    empty.mkdir()
+    assert srv.estimate_model_bytes(ServerConfig(backend="mlx-vlm", model=str(empty))) is None
 
 
 def test_estimate_model_bytes_unknown_returns_none(monkeypatch):
