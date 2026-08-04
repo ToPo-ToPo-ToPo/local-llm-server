@@ -351,9 +351,12 @@ def reexec_daemon() -> None:
     """現在の Python でゲートウェイ本体を再 exec する（更新後、新コードを読み込むため）。
 
     デーモン（`python -m local_llm_server`）が idle 時に自動更新を適用したあと、自分自身を
-    新コードで置き換えるために呼ぶ。呼ぶ前に **単一起動ロックの解放とポートの解放（server_close）
-    を済ませておくこと**（execv は開いた fd を引き継ぐため、握ったままだと再取得で自分自身と
-    衝突する）。CWD を保つ（./gateway.toml の解決が変わらない）。同一 venv の python を使うので、
+    新コードで置き換えるために呼ぶ。呼ぶ前に**単一起動ロックの解放を済ませておくこと**
+    （execv は開いた fd を引き継ぐため、握ったままだと再取得で自分自身と衝突する）。
+    公開ポートの Listen ソケットは**閉じずに** fd を環境変数（GW_LISTEN_FD）で引き継ぐ——
+    新イメージは bind し直さず採用するので衝突せず、再起動の窓に accept キューへ並んだ
+    接続もそのまま処理される（zero-drop restart。→ daemon.GatewayServer.quiesce_for_restart）。
+    CWD を保つ（./gateway.toml の解決が変わらない）。同一 venv の python を使うので、
     git pull 済みの新ソースと uv sync 済みの依存で立ち上がる。呼ぶと戻らない。
     """
     import os

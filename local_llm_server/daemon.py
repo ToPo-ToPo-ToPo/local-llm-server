@@ -31,6 +31,7 @@ from __future__ import annotations
 import hmac
 import json
 import os
+import socket
 import subprocess
 import sys
 import threading
@@ -235,6 +236,8 @@ class ModelManager:
         # 即アンロードする判定に使う。_state ロック下で操作する。
         self._sessions: dict[str, _Session] = {}
         self._model_sessions: dict[str, set[str]] = {}
+        # release 猶予の期限（model_id → monotonic 期限）。→ _free_model_async
+        self._release_holds: dict[str, float] = {}
         # drain（再起動準備）の期限。monotonic 時刻がこれ未満の間は新規 acquire を
         # GatewayDraining で拒否する。0.0 で無効。再起動側が死んでも TTL で自動復帰する。
         self._drain_deadline: float = 0.0
@@ -710,10 +713,14 @@ class ModelManager:
     def begin_drain(self, ttl: float = 120.0) -> dict:
         """再起動準備（drain）を試みる。アイドル確認と新規受付停止を**原子的に**行う。
 
-        `_state` ロック下で「処理中リクエスト 0 かつ 在席エージェント 0」を確認し、
-        満たすときだけ drain を開始する（以後 acquire は GatewayDraining → 503）。
-        busy なら開始せず現状を返す（呼び出し側は空くのを待って再試行する）。
-        再起動側が死んで drain だけ残っても、ttl 秒で自動解除され通常運転へ戻る。
+        `_state` ロック下で「処理中リクエスト 0」を確認し、満たすときだけ drain を開始する
+        （以後 acquire は GatewayDraining → 503）。busy なら開始せず現状を返す（呼び出し側は
+        空くのを待って再試行する）。再起動側が死んで drain だけ残っても、ttl 秒で自動解除され
+        通常運転へ戻る。
+
+        **在席セッションは見ない**。在席は「解放を早める」だけの存在で、drain を塞ぐ権限を
+        持たない（release を送れずに落ちたエージェントの置き去りが、常時使用中の共有モデルに
+        残ると drain が永久に通らなくなるため。sessions は情報として返すだけ）。
 
         戻り値: {"ok": bool, "inflight": n, "sessions": n}
         """
@@ -722,10 +729,10 @@ class ModelManager:
                 i.inflight for m in self._models.values() for i in m.instances
             )
             sessions = len(self._sessions)
-            if inflight or sessions:
+            if inflight:
                 return {"ok": False, "inflight": inflight, "sessions": sessions}
             self._drain_deadline = time.monotonic() + ttl
-            return {"ok": True, "inflight": 0, "sessions": 0}
+            return {"ok": True, "inflight": 0, "sessions": sessions}
 
     def end_drain(self) -> None:
         """drain を解除して通常受付に戻す（更新の見送り・失敗時）。"""
@@ -835,9 +842,15 @@ class ModelManager:
             for _m, srv in victims:
                 srv.stop()  # ログ fd を閉じ、死んだプロセスグループを掃除する
             with self._state:
+                emptied = [m.config.model for m, _srv in victims if not m.instances]
                 for m, _srv in victims:  # 全インスタンスが消えた動的モデルは登録ごと消す
                     if m.dynamic and not m.instances:
                         self._models.pop(m.config.model, None)
+        # ワーカーがクラッシュしたモデルの在席登録を捨てる（エージェントごと巻き込まれた
+        # クラッシュの置き去り対策。生きているエージェントは heartbeat 404 → 再 register で
+        # 自己修復する）。
+        for model_id in emptied:
+            self.drop_sessions_for(model_id)
         return len(victims)
 
     # --- エージェント在席（セッション）管理 -----------------------------------
@@ -905,9 +918,25 @@ class ModelManager:
         release の直後に次のタスクが register するため、即時解放するとアンロード→再ロードを
         毎回繰り返してしまう。猶予中に再 register されれば _free_idle_model 側の在席チェックで
         解放は自然に取り消される。
+
+        猶予は release ごとに**期限で延長**する（_release_holds）。各タイマーは発火時に
+        「自分より新しい release が猶予を延ばしていないか」を確認し、延びていれば何もしない
+        （最後の release のタイマーだけが実際に解放する）。これが無いと、60 秒以内に
+        release が連続したとき**古いタイマーが後続の猶予を侵食**する:
+          T=0 A release（予約T=60）→ T=50 B release（予約T=110）→ T=60 A の古い予約が発火
+          → B の release から 10 秒しか経っていないのに解放される。
         """
+        hold_until = time.monotonic() + _RELEASE_LINGER_S
+        with self._state:
+            self._release_holds[model_id] = hold_until
+
         def _delayed() -> None:
             time.sleep(_RELEASE_LINGER_S)
+            with self._state:
+                hold = self._release_holds.get(model_id, 0.0)
+                if time.monotonic() < hold:
+                    return  # より新しい release が猶予を延長した（そのタイマーが担当する）
+                self._release_holds.pop(model_id, None)
             self._free_idle_model(model_id)
 
         threading.Thread(target=_delayed, daemon=True).start()
@@ -940,6 +969,11 @@ class ModelManager:
                     if mm2 is not None and not mm2.instances and not self._model_sessions.get(model_id):
                         self._models.pop(model_id, None)
         return bool(victims)
+
+    def session_known(self, agent_id: str) -> bool:
+        """agent_id の在席登録が存在するか（heartbeat 互換応答の判定用。生存推定には使わない）。"""
+        with self._state:
+            return agent_id in self._sessions
 
     def drop_sessions_for(self, model_id: str) -> int:
         """model_id の在席登録を全て捨てる（_state 保持下では呼ばない）。
@@ -1025,11 +1059,18 @@ class ModelManager:
             t.join()
 
 
+# zero-drop restart で Listen ソケット fd を新イメージへ渡す環境変数。
+_LISTEN_FD_ENV = "GW_LISTEN_FD"
+
+
 class GatewayServer(ThreadingHTTPServer):
     """model 振り分けゲートウェイの HTTP サーバー。"""
 
     daemon_threads = True
     allow_reuse_address = True
+    # 再起動の受け渡し窓（accept 停止〜新イメージの accept 再開。十数秒）に到着した接続は
+    # カーネルの accept キューで待たせる。既定の 5 では窓の間に溢れて接続拒否になり得る。
+    request_queue_size = 128
 
     def __init__(
         self,
@@ -1048,8 +1089,26 @@ class GatewayServer(ThreadingHTTPServer):
         repetition_penalty: float | None = None,
         repetition_context_size: int | None = None,
         repetition_penalty_skip_structured: bool = False,
+        listen_fd: int | None = None,
     ) -> None:
-        super().__init__(addr, _GatewayHandler)
+        if listen_fd is None:
+            super().__init__(addr, _GatewayHandler)
+        else:
+            # zero-drop restart: 前イメージから Listen ソケットを引き継ぐ。bind/listen は
+            # 行わない——受け渡し窓の間にカーネルの accept キューへ並んだ接続をそのまま引き取る。
+            super().__init__(addr, _GatewayHandler, bind_and_activate=False)
+            inherited = socket.socket(fileno=listen_fd)
+            self.socket.close()
+            self.socket = inherited
+            host, port = inherited.getsockname()[:2]
+            self.server_address = (host, port)
+            self.server_name = socket.getfqdn(host)
+            self.server_port = port
+        # 生きている接続数（accept 済み〜応答完了）。quiesce_for_restart の判定に使う。
+        # inflight（モデル振り分け後のカウント）より外側の数なので、「accept 済みだが
+        # ボディ受信中で inflight 計上前」のリクエストも取りこぼさない。
+        self._active_conns = 0
+        self._conns_cv = threading.Condition()
         self.manager = manager
         # 繰り返しループ抑制の既定注入（mlx 系のみ。None で無効）。do_POST が chat リクエストに
         # 付与する（クライアントが自分で指定していれば尊重して上書きしない）。
@@ -1081,6 +1140,65 @@ class GatewayServer(ThreadingHTTPServer):
         self.pid = os.getpid()
         self.started_at = time.strftime("%Y-%m-%d %H:%M:%S")
         self.start_cwd = os.getcwd()
+
+    # --- zero-drop restart（Listen ソケット引き継ぎ）------------------------------
+    #
+    # 再起動でリクエストを 1 つも落とさないための 3 点セット:
+    #   ① quiesce_for_restart: accept を止め、処理中の接続が掃けるのを待つ。Listen ソケットは
+    #      開いたままなので、以後の新規接続は拒否されずカーネルの accept キューで待つ。
+    #   ② detach_listen_fd: fd を所有権ごと取り出して execv を生き延びさせる。
+    #   ③ __init__(listen_fd=...): 新イメージが fd を引き継ぎ、キューの接続を順に処理する。
+    # クライアントから見ると「再起動の窓に投げた 1 発」は失敗せず、少し待たされるだけになる。
+
+    def process_request(self, request, client_address):
+        # accept スレッド側で数える（ワーカースレッド開始後に数えると、開始前の隙間が
+        # quiesce の判定から漏れる）。減算は shutdown_request（全経路で 1 回呼ばれる）。
+        with self._conns_cv:
+            self._active_conns += 1
+        super().process_request(request, client_address)
+
+    def shutdown_request(self, request):
+        try:
+            super().shutdown_request(request)
+        finally:
+            with self._conns_cv:
+                self._active_conns = max(0, self._active_conns - 1)
+                self._conns_cv.notify_all()
+
+    def quiesce_for_restart(self, timeout: float = 5.0) -> bool:
+        """accept を止め、処理中の接続が掃けるのを待つ。成功なら True。
+
+        成功後も Listen ソケットは開いたままなので、以後に来た接続は接続拒否にも 503 にも
+        ならず accept キューに並ぶ（request_queue_size 分）。新イメージが引き継いだ時点で
+        順に処理される。timeout 内に掃けなければ accept を再開して False（受信中・生成中の
+        接続は切らない。呼び出し側は次周期で再試行する）。
+
+        旧実装（begin_drain の inflight 判定＋503）と違い、接続数で見るので「accept 済みだが
+        ボディ受信中で inflight 計上前」のリクエストも取りこぼさない。
+        """
+        self.shutdown()   # serve_forever を止める（Listen ソケットは閉じない）
+        with self._conns_cv:
+            deadline = time.monotonic() + timeout
+            while self._active_conns > 0:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._conns_cv.wait(remaining)
+            idle = self._active_conns == 0
+        if idle:
+            return True
+        threading.Thread(target=self.serve_forever, daemon=True).start()  # 再開
+        return False
+
+    def detach_listen_fd(self) -> int:
+        """Listen ソケットの fd を所有権ごと取り出し、execv を生き延びるよう継承可能にする。
+
+        detach 後のソケットオブジェクトは fd を閉じない（GC で閉じられると accept キューの
+        接続ごと失われるため、所有権を外すことが本質）。
+        """
+        fd = self.socket.detach()
+        os.set_inheritable(fd, True)
+        return fd
 
 
 # 受け付けるリクエストボディの上限（バイト）。vision の base64 画像を見込んでも十分大きく、
@@ -1549,19 +1667,22 @@ class _GatewayHandler(BaseHTTPRequestHandler):
                               "model": model, "registered": True})
 
     def _handle_session_heartbeat(self, srv, payload: dict) -> None:
-        """旧クライアント互換の no-op。
+        """旧クライアント互換。生存推定には使わない（受けても何も更新しない）。
 
-        ハートビートによる生存推定をやめたので、ゲートウェイ側でやることは何も無い。
-        旧 local-llm-client は定期送信し、404 なら再 register する実装なので、**必ず 200 を
-        返す**（404 を返すと無用な再 register ループを生む）。在席が実際に消えるのは
-        release か、モデルのアンロード時の掃除だけ。
+        既知の agent_id には 200、未知には 404 を返す。404 は旧 local-llm-client の
+        **自己修復経路**——heartbeat 失敗で再 register する実装なので、ゲートウェイ再起動や
+        アンロード時の在席掃除でセッションが消えても、次の heartbeat で登録が復元される。
+        （常時 200 にすると旧クライアントが再 register せず、在席ゼロ扱いのモデルが
+        他エージェントの release で使用中に落とされ得る。）
         """
         agent_id = payload.get("agent_id")
         if not agent_id:
             send_error(self, 400, "no 'agent_id' in the request")
             return
-        send_json(self, 200, {"object": "gateway.session", "agent_id": agent_id,
-                              "alive": True, "deprecated": True})
+        if not srv.manager.session_known(str(agent_id)):
+            send_error(self, 404, f"unknown session '{agent_id}'; register first")
+            return
+        send_json(self, 200, {"object": "gateway.session", "agent_id": agent_id, "alive": True})
 
     def _handle_session_release(self, srv, payload: dict) -> None:
         agent_id = payload.get("agent_id")
@@ -2129,6 +2250,7 @@ def maybe_refresh_update_state(srv) -> None:
 
 def _update_watcher(
     manager: "ModelManager",
+    server: "GatewayServer",
     stop: threading.Event,
     restart_requested: threading.Event,
     *,
@@ -2207,14 +2329,17 @@ def _update_watcher(
                 f"Auto-update: fetched ({msg}); will restart on new code when idle.",
                 file=sys.stderr,
             )
-        # ソース追従済み。処理中/在席が 0 を原子的に確認できた（drain 成功）ときだけ再起動する。
-        # 成功後は新規受付が止まる（503→クライアントが新プロセスへリトライ）ので、下の
-        # メインループが finally でクリーン停止 → run_gateway が execv で新コードに置き換える。
-        if manager.begin_drain()["ok"]:
+        # ソース追従済み。accept を止めて処理中の接続が掃けた（quiesce 成功）ときだけ再起動する。
+        # Listen ソケットは開いたままなので、この後に来た接続は 503 にも接続拒否にもならず
+        # accept キューで待ち、execv 後の新イメージがソケットごと引き継いで処理する
+        # （＝再起動の窓に投げられたリクエストを 1 つも落とさない）。
+        # 在席セッションは見ない: 在席は「解放を早める」だけの存在で、更新を塞ぐ権限を
+        # 持たせない（release を送れず落ちたエージェントの置き去りが残っても更新は進む）。
+        if server.quiesce_for_restart():
             print("Auto-update: idle; restarting the gateway on new code...", file=sys.stderr)
             restart_requested.set()
             return
-        # busy → 何も止めずに保留（次周期で再試行）。
+        # busy（受信中・生成中の接続あり）→ 何も止めずに保留（次周期で再試行）。
 
 
 def run_gateway(cfg: GatewayConfig, config_path: str | None = None) -> int:
@@ -2440,23 +2565,55 @@ def _run_gateway_locked(cfg: GatewayConfig, config_path: str | None = None) -> i
         max_memory_fraction=cfg.max_memory_fraction,
         internal_base_port=cfg.internal_base_port, public_port=cfg.port,
     )
-    server = GatewayServer(
-        (cfg.host, cfg.port),
-        manager,
-        catalog=[c.model for c in cfg.models],
-        default_model=cfg.default_model,
-        timeout_s=cfg.request_timeout,
-        max_resident=cfg.max_resident,
-        idle_timeout=cfg.idle_timeout,
-        load_timeout=cfg.load_timeout,
-        api_key=cfg.api_key,
-        video_frames=cfg.video_frames,
-        video_max_edge=cfg.video_max_edge,
-        image_max_edge=cfg.image_max_edge,
-        repetition_penalty=cfg.repetition_penalty,
-        repetition_context_size=cfg.repetition_context_size,
-        repetition_penalty_skip_structured=cfg.repetition_penalty_skip_structured,
-    )
+    def _make_server(listen_fd: int | None) -> GatewayServer:
+        return GatewayServer(
+            (cfg.host, cfg.port),
+            manager,
+            catalog=[c.model for c in cfg.models],
+            default_model=cfg.default_model,
+            timeout_s=cfg.request_timeout,
+            max_resident=cfg.max_resident,
+            idle_timeout=cfg.idle_timeout,
+            load_timeout=cfg.load_timeout,
+            api_key=cfg.api_key,
+            video_frames=cfg.video_frames,
+            video_max_edge=cfg.video_max_edge,
+            image_max_edge=cfg.image_max_edge,
+            repetition_penalty=cfg.repetition_penalty,
+            repetition_context_size=cfg.repetition_context_size,
+            repetition_penalty_skip_structured=cfg.repetition_penalty_skip_structured,
+            listen_fd=listen_fd,
+        )
+
+    # zero-drop restart: 前イメージが detach した Listen ソケットが在れば引き継ぐ
+    # （bind し直さない＝再起動の窓に accept キューへ並んだ接続をそのまま処理する）。
+    # pop するので、この後に起動する子プロセスへ fd 番号が漏れることは無い。
+    inherited_fd: int | None = None
+    raw_fd = os.environ.pop(_LISTEN_FD_ENV, None)
+    if raw_fd:
+        try:
+            inherited_fd = int(raw_fd)
+        except ValueError:
+            inherited_fd = None
+    try:
+        server = _make_server(inherited_fd)
+        if inherited_fd is not None:
+            print("Zero-drop restart: adopted the listening socket from the previous "
+                  "image; connections that arrived during the restart are being served.",
+                  file=sys.stderr)
+    except Exception:
+        if inherited_fd is None:
+            raise
+        # 引き継ぎに失敗（fd が壊れている等）。fd を閉じてから通常 bind へフォールバック
+        # （閉じないと同ポートの bind が EADDRINUSE で失敗する。キューの接続は失われるが、
+        # このパスは fd 破損という異常時のみ）。
+        try:
+            os.close(inherited_fd)
+        except OSError:
+            pass
+        print("Zero-drop restart: failed to adopt the inherited socket; "
+              "falling back to a fresh bind.", file=sys.stderr)
+        server = _make_server(None)
     public = f"http://{cfg.host}:{cfg.port}/v1"
     wildcard = cfg.host in ("0.0.0.0", "")
     # ループバック以外へ bind したら「公開」扱い（特定 LAN IP への bind も外から届く）。
@@ -2573,7 +2730,7 @@ def _run_gateway_locked(cfg: GatewayConfig, config_path: str | None = None) -> i
     server._update_check_inflight = False
     threading.Thread(
         target=_update_watcher,
-        args=(manager, stop_reaper, restart_requested),
+        args=(manager, server, stop_reaper, restart_requested),
         kwargs={"auto_apply": cfg.auto_update, "state": server.update_state,
                 "notify": _tray_notify},
         daemon=True,
@@ -2594,7 +2751,13 @@ def _run_gateway_locked(cfg: GatewayConfig, config_path: str | None = None) -> i
         stop_reaper.set()
         print("\nShutting down the gateway and its model servers...", file=sys.stderr)
         server.shutdown()
-        server.server_close()
+        if restart:
+            # zero-drop restart: Listen ソケットは閉じず、fd を環境変数で新イメージへ渡す。
+            # 受け渡し窓に到着した接続は accept キューに並んだまま、新イメージが処理する。
+            # （detach するので GC でも閉じられない。execv は環境変数と fd を引き継ぐ。）
+            os.environ[_LISTEN_FD_ENV] = str(server.detach_listen_fd())
+        else:
+            server.server_close()
         manager.shutdown()
         # メニューバーアイコンを畳む（パイプ EOF でも消えるが、明示終了の方が即時）。
         if tray_proc is not None and tray_proc.poll() is None:

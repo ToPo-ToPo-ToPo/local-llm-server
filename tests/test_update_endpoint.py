@@ -195,9 +195,13 @@ def test_watcher_notifies_when_not_applying(monkeypatch):
     stop = threading.Event()
     state: dict = {}
     mgr = ModelManager([])
+    class _Srv:
+        def quiesce_for_restart(self, timeout=5.0):
+            return True
+
     t = threading.Thread(
         target=gw._update_watcher,
-        args=(mgr, stop, threading.Event()),
+        args=(mgr, _Srv(), stop, threading.Event()),
         kwargs={"auto_apply": False, "state": state, "notify": notes.append},
         daemon=True,
     )

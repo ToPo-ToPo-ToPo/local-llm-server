@@ -231,15 +231,18 @@ def test_update_watcher_fetches_then_restarts_on_drain(monkeypatch):
                         lambda *a, **k: (applied.setdefault("ok", True), "done"))
 
     class _Mgr:
-        def begin_drain(self, ttl=120.0):
-            return {"ok": True, "inflight": 0, "sessions": 0}  # idle → drain 成功
+        pass
+
+    class _Srv:
+        def quiesce_for_restart(self, timeout=5.0):
+            return True  # idle → 静止成功（accept 停止済み・接続 0）
 
     stop = threading.Event()
     restart = threading.Event()
     calls = {"n": 0}
     monkeypatch.setattr(stop, "wait", lambda timeout=None: (calls.__setitem__("n", calls["n"] + 1) or calls["n"] > 1))
 
-    daemon._update_watcher(_Mgr(), stop, restart)
+    daemon._update_watcher(_Mgr(), _Srv(), stop, restart)
     assert applied.get("ok") is True       # 取得は先に済ませる
     assert restart.is_set()                # drain が通ったので再起動
 
@@ -257,15 +260,18 @@ def test_update_watcher_holds_when_busy(monkeypatch):
                         lambda *a, **k: (applied.setdefault("ok", True), "done"))
 
     class _Mgr:
-        def begin_drain(self, ttl=120.0):
-            return {"ok": False, "inflight": 1, "sessions": 0}  # busy → drain 拒否
+        pass
+
+    class _Srv:
+        def quiesce_for_restart(self, timeout=5.0):
+            return False  # busy（受信中・生成中の接続あり）→ 静止失敗・accept 再開済み
 
     stop = threading.Event()
     restart = threading.Event()
     calls = {"n": 0}
     monkeypatch.setattr(stop, "wait", lambda timeout=None: (calls.__setitem__("n", calls["n"] + 1) or calls["n"] > 3))
 
-    daemon._update_watcher(_Mgr(), stop, restart)
+    daemon._update_watcher(_Mgr(), _Srv(), stop, restart)
     assert applied.get("ok") is True       # 取得は済ませる（稼働中に先に pull）
     assert not restart.is_set()            # だが busy のあいだは再起動しない
 

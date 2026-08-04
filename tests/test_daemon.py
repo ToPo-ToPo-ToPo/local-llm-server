@@ -1049,10 +1049,10 @@ def test_gateway_session_endpoints(monkeypatch):
         port = server.server_address[1]
         assert _post(port, "/admin/sessions/register", {"agent_id": "A", "model": "m1"})[0] == 200
         _, h = mgr.acquire("m1"); mgr.release(h)   # ロード
-        # heartbeat は旧クライアント互換の no-op。未知の agent でも 200 を返す
-        # （404 だと旧クライアントが無用な再 register ループに入る）。
+        # heartbeat は旧クライアント互換（生存推定には使わない）。既知は 200、
+        # 未知は 404 = 旧クライアントの自己修復経路（404 を受けたら再 register する）。
         assert _post(port, "/admin/sessions/heartbeat", {"agent_id": "A"})[0] == 200
-        assert _post(port, "/admin/sessions/heartbeat", {"agent_id": "ZZ"})[0] == 200
+        assert _post(port, "/admin/sessions/heartbeat", {"agent_id": "ZZ"})[0] == 404
         # admin/status に sessions が出る
         _, st = _get(port, "/admin/status")
         assert {m["model"]: m["sessions"] for m in st["models"]}["m1"] == 1
@@ -1744,11 +1744,26 @@ def test_begin_drain_refuses_when_inflight():
         assert mgr._draining_locked() is False
 
 
-def test_begin_drain_refuses_when_sessions_present():
+def test_begin_drain_ignores_sessions():
+    """在席は drain を塞がない（inflight のみ見る）。
+
+    在席は「解放を早める」だけの存在で、更新を止める権限を持たない。release を送れずに
+    落ちたエージェントの置き去りが常時使用中の共有モデルに残ると、在席を条件にした drain は
+    永久に通らず auto-update が止まる（旧実装のリグレッション要因）。sessions は情報として
+    返るだけ。
+    """
     mgr = gw.ModelManager([], dynamic=True)
     mgr.register_session("agent-1", "some/model")
     res = mgr.begin_drain()
-    assert res["ok"] is False and res["sessions"] == 1
+    assert res["ok"] is True and res["sessions"] == 1
+    mgr.end_drain()
+
+
+def test_begin_drain_refuses_while_inflight():
+    mgr = gw.ModelManager([], dynamic=True)
+    _install_instance(mgr, "m", alive=True, inflight=1, port=9001)
+    res = mgr.begin_drain()
+    assert res["ok"] is False and res["inflight"] == 1
 
 
 def test_begin_drain_ok_when_idle_then_acquire_rejected():
@@ -2079,3 +2094,122 @@ def test_skip_structured_on_still_injects_plain_chat():
     srv = _mk_srv_skip(1.1, {"org/gemma": "mlx-vlm"}, skip=True)
     got = _inject(srv, "org/gemma", {"model": "org/gemma", "messages": []})
     assert got["repetition_penalty"] == 1.1
+
+
+# --- zero-drop restart（Listen ソケット引き継ぎ） --------------------------------
+
+def test_quiesce_handoff_is_lossless(monkeypatch):
+    """再起動の窓に投げたリクエストが 1 つも落ちないことの結線証明。
+
+    quiesce（accept 停止）中に送ったリクエストはカーネルの accept キューで待ち、
+    detach した fd を引き継いだ新サーバーが処理して正常応答が返る——実際の TCP と
+    実 fd で検証する（execv だけ省略した、本番と同じ経路）。
+    """
+    server, mgr, ups = _start_gateway(monkeypatch)
+    server2 = None
+    try:
+        port = server.server_address[1]
+        assert server.quiesce_for_restart(timeout=2.0) is True  # accept 停止
+
+        # 停止中に投げる: 接続は拒否されず、応答待ちでブロックするはず
+        result = {}
+        def _client():
+            try:
+                result["resp"] = _post(port, "/v1/chat/completions",
+                                       {"model": "m1", "messages": [{"role": "user", "content": "hi"}]})
+            except Exception as exc:  # noqa: BLE001
+                result["error"] = exc
+        t = threading.Thread(target=_client, daemon=True)
+        t.start()
+        t.join(0.5)
+        assert t.is_alive(), "quiesce 中のリクエストが即座に失敗した（キューで待つはず）"
+
+        # fd を引き継いで新サーバーを立てる（execv 相当。旧サーバーは以後使わない）
+        fd = server.detach_listen_fd()
+        import os as _os
+        assert _os.get_inheritable(fd) is True  # execv を生き延びる印
+        server2 = gw.GatewayServer(("127.0.0.1", port), mgr, catalog=["m1", "m2"],
+                                   listen_fd=fd)
+        threading.Thread(target=server2.serve_forever, daemon=True).start()
+
+        t.join(10.0)
+        assert "error" not in result, f"引き継ぎ後に失敗: {result.get('error')}"
+        status, obj = result["resp"]
+        assert status == 200 and obj["backend"] == "m1-upstream"
+    finally:
+        server.shutdown()   # 旧サーバー（ソケットは detach 済み）
+        if server2 is not None:
+            server2.shutdown(); server2.server_close()
+        mgr.shutdown()
+        for u in ups:
+            u.shutdown(); u.server_close()
+
+
+def test_quiesce_resumes_when_connection_active(monkeypatch):
+    """受信中の接続（ボディ未送信＝inflight 計上前）があれば quiesce は失敗し、accept を再開する。
+
+    旧 begin_drain は inflight しか見ておらず「accept 済みだがボディ受信中」のリクエストを
+    503 で落とし得た。接続数で判定することでこの隙間が閉じていることを確認する。
+    """
+    import socket as _socket
+    server, mgr, ups = _start_gateway(monkeypatch)
+    try:
+        port = server.server_address[1]
+        # ヘッダだけ送ってボディを送らない接続（受信中の状態を再現）
+        raw = _socket.create_connection(("127.0.0.1", port))
+        raw.sendall(b"POST /v1/chat/completions HTTP/1.0\r\n"
+                    b"Content-Type: application/json\r\nContent-Length: 52\r\n\r\n")
+        time.sleep(0.2)  # ハンドラが accept してボディ待ちに入るまで
+        assert server.quiesce_for_restart(timeout=0.4) is False  # 掃けない → 再開
+
+        # 再開後: 保留中の接続はボディを送れば普通に完走する
+        raw.sendall(b'{"model": "m1", "messages": [{"role": "u", "k": 1}]}')
+        resp = b""
+        raw.settimeout(5.0)
+        while True:
+            chunk = raw.recv(4096)
+            if not chunk:
+                break
+            resp += chunk
+        raw.close()
+        assert b"200" in resp.split(b"\r\n", 1)[0]
+        # 新規リクエストも受け付けている（accept が再開している）
+        status, obj = _post(port, "/v1/chat/completions",
+                            {"model": "m2", "messages": [{"role": "user", "content": "hi"}]})
+        assert status == 200 and obj["backend"] == "m2-upstream"
+    finally:
+        server.shutdown(); server.server_close(); mgr.shutdown()
+        for u in ups:
+            u.shutdown(); u.server_close()
+
+
+def test_release_linger_not_shortened_by_stale_timer(monkeypatch):
+    """release が 60 秒以内に連続しても、古いタイマーが後続の猶予を侵食しない（世代管理）。
+
+    シナリオ: A release（予約 T+L）→ B register → B release（予約 T+1.5L 相当）。
+    A の古い予約が発火する時点では B の猶予がまだ残っているので解放してはならない。
+    """
+    created = _patch_fake(monkeypatch)
+    _short_linger(monkeypatch, 0.4)
+    mgr = gw.ModelManager(_configs())
+    mgr.register_session("A", "m1")
+    _, h = mgr.acquire("m1"); mgr.release(h)
+    mgr.unregister_session("A")          # T=0: 解放予約 T=0.4
+    time.sleep(0.15)
+    mgr.register_session("B", "m1")      # 在席復活（A のタイマーは在席チェックで空振り）
+    time.sleep(0.05)
+    mgr.unregister_session("B")          # T=0.2: 解放予約 T=0.6
+    time.sleep(0.3)                      # T=0.5: A の予約時刻は過ぎたが B の猶予内
+    assert mgr.status()[0]["loaded"] is True, "古いタイマーが B の猶予を侵食した"
+    assert {s.config.model: s.stops for s in created}["m1"] == 0
+    time.sleep(0.4)                      # T=0.9: B の猶予が明けた
+    assert _wait_unloaded(mgr, "m1")
+
+
+def test_dead_worker_reap_drops_sessions():
+    """ワーカーがクラッシュしたモデルの置き去り在席は、死亡回収時に一緒に掃除される。"""
+    mgr = gw.ModelManager([], dynamic=True)
+    _install_instance(mgr, "crashed", alive=False, port=9001)
+    mgr.register_session("ghost", "crashed")
+    assert mgr.reap_dead_instances() == 1
+    assert mgr.session_known("ghost") is False
