@@ -12,17 +12,19 @@ http://127.0.0.1:8799/v1）を 1 つだけ立て、受信した `/v1/chat/comple
 ゲートウェイ 1 プロセスだけを起動/停止すればよい（停止時に配下のモデルサーバーも全て止める）。
 
 **在席ベースの即時アンロード（任意）**: エージェントは「このモデルを使う」ことを宣言でき、
-停止時に解除できる。あるモデルの在席エージェントが 0 になった瞬間（＝他に同じモデルへ
-接続しているエージェントが居ない）、処理中（inflight>0）でなければ **idle_timeout を待たずに
-即アンロード**してメモリを解放する。チャット転送（/v1/...）とは別系統の管理エンドポイント:
+停止時に解除できる。あるモデルの在席エージェントが 0 になったら、処理中（inflight>0）で
+なければ短い猶予（_RELEASE_LINGER_S）ののち **idle_timeout を待たずにアンロード**して
+メモリを解放する。チャット転送（/v1/...）とは別系統の管理エンドポイント:
 
   - `POST /admin/sessions/register`   `{"agent_id", "model"}`  … 利用開始（在席を宣言）
-  - `POST /admin/sessions/heartbeat`  `{"agent_id"}`           … 生存通知（session_ttl 内に定期送信）
   - `POST /admin/sessions/release`    `{"agent_id"}`           … 利用終了（= `DELETE /admin/sessions`）
+  - `POST /admin/sessions/heartbeat`  `{"agent_id"}`           … 旧クライアント互換の no-op
 
-明示の release を送れずに落ちたエージェントは、ハートビートが `session_ttl` 秒途絶した時点で
-掃除スレッドが無人扱いし、同じく即アンロードする。在席はメモリをピン留めしない（枠が要れば
-従来どおり LRU 退避が優先される）。あくまで「使う人が居なくなったら早く片付ける」仕組み。
+**生存推定はしない**。ハートビート途絶からエージェントの死を推定してモデルを落とすことはない
+（旧実装はこれで、生成中のクライアントの足元から 148GB のモデルを外す事故を起こした）。
+release を送れずに落ちたエージェントの置き去りセッションは、モデルが idle_timeout で解放される
+ときに一緒に掃除される。したがって**在席は解放を早めるだけで、遅らせる力を持たない**。
+在席はメモリをピン留めもしない（枠が要れば従来どおり LRU 退避が優先される）。
 """
 from __future__ import annotations
 
@@ -146,18 +148,31 @@ class _Model:
     footprint: int | None = None  # 1 インスタンスの概算占有メモリ（バイト）。0=見積もり不能
 
 
+# release 後にモデルを保持する猶予（秒）。設定にはしない——値の精度に意味が無く
+# 「プロセスの入れ替わりを吸収できれば十分」だからで、ノブを増やさない方針。
+#
+# 即時アンロードだった頃は、タスクごとに子プロセスを起動する構成（cad-agent の MCP）で
+# release の数秒後に次のタスクが register し、その都度アンロード→再ロードが起きていた
+# （実測: 148GB のモデルで毎回 21 秒。クライアントの入口プローブまで食い潰した）。
+_RELEASE_LINGER_S = 60.0
+
+
 @dataclass
 class _Session:
     """1 エージェントの在席（このモデルを使うと宣言したクライアント）。
 
     inflight（処理中リクエスト数）とは別の軸で「接続中のエージェント」を数えるための
-    もの。register で増え、release / ハートビート途絶（reap）で減る。あるモデルの
-    セッションが 0 になった瞬間（＝そのモデルを使うエージェントが誰も居なくなった）に、
-    処理中でなければ即座にアンロードしてメモリを解放する（idle_timeout を待たない）。
+    もの。register で増え、release で減る。あるモデルのセッションが 0 になったら、
+    _RELEASE_LINGER_S の猶予後に（その間に誰も来なければ）アンロードする。
+
+    **生存推定はしない**。ハートビートによる死活監視は持たず、在席したまま応答が無い
+    エージェントを「死んだ」と推定してモデルを落とすことは無い（旧実装はこれで、生成中の
+    クライアントの足元から 148GB のモデルを外す事故を起こした）。release を送れずに落ちた
+    エージェントの置き去りセッションは、モデルが idle_timeout で解放される際に一緒に掃除
+    される（セッションは解放を**早める**だけで、遅らせる力を持たない）。
     """
 
     model_id: str
-    last_seen: float  # time.monotonic()。最後のハートビート/登録時刻
 
 
 class ModelManager:
@@ -788,6 +803,11 @@ class ModelManager:
                             m.instances.remove(i)
             for _m, srv in victims:
                 srv.stop()  # state ロックの外で（最長 ~10s かかるため）
+            # アンロードしたモデルの在席登録を捨てる。release を送れずに落ちたエージェントの
+            # 置き去りはここで回収されるので、ハートビートによる死活監視は要らない。
+            for m, _srv in victims:
+                if not m.instances:
+                    self.drop_sessions_for(m.config.model)
             with self._state:
                 for m, _srv in victims:  # 全インスタンスが消えた動的モデルは登録ごと消す
                     if m.dynamic and not m.instances:
@@ -832,32 +852,23 @@ class ModelManager:
         """エージェントの利用開始を記録する（モデルは従来どおり初回リクエストで遅延ロード）。
 
         既に別モデルに在席していた agent_id は、まず旧モデルから外す（乗り換え）。旧モデルが
-        それで無人かつ処理中でなくなれば、バックグラウンドで即アンロードする。
+        それで無人かつ処理中でなくなれば、猶予後にアンロードする。
         """
-        now = time.monotonic()
         freed: str | None = None
         with self._state:
             prev = self._sessions.get(agent_id)
             if prev is not None and prev.model_id != model_id:
                 freed = self._detach_locked(agent_id, prev.model_id)
-            self._sessions[agent_id] = _Session(model_id=model_id, last_seen=now)
+            self._sessions[agent_id] = _Session(model_id=model_id)
             self._model_sessions.setdefault(model_id, set()).add(agent_id)
         if freed is not None:
             self._free_model_async(freed)
 
-    def heartbeat(self, agent_id: str) -> bool:
-        """在席エージェントの生存を更新する。未知の agent_id なら False（要 register）。"""
-        with self._state:
-            sess = self._sessions.get(agent_id)
-            if sess is None:
-                return False
-            sess.last_seen = time.monotonic()
-            return True
-
     def unregister_session(self, agent_id: str) -> bool:
         """エージェントの利用終了を記録する（停止時に呼ぶ）。
 
-        対象モデルがそれで無人になり、かつ処理中でなければ即アンロードする（バックグラウンド）。
+        対象モデルがそれで無人になったら、_RELEASE_LINGER_S の猶予後にアンロードする
+        （バックグラウンド）。猶予中に誰かが register すれば解放は取り消される。
         登録の有無に関わらず冪等。実際に登録が在ったときだけ True。
         """
         with self._state:
@@ -887,10 +898,19 @@ class ModelManager:
         return model_id
 
     def _free_model_async(self, model_id: str) -> None:
-        """無人になったモデルを別スレッドで即アンロードする（HTTP 応答を 10s 待たせない）。"""
-        threading.Thread(
-            target=self._free_idle_model, args=(model_id,), daemon=True
-        ).start()
+        """無人になったモデルを、猶予をおいて別スレッドで解放する。
+
+        HTTP 応答を stop の 10s 待たせないためにスレッドへ逃がすのは従来どおり。加えて
+        _RELEASE_LINGER_S 待ってから解放する: タスクごとに子プロセスを起動する構成では
+        release の直後に次のタスクが register するため、即時解放するとアンロード→再ロードを
+        毎回繰り返してしまう。猶予中に再 register されれば _free_idle_model 側の在席チェックで
+        解放は自然に取り消される。
+        """
+        def _delayed() -> None:
+            time.sleep(_RELEASE_LINGER_S)
+            self._free_idle_model(model_id)
+
+        threading.Thread(target=_delayed, daemon=True).start()
 
     def _free_idle_model(self, model_id: str) -> bool:
         """無人かつ処理中でないモデルを即停止してメモリを解放する。停止したら True。
@@ -921,30 +941,19 @@ class ModelManager:
                         self._models.pop(model_id, None)
         return bool(victims)
 
-    def reap_sessions(self, ttl: float) -> int:
-        """ハートビートが ttl 秒途絶えた在席を掃除する（異常終了したエージェント対策）。
+    def drop_sessions_for(self, model_id: str) -> int:
+        """model_id の在席登録を全て捨てる（_state 保持下では呼ばない）。
 
-        途絶検出で無人になったモデルは即アンロードする。解放したモデル数を返す。掃除
-        スレッドから定期的に呼ぶ（明示の release を呼べずに落ちたエージェントの保険）。
+        モデルがアンロードされた時点で呼ぶ。release を送れずに落ちたエージェントの
+        置き去りセッションはここで回収されるので、ハートビートによる死活監視は要らない。
+        「セッションは解放を早めるだけで、遅らせる力を持たない」という不変条件をこれが担保する
+        （置き去りが残っても idle_timeout の解放は在席を見ないので、必ず解放される）。
         """
-        if ttl <= 0:
-            return 0
-        now = time.monotonic()
-        freed: list[str] = []
         with self._state:
-            dead = [
-                aid for aid, s in self._sessions.items() if (now - s.last_seen) > ttl
-            ]
-            for aid in dead:
-                sess = self._sessions.pop(aid)
-                gone = self._detach_locked(aid, sess.model_id)
-                if gone is not None:
-                    freed.append(gone)
-        count = 0
-        for model_id in freed:
-            if self._free_idle_model(model_id):
-                count += 1
-        return count
+            members = self._model_sessions.pop(model_id, set())
+            for aid in members:
+                self._sessions.pop(aid, None)
+        return len(members)
 
     def session_counts(self) -> dict[str, int]:
         """model_id → 在席エージェント数（status 表示用）。"""
@@ -1032,7 +1041,6 @@ class GatewayServer(ThreadingHTTPServer):
         max_resident: int | None = None,
         idle_timeout: float | None = None,
         load_timeout: float | None = None,
-        session_ttl: float | None = None,
         api_key: str | None = None,
         video_frames: int = 8,
         video_max_edge: int = 768,
@@ -1067,7 +1075,6 @@ class GatewayServer(ThreadingHTTPServer):
         self.max_resident = max_resident
         self.idle_timeout = idle_timeout
         self.load_timeout = load_timeout
-        self.session_ttl = session_ttl
         # 起動元情報（provenance）。「いつ・どこから立ったゲートウェイか」を /admin/status で
         # 見えるようにする。起動経路は `gw start` の 1 本だけ（__main__ が spawn マークの無い
         # 直接起動を拒否する）ので、経路の識別（旧 launcher フィールド）は無い。
@@ -1191,7 +1198,6 @@ class _GatewayHandler(BaseHTTPRequestHandler):
                 "max_resident": srv.max_resident,
                 "idle_timeout": srv.idle_timeout,
                 "load_timeout": srv.load_timeout,
-                "session_ttl": srv.session_ttl,
                 "default_model": srv.default_model,
                 "uptime": round(srv.manager.uptime(), 1),
                 "requests": sum(m.get("requests", 0) for m in models),
@@ -1543,16 +1549,19 @@ class _GatewayHandler(BaseHTTPRequestHandler):
                               "model": model, "registered": True})
 
     def _handle_session_heartbeat(self, srv, payload: dict) -> None:
+        """旧クライアント互換の no-op。
+
+        ハートビートによる生存推定をやめたので、ゲートウェイ側でやることは何も無い。
+        旧 local-llm-client は定期送信し、404 なら再 register する実装なので、**必ず 200 を
+        返す**（404 を返すと無用な再 register ループを生む）。在席が実際に消えるのは
+        release か、モデルのアンロード時の掃除だけ。
+        """
         agent_id = payload.get("agent_id")
         if not agent_id:
             send_error(self, 400, "no 'agent_id' in the request")
             return
-        alive = srv.manager.heartbeat(str(agent_id))
-        if not alive:
-            # 未知のセッション（reap 済み or 未 register）。クライアントに再登録を促す。
-            send_error(self, 404, f"unknown session '{agent_id}'; register first")
-            return
-        send_json(self, 200, {"object": "gateway.session", "agent_id": agent_id, "alive": True})
+        send_json(self, 200, {"object": "gateway.session", "agent_id": agent_id,
+                              "alive": True, "deprecated": True})
 
     def _handle_session_release(self, srv, payload: dict) -> None:
         agent_id = payload.get("agent_id")
@@ -1577,13 +1586,6 @@ class GatewayConfig:
     request_timeout: float | None = 600.0  # 秒。上流との通信が無応答のとき打ち切る（0 で無制限）。ハングした／
                                        # 沈黙した上流が inflight を握ったまま枠を塞ぎ続けるのを防ぐ保険。トークンが
                                        # 流れている限り切れないので、長時間ストリーミング生成は妨げない（既定 600=10分）
-    session_ttl: float | None = 600.0  # 秒。在席エージェントのハートビートがこれだけ途絶えたら無人扱いで掃除
-                                       # （既定 600。None/0 で無効）。これは「release を送れずに落ちた
-                                       # エージェント」への保険であって、遅いエージェントを切るものではない。
-                                       # 旧既定 90 は誤発動した——CAD エージェントで 1 課題に数分かかる巨大
-                                       # モデル（148GB）が、生きているエージェントの足元でアンロードされた
-                                       # （"Session unload: stopped 1 model(s) (agent heartbeat timed out)"）。
-                                       # 再ロードに 21 秒かかり、クライアント側の入口プローブも食い潰した。
     dynamic: bool = True               # 未登録モデルを ID 推論で動的ロードする（false で事前登録のみ）
     disable_thinking: bool = False     # 動的ロード時の既定（思考抑制）。事前登録は各 [[models]] が優先
     draft_model: str | None = None     # 動的ロード時の MTP 既定。None で mlx-vlm は "auto"（対応表から自動）。"off" で無効
@@ -1663,7 +1665,6 @@ def load_gateway_config(path: str) -> GatewayConfig:
         max_resident = 2            # 同時常駐モデル数の上限（ハード。省略時 無制限）
         load_timeout = 300          # 全枠処理中のとき空くのを待つ最大秒数（超過で 503。省略時 300）
         idle_timeout = 1200         # この秒数使われないモデルを自動アンロード（省略時 1200=20分。0 で無効）
-        session_ttl = 600           # 在席エージェントのハートビート猶予秒数（省略時 600。0 で無効）
         internal_base_port = 9001   # 内部サーバーの割当開始ポート（省略時 9001）
         default_model = "..."       # model 省略リクエスト時のモデル（省略可）
         draft_model = "auto"        # 全モデルの MTP ドラフター既定（mlx-vlm のみ有効。省略可）
@@ -1731,15 +1732,12 @@ def load_gateway_config(path: str) -> GatewayConfig:
             raise ValueError("request_timeout must be 0 or greater (0 disables)")
         if request_timeout == 0:
             request_timeout = None
-    # 在席エージェントのハートビート猶予秒数。途絶でそのエージェントを無人扱いし、モデルが
-    # 無人になれば即アンロード（明示 release を呼べずに落ちたエージェントの保険）。0 で無効。
-    session_ttl = data.get("session_ttl", 600)
-    if session_ttl is not None:
-        session_ttl = float(session_ttl)
-        if session_ttl < 0:
-            raise ValueError("session_ttl must be 0 or greater (0 disables)")
-        if session_ttl == 0:
-            session_ttl = None
+    # session_ttl は廃止（ハートビートによる生存推定をやめたため）。古い設定ファイルを
+    # そのまま読めるよう、キーが在っても**エラーにせず無視**して警告だけ出す。
+    if "session_ttl" in data:
+        print("gateway.toml: session_ttl は廃止されました（ハートビートによる生存推定を"
+              "やめたため無視します）。モデルの保持時間は idle_timeout で調整してください。",
+              file=sys.stderr)
     # TUI が PyPI 新版を検知したら git pull で自動追従するか（既定 true。false で無効）。
     auto_update = bool(data.get("auto_update", True))
     tray = bool(data.get("tray", True))
@@ -1864,7 +1862,6 @@ def load_gateway_config(path: str) -> GatewayConfig:
         host, port, max_resident, default_model, configs, idle_timeout, load_timeout,
         start_timeout=start_timeout,
         request_timeout=request_timeout,
-        session_ttl=session_ttl,
         dynamic=dynamic, disable_thinking=dyn_disable_thinking,
         draft_model=default_draft, parallel=default_parallel,
         max_memory_fraction=max_memory_fraction,
@@ -1963,9 +1960,6 @@ def apply_live_config(
     if cfg.idle_timeout != new.idle_timeout:
         note("idle_timeout", cfg.idle_timeout, new.idle_timeout)
         server.idle_timeout = new.idle_timeout
-    if cfg.session_ttl != new.session_ttl:
-        note("session_ttl", cfg.session_ttl, new.session_ttl)
-        server.session_ttl = new.session_ttl
     if cfg.load_timeout != new.load_timeout:
         note("load_timeout", cfg.load_timeout, new.load_timeout)
         server.load_timeout = new.load_timeout
@@ -2005,7 +1999,7 @@ def apply_live_config(
             note("max_memory_fraction", cfg.max_memory_fraction,
                  new.max_memory_fraction)
 
-    # cfg を new に揃える: ①掃除スレッドが cfg.idle_timeout / cfg.session_ttl を毎周期読む
+    # cfg を new に揃える: ①掃除スレッドが cfg.idle_timeout を毎周期読む
     # ②次回リロードの比較基準を「今の設定」にして、未適用の構造設定を毎回警告し続けないため。
     # 構造設定(host/port/...)も cfg 上は new に寄せる（稼働中の bind 済みソケットは旧値のまま
     # だが、cfg のこれらは起動時以外に参照されない）。
@@ -2455,7 +2449,6 @@ def _run_gateway_locked(cfg: GatewayConfig, config_path: str | None = None) -> i
         max_resident=cfg.max_resident,
         idle_timeout=cfg.idle_timeout,
         load_timeout=cfg.load_timeout,
-        session_ttl=cfg.session_ttl,
         api_key=cfg.api_key,
         video_frames=cfg.video_frames,
         video_max_edge=cfg.video_max_edge,
@@ -2504,8 +2497,8 @@ def _run_gateway_locked(cfg: GatewayConfig, config_path: str | None = None) -> i
         file=sys.stderr,
     )
     print(
-        "  session unload: immediate when no agent is registered"
-        + (f" (heartbeat TTL {cfg.session_ttl:g}s)" if cfg.session_ttl else " (release only)"),
+        f"  session unload: {_RELEASE_LINGER_S:g}s after the last agent releases "
+        "(no heartbeat/liveness guessing; strays are swept on idle unload)",
         file=sys.stderr,
     )
     if cfg.image_max_edge:
@@ -2525,11 +2518,12 @@ def _run_gateway_locked(cfg: GatewayConfig, config_path: str | None = None) -> i
     write_gateway_runtime(cfg.host, cfg.port, server.pid, server.start_cwd, server.started_at)
 
     # 掃除スレッド: ①クラッシュした内部ワーカーの健全性チェック（常時）②idle TTL 超過モデルの
-    # アンロード ③在席ハートビート途絶の掃除。健全性チェックは常に走らせる（死んだワーカーへ
-    # 流し続けて 502 を返す事態を防ぐ）。チェック間隔は有効な閾値と健全性チェック周期の短い方。
+    # アンロード。健全性チェックは常に走らせる（死んだワーカーへ流し続けて 502 を返す事態を
+    # 防ぐ）。チェック間隔は有効な閾値と健全性チェック周期の短い方。
+    # 在席の「ハートビート途絶の掃除」は持たない（生存推定をしない設計。→ _Session）。
     stop_reaper = threading.Event()
-    _HEALTH_INTERVAL = 15.0  # 死んだワーカーの検知周期（idle/session が無効でもこの周期で回す）
-    bounds = [t / 2 for t in (cfg.idle_timeout, cfg.session_ttl) if t]
+    _HEALTH_INTERVAL = 15.0  # 死んだワーカーの検知周期（idle が無効でもこの周期で回す）
+    bounds = [t / 2 for t in (cfg.idle_timeout,) if t]
     bounds.append(_HEALTH_INTERVAL)
     interval = min(max(min(bounds), 1.0), 30.0)  # チェック間隔（最大 30s）
 
@@ -2543,14 +2537,6 @@ def _run_gateway_locked(cfg: GatewayConfig, config_path: str | None = None) -> i
                         "(crashed); the slot is free to reload on the next request.",
                         file=sys.stderr,
                     )
-                if cfg.session_ttl:
-                    gone = manager.reap_sessions(cfg.session_ttl)
-                    if gone:
-                        print(
-                            f"Session unload: stopped {gone} model(s) "
-                            "(agent heartbeat timed out).",
-                            file=sys.stderr,
-                        )
                 if cfg.idle_timeout:
                     freed = manager.evict_idle(cfg.idle_timeout)
                     if freed:

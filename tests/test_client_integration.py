@@ -109,14 +109,17 @@ def test_client_is_ready_and_list_models(monkeypatch):
 
 def test_client_respond_round_trip_and_presence_unload(monkeypatch):
     # 本丸: respond() が gateway 経由で応答を得る（OpenAI 互換の契約）＋
-    # 在席セッション（register/heartbeat/release）が効き、close() で在席 0 に
-    # なった瞬間モデルが即アンロードされる（対パッケージ間の独自プロトコル）。
+    # 在席セッション（register/release）が効き、close() で在席 0 になれば猶予後に
+    # モデルがアンロードされる（対パッケージ間の独自プロトコル）。
+    # 公開クライアントは今も heartbeat を定期送信するが、gateway 側は no-op で 200 を
+    # 返すだけ（生存推定を廃止した）。ここでその互換性も合わせて確認する。
+    monkeypatch.setattr(gw, "_RELEASE_LINGER_S", 0.05)   # 猶予を詰めて検証する
     server, mgr, upstream, base = _start_gateway(monkeypatch)
     client = llc.LLMClient(model="itest-model", base_url=base, stream=False)
     try:
         assert client.respond("ping") == "pong"
         assert mgr._models["itest-model"].instances  # 応答後はロード済み
-        client.close()  # 在席 release → 他に在席が無いので即アンロード
+        client.close()  # 在席 release → 他に在席が無いので猶予後にアンロード
         assert _wait_until(lambda: not mgr._models["itest-model"].instances)
     finally:
         client.close()

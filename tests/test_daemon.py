@@ -921,30 +921,56 @@ def _wait_unloaded(mgr, model, timeout=2.0):
     return False
 
 
-def test_load_gateway_config_session_ttl(tmp_path):
-    # 明示・既定(600)・無効(0→None)・負数で ValueError。
+def test_load_gateway_config_ignores_retired_session_ttl(tmp_path, capsys):
+    """廃止した session_ttl は、書かれていてもエラーにせず無視する（旧設定ファイル互換）。"""
     base = '[[models]]\nmodel = "x"\nbackend = "mlx"\n'
-    assert gw.load_gateway_config(_write(tmp_path, 'session_ttl = 30\n' + base)).session_ttl == 30.0
-    assert gw.load_gateway_config(_write(tmp_path, base)).session_ttl == 600.0  # 省略時の既定
-    assert gw.load_gateway_config(_write(tmp_path, 'session_ttl = 0\n' + base)).session_ttl is None
-    with pytest.raises(ValueError, match="session_ttl"):
-        gw.load_gateway_config(_write(tmp_path, 'session_ttl = -1\n' + base))
+    cfg = gw.load_gateway_config(_write(tmp_path, 'session_ttl = 30\n' + base))
+    assert not hasattr(cfg, "session_ttl")
+    assert "session_ttl" in capsys.readouterr().err   # 警告は出す（黙って無視しない）
+    gw.load_gateway_config(_write(tmp_path, base))    # 未指定でも当然 OK
 
 
-def test_session_last_agent_release_frees_immediately(monkeypatch):
+def _short_linger(monkeypatch, seconds=0.05):
+    """release 後の猶予をテスト用に詰める（既定 60 秒を待たない）。"""
+    monkeypatch.setattr(gw, "_RELEASE_LINGER_S", seconds)
+
+
+def test_session_last_agent_release_frees_after_linger(monkeypatch):
     created = _patch_fake(monkeypatch)
+    _short_linger(monkeypatch)
     mgr = gw.ModelManager(_configs())
     mgr.register_session("A", "m1")
     _, h = mgr.acquire("m1")   # ロードさせる
     mgr.release(h)
     assert mgr.status()[0]["loaded"] is True
-    mgr.unregister_session("A")  # 最後の在席 → 即アンロード（別スレッド）
+    mgr.unregister_session("A")  # 最後の在席 → 猶予後にアンロード（別スレッド）
     assert _wait_unloaded(mgr, "m1")
     assert {s.config.model: s.stops for s in created}["m1"] == 1
 
 
+def test_reregister_within_linger_cancels_unload(monkeypatch):
+    """猶予中に再 register されたら解放しない。
+
+    タスクごとに子プロセスを起動する構成（cad-agent の MCP）では release の直後に次の
+    タスクが register する。即時解放だとアンロード→再ロードを毎回繰り返し、巨大モデルでは
+    1 タスクあたり 21 秒を無駄にしていた。
+    """
+    created = _patch_fake(monkeypatch)
+    _short_linger(monkeypatch, 0.3)
+    mgr = gw.ModelManager(_configs())
+    mgr.register_session("A", "m1")
+    _, h = mgr.acquire("m1"); mgr.release(h)
+    mgr.unregister_session("A")          # 解放予約（0.3 秒後）
+    time.sleep(0.05)
+    mgr.register_session("B", "m1")      # 猶予中に次のエージェントが来た
+    time.sleep(0.5)                      # 猶予を過ぎても…
+    assert mgr.status()[0]["loaded"] is True          # …解放されない
+    assert {s.config.model: s.stops for s in created}["m1"] == 0
+
+
 def test_session_kept_while_another_agent_present(monkeypatch):
     _patch_fake(monkeypatch)
+    _short_linger(monkeypatch)
     mgr = gw.ModelManager(_configs())
     mgr.register_session("A", "m1")
     mgr.register_session("B", "m1")
@@ -960,6 +986,7 @@ def test_session_kept_while_another_agent_present(monkeypatch):
 
 def test_session_not_freed_while_inflight(monkeypatch):
     _patch_fake(monkeypatch)
+    _short_linger(monkeypatch)
     mgr = gw.ModelManager(_configs())
     mgr.register_session("A", "m1")
     _, h = mgr.acquire("m1")           # inflight=1 のまま
@@ -969,30 +996,42 @@ def test_session_not_freed_while_inflight(monkeypatch):
     mgr.release(h)
 
 
-def test_reap_sessions_frees_on_heartbeat_timeout(monkeypatch):
-    import time
+def test_silent_agent_is_never_unloaded(monkeypatch):
+    """在席したまま無応答でも、生存推定でモデルを落とさない（本設計の中核）。
+
+    旧実装はハートビート途絶で「死んだ」と推定して即アンロードしており、1 課題に数分かかる
+    エージェントの足元から 148GB のモデルを外す事故を起こした。掃除機構ごと持たない。
+    """
     created = _patch_fake(monkeypatch)
     mgr = gw.ModelManager(_configs())
     mgr.register_session("A", "m1")
     _, h = mgr.acquire("m1"); mgr.release(h)
-    # 心拍を過去にして途絶扱いにする。
-    mgr._sessions["A"].last_seen = time.monotonic() - 100
-    assert mgr.reap_sessions(ttl=10) == 1
-    assert mgr.status()[0]["loaded"] is False
-    assert {s.config.model: s.stops for s in created}["m1"] == 1
+    assert not hasattr(mgr, "reap_sessions"), "生存推定の掃除が復活している"
+    assert not hasattr(mgr, "heartbeat"), "ハートビートの受け口が復活している"
+    time.sleep(0.3)                                    # どれだけ黙っていても
+    assert mgr.status()[0]["loaded"] is True           # 落ちない
+    assert {s.config.model: s.stops for s in created}["m1"] == 0
 
 
-def test_heartbeat_unknown_agent_returns_false(monkeypatch):
+def test_idle_eviction_drops_stale_sessions(monkeypatch):
+    """release を送れずに落ちたエージェントの置き去りは idle 解放時に回収される。
+
+    これがハートビートの代わりの回収経路。「在席は解放を早めるだけで遅らせる力を持たない」
+    という不変条件（idle 退避は在席を見ない）とセットで、リークが残らないことを保証する。
+    """
     _patch_fake(monkeypatch)
     mgr = gw.ModelManager(_configs())
-    assert mgr.heartbeat("ghost") is False
-    mgr.register_session("A", "m1")
-    assert mgr.heartbeat("A") is True
+    mgr.register_session("ghost", "m1")                # release されないまま放置される
+    _, h = mgr.acquire("m1"); mgr.release(h)
+    time.sleep(0.05)                                   # last_used を経過させる
+    assert mgr.evict_idle(timeout=0.01) == 1
+    assert {s["model"]: s["sessions"] for s in mgr.status()}["m1"] == 0
 
 
 def test_session_switch_model_detaches_old(monkeypatch):
     # 同じ agent が別モデルへ乗り換えたら、旧モデルから外れる（旧モデルが無人なら解放）。
     _patch_fake(monkeypatch)
+    _short_linger(monkeypatch)
     mgr = gw.ModelManager(_configs())
     mgr.register_session("A", "m1")
     _, h = mgr.acquire("m1"); mgr.release(h)
@@ -1003,17 +1042,21 @@ def test_session_switch_model_detaches_old(monkeypatch):
 
 
 def test_gateway_session_endpoints(monkeypatch):
-    # HTTP 経由で register/heartbeat/release を叩き、最後の解除で即アンロードされる。
+    # HTTP 経由で register/release を叩き、最後の解除（＋猶予）でアンロードされる。
+    monkeypatch.setattr(gw, "_RELEASE_LINGER_S", 0.05)
     server, mgr, ups = _start_gateway(monkeypatch)
     try:
         port = server.server_address[1]
         assert _post(port, "/admin/sessions/register", {"agent_id": "A", "model": "m1"})[0] == 200
         _, h = mgr.acquire("m1"); mgr.release(h)   # ロード
+        # heartbeat は旧クライアント互換の no-op。未知の agent でも 200 を返す
+        # （404 だと旧クライアントが無用な再 register ループに入る）。
         assert _post(port, "/admin/sessions/heartbeat", {"agent_id": "A"})[0] == 200
-        assert _post(port, "/admin/sessions/heartbeat", {"agent_id": "ZZ"})[0] == 404
-        # admin/status に sessions と session_ttl が出る
+        assert _post(port, "/admin/sessions/heartbeat", {"agent_id": "ZZ"})[0] == 200
+        # admin/status に sessions が出る
         _, st = _get(port, "/admin/status")
         assert {m["model"]: m["sessions"] for m in st["models"]}["m1"] == 1
+        assert "session_ttl" not in st          # 廃止した設定は status にも出さない
         assert _post(port, "/admin/sessions/release", {"agent_id": "A"})[0] == 200
         assert _wait_unloaded(mgr, "m1")
     finally:
@@ -1356,7 +1399,7 @@ def _live_server(cfg):
         ("127.0.0.1", 0), mgr, catalog=[c.model for c in cfg.models],
         default_model=cfg.default_model, timeout_s=cfg.request_timeout,
         max_resident=cfg.max_resident, idle_timeout=cfg.idle_timeout,
-        load_timeout=cfg.load_timeout, session_ttl=cfg.session_ttl,
+        load_timeout=cfg.load_timeout,
         api_key=cfg.api_key,
     )
     return server, mgr
@@ -1364,20 +1407,19 @@ def _live_server(cfg):
 
 def test_apply_live_config_updates_policy_fields(tmp_path):
     base = ('default_model = "org/dft-a"\nidle_timeout = 1200\nrequest_timeout = 600\n'
-            'session_ttl = 90\ndraft_model = "auto"\n')
+            'draft_model = "auto"\n')
     cfg = gw.load_gateway_config(_write(tmp_path, base))
     server, mgr = _live_server(cfg)
     try:
         new = gw.load_gateway_config(_write(
             tmp_path,
             'idle_timeout = 60\nrequest_timeout = 0\n'
-            'session_ttl = 30\ndraft_model = "off"\ndefault_model = "org/dft"\n'))
+            'draft_model = "off"\ndefault_model = "org/dft"\n'))
         changed, restart = gw.apply_live_config(server, mgr, cfg, new)
         # サーバーが per-request で読む値が差し替わる。
         assert server.default_model == "org/dft"
         assert server.timeout_s == new.request_timeout   # request_timeout=0 → 無制限
         assert server.idle_timeout == 60
-        assert server.session_ttl == 30
         # 動的ロード既定（manager 側）も new 値へ差し替わる（"off" 等の正規化は各ロード時）。
         assert mgr._default_draft == new.draft_model
         # 掃除スレッドが読む cfg 本体も new に揃う。

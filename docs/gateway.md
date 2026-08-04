@@ -14,7 +14,6 @@ port = 8799                 # 公開ポート（省略時 8799）。クライア
 max_resident = 1            # 同時常駐モデル数のハード上限。超えたら LRU 退避（省略時 無制限）
 load_timeout = 300          # 全枠処理中のとき空くのを待つ最大秒数（超過で 503。省略時 300）
 idle_timeout = 1200         # この秒数使われないモデルを自動アンロード（省略時 1200=20分。0 で無効）
-session_ttl = 600           # 在席エージェントのハートビート猶予秒数。途絶でそのエージェントを無人扱い（省略時 600。0 で無効）
 internal_base_port = 9001   # 内部モデルサーバーの割当開始ポート（9001, 9002, … と連番）
 default_model = "..."       # model 省略リクエスト時のモデル（任意）
 draft_model = "off"         # MTP（speculative decoding）の既定。省略時は mlx-vlm を "auto"（対応表から自動）。"off" で無効
@@ -50,7 +49,6 @@ backend = "mlx-vlm"
 | `start_timeout` | `120` | モデルサーバー1つの起動完了（ready）を待つ最大秒数。巨大モデルで足りなければ延ばす |
 | `request_timeout` | `600` | 上流モデルサーバーとの通信が無応答のとき打ち切る秒数（`0` で無制限）。トークンが流れている限り切れない。ハングした／沈黙したサーバーが枠を塞ぎ続ける事故の保険 |
 | `idle_timeout` | `1200` | この秒数使われないモデルを自動アンロード（`0` で無効） |
-| `session_ttl` | `600` | 在席エージェントのハートビート猶予秒数。途絶で無人扱い（`0` で無効）。**落ちたエージェントへの保険であって遅いエージェントを切るものではない**——旧既定 90 は 1 課題に数分かかる巨大モデルで誤発動した。→ [在席ベースの即時アンロード](#在席ベースの即時アンロード) |
 | `internal_base_port` | `9001` | 内部モデルサーバーの割当開始ポート |
 | `default_model` | なし | `model` 省略リクエスト時に使うモデル |
 | `draft_model` | mlx-vlm は `auto` | 動的ロード時の MTP 既定。省略時は mlx-vlm が対応表から自動選択、`"off"` で無効。各 `[[models]]` で上書き。→ [mtp.md](mtp.md) |
@@ -117,7 +115,7 @@ backend = "mlx-vlm"
   prefill だけで数十秒かかる。→ [画像入力の縮小](#画像入力の縮小image_max_edge)
 - **設定のホットリロード**: `gateway.toml` を**保存した瞬間**にポリシー設定を無停止で反映する
   （プロセスは動かしたまま。~1 秒以内）。反映されるのは `default_model`・`image_max_edge`・
-  `max_resident`・`request_timeout`・`idle_timeout`・`session_ttl`・`load_timeout`・`api_key`
+  `max_resident`・`request_timeout`・`idle_timeout`・`load_timeout`・`api_key`
   と動的ロードの既定（`draft_model`・`parallel`・`disable_thinking`・`max_memory_fraction`・
   `dynamic`・`start_timeout`）。動的ロード既定は**次回ロードから**有効。一方 `host`・`port`・
   `internal_base_port`・`[[models]]` はソケット bind 済み等で稼働中に変えられないため、変更を
@@ -289,7 +287,7 @@ OpenAI SDK からもそのまま使える（`client.audio.transcriptions.create(
 
 | 種別 | 対象 | 反映 |
 |---|---|---|
-| **即時反映（ポリシー）** | `default_model`, `image_max_edge`, `max_resident`, `request_timeout`, `idle_timeout`, `session_ttl`, `load_timeout`, `api_key` | 保存した瞬間に有効 |
+| **即時反映（ポリシー）** | `default_model`, `image_max_edge`, `max_resident`, `request_timeout`, `idle_timeout`, `load_timeout`, `api_key` | 保存した瞬間に有効 |
 | **次回ロードから（動的既定）** | トップレベルの `draft_model`, `parallel`, `disable_thinking`, `max_memory_fraction`, `dynamic`, `start_timeout` | 既にロード済みのモデルは次にロードし直すまで旧設定のまま |
 | **要再起動（構造）** | `host`, `port`, `internal_base_port`, `[[models]]` | 稼働中は変えられない（ソケット bind 済み・内部ポート割当は起動時固定）。変更を検知しても**適用せず「要再起動」をログ警告**し、旧値のまま動き続ける |
 
@@ -357,36 +355,41 @@ OpenAI SDK からもそのまま使える（`client.audio.transcriptions.create(
 | 操作 | リクエスト | ボディ | 補足 |
 |---|---|---|---|
 | 利用開始 | `POST /admin/sessions/register` | `{"agent_id", "model"}` | 在席を宣言。モデルは従来どおり初回リクエストで遅延ロード |
-| 生存通知 | `POST /admin/sessions/heartbeat` | `{"agent_id"}` | `session_ttl` 内に定期送信。未知の `agent_id` は 404（要再 register） |
-| 利用終了 | `POST /admin/sessions/release` | `{"agent_id"}` | `DELETE /admin/sessions` でも可。最後の在席なら即アンロード |
+| 利用終了 | `POST /admin/sessions/release` | `{"agent_id"}` | `DELETE /admin/sessions` でも可。最後の在席なら猶予後にアンロード |
+| （廃止）生存通知 | `POST /admin/sessions/heartbeat` | `{"agent_id"}` | 旧クライアント互換の no-op。常に 200 |
 
-- **正常終了**は `release` で即解放（最速）。
-- **異常終了**（`release` を呼べずに落ちた）はハートビートが `session_ttl` 秒途絶した時点で掃除
-  スレッドが無人扱いし、同じく即アンロードする。ハートビート間隔は `session_ttl` より十分短くする
-  （例: TTL 600s に対し 60s ごと）。`session_ttl = 0` で無効化（`release` のみで運用）。
+- **正常終了**は `release` で解放。ただし**即時ではなく 60 秒の猶予**を置く（コード定数
+  `_RELEASE_LINGER_S`。設定にはしない）。タスクごとに子プロセスを起動する構成では release の
+  直後に次のタスクが `register` するため、即時解放するとアンロード→再ロードを毎回繰り返す
+  （実測: 148GB のモデルで毎回 21 秒）。猶予中に `register` されれば解放は取り消される。
+- **異常終了**（`release` を呼べずに落ちた）の置き去りは、そのモデルが `idle_timeout` で解放される
+  ときに一緒に掃除される。**ハートビートによる生存推定はしない** — 在席したまま無応答でも
+  モデルは落とされない（旧実装はこれで、生成中のクライアントの足元から 148GB のモデルを
+  外す事故を起こした）。
+- したがって**在席は解放を早めるだけで、遅らせる力を持たない**。モデルの保持時間を延ばしたい
+  ときは `idle_timeout` を調整する（在席の有無に関わらず効く唯一の時間軸）。
 - 各モデルの在席数は `GET /admin/status` の `models[].sessions`、および `gw ps` の SESSIONS 列で見える。
 
 ### エージェント側の実装（任意・推奨）
 
-通知は**任意**で、登録しなければ従来どおり `idle_timeout` でのみ解放される。即時解放したいエージェント
-だけ、起動時に `register`＋ハートビート、終了時に `release` を仕込めばよい。base_url は従来どおり公開
+通知は**任意**で、登録しなければ従来どおり `idle_timeout` でのみ解放される。早期に解放したい
+エージェントだけ、起動時に `register`、終了時に `release` を仕込めばよい（ハートビートは不要）。base_url は従来どおり公開
 ポートのまま、追加でこの数本を叩くだけ（チャットの送り方は変えない）。
 
 標準ライブラリだけで完結する最小実装の例:
 
 ```python
-import atexit, json, signal, threading, urllib.request
+import atexit, json, signal, urllib.request
 
 class GatewaySession:
-    """ゲートウェイに在席を登録し、終了時に即アンロードさせるヘルパー。
+    """ゲートウェイに在席を登録し、終了時に早期アンロードさせるヘルパー。
 
         with GatewaySession(agent_id="agent-7", model="org/Model:Q4"):
             ...  # base_url=http://127.0.0.1:8799/v1 でいつものチャット
-        # ブロックを抜けた瞬間、他に同モデル利用者が居なければメモリが即解放される
+        # ブロックを抜けて猶予（60秒）の間に誰も来なければメモリが解放される
     """
-    def __init__(self, *, base="http://127.0.0.1:8799", agent_id, model, heartbeat=30):
-        self.base, self.agent_id, self.model, self.hb = base, agent_id, model, heartbeat
-        self._stop = threading.Event()
+    def __init__(self, *, base="http://127.0.0.1:8799", agent_id, model):
+        self.base, self.agent_id, self.model = base, agent_id, model
 
     def _call(self, path, payload):
         req = urllib.request.Request(
@@ -399,18 +402,13 @@ class GatewaySession:
 
     def __enter__(self):
         self._call("/admin/sessions/register", {"agent_id": self.agent_id, "model": self.model})
-        threading.Thread(target=self._beat, daemon=True).start()
         atexit.register(self.release)                       # プロセス終了時の保険
         signal.signal(signal.SIGTERM, lambda *_: self.release())  # kill されたら解放
         return self
 
-    def _beat(self):
-        while not self._stop.wait(self.hb):
-            self._call("/admin/sessions/heartbeat", {"agent_id": self.agent_id})
-
     def release(self):
-        if not self._stop.is_set():
-            self._stop.set()
+        if not getattr(self, "_released", False):
+            self._released = True
             self._call("/admin/sessions/release", {"agent_id": self.agent_id})
 
     def __exit__(self, *exc):
@@ -418,7 +416,7 @@ class GatewaySession:
 ```
 
 `with` ブロックを抜ける／プロセスが終わる／`SIGTERM` で殺される、のいずれでも `release` が呼ばれる。
-万一それも取りこぼしても、ハートビート途絶で `session_ttl` 後に回収される（二重の安全網）。
+万一それも取りこぼしても、モデルが `idle_timeout` で解放される際に置き去りの在席ごと回収される（二重の安全網）。
 
 > `agent_id` はエージェントごとに一意な文字列にする（PID やUUID等）。同一 `agent_id` で別 `model` を
 > `register` し直すと、旧モデルから自動的に外れる（乗り換え。旧モデルが無人になれば解放される）。
