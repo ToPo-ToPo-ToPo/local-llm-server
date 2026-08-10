@@ -1148,6 +1148,14 @@ class LocalServer:
                 start_marker, end_marker = thinking_markers(self.config.model)
                 env.setdefault("MLX_VLM_THINKING_START_TOKEN", start_marker)
                 env.setdefault("MLX_VLM_THINKING_END_TOKEN", end_marker)
+                # プロンプトキャッシュ（APC）を既定で有効にする。mlx-vlm は
+                # APC_ENABLED が無いとキャッシュ管理そのものを作らない
+                # （apc.from_env が None を返す）ので、既定のままだと毎回フルに
+                # プリフィルしていた。実測: 同一プロンプトの再送で 1623ms → 60ms。
+                # メモリ増は観測されず（26B-4bit で RSS 16.1GB のまま）、外して
+                # おく理由が無いため既定を有効側にする。ブロック数などの調整は
+                # APC_* を環境変数で渡す（ここは未設定時のみ＝ユーザー指定が優先）。
+                env.setdefault("APC_ENABLED", "1")
             cmd = build_command(self.config)
             extra: dict = {}
             # 繋留が有効（デーモン内）なら、ワーカーを tether ラッパー越しに起動する。
