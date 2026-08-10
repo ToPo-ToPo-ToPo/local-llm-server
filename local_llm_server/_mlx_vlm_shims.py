@@ -54,9 +54,48 @@ def _patch_content_markers() -> None:
         responses_state._CONTENT_MARKERS = tuple(markers) + missing
 
 
+def _patch_apc_extra_hash() -> None:
+    """APC の照合キーから inputs_embeds / attention_mask を除外する。
+
+    上流の問題（mlx-vlm 0.6.9 時点）: サーバーの連続バッチング経路は**全リクエスト**で
+    get_input_embeddings を呼び、prompt_kwargs に inputs_embeds を積む（BatchGenerator の
+    前提。server/generation.py の _gpu_embed）。一方 APC の照合キー semantic_extra_hash は
+    media["embeddings"] として inputs_embeds を、media["masks"] として attention_mask を
+    **テンソル内容ごと**ハッシュする。テキストの埋め込みはトークン列から決定的に決まる
+    ので、これはプロンプト全体を照合キーへ焼き込むのと同じ — 1 トークンでも違えば
+    キーが変わり、exact キャッシュの**前方一致が完全一致に退化**する
+    （実測: exact_stores だけ増えて exact_hits は 0。同一プロンプトの再送だけ当たる）。
+
+    埋め込みとマスクを除いても照合の安全性は落ちない:
+      - exact キャッシュのエントリは**トークン列そのもの**を持ち、照合は
+        token_tuple[:n] == entry.token_ids で行われる。テキストの同一性はここで担保される
+      - 画像は image_hash（pixel_values の内容ハッシュ）が別枠で残る
+      - 音声・動画（input_features / pixel_values_videos）もそのまま残す
+    """
+    try:
+        from mlx_vlm import apc as _apc
+    except Exception:
+        return
+    original = getattr(_apc, "semantic_extra_hash", None)
+    if original is None or getattr(original, "_llmserver_patched", False):
+        return  # 上流が実装を変えた / 適用済み。触らない
+
+    def semantic_extra_hash(*, media=None, **kwargs):
+        if media:
+            media = {k: v for k, v in media.items()
+                     if k not in ("embeddings", "masks")}
+        return original(media=media, **kwargs)
+
+    semantic_extra_hash._llmserver_patched = True
+    _apc.semantic_extra_hash = semantic_extra_hash
+    # ar.py は `from .. import apc as _apc` のモジュール参照経由で呼ぶため、
+    # モジュール属性の差し替えだけで全呼び出し箇所に効く
+
+
 def apply() -> None:
     """既知のパッチを全て適用する。失敗しても起動は止めない。"""
     _patch_content_markers()
+    _patch_apc_extra_hash()
 
 
 def main() -> None:

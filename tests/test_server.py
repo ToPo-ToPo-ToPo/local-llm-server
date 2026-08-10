@@ -908,6 +908,15 @@ def test_non_mlx_vlm_backend_does_not_get_apc(monkeypatch, tmp_path):
     assert "APC_ENABLED" not in env
 
 
+def test_mlx_vlm_gets_exact_apc_tuning_defaults(monkeypatch, tmp_path):
+    # exact モード(gemma4 等のハイブリッド注意機構)向けの既定。上流既定
+    # (guard=16 / entries=2)は同一プロンプト再送にしか効かず、エージェント用途の
+    # 「共通の前方 + 毎回変わる末尾」では前方一致が一度も当たらない(実測)。
+    env = _capture_start_env(monkeypatch, tmp_path, "mlx-vlm")
+    assert env["APC_EXACT_PREFIX_GUARD_TOKENS"] == "1024"
+    assert env["APC_EXACT_CACHE_ENTRIES"] == "8"
+
+
 def test_user_can_disable_prompt_cache(monkeypatch, tmp_path):
     # ユーザーが env で明示していれば尊重する（setdefault なので切れる）。
     env = _capture_start_env(monkeypatch, tmp_path, "mlx-vlm",
