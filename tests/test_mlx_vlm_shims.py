@@ -47,3 +47,38 @@ def test_upstream_fixed_gaps_are_not_repatched():
         assert hasattr(inkling, name), f"{name} が未エクスポート（mlx-vlm < 0.6.9？）"
     assert "inkling" in prompt_utils.MODEL_CONFIG
     assert utils.MODEL_REMAPPING.get("inkling_mm_model") == "inkling"
+
+
+def test_apc_extra_hash_ignores_embeddings_and_masks():
+    """APC の照合キーが inputs_embeds / attention_mask に左右されないこと。
+
+    上流はサーバーの連続バッチング経路で全リクエストに inputs_embeds を積み、
+    semantic_extra_hash がそれを内容ごとハッシュする。テキストの埋め込みは
+    トークン列から決定的に決まるため、これは照合キーへプロンプト全体を焼き込む
+    のと同じで、exact キャッシュの前方一致が完全一致に退化していた
+    （実測: exact_stores だけ増えて exact_hits が 0）。
+    """
+    apc = pytest.importorskip("mlx_vlm.apc")
+    mx = pytest.importorskip("mlx.core")
+    _mlx_vlm_shims.apply()
+
+    base = apc.semantic_extra_hash(tenant=None, image_hash=7, media=None)
+    with_embeds = apc.semantic_extra_hash(
+        tenant=None, image_hash=7,
+        media={"embeddings": mx.ones((1, 8, 4)), "masks": mx.ones((1, 8))},
+    )
+    assert with_embeds == base  # 埋め込み・マスクはキーに影響しない
+
+    # 音声・動画は従来どおりキーに効く（別コンテンツを同一視しない）
+    with_audio = apc.semantic_extra_hash(
+        tenant=None, image_hash=7, media={"audio": mx.ones((1, 4))},
+    )
+    assert with_audio != base
+
+
+def test_apc_patch_is_idempotent():
+    apc = pytest.importorskip("mlx_vlm.apc")
+    _mlx_vlm_shims.apply()
+    once = apc.semantic_extra_hash
+    _mlx_vlm_shims.apply()
+    assert apc.semantic_extra_hash is once   # 二重ラップしない

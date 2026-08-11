@@ -895,6 +895,35 @@ def test_user_override_of_thinking_markers_is_respected(monkeypatch, tmp_path):
     assert env["MLX_VLM_THINKING_START_TOKEN"] == "<custom>"
 
 
+def test_mlx_vlm_enables_prompt_cache_by_default(monkeypatch, tmp_path):
+    # mlx-vlm は APC_ENABLED が無いとプロンプトキャッシュ管理を作らず、毎回フルに
+    # プリフィルする（実測: 同一プロンプトの再送で 1623ms → 60ms の差）。既定で有効にする。
+    env = _capture_start_env(monkeypatch, tmp_path, "mlx-vlm")
+    assert env["APC_ENABLED"] == "1"
+
+
+def test_non_mlx_vlm_backend_does_not_get_apc(monkeypatch, tmp_path):
+    # APC は mlx-vlm の機能。他バックエンドには付けない。
+    env = _capture_start_env(monkeypatch, tmp_path, "mlx")
+    assert "APC_ENABLED" not in env
+
+
+def test_mlx_vlm_gets_exact_apc_tuning_defaults(monkeypatch, tmp_path):
+    # exact モード(gemma4 等のハイブリッド注意機構)向けの既定。上流既定
+    # (guard=16 / entries=2)は同一プロンプト再送にしか効かず、エージェント用途の
+    # 「共通の前方 + 毎回変わる末尾」では前方一致が一度も当たらない(実測)。
+    env = _capture_start_env(monkeypatch, tmp_path, "mlx-vlm")
+    assert env["APC_EXACT_PREFIX_GUARD_TOKENS"] == "1024"
+    assert env["APC_EXACT_CACHE_ENTRIES"] == "8"
+
+
+def test_user_can_disable_prompt_cache(monkeypatch, tmp_path):
+    # ユーザーが env で明示していれば尊重する（setdefault なので切れる）。
+    env = _capture_start_env(monkeypatch, tmp_path, "mlx-vlm",
+                             preset_env={"APC_ENABLED": "0"})
+    assert env["APC_ENABLED"] == "0"
+
+
 def test_rotate_log_pushes_generations_and_drops_oldest(tmp_path):
     # 起動のたびに x.log → x-1.log と押し出し、keep 世代を超えた分は捨てる（Ollama 方式）。
     log = tmp_path / "gateway-8799.log"

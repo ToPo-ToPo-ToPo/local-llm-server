@@ -1148,6 +1148,30 @@ class LocalServer:
                 start_marker, end_marker = thinking_markers(self.config.model)
                 env.setdefault("MLX_VLM_THINKING_START_TOKEN", start_marker)
                 env.setdefault("MLX_VLM_THINKING_END_TOKEN", end_marker)
+                # プロンプトキャッシュ（APC）を既定で有効にする。mlx-vlm は
+                # APC_ENABLED が無いとキャッシュ管理そのものを作らない
+                # （apc.from_env が None を返す）ので、既定のままだと毎回フルに
+                # プリフィルしていた。実測: 同一プロンプトの再送で 1623ms → 60ms。
+                # メモリ増は観測されず（26B-4bit で RSS 16.1GB のまま）、外して
+                # おく理由が無いため既定を有効側にする。ブロック数などの調整は
+                # APC_* を環境変数で渡す（ここは未設定時のみ＝ユーザー指定が優先）。
+                env.setdefault("APC_ENABLED", "1")
+                # exact モード（gemma4 系などハイブリッド注意機構のモデルが該当。
+                # RotatingKVCache 層はブロック分割で再構成できないため、mlx-vlm は
+                # プレフィックス丸ごとのスナップショット方式に落とす）向けの既定。
+                #
+                # guard: スナップショットを「プロンプト末尾から何トークン手前」で
+                # 切るか。上流既定の 16 は同一プロンプト再送にしか効かない。
+                # エージェント用途のプロンプトは「共通の前方（system+履歴）+
+                # 毎回変わる末尾（状態通知・ユーザー発言）」の形で、切れ目が共通部分に
+                # 入るまで広げて初めて前方一致が働く（実測: guard=512 で別末尾の
+                # プリフィル 1901〜3110ms → 409〜524ms）。1024 は実キャラクター
+                # アプリの動的な末尾（数百トークン）を覆う値。
+                # entries: スナップショットの保持数。上流既定の 2 は 1 ターンに複数回
+                # LLM を呼ぶエージェントで玉突き追い出しを起こす。8 でも RSS 増は
+                # 観測されなかった（26B-4bit で 16.1GB のまま）。
+                env.setdefault("APC_EXACT_PREFIX_GUARD_TOKENS", "1024")
+                env.setdefault("APC_EXACT_CACHE_ENTRIES", "8")
             cmd = build_command(self.config)
             extra: dict = {}
             # 繋留が有効（デーモン内）なら、ワーカーを tether ラッパー越しに起動する。
