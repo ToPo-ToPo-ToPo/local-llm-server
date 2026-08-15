@@ -460,7 +460,7 @@ MTP_DRAFTERS = {
     # 非QAT 8bit（26B-A4B）。ドラフターは非QAT の assistant-bf16。
     "mlx-community/gemma-4-26b-a4b-it-8bit":
         "mlx-community/gemma-4-26B-A4B-it-assistant-bf16",
-    # Qwen3.6-27B（既定モデル）の MTP ドラフター。実測 ~2倍速（38→75 tok/s, 採択93%）。
+    # Qwen3.6-27B（既定モデル）の MTP ドラフター。
     "mlx-community/Qwen3.6-27B-4bit":
         "mlx-community/Qwen3.6-27B-MTP-4bit",
     # 自作 ToPo-ToPo 版の Qwen3.6-27B（既定運用）。本体は同じ Qwen3.6-27B ベースなので、
@@ -642,7 +642,7 @@ def mtp_status(model: str) -> str | None:
 
     対応表（MTP_DRAFTERS）に本体が在るかと、対応ドラフターがローカルにキャッシュ済みかで判定する:
 
-    - "ready"     … 対応ドラフターがキャッシュ済み。そのまま MTP が効く（~2倍速）。
+    - "ready"     … 対応ドラフターがキャッシュ済み。そのまま MTP が効く。
     - "available" … MTP には対応するがドラフターが未取得。`hf download <drafter>` で有効化できる。
     - None        … MTP 非対応（対応表に無い）。
 
@@ -828,7 +828,7 @@ def estimate_model_bytes(config: ServerConfig) -> int | None:
             return total
         # mlx / mlx-vlm: ローカルパス指定なら、そのディレクトリの重みサイズ合計。
         # repo-id ではないので下の HF キャッシュ探索には載らず、そのままだと見積もり不能
-        # （＝メモリガードがそのモデルを素通しする）。138GiB 級をローカル変換物として
+        # （＝メモリガードがそのモデルを素通しする）。巨大なモデルをローカル変換物として
         # 登録する運用（→ gateway.toml の Inkling / DeepSeek）では素通しは危険なので数える。
         # ドラフター（MTP）も常駐するので合算する。
         spec = config.model.strip()

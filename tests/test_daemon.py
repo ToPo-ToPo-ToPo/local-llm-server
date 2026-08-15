@@ -1000,7 +1000,7 @@ def test_silent_agent_is_never_unloaded(monkeypatch):
     """在席したまま無応答でも、生存推定でモデルを落とさない（本設計の中核）。
 
     旧実装はハートビート途絶で「死んだ」と推定して即アンロードしており、1 課題に数分かかる
-    エージェントの足元から 148GB のモデルを外す事故を起こした。掃除機構ごと持たない。
+    エージェントの足元から巨大なモデルを外す事故を起こした。掃除機構ごと持たない。
     """
     created = _patch_fake(monkeypatch)
     mgr = gw.ModelManager(_configs())

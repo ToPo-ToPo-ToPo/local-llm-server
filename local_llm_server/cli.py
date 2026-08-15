@@ -774,7 +774,7 @@ def cmd_pull(gcfg, args) -> int:
     print(f"done: {args.model}（キャッシュ {_human_size(_dir_size(_model_cache_dir(repo)))}）")
     if mtp_status(repo) == "available":
         drafter = MTP_DRAFTERS.get(repo)
-        print(f"ヒント: MTP（~2倍速）に対応しています。`gw pull {drafter}` で有効化できます。")
+        print(f"ヒント: MTP に対応しています。`gw pull {drafter}` で有効化できます。")
     return 0
 
 
