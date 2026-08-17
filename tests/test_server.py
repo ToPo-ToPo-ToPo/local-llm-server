@@ -1,3 +1,4 @@
+import json
 import os
 from types import SimpleNamespace
 
@@ -281,13 +282,50 @@ def test_ensure_cached_errors_when_not_cached(hf_cache):
 
 
 def test_ensure_cached_errors_on_incomplete(hf_cache, tmp_path):
-    # DL 途中（*.incomplete 残存）は「未取得」と同じ扱い（今回の不具合の主症状）。
+    # DL 途中（確定 blob の無い *.incomplete が残存）は「未取得」と同じ扱い。
     hf_cache("org/mlx-model", ["config.json", "model.safetensors"])
     blobs = tmp_path / "hub" / "models--org--mlx-model" / "blobs"
     blobs.mkdir(parents=True, exist_ok=True)
     (blobs / "abc123.incomplete").write_bytes(b"")
     with pytest.raises(ValueError, match="hf download"):
         srv.ensure_cached("org/mlx-model")
+
+
+def test_ensure_cached_ignores_incomplete_when_final_blob_exists(hf_cache, tmp_path):
+    # 中断→再試行が成功したあとの残骸（確定 blob が既にある .incomplete）は無視する。
+    # これを「未取得」と数えると、完全に取得できているモデルが永久に使えなくなる。
+    snap = hf_cache("org/mlx-model", ["config.json", "model.safetensors"])
+    blobs = tmp_path / "hub" / "models--org--mlx-model" / "blobs"
+    blobs.mkdir(parents=True, exist_ok=True)
+    (blobs / "abc123").write_bytes(b"final")                 # 再試行で確定した blob
+    (blobs / "abc123.deadbeef.incomplete").write_bytes(b"")  # 前回の残骸
+    assert srv.ensure_cached("org/mlx-model") == str(snap)
+
+
+def _write_index(snap, shards):
+    (snap / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {str(i): s for i, s in enumerate(shards)}}),
+        encoding="utf-8",
+    )
+
+
+def test_ensure_cached_errors_on_missing_shard(hf_cache):
+    # index が要求するシャードが歯抜けなら未取得。「重みが 1 つはある」で通さない
+    # （通すとロードして初めて落ちる）。
+    snap = hf_cache("org/sharded", ["config.json", "model-00001-of-00002.safetensors"])
+    _write_index(snap, ["model-00001-of-00002.safetensors",
+                        "model-00002-of-00002.safetensors"])   # 00002 は未取得
+    with pytest.raises(ValueError, match="揃っていません"):
+        srv.ensure_cached("org/sharded")
+
+
+def test_ensure_cached_ok_when_all_shards_present(hf_cache):
+    # 全シャードが揃っていれば OK。
+    snap = hf_cache("org/sharded-ok", ["model-00001-of-00002.safetensors",
+                                       "model-00002-of-00002.safetensors"])
+    _write_index(snap, ["model-00001-of-00002.safetensors",
+                        "model-00002-of-00002.safetensors"])
+    assert srv.ensure_cached("org/sharded-ok") == str(snap)
 
 
 def test_ensure_cached_rejects_bare_name(hf_cache):
