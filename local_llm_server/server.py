@@ -585,6 +585,48 @@ def resolve_gguf(model: str) -> str:
     return pool[0]
 
 
+def _snapshot_weights_complete(snap: str) -> bool:
+    """スナップショットの重みが実体（シンボリックリンク先）まで揃っているか。
+
+    `model.safetensors.index.json` があるときは **weight_map が要求する全シャード**を
+    確認する。1 つでも欠けていれば未完了とみなす（歯抜けのまま「重みが 1 つはある」で
+    通すと、ロードして初めて落ちる）。index を持たないリポジトリ（単一 safetensors や
+    whisper 系の *.npz）は、重みが 1 つ以上あることをもって完了とする。
+    """
+    index = os.path.join(snap, "model.safetensors.index.json")
+    if os.path.isfile(index):
+        try:
+            with open(index, encoding="utf-8") as fh:
+                shards = set(json.load(fh).get("weight_map", {}).values())
+        except Exception:  # noqa: BLE001 壊れた index は「index 無し」として扱う
+            shards = set()
+        if shards:
+            return all(
+                os.path.exists(os.path.realpath(os.path.join(snap, s))) for s in shards
+            )
+    return any(
+        os.path.exists(os.path.realpath(f))
+        for pattern in ("*.safetensors", "*.npz")
+        for f in glob.glob(os.path.join(snap, pattern))
+    )
+
+
+def _blocking_incomplete(blobs_dir: str) -> list[str]:
+    """「取得途中」と判断すべき `*.incomplete` だけを返す。
+
+    hf は `<sha>.<乱数>.incomplete` に書いてから `<sha>` へ確定させるが、**中断して
+    再試行が成功しても前回の .incomplete が消えずに残ることがある**。残骸の有無だけで
+    判定すると、完全に取得できているモデルが永久に「キャッシュにありません」になる
+    （実際に起きた）。よって **対応する確定 blob が無いものだけ**を取得途中とみなす。
+    """
+    out = []
+    for f in glob.glob(os.path.join(blobs_dir, "*.incomplete")):
+        sha = os.path.basename(f).split(".", 1)[0]
+        if not os.path.exists(os.path.join(blobs_dir, sha)):
+            out.append(f)
+    return out
+
+
 def ensure_cached(repo: str, *, what: str = "モデル") -> str:
     """mlx 系（mlx / mlx-vlm）の HF repo-id がローカルキャッシュに**完全に**存在するか検証する。
 
@@ -595,8 +637,10 @@ def ensure_cached(repo: str, *, what: str = "モデル") -> str:
 
     次のいずれも「未取得」とみなしてエラーにする:
       - スナップショットが存在しない。
-      - ダウンロード途中の残骸（blobs/ 配下の *.incomplete）が残っている。
-      - 重み（*.safetensors）の実体がキャッシュに揃っていない。
+      - ダウンロードが途中（確定 blob の無い *.incomplete が blobs/ に残っている）。
+        確定 blob が既にある .incomplete は**再試行が成功した後の残骸**なので無視する。
+      - 重み（*.safetensors / *.npz）の実体がキャッシュに揃っていない。index がある
+        場合は全シャードを要求する。
     """
     spec = repo.strip()
     # 実ファイル/ディレクトリパス指定（repo-id ではない）はそのパスの存在のみ確認する。
@@ -612,29 +656,24 @@ def ensure_cached(repo: str, *, what: str = "モデル") -> str:
     org, name = spec.split("/", 1)
     base = os.path.join(_hf_hub_cache(), f"models--{org}--{name}")
     snap_root = os.path.join(base, "snapshots")
-    # ダウンロード途中の残骸があれば「未取得」と同じ扱い（今回の不具合＝DL 停滞の主症状）。
-    incomplete = glob.glob(os.path.join(base, "blobs", "*.incomplete"))
+    # ダウンロードが途中なら「未取得」と同じ扱い（DL 停滞の主症状）。ただし確定 blob が
+    # 既にある .incomplete は再試行成功後の残骸なので数えない（_blocking_incomplete）。
+    incomplete = _blocking_incomplete(os.path.join(base, "blobs"))
     snaps = sorted(glob.glob(os.path.join(snap_root, "*"))) if os.path.isdir(snap_root) else []
     if not snaps or incomplete:
         raise ValueError(
             f"{what} '{repo}' がローカルキャッシュにありません（自動ダウンロードは無効）。"
             f" 先に取得してください: hf download {spec}"
         )
-    # 重み（safetensors / npz）の実体（シンボリックリンク先まで）が存在するか確認する。
+    # 重みの実体（シンボリックリンク先まで）が揃っているスナップショットを選ぶ。
     # whisper 系の mlx リポジトリは *.npz で重みを持つものがあるため両方を許容する。
-    weights = [
-        f
-        for s in snaps
-        for pattern in ("*.safetensors", "*.npz")
-        for f in glob.glob(os.path.join(s, pattern))
-        if os.path.exists(os.path.realpath(f))
-    ]
-    if not weights:
+    complete = [s for s in snaps if _snapshot_weights_complete(s)]
+    if not complete:
         raise ValueError(
             f"{what} '{repo}' の重み（*.safetensors / *.npz）がキャッシュに揃っていません。"
             f" 取得し直してください: hf download {spec}"
         )
-    return os.path.dirname(weights[0])
+    return complete[0]
 
 
 def mtp_status(model: str) -> str | None:
