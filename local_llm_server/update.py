@@ -9,6 +9,8 @@ run_gateway が reexec_daemon で自分自身を新コードに置き換える�
 方針（安全側）:
   - **git クローン & upstream 追跡ブランチ & 作業ツリーがクリーンな時だけ**適用する
     （開発中の PC＝未コミット変更がある場合は適用せず「保留」を表示。WIP を壊さない）。
+    ただし再生成される成果物（uv.lock）の差分は「クリーン」とみなす——`uv sync` が
+    書き換えるだけのファイルで永久に自動更新が止まらないように（→ _REGENERATED）。
   - ネットワーク I/O は短いタイムアウトで、失敗しても常に None/False を返す（オフラインでも
     TUI の起動を妨げない）。
   - PyPI 公開版を「トリガー」に使う（公開時に main へ push 済みなので pull で同じコードが得られる）。
@@ -306,13 +308,49 @@ def _on_default_branch(root: Path) -> bool:
     return cur == default
 
 
-def _working_tree_clean(root: Path) -> bool:
-    """未コミットの変更（追跡ファイル）が無いか。開発中 PC の WIP を守るためのガード。"""
+# クリーン判定で無視する「再生成される成果物」。
+#
+# uv は `uv sync` / `uv run`（`make dev` も）のたびに解決をやり直し、**uv.lock を書き換える
+# ことがある**——ロックを作った uv とローカルの uv の版が違えばマーカー表記が変わり、
+# リリース commit でロックを作り直し忘れていれば版だけでも差が出る。その結果、普通に
+# 使っているだけで作業ツリーが恒久的に dirty になり、`can_apply` が二度と真にならない
+# ＝**自動更新が永久に止まり、更新マークも消えない**（実測: `uv lock` 一発で 400 行差分）。
+# ロックは pyproject から機械的に再生成できる成果物で、pyproject を触っていないときの
+# 差分は「WIP」ではなく再解決ノイズなので、更新の可否判定では無視する
+# （pyproject.toml 自身を編集していれば下の判定で dirty のまま＝手を出さない）。
+_REGENERATED = ("uv.lock",)
+
+
+def _dirty_paths(root: Path) -> list[str] | None:
+    """未コミットの変更がある追跡ファイルのパス（git が引けなければ None）。"""
     try:
         r = _git(root, "status", "--porcelain", "--untracked-files=no")
     except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0:
+        return None
+    paths = []
+    for line in r.stdout.splitlines():
+        if not line.strip():
+            continue
+        path = line[3:].strip()          # "XY <path>"（リネームは "old -> new"）
+        if " -> " in path:
+            path = path.split(" -> ", 1)[1]
+        paths.append(path.strip('"'))
+    return paths
+
+
+def _working_tree_clean(root: Path) -> bool:
+    """未コミットの変更（追跡ファイル）が無いか。開発中 PC の WIP を守るためのガード。
+
+    再生成される成果物（_REGENERATED）だけの差分は「クリーン」とみなす——これが無いと
+    `uv sync` が書き換えた uv.lock で自動更新が永久に止まる。それ以外のファイルが
+    1 つでも変わっていれば dirty（＝WIP は従来どおり守る）。
+    """
+    paths = _dirty_paths(root)
+    if paths is None:
         return False
-    return r.returncode == 0 and not r.stdout.strip()
+    return all(p in _REGENERATED for p in paths)
 
 
 @dataclass
@@ -374,6 +412,11 @@ def apply_update(root: Path | None = None, timeout: float = 120.0) -> tuple[bool
         return False, "git クローン運用ではありません（自動更新の対象外）"
     if not _working_tree_clean(root):
         return False, "作業ツリーに未コミットの変更があります"
+    # 再解決で書き換わっただけの成果物（uv.lock）は捨ててから ff pull する。残したままだと
+    # 「そのファイルを触る commit を取り込めない」と git が pull 自体を拒む。捨ててよいのは
+    # _working_tree_clean を通った＝他に変更が無い（pyproject も無傷）ときだけなので、
+    # ここに来た時点の差分は pyproject から再生成できるものに限られる。
+    _git(root, "checkout", "--", *_REGENERATED)
     try:
         pull = _git(root, "pull", "--ff-only", timeout=timeout)
     except (OSError, subprocess.SubprocessError) as exc:
@@ -386,8 +429,11 @@ def apply_update(root: Path | None = None, timeout: float = 120.0) -> tuple[bool
     uv = _find_uv()
     if uv is not None:
         try:
+            # `--frozen` = ロックを更新せず、取り込んだ uv.lock のまま同期する。これが無いと
+            # uv が解決をやり直して uv.lock を書き換え、**自分で作業ツリーを dirty にして
+            # 次回以降の自動更新を塞ぐ**（更新マークが消えなくなる元凶）。
             subprocess.run(
-                [uv, "sync", "--quiet"], cwd=str(root),
+                [uv, "sync", "--frozen", "--quiet"], cwd=str(root),
                 capture_output=True, text=True, timeout=timeout,
             )
         except (OSError, subprocess.SubprocessError):

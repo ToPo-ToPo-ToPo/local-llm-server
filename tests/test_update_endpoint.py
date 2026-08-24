@@ -110,7 +110,8 @@ def test_update_now_when_up_to_date(monkeypatch):
     from local_llm_server import update as upd_mod
 
     monkeypatch.setattr(upd_mod, "check", lambda timeout=3.0: types.SimpleNamespace(
-        available=False, can_apply=False, current="1.0", latest="1.0", reason="ok"))
+        available=False, can_apply=False, current="1.0", latest="1.0", reason="ok",
+        restart_required=False))
     server, mgr = _start_bare_gateway()
     try:
         restarted = threading.Event()
@@ -119,6 +120,33 @@ def test_update_now_when_up_to_date(monkeypatch):
         status, obj = _req(server.server_address[1], "POST", "/admin/update")
         assert status == 200 and obj["status"] == "up-to-date"
         assert not restarted.wait(1.0), "must not restart when up to date"
+    finally:
+        server.shutdown(); server.server_close(); mgr.shutdown()
+
+
+def test_update_now_restarts_when_process_is_stale(monkeypatch):
+    """新版は無いが走っているコードが古い（restart_required）なら、**再起動だけ**する。
+
+    editable 運用で別経路の `git pull` が入った後の状態。ここで up-to-date と答えて
+    何もしないと、トレイの更新マークを押しても状態が変わらず消えないままになる
+    （`gw update` は同じ状況で再起動する。挙動を揃える）。
+    """
+    from local_llm_server import update as upd_mod
+
+    monkeypatch.setattr(upd_mod, "check", lambda timeout=3.0: types.SimpleNamespace(
+        available=False, can_apply=True, current="0.38.2", latest="0.38.2",
+        reason="ok", restart_required=True))
+    monkeypatch.setattr(upd_mod, "apply_update",
+                        lambda: (_ for _ in ()).throw(AssertionError("must not pull")))
+    server, mgr = _start_bare_gateway()
+    try:
+        restarted = threading.Event()
+        server.request_restart = restarted.set
+        server.update_state = {"fetched": False}
+        status, obj = _req(server.server_address[1], "POST", "/admin/update")
+        assert status == 200 and obj["status"] == "restarting"
+        assert obj["latest"] == "0.38.2"     # 再起動後に走るソース版
+        assert restarted.wait(3.0), "stale process must be restarted"
     finally:
         server.shutdown(); server.server_close(); mgr.shutdown()
 

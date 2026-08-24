@@ -52,6 +52,10 @@ def test_icon_is_static_with_no_periodic_work():
     # 更新を押したら即フィードバック: アイコン横に「更新中…」を出す（通知に依らない）。
     assert tray_mod._UPDATING_TITLE == "更新中…"
     assert "setTitle_(_UPDATING_TITLE)" in src and "resetTitle_" in src
+    # 更新マークは上げるだけでなく**降ろす**（更新後も ⬆ が残る不具合の回帰ガード）。
+    # 題字を無条件に _UPDATE_MARK へ固定する書き方に戻したら落ちる。
+    assert "setTitle_(_UPDATE_MARK if merged.get(\"kind\") else base_title)" in src
+    assert "base_title = \"\" if icon is not None else _FALLBACK_TITLE" in src
 
 
 def test_menu_action_items_are_enabled_and_wired():
@@ -138,6 +142,43 @@ def test_merge_update_info_prefers_fetched():
     assert merge_update_info({"kind": None, "latest": None}, {"update": {}})["kind"] is None
 
 
+def test_merge_update_info_clears_stale_mark():
+    """更新が済んだら、通知由来のマークを**降ろす**（更新後も消えない不具合の回帰ガード）。
+
+    パイプ通知は 1 版 1 回のプッシュなので、通知の後に別経路（`gw update` / 手元の
+    `git pull`）で更新されると kind が残り続ける。デーモンが「更新なし」と確認できた
+    （latest を引けて available/fetched/restart_required のどれでもない）ら降ろす。
+    """
+    m = merge_update_info(
+        {"kind": "update-available", "latest": "0.38.2"},
+        {"update": {"available": False, "fetched": False, "restart_required": False,
+                    "current": "0.38.2", "latest": "0.38.2"}},
+    )
+    assert m["kind"] is None and m["latest"] is None
+    # 断言できないときは残す: オフライン・未確認（latest を引けていない）。
+    m = merge_update_info(
+        {"kind": "update-ready", "latest": "0.38.2"},
+        {"update": {"available": False, "latest": None, "reason": "offline"}},
+    )
+    assert m["kind"] == "update-ready" and m["latest"] == "0.38.2"
+
+
+def test_merge_update_info_marks_restart_required():
+    """pull 済みでプロセスだけ古い（restart_required）ときもマークを出す。
+
+    取ってくるものは無いが再起動すれば新版になる状態。見せる版は再起動後に走る
+    ソース版（current）。
+    """
+    m = merge_update_info(
+        {"kind": None, "latest": None},
+        {"update": {"available": False, "restart_required": True,
+                    "current": "0.38.2", "latest": "0.38.2", "running": "0.38.1"}},
+    )
+    assert m["kind"] == "update-ready" and m["latest"] == "0.38.2"
+    label, clickable = update_menu_item(m, {"update": {"restart_required": True}})
+    assert clickable is True and "今すぐ更新" in label
+
+
 def test_update_menu_item_states():
     """更新項目の出し分け: 新版あり=クリック可 / 最新=非クリック / 未確認=クリック可。"""
     # 新版あり（パイプ通知）→ 「今すぐ更新して再起動（vX）」・クリック可
@@ -155,6 +196,25 @@ def test_update_menu_item_states():
     # admin 情報がまだ無い（初回オープン前）→ 「更新を確認」
     label, clickable = update_menu_item({"kind": None}, None)
     assert clickable is True and label == "更新を確認"
+
+
+def test_update_menu_item_explains_why_it_is_held():
+    """新版はあるのに適用できないときは、**理由**をメニューに出す。
+
+    「今すぐ更新して再起動」と言い続けて押しても何も起きない（＝マークが消えない）
+    のが一番わかりにくいので、保留の理由を見せる。押して再確認はできる（状態は最大
+    30 秒古く、その間に解消していることがある）。
+    """
+    admin = {"update": {"available": True, "latest": "0.38.3", "current": "0.38.2",
+                        "reason": "dirty"}}
+    label, clickable = update_menu_item({"kind": "update-available", "latest": "0.38.3"},
+                                        admin)
+    assert label == "更新あり（v0.38.3）— 未コミットの変更があるため保留"
+    assert clickable is True
+    # 適用できる（reason=ok）ときは従来どおり「今すぐ更新して再起動」。
+    admin["update"]["reason"] = "ok"
+    label, _ = update_menu_item({"kind": "update-available", "latest": "0.38.3"}, admin)
+    assert label == "今すぐ更新して再起動（v0.38.3）"
 
 
 def test_daemon_spawns_tray_before_provisioning():

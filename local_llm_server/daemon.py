@@ -1464,6 +1464,11 @@ class _GatewayHandler(BaseHTTPRequestHandler):
         してから再起動を要求する。drain（アイドル待ち）は**しない**——ユーザーが明示的に
         「今すぐ」を選んだ操作なので、処理中のリクエストより更新を優先する。
         応答を返し切ってから再起動する（応答が途中で切れないよう少しだけ遅らせる）。
+
+        取ってくるものが無くても、**走っているコードがディスク上のソースより古ければ
+        再起動する**（restart_required。editable 運用で別経路の `git pull` が入った後の
+        状態）。ここで up-to-date と答えて何もしないと、`gw update` なら直る状態が
+        トレイからは直せず、更新マークを押しても消えないままになる（→ cmd_update と同じ挙動）。
         """
         request_restart = getattr(srv, "request_restart", None)
         if request_restart is None:
@@ -1477,23 +1482,28 @@ class _GatewayHandler(BaseHTTPRequestHandler):
             except Exception as exc:  # noqa: BLE001 - ネットワーク不調は 502 で返す
                 send_error(self, 502, f"update check failed: {exc}")
                 return
-            if not st.available:
+            if not st.available and not st.restart_required:
                 send_json(self, 200, {"object": "gateway.update", "status": "up-to-date",
                                       "current": st.current, "latest": st.latest})
                 return
-            if not st.can_apply:
-                send_error(self, 409,
-                           f"update available but cannot auto-apply: {st.reason}")
-                return
-            try:
-                ok, msg = update.apply_update()
-            except Exception as exc:  # noqa: BLE001
-                ok, msg = False, str(exc)
-            if not ok:
-                send_error(self, 500, f"update failed: {msg}")
-                return
+            if st.available:
+                if not st.can_apply:
+                    send_error(self, 409,
+                               f"update available but cannot auto-apply: {st.reason}")
+                    return
+                try:
+                    ok, msg = update.apply_update()
+                except Exception as exc:  # noqa: BLE001
+                    ok, msg = False, str(exc)
+                if not ok:
+                    send_error(self, 500, f"update failed: {msg}")
+                    return
+            # 新版が無くても restart_required ならここへ落ちる＝**再起動だけ**する。
             if state is not None:
-                state.update({"fetched": True, "latest": st.latest})
+                # 見せる版は「再起動後に走る版」。取得した直後はそれが PyPI 最新、
+                # 再起動だけのときは（既に pull 済みの）ソース版。
+                state.update({"fetched": True,
+                              "latest": st.latest if st.available else st.current})
         send_json(self, 200, {"object": "gateway.update", "status": "restarting",
                               "latest": (state or {}).get("latest")})
         threading.Timer(0.5, request_restart).start()

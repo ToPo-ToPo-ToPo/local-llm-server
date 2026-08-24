@@ -110,6 +110,71 @@ def test_check_same_version_not_available(monkeypatch, tmp_path):
     assert st.available is False and st.can_apply is True  # 追従可能だが更新は無い
 
 
+# --- クリーン判定（再生成される成果物は無視する）-----------------------------
+def _porcelain(update_mod, monkeypatch, text: str):
+    class _R:
+        returncode = 0
+        stdout = text
+        stderr = ""
+
+    monkeypatch.setattr(update_mod, "_git", lambda root, *a, **k: _R())
+
+
+def test_working_tree_clean_ignores_regenerated_lock(monkeypatch, tmp_path):
+    """uv.lock だけの差分は「クリーン」。他のファイルが変わっていれば dirty のまま。
+
+    `uv sync` / `uv run` は解決をやり直して uv.lock を書き換えることがある（uv の版差・
+    リリース時のロック作り直し漏れ）。これを dirty と数えると、普通に使っているだけで
+    **自動更新が永久に止まり、更新マークが消えなくなる**——実際に起きた不具合の回帰ガード。
+    """
+    _porcelain(update, monkeypatch, " M uv.lock\n")
+    assert update._working_tree_clean(tmp_path) is True
+    # 手で触った WIP は従来どおり守る（uv.lock と一緒でも dirty）。
+    _porcelain(update, monkeypatch, " M uv.lock\n M local_llm_server/daemon.py\n")
+    assert update._working_tree_clean(tmp_path) is False
+    # 依存を自分で変えている（pyproject 編集）なら、ロックの差分は再解決ノイズではない。
+    _porcelain(update, monkeypatch, " M uv.lock\n M pyproject.toml\n")
+    assert update._working_tree_clean(tmp_path) is False
+    # 変更なしはもちろんクリーン。
+    _porcelain(update, monkeypatch, "")
+    assert update._working_tree_clean(tmp_path) is True
+
+
+def test_apply_update_pulls_over_regenerated_lock(tmp_path, monkeypatch):
+    """実際の git クローンで、uv.lock だけ汚れていても ff pull が通る（E2E）。
+
+    クリーン判定を緩めるだけでは足りない: git は「ローカルの変更が上書きされる」と
+    pull 自体を拒むので、apply_update は pull の前に成果物を捨てる必要がある。
+    """
+    import subprocess as sp
+
+    def git(cwd, *args):
+        return sp.run(["git", "-C", str(cwd), *args], capture_output=True, text=True)
+
+    origin, work = tmp_path / "origin", tmp_path / "work"
+    origin.mkdir()
+    git(origin, "init", "-q", "-b", "main")
+    git(origin, "config", "user.email", "t@t")
+    git(origin, "config", "user.name", "t")
+    (origin / "pyproject.toml").write_text('[project]\nname = "demo"\nversion = "0.1.0"\n')
+    (origin / "uv.lock").write_text("lock v1\n")
+    git(origin, "add", "-A"); git(origin, "commit", "-qm", "v0.1.0")
+    (origin / "pyproject.toml").write_text('[project]\nname = "demo"\nversion = "0.2.0"\n')
+    (origin / "uv.lock").write_text("lock v2\n")     # リリースでロックも作り直される
+    git(origin, "add", "-A"); git(origin, "commit", "-qm", "v0.2.0")
+    sp.run(["git", "clone", "-q", str(origin), str(work)], capture_output=True)
+    git(work, "reset", "-q", "--hard", "HEAD~1")     # 1 版遅れた状態にする
+    (work / "uv.lock").write_text("locally re-resolved\n")  # uv sync が書き換えた想定
+
+    monkeypatch.setattr(update, "_find_uv", lambda: None)    # 同期はこのテストの対象外
+    assert update._working_tree_clean(work) is True
+    ok, _msg = update.apply_update(root=work)
+    assert ok is True
+    assert update._source_version(work) == "0.2.0"           # 追従できた
+    assert (work / "uv.lock").read_text() == "lock v2\n"     # 取り込んだロックに置き換わる
+    assert git(work, "status", "--porcelain").stdout == ""   # 汚れも残らない
+
+
 # --- apply_update（git 呼び出しは monkeypatch）-----------------------------
 def test_apply_update_refuses_dirty_tree(monkeypatch, tmp_path):
     monkeypatch.setattr(update, "_working_tree_clean", lambda root: False)
@@ -142,8 +207,14 @@ def test_apply_update_runs_pull_and_sync(monkeypatch, tmp_path):
     # git pull --ff-only が呼ばれ、続いて uv sync が試行される（uv は絶対パス解決あり）。
     # Windows では which("uv") が uv.exe を返すため、拡張子を除いた名前で判定する。
     assert ("git", ("pull", "--ff-only")) in calls
+    # 再生成される成果物は pull の**前に**捨てる（残すと git が pull を拒む）。
+    checkout = ("git", ("checkout", "--", "uv.lock"))
+    assert checkout in calls and calls.index(checkout) < calls.index(("git", ("pull", "--ff-only")))
+    # uv sync は **--frozen**（ロックを更新しない）。これが無いと自動更新が自分で
+    # 作業ツリーを dirty にして、次回以降の更新を永久に塞ぐ。
     assert any(
         c[0] == "run" and Path(c[1][0]).stem == "uv" and c[1][1] == "sync"
+        and "--frozen" in c[1]
         for c in calls
     )
 
