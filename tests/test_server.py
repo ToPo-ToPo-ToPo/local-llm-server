@@ -267,6 +267,41 @@ def test_build_command_mlx_vlm_draft_auto(stub_cache):
     assert cmd[cmd.index("--draft-kind") + 1] == "mtp"
 
 
+def test_mtp_status_table_and_explicit(hf_cache, tmp_path):
+    # 対応表からの判定（従来どおり）。
+    target = "mlx-community/gemma-4-12B-it-qat-4bit"
+    assert srv.mtp_status(target) == "available"        # ドラフター未取得
+    hf_cache(MTP_DRAFTERS[target], ["config.json", "model.safetensors"])
+    assert srv.mtp_status(target) == "ready"
+    # 対応表に無いモデルは MTP なし……
+    assert srv.mtp_status("org/unlisted-27b") is None
+    # ……が、明示指定（gateway.toml の draft_model）があればそれで判定する。
+    assert srv.mtp_status("org/unlisted-27b", "org/unlisted-MTP-bf16") == "available"
+    hf_cache("org/unlisted-MTP-bf16", ["config.json", "model.safetensors"])
+    assert srv.mtp_status("org/unlisted-27b", "org/unlisted-MTP-bf16") == "ready"
+
+
+def test_mtp_status_explicit_local_path(tmp_path):
+    # ローカルパス指定のドラフターは HF キャッシュではなく実ディレクトリの重みを見る。
+    d = tmp_path / "MyDrafter"
+    d.mkdir()
+    assert srv.mtp_status("org/x", str(d)) == "available"   # 重みがまだ無い
+    (d / "model.safetensors").write_bytes(b"0" * 16)
+    assert srv.mtp_status("org/x", str(d)) == "ready"
+
+
+def test_qwen38_mtp_pair_and_drafter_hidden():
+    # gateway.toml が明示している Qwen3.8 のペアを対応表でも引けること（"auto" 可・一覧に出る）。
+    for bits in ("4bit", "8bit", "bf16"):
+        target = f"ToPo-ToPo/Qwen3.8-27B-mlx-{bits}"
+        assert MTP_DRAFTERS[target] == "ToPo-ToPo/Qwen3.8-27B-MTP-bf16"
+        assert resolve_drafter(target, "auto") == "ToPo-ToPo/Qwen3.8-27B-MTP-bf16"
+    # ドラフターそのものは「使えるモデル」の発見一覧に出さない。
+    assert "ToPo-ToPo/Qwen3.8-27B-MTP-bf16" in srv._DRAFTER_REPOS
+    # 対応表に載せない（＝auto で引かせない）ドラフターも一覧からは隠す。
+    assert "ToPo-ToPo/DeepSeek-V4-Flash-MTP-bf16" in srv._DRAFTER_REPOS
+
+
 # --- 事前 DL 必須（自動ダウンロード無効）の検証 ----------------------------
 
 def test_ensure_cached_ok_when_present(hf_cache):

@@ -162,11 +162,18 @@ def merge_status(gcfg, admin: dict | None, ready: bool | None = None) -> dict:
     """
     live = {m["model"]: m for m in (admin or {}).get("models", [])}
     idle_timeout = gcfg.idle_timeout
+    # 事前登録モデルの draft_model は設定読み込み時に解決済み（"auto" は対応表で引かれ、
+    # "off"/"none"/"" と非 mlx-vlm バックエンドは None になっている）。MTP 判定はこれを
+    # 優先する——対応表に無いモデルでも gateway.toml で明示指定していれば MTP は実際に効くので、
+    # 対応表だけを見ていると設定済みのモデルが「MTP 非対応」に見えてしまう。
+    drafters = {c.model: c.draft_model for c in gcfg.models}
 
     def _row(model, backend, port, m):
         """ライブ状態 m（None=未ロード）から表示用の 1 行を作る。"""
-        # MTP（高速化）の利用可否は本体名から判定する（ドラフターがキャッシュ済みなら "ready"）。
-        mtp = mtp_status(model)
+        # MTP（高速化）の利用可否は gateway.toml の明示指定 → 対応表の順に判定する
+        # （ドラフターが手元にあれば "ready"）。動的ロード／キャッシュ発見のモデルは
+        # 明示指定が無いので対応表だけで判定する（デーモン側の _dynamic_draft と同じ扱い）。
+        mtp = mtp_status(model, drafters.get(model))
         if not m or not m.get("loaded"):
             return {
                 "model": model, "backend": backend, "port": port,

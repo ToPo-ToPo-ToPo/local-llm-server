@@ -471,6 +471,12 @@ MTP_DRAFTERS = {
         "mlx-community/Qwen3.6-27B-MTP-4bit",
     "ToPo-ToPo/Qwen3.6-27B-mlx-bf16":
         "mlx-community/Qwen3.6-27B-MTP-4bit",
+    # Qwen3.8-27B（自作 ToPo-ToPo 版）。ドラフターは公式 bf16 チェックポイント内蔵の mtp.* を
+    # 切り出した自作 MTP ヘッド（量子化後のリポからは mtp が落ちるので必ず公式 bf16 から切り出す）。
+    # 量子化違いは同一ドラフターで共用できる（greedy では bf16 と 4bit で採択が一致する）。
+    "ToPo-ToPo/Qwen3.8-27B-mlx-4bit": "ToPo-ToPo/Qwen3.8-27B-MTP-bf16",
+    "ToPo-ToPo/Qwen3.8-27B-mlx-8bit": "ToPo-ToPo/Qwen3.8-27B-MTP-bf16",
+    "ToPo-ToPo/Qwen3.8-27B-mlx-bf16": "ToPo-ToPo/Qwen3.8-27B-MTP-bf16",
     # 自作 ToPo-ToPo 版 gemma 4。各 model card が推奨する Google 公式 MTP ドラフター
     # google/gemma-4-<size>-it-assistant を使う（mlx-vlm で変換不要・サイズ固有で量子化に依らず共通。
     # mlx-vlm >= 0.6.3 が必要）。
@@ -487,10 +493,20 @@ MTP_DRAFTERS = {
 }
 
 
+# 対応表（MTP_DRAFTERS）には載せないが、ドラフターであることが分かっている repo。
+# 対応表に載せると draft_model="auto" が引いてしまうので載せられない——けれど発見一覧には
+# 出したくない、というものをここに書く（例: 上流バグで実用不能なため gateway.toml では
+# off にしている DeepSeek-V4-Flash の MTP ヘッド）。
+_EXTRA_DRAFTER_REPOS = frozenset({
+    "ToPo-ToPo/DeepSeek-V4-Flash-MTP-bf16",
+})
+
 # MTP ドラフター（speculative decoding 用の補助モデル）の repo-id 集合。これ自体は
 # 単体のチャットモデルとして使うものではないので、発見一覧（discover_cached_models）には
 # 「使えるモデル」として出さない。`org/repo:selector` 形式のドラフターは repo 部分で判定する。
-_DRAFTER_REPOS = frozenset(v.split(":", 1)[0] for v in MTP_DRAFTERS.values())
+_DRAFTER_REPOS = frozenset(
+    [v.split(":", 1)[0] for v in MTP_DRAFTERS.values()]
+) | _EXTRA_DRAFTER_REPOS
 
 
 def resolve_drafter(model: str, draft_model: str | None) -> str | None:
@@ -676,21 +692,29 @@ def ensure_cached(repo: str, *, what: str = "モデル") -> str:
     return complete[0]
 
 
-def mtp_status(model: str) -> str | None:
+def mtp_status(model: str, drafter: str | None = None) -> str | None:
     """model の MTP（Multi-Token Prediction による高速化）の利用可否を返す。
 
-    対応表（MTP_DRAFTERS）に本体が在るかと、対応ドラフターがローカルにキャッシュ済みかで判定する:
+    使うドラフターが決まるかと、それがローカルに在るかで判定する:
 
-    - "ready"     … 対応ドラフターがキャッシュ済み。そのまま MTP が効く。
-    - "available" … MTP には対応するがドラフターが未取得。`hf download <drafter>` で有効化できる。
-    - None        … MTP 非対応（対応表に無い）。
+    - "ready"     … ドラフターが手元にある。そのまま MTP が効く。
+    - "available" … ドラフターは決まるが未取得。`hf download <drafter>` で有効化できる。
+    - None        … MTP なし（明示指定も対応表の項目も無い）。
 
-    一覧表示（discover_cached_models / TUI）から呼ぶ。ドラフターの有無確認に ensure_cached を
-    使う（自動 DL はしない方針と一貫）。
+    `drafter` は gateway.toml で **明示指定された（＝解決済みの）** draft_model。指定があれば
+    対応表より優先する——対応表は `draft_model="auto"` 用の内蔵ペア表でしかないので、これを
+    見ないと「gateway.toml で明示指定してあるのに一覧では MTP 非対応に見える」ことになる。
+    無効化（off/none/""）は呼び出し側で解決済み＝None で渡ってくる前提。
+
+    一覧表示（discover_cached_models / merge_status / TUI）から呼ぶ。ドラフターの有無確認に
+    ensure_cached を使う（自動 DL はしない方針と一貫）。
     """
-    drafter = MTP_DRAFTERS.get(model)
+    drafter = drafter or MTP_DRAFTERS.get(model)
     if not drafter:
         return None
+    if looks_like_local_path(drafter):
+        # ローカルパス指定のドラフター（HF キャッシュではない実ディレクトリ）は重みを直接見る。
+        return "ready" if _dir_weight_bytes(os.path.expanduser(drafter.strip())) else "available"
     try:
         ensure_cached(drafter, what="ドラフター")
         return "ready"

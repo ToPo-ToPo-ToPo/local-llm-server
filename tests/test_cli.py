@@ -38,7 +38,7 @@ def test_fmt_hms():
 
 def test_merge_status_lists_catalog_live_and_cached(tmp_path, monkeypatch):
     # カタログ（未ロード）・動的ロード分・HF キャッシュの候補が重複なく 1 ビューに並ぶこと。
-    monkeypatch.setattr(cli, "mtp_status", lambda m: None)
+    monkeypatch.setattr(cli, "mtp_status", lambda m, d=None: None)
     gcfg = load_gateway_config(str(_write_cfg(tmp_path, "port = 8799\n")))
     admin = {
         "uptime": 12.0, "requests": 3, "max_resident": 2,
@@ -53,9 +53,56 @@ def test_merge_status_lists_catalog_live_and_cached(tmp_path, monkeypatch):
     assert view["max_resident"] == 2 and view["requests"] == 3
 
 
+def test_merge_status_mtp_uses_explicit_draft_model(tmp_path, monkeypatch):
+    # 対応表（MTP_DRAFTERS）に無いモデルでも、gateway.toml で draft_model を明示していれば
+    # MTP は実際に効く。一覧がそれを「非対応」と表示していた回帰の防止。
+    seen = {}
+
+    def _fake(model, drafter=None):
+        seen[model] = drafter
+        return "ready" if drafter else None
+
+    monkeypatch.setattr(cli, "mtp_status", _fake)
+    gcfg = load_gateway_config(str(_write_cfg(tmp_path, """
+port = 8799
+[[models]]
+model = "org/NoTable-27B-mlx-4bit"
+backend = "mlx-vlm"
+draft_model = "org/NoTable-27B-MTP-bf16"
+[[models]]
+model = "org/Plain-27B-mlx-4bit"
+backend = "mlx-vlm"
+""")))
+    view = cli.merge_status(gcfg, None, ready=False)
+    by = {m["model"]: m for m in view["models"]}
+    assert by["org/NoTable-27B-mlx-4bit"]["mtp"] == "ready"
+    assert seen["org/NoTable-27B-mlx-4bit"] == "org/NoTable-27B-MTP-bf16"
+    # draft_model 無しは従来どおり対応表任せ（drafter は渡らない）。
+    assert seen["org/Plain-27B-mlx-4bit"] is None
+    assert by["org/Plain-27B-mlx-4bit"]["mtp"] is None
+    assert "mtp" in cli.render_list(gcfg, {"available": []})
+
+
+def test_merge_status_mtp_ignores_disabled_draft_model(tmp_path, monkeypatch):
+    # draft_model = "off" は設定読み込み時に None へ解決される（"off" をドラフター名として
+    # 渡してしまわないこと）。
+    seen = {}
+    monkeypatch.setattr(cli, "mtp_status",
+                        lambda m, d=None: seen.setdefault(m, d) and None)
+    gcfg = load_gateway_config(str(_write_cfg(tmp_path, """
+port = 8799
+[[models]]
+model = "org/Off-27B-mlx-4bit"
+backend = "mlx-vlm"
+draft_model = "off"
+""")))
+    cli.merge_status(gcfg, None, ready=False)
+    assert seen["org/Off-27B-mlx-4bit"] is None
+
+
 # --- 描画 -------------------------------------------------------------------
 def test_render_status_running_and_stopped(tmp_path, monkeypatch):
-    monkeypatch.setattr(cli, "mtp_status", lambda m: None)
+    monkeypatch.setattr(cli, "mtp_status", lambda m, d=None: None)
     gcfg = load_gateway_config(str(_write_cfg(tmp_path, "port = 8799\n")))
     stopped = cli.render_status(gcfg, None, ready=False)
     assert "stopped" in stopped and "gw start" in stopped
@@ -66,7 +113,7 @@ def test_render_status_running_and_stopped(tmp_path, monkeypatch):
 
 
 def test_render_ps_only_loaded(tmp_path, monkeypatch):
-    monkeypatch.setattr(cli, "mtp_status", lambda m: None)
+    monkeypatch.setattr(cli, "mtp_status", lambda m, d=None: None)
     gcfg = load_gateway_config(str(_write_cfg(tmp_path, "port = 8799\n")))
     # ロード無し → 案内文
     assert cli.render_ps(gcfg, {"models": [], "available": []}, ready=True) == "no models loaded"
@@ -95,7 +142,7 @@ def _use_cfg(tmp_path, monkeypatch, body="port = 8799\n"):
 def test_status_dispatch_running(tmp_path, monkeypatch):
     _use_cfg(tmp_path, monkeypatch)
     monkeypatch.setattr(cli, "read_gateway_runtime", lambda: None)  # 記録なし → 設定で解決
-    monkeypatch.setattr(cli, "mtp_status", lambda m: None)
+    monkeypatch.setattr(cli, "mtp_status", lambda m, d=None: None)
     monkeypatch.setattr(cli, "gateway_admin_status",
                         lambda h, p: {"uptime": 1.0, "requests": 0, "max_resident": 1,
                                       "pid": 1, "models": [], "available": []})
@@ -118,7 +165,7 @@ def test_start_dispatch_calls_background(tmp_path, monkeypatch):
                         lambda cwd, host, port: called.setdefault("cwd", cwd) or 111)
     monkeypatch.setattr(cli, "gateway_admin_status", lambda h, p: None)
     monkeypatch.setattr(cli, "is_ready", lambda url, **k: True)
-    monkeypatch.setattr(cli, "mtp_status", lambda m: None)
+    monkeypatch.setattr(cli, "mtp_status", lambda m, d=None: None)
     assert cli.main(["start"]) == 0
     # どこから打っても、設定ファイルのあるディレクトリを cwd にして起動する。
     assert called["cwd"] == str(tmp_path)
@@ -133,7 +180,7 @@ def test_start_autocreates_config(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(update, "repo_root", lambda: None)  # クローン例の複製ではなく既定を生成
     monkeypatch.setattr(cli, "gateway_admin_status", lambda h, p: None)
     monkeypatch.setattr(cli, "is_ready", lambda url, **k: True)
-    monkeypatch.setattr(cli, "mtp_status", lambda m: None)
+    monkeypatch.setattr(cli, "mtp_status", lambda m, d=None: None)
     seen = {}
     monkeypatch.setattr(cli, "start_gateway_background",
                         lambda cwd, host, port: seen.update(cwd=cwd, port=port) or 1)
@@ -165,7 +212,7 @@ def test_missing_config_returns_2(tmp_path, monkeypatch):
 def test_status_from_anywhere_uses_runtime_record(tmp_path, monkeypatch):
     # 設定ファイルが無くても、稼働中デーモンのランタイム記録（＝実物）から接続先を引いて動く。
     monkeypatch.setattr(cli, "user_config_path", lambda: str(tmp_path / "gateway.toml"))
-    monkeypatch.setattr(cli, "mtp_status", lambda m: None)
+    monkeypatch.setattr(cli, "mtp_status", lambda m, d=None: None)
     monkeypatch.setattr(cli, "read_gateway_runtime",
                         lambda: {"host": "127.0.0.1", "port": 8795, "pid": 4242})
     seen = {}
