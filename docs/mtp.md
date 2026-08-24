@@ -90,15 +90,21 @@ ToPo-ToPo/gemma-4-31b-it-mlx-4bit
 - `[ready]` はドラフター取得済み（そのまま MTP が効く）、`[available]` は未取得（そのまま貼れる
   `hf download` コマンドを添えて表示）。
 - 対応表に無いモデルは「MTP 非対応」と表示する（使うなら `draft_model` に
-  ドラフターの HF id を明示する）。
+  ドラフターの HF id を明示する）。`gw mtp` は gateway.toml を読まない（どのディレクトリからでも
+  実行できるようにするため）ので、ここの判定は対応表だけで行う。設定済みかどうかも含めて
+  見たいときは `gw list` / `gw ps` の MTP 列を使う——こちらは gateway.toml の `draft_model`
+  （明示指定）を対応表より優先して判定する。
 
 ## 対応モデル（`MTP_DRAFTERS`）
 
-`"auto"` で解決できる本体→ドラフターの対応表。Qwen3.6 / Gemma 4 系を収録（mlx-community 版と
-自作 ToPo-ToPo 版の両方）。ドラフターの選び方:
+`"auto"` で解決できる本体→ドラフターの対応表。Qwen3.6 / Qwen3.8 / Gemma 4 系を収録
+（mlx-community 版と自作 ToPo-ToPo 版の両方）。ドラフターの選び方:
 
 - **Qwen3.6-27B（ToPo-ToPo 版）**: 同じ Qwen3.6-27B ベースなので mlx-community の MTP ヘッド
   `mlx-community/Qwen3.6-27B-MTP-4bit` を共用する（量子化 4bit/8bit/bf16 とも）。
+- **Qwen3.8-27B（ToPo-ToPo 版）**: 公式 bf16 チェックポイント内蔵の `mtp.*` を切り出した
+  `ToPo-ToPo/Qwen3.8-27B-MTP-bf16` を量子化 4bit/8bit/bf16 で共用する（量子化後のリポからは
+  `mtp` が落ちているので、切り出しは必ず公式 bf16 から行う）。
 - **Gemma 4（ToPo-ToPo 版）**: 各 model card 推奨の **Google 公式ドラフター
   `google/gemma-4-<size>-it-assistant`**（mlx-vlm で変換不要・サイズ固有で量子化に依らず共通）。
   `mlx-vlm >= 0.6.3` が必要。ドラフターはサイズ間で互換性が無い（31B / 26B-A4B / E4B / E2B で別）。
