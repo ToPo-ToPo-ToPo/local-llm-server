@@ -100,8 +100,11 @@ ToPo-ToPo/gemma-4-31b-it-mlx-4bit
 `"auto"` で解決できる本体→ドラフターの対応表。Qwen3.6 / Qwen3.8 / Gemma 4 系を収録
 （mlx-community 版と自作 ToPo-ToPo 版の両方）。ドラフターの選び方:
 
-- **Qwen3.6-27B（ToPo-ToPo 版）**: 同じ Qwen3.6-27B ベースなので mlx-community の MTP ヘッド
-  `mlx-community/Qwen3.6-27B-MTP-4bit` を共用する（量子化 4bit/8bit/bf16 とも）。
+- **Qwen3.6-27B（ToPo-ToPo 版）**: 公式 bf16 チェックポイント内蔵の `mtp.*` を切り出した
+  `ToPo-ToPo/Qwen3.6-27B-MTP-bf16` を量子化 4bit/8bit/bf16 で共用する（Qwen3.8-27B と同じ作り方。
+  量子化後のリポからは `mtp` が落ちているので、切り出しは必ず公式 bf16 から行う）。
+  `mlx-community/Qwen3.6-27B-MTP-4bit` も同じベースなので使えるが、実測では bf16 の方が
+  採択率が高い（コード生成 86.4% / JSON 91.5% / 日本語自由文 48.0%）。
 - **Qwen3.8-27B（ToPo-ToPo 版）**: 公式 bf16 チェックポイント内蔵の `mtp.*` を切り出した
   `ToPo-ToPo/Qwen3.8-27B-MTP-bf16` を量子化 4bit/8bit/bf16 で共用する（量子化後のリポからは
   `mtp` が落ちているので、切り出しは必ず公式 bf16 から行う）。
