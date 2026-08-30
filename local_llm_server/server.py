@@ -463,14 +463,14 @@ MTP_DRAFTERS = {
     # Qwen3.6-27B（既定モデル）の MTP ドラフター。
     "mlx-community/Qwen3.6-27B-4bit":
         "mlx-community/Qwen3.6-27B-MTP-4bit",
-    # 自作 ToPo-ToPo 版の Qwen3.6-27B（既定運用）。本体は同じ Qwen3.6-27B ベースなので、
-    # ドラフターは mlx-community の MTP ヘッドを共用できる（量子化違いも同一ドラフターで可）。
-    "ToPo-ToPo/Qwen3.6-27B-mlx-4bit":
-        "mlx-community/Qwen3.6-27B-MTP-4bit",
-    "ToPo-ToPo/Qwen3.6-27B-mlx-8bit":
-        "mlx-community/Qwen3.6-27B-MTP-4bit",
-    "ToPo-ToPo/Qwen3.6-27B-mlx-bf16":
-        "mlx-community/Qwen3.6-27B-MTP-4bit",
+    # 自作 ToPo-ToPo 版の Qwen3.6-27B（既定運用）。ドラフターは Qwen3.8-27B と同じ手順で、
+    # 公式 bf16 チェックポイント内蔵の mtp.* を切り出した自作 MTP ヘッド
+    # （量子化後のリポからは mtp が落ちるので必ず公式 bf16 から切り出す）。量子化違いは
+    # 同一ドラフターで共用できる。mlx-community/Qwen3.6-27B-MTP-4bit も使えるが、
+    # 実測では bf16 の方が採択率が高い（コード生成で 95.2%）。
+    "ToPo-ToPo/Qwen3.6-27B-mlx-4bit": "ToPo-ToPo/Qwen3.6-27B-MTP-bf16",
+    "ToPo-ToPo/Qwen3.6-27B-mlx-8bit": "ToPo-ToPo/Qwen3.6-27B-MTP-bf16",
+    "ToPo-ToPo/Qwen3.6-27B-mlx-bf16": "ToPo-ToPo/Qwen3.6-27B-MTP-bf16",
     # Qwen3.8-27B（自作 ToPo-ToPo 版）。ドラフターは公式 bf16 チェックポイント内蔵の mtp.* を
     # 切り出した自作 MTP ヘッド（量子化後のリポからは mtp が落ちるので必ず公式 bf16 から切り出す）。
     # 量子化違いは同一ドラフターで共用できる（greedy では bf16 と 4bit で採択が一致する）。
