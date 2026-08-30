@@ -99,7 +99,7 @@ def test_dynamic_register_auto_enables_mtp_for_supported_mlx_vlm():
     m = mgr._register_dynamic_locked("mlx-community/Qwen3.6-27B-4bit")
     assert m.config.draft_model == "mlx-community/Qwen3.6-27B-MTP-4bit"
     topo = mgr._register_dynamic_locked("ToPo-ToPo/Qwen3.6-27B-mlx-4bit")
-    assert topo.config.draft_model == "mlx-community/Qwen3.6-27B-MTP-4bit"
+    assert topo.config.draft_model == "ToPo-ToPo/Qwen3.6-27B-MTP-bf16"
     # ToPo-ToPo 版 gemma 4 は model card 推奨の Google 公式ドラフターに解決する。
     g = mgr._register_dynamic_locked("ToPo-ToPo/gemma-4-31b-it-mlx-4bit")
     assert g.config.draft_model == "google/gemma-4-31B-it-assistant"
