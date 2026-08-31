@@ -259,11 +259,17 @@ def test_resolve_drafter_auto_unknown_raises():
         resolve_drafter("some/unknown-model", "auto")
 
 
-def test_command_builders_cover_all_backends():
-    # ディスパッチ表 _COMMAND_BUILDERS は公開値 BACKENDS と 1:1（バックエンド追加時の
-    # 「表に足し忘れて unknown backend になる」を防ぐ）。
+def test_backend_specs_cover_all_backends():
+    # 登録簿 BACKEND_SPECS は公開値 BACKENDS と 1:1（バックエンド追加時の
+    # 「表に足し忘れて unknown backend になる」を防ぐ）。name キーも一致していること。
     from local_llm_server.constants import BACKENDS
-    assert set(srv._COMMAND_BUILDERS) == set(BACKENDS)
+    assert set(srv.BACKEND_SPECS) == set(BACKENDS)
+    assert all(name == spec.name for name, spec in srv.BACKEND_SPECS.items())
+
+
+def test_backend_spec_unknown_raises():
+    with pytest.raises(ValueError):
+        srv.backend_spec("no-such-backend")
 
 
 def test_build_command_mlx_vlm_draft_auto(stub_cache):

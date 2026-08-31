@@ -59,6 +59,8 @@ from .server import (
     infer_backend,
     llama_provision_info,
     local_connect_host,
+    BACKEND_SPECS,
+    backend_spec,
     parallel_supported,
     primary_lan_ip,
     reap_orphan_workers,
@@ -78,9 +80,8 @@ from .server import (
 # 複製が誤発動しないよう、猶予を置いてから持続的な競合かを再確認する。
 _REPLICA_GRACE_S = 1.0
 
-# MTP（speculative decoding）が効くバックエンド。draft_model は mlx-vlm のみ build_command が
-# 反映する（他は無視）。ゲートウェイはこれを使って継承・検証する。
-_MTP_BACKEND = "mlx-vlm"
+# どのバックエンドで MTP（speculative decoding）が効くかは BACKEND_SPECS の draft_style が
+# 持つ（"mtp" のみ対応表 MTP_DRAFTERS で解決する）。ここに backend 名は直書きしない。
 # draft_model を無効化する文字列（ゲートウェイ既定を個別に打ち消すため）。
 _DRAFT_OFF = ("", "off", "none")
 
@@ -304,7 +305,7 @@ class ModelManager:
         raw = self._default_draft if self._default_draft is not None else "auto"
         if isinstance(raw, str) and raw.strip().lower() in _DRAFT_OFF:
             return None
-        if backend != _MTP_BACKEND:
+        if backend_spec(backend).draft_style != "mtp":
             return None
         if raw == "auto" and model_id not in MTP_DRAFTERS:
             return None  # 対応表に無い → MTP なしで普通にロード
@@ -1797,22 +1798,26 @@ def _resolve_model_draft(
         raw = None
     if not raw:
         return None
-    if backend == _MTP_BACKEND:
+    style = backend_spec(backend).draft_style
+    if style == "mtp":
         try:
             return resolve_drafter(model, raw)
         except ValueError:
             return None  # "auto" が対応表に無い → MTP なしで普通に登録する
-    if backend == "llama-cpp":
-        # llama.cpp のspeculative decodingはドラフト GGUF のパスを直接指定する（-md）。
+    if style == "gguf":
+        # speculative decoding のドラフト GGUF のパス/HF id を直接指定する方式（-md）。
         # MTP ヘッドのファイル名は build_command 側で検出して --spec-type draft-mtp を付ける。
-        # "auto" の自動解決表は llama.cpp には無いので、明示パス以外は無効扱い。
+        # "auto" の自動解決表は無いので、明示パス以外は無効扱い。
         if raw == "auto":
             return None
         return raw
     if has_own:
+        mtp_capable = ", ".join(
+            name for name, spec in BACKEND_SPECS.items() if spec.draft_style == "mtp"
+        )
         print(
             f"Warning: draft_model (MTP) is ignored for backend '{backend}' "
-            f"(MTP needs {_MTP_BACKEND}); model {model}",
+            f"(MTP needs {mtp_capable}); model {model}",
             file=sys.stderr,
         )
     return None
@@ -2484,7 +2489,7 @@ def _llama_cpp_in_use(cfg: GatewayConfig) -> bool:
     Apple Silicon で llama-cpp モデルの登録が無い場合は、既定が mlx-vlm なので False
     （GGUF を明示要求したときだけ llama-server が要る。その場合は PATH / system で賄う）。
     """
-    if any(c.backend == "llama-cpp" for c in cfg.models):
+    if any(backend_spec(c.backend).provisioner == "llama" for c in cfg.models):
         return True
     return cfg.dynamic and DEFAULT_BACKEND == "llama-cpp"
 
@@ -2518,7 +2523,7 @@ def provision_llama_if_needed(cfg: GatewayConfig) -> None:
 
 def _vllm_in_use(cfg: GatewayConfig) -> bool:
     """事前登録に backend="vllm" のモデルがあるか（vLLM は明示 opt-in 専用）。"""
-    return any(c.backend == "vllm" for c in cfg.models)
+    return any(backend_spec(c.backend).provisioner == "vllm" for c in cfg.models)
 
 
 def provision_vllm_if_needed(cfg: GatewayConfig) -> None:
@@ -2541,7 +2546,7 @@ def provision_vllm_if_needed(cfg: GatewayConfig) -> None:
 
 def _sglang_in_use(cfg: GatewayConfig) -> bool:
     """事前登録に backend="sglang" のモデルがあるか（SGLang は明示 opt-in 専用）。"""
-    return any(c.backend == "sglang" for c in cfg.models)
+    return any(backend_spec(c.backend).provisioner == "sglang" for c in cfg.models)
 
 
 def provision_sglang_if_needed(cfg: GatewayConfig) -> None:
