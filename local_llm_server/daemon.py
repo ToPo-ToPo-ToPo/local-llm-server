@@ -615,8 +615,9 @@ class ModelManager:
         """常駐数・メモリ予算の超過判定（state ロック保持下で呼ぶ）。
 
         _make_room_for_replica と _evict_if_needed が共有する LRU 退避の判定部。
-        戻り値: (over: bool, running, need)。need は keep の概算占有バイト
-        （メモリ予算が無効なら 0。_evict_if_needed の CapacityError 文面が使う）。
+        戻り値: (over, over_mem, running, need)。over は数・メモリいずれかの超過、
+        over_mem はメモリ超過のみ、need は keep の概算占有バイト（メモリ予算が無効なら 0。
+        _evict_if_needed の CapacityError 文面が使う）。
         """
         running = self._running_instances_locked()
         over_count = (
@@ -2505,7 +2506,7 @@ def provision_llama_if_needed(cfg: GatewayConfig) -> None:
     if not _llama_cpp_in_use(cfg):
         return
     try:
-        binary = provisioner.ensure_llama_server(
+        binary, info = provisioner.ensure_llama_server(
             accel=cfg.llama_accel,
             build=cfg.llama_build,
         )
@@ -2513,8 +2514,7 @@ def provision_llama_if_needed(cfg: GatewayConfig) -> None:
         print(f"llama.cpp provisioning failed (continuing without it): {exc}",
               file=sys.stderr)
         return
-    # 実際に解決された素性（実ビルド番号・accel）はプロビジョナが記録している。
-    info = provisioner.last_info() or {}
+    # 実際に解決された素性（実ビルド番号・accel）ごと登録する。
     set_llama_server_binary(binary, build=info.get("build"), accel=info.get("accel"))
     print(f"llama.cpp ready: {binary} "
           f"(build={info.get('build') or '-'}, accel={info.get('accel') or '-'})",
