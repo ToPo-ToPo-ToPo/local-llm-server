@@ -2796,7 +2796,7 @@ def _run_gateway_locked(cfg: GatewayConfig, config_path: str | None = None) -> i
         ).start()
 
     # 自動更新監視: 新しいリリースタグを検知し、作業ツリーがクリーンかつ処理中/在席が 0（idle）の
-    # 瞬間に git pull で追従する。適用できたら restart_requested を立てて下のメインループを
+    # 瞬間にリリースタグへ fast-forward する。適用できたら restart_requested を立てて下のメインループを
     # 抜け、finally でクリーン停止 → run_gateway が execv で新コードに置き換える。
     # TUI 廃止に伴い、旧 TUI が担っていた「リリースタグへ git で追従」をデーモン本体へ移した。
     # gateway.toml の auto_update=false で**適用**は無効化できるが、**チェックは常に行う**
