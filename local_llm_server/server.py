@@ -45,77 +45,79 @@ def default_backend() -> str:
 DEFAULT_BACKEND = default_backend()
 
 
-# llama-server 実行ファイルのパス。ゲートウェイ起動時にプロビジョナ（provisioner）が解決して
-# set_llama_server_binary() で差し込む。未設定なら PATH の "llama-server"（単体テスト等の素通し）。
-_LLAMA_SERVER_BIN: str | None = None
-# 導入した llama.cpp の素性（build/accel/binary）。/admin/status 表示用。
-_LLAMA_INFO: dict | None = None
+# ── プロビジョン済みランタイムの登録簿（プロセス内で唯一の可変状態） ──
+# 起動時にプロビジョナが解決した実行体（llama-server バイナリ / vLLM・SGLang の python）と
+# その素性を、kind（= BackendSpec.provisioner の値: "llama" / "vllm" / "sglang"）で持つ。
+# 書き込みは set_provisioned() の 1 箇所だけ。未登録時は各 getter がフォールバックを返す
+# （PATH の "llama-server" / sys.executable）——単体テスト等の素通しを保つため。
+_PROVISIONED: dict[str, dict] = {}
+
+
+def set_provisioned(kind: str, info: dict | None) -> None:
+    """起動時にプロビジョナが解決したランタイムを登録する（None で解除）。
+
+    info は kind ごとの素性 dict（llama: {"binary", "build", "accel"} /
+    vllm・sglang: {"python"}）。/admin/status がそのまま表示に使う。
+    """
+    if info is None:
+        _PROVISIONED.pop(kind, None)
+    else:
+        _PROVISIONED[kind] = dict(info)
+
+
+def provisioned(kind: str) -> dict | None:
+    """kind のプロビジョン結果（未導入は None）。/admin/status・TUI が表示に使う。"""
+    return _PROVISIONED.get(kind)
 
 
 def set_llama_server_binary(
     path: str | None, *, build: str | None = None, accel: str | None = None,
 ) -> None:
     """起動時にプロビジョナが解決した llama-server の絶対パス（と素性）を登録する。"""
-    global _LLAMA_SERVER_BIN, _LLAMA_INFO
-    _LLAMA_SERVER_BIN = path
-    _LLAMA_INFO = None if path is None else {
-        "binary": path, "build": build, "accel": accel,
-    }
+    set_provisioned(
+        "llama",
+        None if path is None else {"binary": path, "build": build, "accel": accel},
+    )
 
 
 def llama_server_binary() -> str:
     """build_command が使う llama-server コマンド（未プロビジョン時は PATH 探索の名前）。"""
-    return _LLAMA_SERVER_BIN or "llama-server"
+    return ((provisioned("llama") or {}).get("binary")) or "llama-server"
 
 
 def llama_provision_info() -> dict | None:
     """導入済み llama.cpp の素性（未導入は None）。/admin/status・TUI が表示に使う。"""
-    return _LLAMA_INFO
-
-
-# vLLM を起動する python のパス。起動時に vllm_provisioner が解決して差し込む
-# （現在の環境に有ればそれ、無ければ隔離 venv）。未設定なら sys.executable。
-_VLLM_PYTHON: str | None = None
-_VLLM_INFO: dict | None = None
+    return provisioned("llama")
 
 
 def set_vllm_python(path: str | None) -> None:
     """起動時にプロビジョナが解決した vLLM 用 python のパスを登録する。"""
-    global _VLLM_PYTHON, _VLLM_INFO
-    _VLLM_PYTHON = path
-    _VLLM_INFO = None if path is None else {"python": path}
+    set_provisioned("vllm", None if path is None else {"python": path})
 
 
 def vllm_python() -> str:
     """build_command が使う vLLM 用 python（未プロビジョン時は現在の python）。"""
-    return _VLLM_PYTHON or sys.executable
+    return ((provisioned("vllm") or {}).get("python")) or sys.executable
 
 
 def vllm_provision_info() -> dict | None:
     """導入済み vLLM の素性（未導入は None）。/admin/status・TUI が表示に使う。"""
-    return _VLLM_INFO
-
-
-# SGLang を起動する python（隔離 venv）のパス。起動時に sglang_provisioner が解決して差し込む。
-_SGLANG_PYTHON: str | None = None
-_SGLANG_INFO: dict | None = None
+    return provisioned("vllm")
 
 
 def set_sglang_python(path: str | None) -> None:
     """起動時にプロビジョナが解決した SGLang 用 python のパスを登録する。"""
-    global _SGLANG_PYTHON, _SGLANG_INFO
-    _SGLANG_PYTHON = path
-    _SGLANG_INFO = None if path is None else {"python": path}
+    set_provisioned("sglang", None if path is None else {"python": path})
 
 
 def sglang_python() -> str:
     """build_command が使う SGLang 用 python（未プロビジョン時は現在の python）。"""
-    return _SGLANG_PYTHON or sys.executable
+    return ((provisioned("sglang") or {}).get("python")) or sys.executable
 
 
 def sglang_provision_info() -> dict | None:
     """導入済み SGLang の素性（未導入は None）。/admin/status・TUI が表示に使う。"""
-    return _SGLANG_INFO
+    return provisioned("sglang")
 
 
 def _physical_cores() -> int:

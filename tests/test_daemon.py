@@ -1627,7 +1627,7 @@ def test_provision_llama_sets_binary_when_used(tmp_path, monkeypatch):
         tmp_path,
         'dynamic = false\n[[models]]\nmodel = "org/m.gguf"\nbackend = "llama-cpp"\n'))
     monkeypatch.setattr(gw.provisioner, "ensure_llama_server",
-                        lambda **k: "/managed/llama-server")
+                        lambda **k: ("/managed/llama-server", {}))
     set_calls = []
     monkeypatch.setattr(gw, "set_llama_server_binary",
                         lambda p, **k: set_calls.append(p))
@@ -1641,7 +1641,7 @@ def test_provision_llama_skipped_when_not_used(tmp_path, monkeypatch):
     monkeypatch.setattr(gw, "DEFAULT_BACKEND", "mlx-vlm")
     called = []
     monkeypatch.setattr(gw.provisioner, "ensure_llama_server",
-                        lambda **k: called.append(1) or "x")
+                        lambda **k: called.append(1) or ("x", {}))
     gw.provision_llama_if_needed(cfg)
     assert called == []
 

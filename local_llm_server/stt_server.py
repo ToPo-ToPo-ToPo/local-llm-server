@@ -35,23 +35,19 @@ from . import multipart
 # mlx_whisper.transcribe は毎回 load_model() でディスクからモデルを読み直す（キャッシュ無し）。
 # 単一モデルを常駐させる本サーバでは無駄なので、モジュール属性を lru_cache で包んで
 # 「初回だけロード、以降は再利用」にする（本サーバは 1 モデル固定なので maxsize=1 で十分）。
-_mod = None  # mlx_whisper.transcribe サブモジュール（遅延 import。import 自体が重い＝mlx/torch）
-
-
+@functools.lru_cache(maxsize=1)
 def _backend_module():
     """mlx_whisper.transcribe サブモジュールを返す（load_model を lru_cache 済みにして）。
 
+    import 自体が重い（mlx/torch）ので遅延させ、lru_cache で 1 回だけにする。
     注意: `mlx_whisper.__init__` が `transcribe` 属性を関数で上書きするため、
     `import mlx_whisper.transcribe as t` では関数が束縛されてしまう。サブモジュール
     実体は importlib で取得する。
     """
-    global _mod
-    if _mod is None:
-        import importlib
-        t = importlib.import_module("mlx_whisper.transcribe")
-        t.load_model = functools.lru_cache(maxsize=1)(t.load_model)
-        _mod = t
-    return _mod
+    import importlib
+    t = importlib.import_module("mlx_whisper.transcribe")
+    t.load_model = functools.lru_cache(maxsize=1)(t.load_model)
+    return t
 
 
 def _srt_timestamp(seconds: float) -> str:

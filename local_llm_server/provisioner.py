@@ -186,15 +186,6 @@ def installed_builds(os_name: str, arch: str, accel: str) -> list[str]:
     return sorted(builds, key=lambda b: int(b[1:]), reverse=True)
 
 
-# 直近に ensure_llama_server が解決した素性（build/accel）。/admin/status の
-# 表示用に、呼び出し側（daemon）が last_info() で取得する。
-_LAST_INFO: dict | None = None
-
-
-def last_info() -> dict | None:
-    return _LAST_INFO
-
-
 def _find_llama_server(root: str) -> str | None:
     """展開ディレクトリ配下から llama-server 実行ファイルを探す（無ければ None）。"""
     for dirpath, _dirs, files in os.walk(root):
@@ -250,8 +241,8 @@ def ensure_llama_server(
     build: str | None = None,
     download=_download,
     verify=_verify,
-) -> str:
-    """起動に使う llama-server の絶対パスを返す（必要なら自動導入する）。
+) -> tuple[str, dict]:
+    """起動に使う llama-server の絶対パスと素性 {"build", "accel"} を返す（必要なら自動導入する）。
 
     ルートは 1 つだけ（Ollama 流に導入方法をユーザーに選ばせない）:
     管理ディレクトリに導入済みならそれを再利用し、無ければ GitHub Releases から
@@ -260,7 +251,6 @@ def ensure_llama_server(
 
     download/verify は差し替え可能（テスト用）。
     """
-    global _LAST_INFO
     os_name = detect_os()
     arch = detect_arch()
     accel = detect_accelerator(os_name) if accel == "auto" else accel
@@ -271,8 +261,7 @@ def ensure_llama_server(
         for installed in installed_builds(os_name, arch, accel):
             binary = _find_llama_server(install_dir(installed, os_name, arch, accel))
             if binary and verify(binary):
-                _LAST_INFO = {"build": installed, "accel": accel}
-                return binary
+                return binary, {"build": installed, "accel": accel}
         try:
             build = latest_build()
         except (OSError, ValueError, KeyError) as exc:  # URLError も OSError の subclass
@@ -284,8 +273,7 @@ def ensure_llama_server(
     target = install_dir(build, os_name, arch, accel)
     existing = _find_llama_server(target)
     if existing and verify(existing):
-        _LAST_INFO = {"build": build, "accel": accel}
-        return existing
+        return existing, {"build": build, "accel": accel}
 
     name = asset_name(build, os_name, arch, accel)
     url = asset_url(build, name)
@@ -313,5 +301,4 @@ def ensure_llama_server(
             f"llama-server を導入したが --version に失敗（{binary}）。"
             f"accel={accel} が環境に合っていない可能性（accel を cpu 等に変えて再試行）"
         )
-    _LAST_INFO = {"build": build, "accel": accel}
-    return binary
+    return binary, {"build": build, "accel": accel}

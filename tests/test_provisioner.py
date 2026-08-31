@@ -134,10 +134,11 @@ def test_ensure_downloads_extracts_and_returns_path(tmp_path, monkeypatch):
         downloaded["url"] = url
         _fake_tarball(dest)
 
-    path = pv.ensure_llama_server(
+    path, info = pv.ensure_llama_server(
         accel="cpu", build="b9946",
         download=fake_download, verify=lambda p, **k: True,
     )
+    assert info == {"build": "b9946", "accel": "cpu"}
     assert path.endswith(os.path.join("bin", pv._EXE))
     assert os.path.exists(path)
     assert "llama-b9946-bin-ubuntu-x64.tar.gz" in downloaded["url"]
@@ -156,8 +157,8 @@ def test_ensure_reuses_existing_install(tmp_path, monkeypatch):
 
     kw = dict(accel="cpu", build="b9946",
               download=fake_download, verify=lambda p, **k: True)
-    p1 = pv.ensure_llama_server(**kw)
-    p2 = pv.ensure_llama_server(**kw)  # 2 回目はダウンロードしない
+    p1, _ = pv.ensure_llama_server(**kw)
+    p2, _ = pv.ensure_llama_server(**kw)  # 2 回目はダウンロードしない
     assert p1 == p2
     assert calls["n"] == 1
 
@@ -214,16 +215,16 @@ def test_ensure_reuses_installed_build_without_network(tmp_path, monkeypatch):
     kw = dict(accel="cpu",
               download=lambda url, dest, timeout=300.0: _fake_tarball(dest),
               verify=lambda p, **k: True)
-    p1 = pv.ensure_llama_server(build=None, **kw)
+    p1, _ = pv.ensure_llama_server(build=None, **kw)
 
     # 2 回目: ネットワーク断＋上流には新ビルドがある想定 → それでも導入済みを使う。
     def offline(timeout=5.0):
         raise OSError("network unreachable")
 
     monkeypatch.setattr(pv, "latest_build", offline)
-    p2 = pv.ensure_llama_server(build=None, **kw)
+    p2, info = pv.ensure_llama_server(build=None, **kw)
     assert p2 == p1
-    assert pv.last_info()["build"] == "b9946"
+    assert info["build"] == "b9946"
 
 
 def test_ensure_offline_without_install_raises_provision_error(tmp_path, monkeypatch):

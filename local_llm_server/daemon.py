@@ -2505,7 +2505,7 @@ def provision_llama_if_needed(cfg: GatewayConfig) -> None:
     if not _llama_cpp_in_use(cfg):
         return
     try:
-        binary = provisioner.ensure_llama_server(
+        binary, info = provisioner.ensure_llama_server(
             accel=cfg.llama_accel,
             build=cfg.llama_build,
         )
@@ -2513,8 +2513,7 @@ def provision_llama_if_needed(cfg: GatewayConfig) -> None:
         print(f"llama.cpp provisioning failed (continuing without it): {exc}",
               file=sys.stderr)
         return
-    # 実際に解決された素性（実ビルド番号・accel）はプロビジョナが記録している。
-    info = provisioner.last_info() or {}
+    # 実際に解決された素性（実ビルド番号・accel）ごと登録する。
     set_llama_server_binary(binary, build=info.get("build"), accel=info.get("accel"))
     print(f"llama.cpp ready: {binary} "
           f"(build={info.get('build') or '-'}, accel={info.get('accel') or '-'})",
