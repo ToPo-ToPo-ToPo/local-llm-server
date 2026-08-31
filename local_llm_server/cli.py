@@ -22,7 +22,7 @@
   - `gw log [-f]`       … ゲートウェイログの末尾を表示（-f で追従）
   - `gw max <n|off>`    … max_resident を無停止で変更
   - `gw mtp [model]`    … MTP ドラフターの取得状況を確認（ダウンロードはしない）
-  - `gw update`         … PyPI 新版があれば git pull で追従してデーモンを再起動
+  - `gw update`         … 新しいリリースタグがあれば追従してデーモンを再起動
   - 引数なし `gw`       … start してから status/ps を表示（従来の `uv run gw` 相当）
 
 設定は **カレントディレクトリの `./gateway.toml` のみ**を見る（場所は CWD 固定の 1 ルール）。
@@ -925,7 +925,7 @@ def cmd_show(gcfg, args) -> int:
 
 
 def cmd_update(gcfg, args) -> int:
-    """PyPI 新版があれば git pull で追従し、稼働中デーモンを再起動する（手動トリガ）。
+    """新しいリリースタグがあれば追従し、稼働中デーモンを再起動する（手動トリガ）。
 
     自動更新は稼働中デーモンが裏で行う（idle 時に自動適用）。このコマンドは「今すぐ確認・適用」
     したいとき用。ソース更新後、稼働中デーモンを止めて start し直す（新コードで立ち上がる）。
@@ -1042,7 +1042,7 @@ def build_parser() -> argparse.ArgumentParser:
     rm.add_argument("-y", "--yes", action="store_true", help="確認プロンプトを省略する")
     show = sub.add_parser("show", help="モデルの素性（量子化・コンテキスト長・サイズ等）を表示する")
     show.add_argument("model", help="HF repo-id（org/repo[:量子化名]）")
-    sub.add_parser("update", help="PyPI 新版があれば git pull で追従して再起動する")
+    sub.add_parser("update", help="新しいリリースタグがあれば追従して再起動する")
     mig = sub.add_parser("migrate", help="設定ファイルを現行スキーマへ移行する（通常は更新時に自動）")
     mig.add_argument("--dry-run", action="store_true", help="書き換えず、変更内容だけ表示する")
     sub.add_parser("help", help="このコマンド一覧を表示する")

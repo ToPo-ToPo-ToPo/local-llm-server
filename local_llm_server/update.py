@@ -1,10 +1,16 @@
-"""PyPI 公開版の検知と、ソースの自動更新（git クローン運用向け）。
+"""リリースタグ（git tag）の検知と、ソースの自動更新（git クローン運用向け）。
 
-このリポジトリは PyPI に公開しつつ、実運用は **GitHub から clone して `uv run gw`** で
-動かす。そのためバージョンアップが手作業になりがち。ここでは「PyPI に新版が出たら検知し、
-作業ツリーがクリーンなら `git pull --ff-only` で追従する」ための小さな道具を提供する。
-常駐デーモン（daemon._run_gateway_locked の更新ウォッチャー）が idle 時にこれを使い、適用後は
-run_gateway が reexec_daemon で自分自身を新コードに置き換える（手動なら `gw update`）。
+このリポジトリは **GitHub から clone して `uv run gw`** で動かす。そのため
+バージョンアップが手作業になりがち。ここでは「リモートに新しいバージョンタグ
+（vX.Y.Z）が出たら検知し、作業ツリーがクリーンなら fast-forward で追従する」ための
+小さな道具を提供する。常駐デーモン（daemon._run_gateway_locked の更新ウォッチャー）が
+idle 時にこれを使い、適用後は run_gateway が reexec_daemon で自分自身を新コードに
+置き換える（手動なら `gw update`）。
+
+リリース手順は「バージョン上げを main へマージ → `git tag vX.Y.Z && git push origin vX.Y.Z`」
+だけ。タグを打つまでは配られない（マージしただけでは各 PC に届かない）。
+かつては PyPI 公開版をトリガーに使っていたが、コードの配布は常に git で PyPI は
+バージョン掲示板でしかなく、リリース手順が二重になるためタグ照会へ一本化した。
 
 方針（安全側）:
   - **git クローン & upstream 追跡ブランチ & 作業ツリーがクリーンな時だけ**適用する
@@ -12,22 +18,25 @@ run_gateway が reexec_daemon で自分自身を新コードに置き換える�
     ただし再生成される成果物（uv.lock）の差分は「クリーン」とみなす——`uv sync` が
     書き換えるだけのファイルで永久に自動更新が止まらないように（→ _REGENERATED）。
   - ネットワーク I/O は短いタイムアウトで、失敗しても常に None/False を返す（オフラインでも
-    TUI の起動を妨げない）。
-  - PyPI 公開版を「トリガー」に使う（公開時に main へ push 済みなので pull で同じコードが得られる）。
+    起動を妨げない）。
+  - 適用はブランチ先端でなく**タグへの fast-forward**。タグ後に main へ積まれた
+    未リリースのコミットは配られない。
 """
 from __future__ import annotations
 
-import json
+import re
 import subprocess
 import sys
 import tomllib
-import urllib.error
-import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
 _PKG = "local-llm-server"
-_PYPI_JSON = f"https://pypi.org/pypi/{_PKG}/json"
+# clone が無い（editable でない導入等）ときにタグを照会する公式リポジトリ。
+# clone があるときはその origin を使う（fork 運用を尊重する）。
+_CANONICAL_REPO = "https://github.com/ToPo-ToPo-ToPo/local-llm-server.git"
+# リリースタグの形式: v0.38.7 / 0.38.7（先頭 v は任意）。それ以外のタグは無視する。
+_VERSION_TAG = re.compile(r"refs/tags/v?(\d+(?:\.\d+)*)$")
 
 
 def installed_version() -> str | None:
@@ -42,16 +51,40 @@ def installed_version() -> str | None:
         return None
 
 
-def latest_pypi_version(timeout: float = 3.0) -> str | None:
-    """PyPI の最新公開版（取得失敗・オフラインは None）。"""
+def _parse_version_tags(ls_remote_output: str) -> list[str]:
+    """`git ls-remote --tags` の出力からバージョン文字列を抜き出す（v プレフィックスは剥がす）。
+
+    annotated tag の peeled 行（`^{}` 付き）は同じタグの重複なので落とす。
+    """
+    versions = []
+    for line in ls_remote_output.splitlines():
+        ref = line.split("\t")[-1].strip()
+        m = _VERSION_TAG.match(ref)
+        if m:
+            versions.append(m.group(1))
+    return versions
+
+
+def latest_release_version(timeout: float = 10.0) -> str | None:
+    """リモートの最新リリースタグの版（取得失敗・オフラインは None）。
+
+    clone があればその origin、無ければ公式リポジトリへ `git ls-remote --tags` で照会する
+    （認証不要・API レート制限なし。GitHub の Releases 機能ではなく git タグそのものを見る）。
+    """
+    root = repo_root()
+    remote = "origin" if root is not None else _CANONICAL_REPO
     try:
-        with urllib.request.urlopen(_PYPI_JSON, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-    except (urllib.error.URLError, OSError, ValueError):
+        r = subprocess.run(
+            ["git", "ls-remote", "--tags", remote],
+            cwd=str(root) if root is not None else None,
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except (OSError, subprocess.SubprocessError):
         return None
-    info = data.get("info") if isinstance(data, dict) else None
-    ver = info.get("version") if isinstance(info, dict) else None
-    return ver if isinstance(ver, str) and ver else None
+    if r.returncode != 0:
+        return None
+    versions = _parse_version_tags(r.stdout)
+    return max(versions, key=_version_key, default=None)
 
 
 def _version_key(v: str):
@@ -83,7 +116,7 @@ def repo_root() -> Path | None:
     """git クローン運用なら、この起動が読んでいるソースの repo ルートを返す。
 
     パッケージソース（local_llm_server/__init__.py）の 2 つ上に `.git` と `pyproject.toml`
-    があれば「編集可能な git クローン」とみなす。PyPI から `uv tool install` した場合等は
+    があれば「編集可能な git クローン」とみなす。git clone を伴わない導入（アーカイブ展開等）は
     `.git` が無いので None（＝自動更新の対象外）。
     """
     try:
@@ -358,8 +391,8 @@ class UpdateStatus:
     """更新チェックの結果（TUI のバナー表示と適用判断に使う）。"""
 
     current: str | None       # 稼働中（＝チェックアウト中のソース）バージョン
-    latest: str | None        # PyPI 最新
-    available: bool           # PyPI が現行より新しい
+    latest: str | None        # リモートの最新リリースタグの版
+    available: bool           # 最新リリースが現行より新しい
     can_apply: bool           # 既定ブランチ & git クローン & クリーン & upstream 追跡（＝自動適用してよい）
     # "ok" / "not-a-git-clone" / "not-on-default-branch" / "no-upstream" / "dirty" / "offline"
     reason: str
@@ -368,8 +401,8 @@ class UpdateStatus:
     restart_required: bool = False
 
 
-def check(timeout: float = 3.0) -> UpdateStatus:
-    """現行と PyPI 最新を比べ、自動適用できるかまで含めて判定する（副作用なし）。
+def check(timeout: float = 10.0) -> UpdateStatus:
+    """現行と最新リリースタグを比べ、自動適用できるかまで含めて判定する（副作用なし）。
 
     現行版はクローンの pyproject.toml（ソース）から取る。editable インストールで固定される
     メタデータ版ではなく、pull で上がる版を見る（→ 再起動ループを防ぐ）。自動適用は**既定
@@ -378,13 +411,13 @@ def check(timeout: float = 3.0) -> UpdateStatus:
     `restart_required` は「取ってくるものは無いが、走っているプロセスが古い」ケース。
     mark_running_source() を呼んだプロセス（＝デーモン）でだけ真になりうる。
     """
-    latest = latest_pypi_version(timeout)
+    latest = latest_release_version(timeout)
     root = repo_root()
     # 現行版はソース（pyproject）優先。取れないときだけインストールメタデータへフォールバック。
     cur = (_source_version(root) if root else None) or installed_version()
     available = is_newer(latest, cur)
     # 走っているコードがディスク上のソースより古いなら、pull ではなく**再起動**が要る。
-    # （PyPI との比較とは独立。オフラインでも判定できる。）
+    # （リリースタグとの比較とは独立。オフラインでも判定できる。）
     running = running_source_version()
     stale = bool(running and cur and running != cur)
     if latest is None:
@@ -401,9 +434,11 @@ def check(timeout: float = 3.0) -> UpdateStatus:
 
 
 def apply_update(root: Path | None = None, timeout: float = 120.0) -> tuple[bool, str]:
-    """`git pull --ff-only`（＋可能なら `uv sync`）でソースを最新へ更新する。
+    """最新リリースタグへ fast-forward（＋可能なら `uv sync`）でソースを更新する。
 
-    成功したら (True, メッセージ)。呼び出し側は**プロセスを再起動**して新コードを読み込むこと
+    追従先は**ブランチ先端ではなくタグ**。タグ後に main へ積まれた未リリースの
+    コミットは配られない（「タグを打つまで配らない」の担保）。成功したら
+    (True, メッセージ)。呼び出し側は**プロセスを再起動**して新コードを読み込むこと
     （実行中の Python は古いコードを保持したままなので、reexec_daemon で入れ替える）。
     直前に作業ツリーを再確認し、汚れていれば適用しない（チェック〜適用間の変更に対する保険）。
     """
@@ -412,17 +447,37 @@ def apply_update(root: Path | None = None, timeout: float = 120.0) -> tuple[bool
         return False, "git クローン運用ではありません（自動更新の対象外）"
     if not _working_tree_clean(root):
         return False, "作業ツリーに未コミットの変更があります"
-    # 再解決で書き換わっただけの成果物（uv.lock）は捨ててから ff pull する。残したままだと
-    # 「そのファイルを触る commit を取り込めない」と git が pull 自体を拒む。捨ててよいのは
+    # 再解決で書き換わっただけの成果物（uv.lock）は捨ててから ff する。残したままだと
+    # 「そのファイルを触る commit を取り込めない」と git が適用自体を拒む。捨ててよいのは
     # _working_tree_clean を通った＝他に変更が無い（pyproject も無傷）ときだけなので、
     # ここに来た時点の差分は pyproject から再生成できるものに限られる。
     _git(root, "checkout", "--", *_REGENERATED)
     try:
-        pull = _git(root, "pull", "--ff-only", timeout=timeout)
+        fetch = _git(root, "fetch", "--tags", "--force", "origin", timeout=timeout)
     except (OSError, subprocess.SubprocessError) as exc:
-        return False, f"git pull を実行できませんでした: {exc}"
+        return False, f"git fetch を実行できませんでした: {exc}"
+    if fetch.returncode != 0:
+        return False, f"git fetch 失敗: {(fetch.stderr or fetch.stdout).strip()[:200]}"
+    # fetch 済みのローカルタグから最新リリースを決める（リモート照会と二度手間にしない）。
+    tags = _git(root, "for-each-ref", "--format=%(refname)", "refs/tags")
+    best: tuple | None = None  # (_version_key, version, refname)
+    if tags.returncode == 0:
+        for line in tags.stdout.splitlines():
+            m = _VERSION_TAG.match(line.strip())
+            if m is None:
+                continue
+            cand = (_version_key(m.group(1)), m.group(1), line.strip())
+            if best is None or cand[0] > best[0]:
+                best = cand
+    if best is None:
+        return False, "リリースタグ（vX.Y.Z）が見つかりません"
+    _key, target_version, target_ref = best
+    cur = _source_version(root) or installed_version()
+    if not is_newer(target_version, cur):
+        return True, f"更新なし（最新リリース {target_version} は適用済み）"
+    pull = _git(root, "merge", "--ff-only", target_ref, timeout=timeout)
     if pull.returncode != 0:
-        return False, f"git pull 失敗: {(pull.stderr or pull.stdout).strip()[:200]}"
+        return False, f"fast-forward 失敗: {(pull.stderr or pull.stdout).strip()[:200]}"
     # 依存が変わっている可能性があるので uv sync を試みる（プロジェクト venv 用。
     # tool venv の依存入れ直しは refresh_tool_env が再起動直前に行う）。uv は launchd
     # 配下だと PATH に居ないことがあるので _find_uv で標準の導入先まで探す。
