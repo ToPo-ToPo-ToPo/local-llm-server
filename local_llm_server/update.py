@@ -7,10 +7,7 @@
 idle 時にこれを使い、適用後は run_gateway が reexec_daemon で自分自身を新コードに
 置き換える（手動なら `gw update`）。
 
-リリース手順は「バージョン上げを main へマージ → `git tag vX.Y.Z && git push origin vX.Y.Z`」
-だけ。タグを打つまでは配られない（マージしただけでは各 PC に届かない）。
-かつては PyPI 公開版をトリガーに使っていたが、コードの配布は常に git で PyPI は
-バージョン掲示板でしかなく、リリース手順が二重になるためタグ照会へ一本化した。
+リリースは「バージョン上げを main へマージ → `git tag vX.Y.Z && git push origin vX.Y.Z`」。
 
 方針（安全側）:
   - **git クローン & upstream 追跡ブランチ & 作業ツリーがクリーンな時だけ**適用する
