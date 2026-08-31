@@ -511,6 +511,12 @@ MTP_DRAFTERS = {
 # off にしている DeepSeek-V4-Flash の MTP ヘッド）。
 _EXTRA_DRAFTER_REPOS = frozenset({
     "ToPo-ToPo/DeepSeek-V4-Flash-MTP-bf16",
+    # Qwen3.8-Flash-Next（qwen4_exp）の MTP ヘッド。公式 bf16 から切り出した自作ドラフターで、
+    # 採択率 94.1%・block-size 2 で 1.39 倍を実測済み。ただし qwen4_exp_mtp は mlx-vlm の
+    # main にしか無く（0.7.0 未リリース・PyPI の最新は 0.6.17）、いま対応表に載せると
+    # draft_model="auto" が実行できないドラフターを引いてしまう。0.7.0 が出たら
+    # MTP_DRAFTERS へ移す。
+    "ToPo-ToPo/Qwen3.8-Flash-Next-MTP-bf16",
 })
 
 # MTP ドラフター（speculative decoding 用の補助モデル）の repo-id 集合。これ自体は
