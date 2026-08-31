@@ -1818,6 +1818,122 @@ def _resolve_model_draft(
     return None
 
 
+def _parse_repetition_settings(data: dict):
+    """繰り返しループ抑制の既定注入（mlx 系のみ）の設定を読む。
+
+    既定 1.1。0 / false / "off" / "none" で無効化（＝注入しない＝「設定しない」選択）。
+    < 1.0 は繰り返しを助長するので拒否する（1.0 は中立＝無効相当だが受け付ける）。
+    戻り値: (repetition_penalty, repetition_context_size, skip_structured)。
+    """
+    rp_raw = data.get("repetition_penalty", 1.1)
+    if (rp_raw is None or rp_raw is False
+            or (isinstance(rp_raw, str) and rp_raw.strip().lower() in ("off", "none", "false", ""))):
+        repetition_penalty = None
+    else:
+        repetition_penalty = float(rp_raw)
+        if repetition_penalty == 0.0:
+            repetition_penalty = None  # 0 も無効化として扱う
+        elif repetition_penalty < 1.0:
+            raise ValueError(
+                "repetition_penalty must be >= 1.0 (1.0 = neutral; < 1.0 encourages "
+                "repetition). Use 0 / false / \"off\" to disable injection."
+            )
+    # 併せて注入する参照窓（省略時は付けない＝上流の既定 20 に任せる）。
+    rcs_raw = data.get("repetition_context_size")
+    repetition_context_size = None if rcs_raw is None else int(rcs_raw)
+    if repetition_context_size is not None and repetition_context_size < 1:
+        raise ValueError("repetition_context_size must be 1 or greater")
+    # 構造化リクエスト（tools / response_format）を注入対象から外すか（既定 false）。
+    skip_structured = bool(data.get("repetition_penalty_skip_structured", False))
+    return repetition_penalty, repetition_context_size, skip_structured
+
+
+def _parse_llama_cpp_table(data: dict):
+    """[llama_cpp] テーブル: llama-server バイナリの自動導入設定（すべて省略可＝全自動）。
+
+    導入方法の選択肢（旧 provision）は無い——一本道なので accel / pin だけ。
+    戻り値: (llama_accel, llama_build)。
+    """
+    llama = data.get("llama_cpp") or {}
+    if not isinstance(llama, dict):
+        raise ValueError("[llama_cpp] must be a table")
+    llama_accel = str(llama.get("accel", "auto"))
+    if llama_accel not in ("auto", "cuda", "vulkan", "metal", "cpu"):
+        raise ValueError("llama_cpp.accel must be auto / cuda / vulkan / metal / cpu")
+    llama_build = llama.get("pin")
+    if llama_build is not None:
+        llama_build = str(llama_build).strip() or None
+    return llama_accel, llama_build
+
+
+def _parse_media_settings(data: dict):
+    """画像・動画入力の展開設定。戻り値: (video_frames, video_max_edge, image_max_edge)。"""
+    # 動画入力のフレーム展開設定。省略で 8 フレーム / 長辺 768px。
+    video_frames = int(data.get("video_frames", 8))
+    if video_frames < 1:
+        raise ValueError("video_frames must be 1 or greater")
+    video_max_edge = int(data.get("video_max_edge", 768))
+    if video_max_edge < 64:
+        raise ValueError("video_max_edge must be 64 or greater")
+    # 静止画の長辺上限（0 で無効）。極端に小さい値は事故なので 64px を下限にする。
+    image_max_edge = int(data.get("image_max_edge", 1024))
+    if image_max_edge != 0 and image_max_edge < 64:
+        raise ValueError("image_max_edge must be 0 (disabled) or 64 or greater")
+    return video_frames, video_max_edge, image_max_edge
+
+
+def _parse_model_entries(
+    data: dict, *, dynamic: bool, internal_base: int, public_port: int, default_draft,
+):
+    """[[models]] 配列を検証して ServerConfig 群に組み立てる。
+
+    戻り値: (configs, seen)。seen は登録済み model id の集合（default_model の検証に使う）。
+    """
+    entries = data.get("models") or []
+    if not isinstance(entries, list):
+        raise ValueError("[[models]] must be an array")
+    if not entries and not dynamic:
+        raise ValueError(
+            "gateway config needs a non-empty [[models]] array (or set dynamic = true)"
+        )
+
+    configs: list[ServerConfig] = []
+    seen: set[str] = set()
+    for i, entry in enumerate(entries):
+        if not isinstance(entry, dict) or not entry.get("model"):
+            raise ValueError("each [[models]] entry needs a 'model'")
+        model = str(entry["model"])
+        if model in seen:
+            raise ValueError(f"duplicate model in gateway config: {model}")
+        seen.add(model)
+        backend = str(entry.get("backend", DEFAULT_BACKEND))
+        if backend not in BACKENDS:
+            raise ValueError(f"backend must be one of {BACKENDS} (model {model})")
+        internal_port = internal_base + i
+        if internal_port == public_port:
+            raise ValueError(
+                f"internal port {internal_port} collides with the public port {public_port}; "
+                "raise internal_base_port"
+            )
+        parallel = entry.get("parallel")
+        if parallel is not None and int(parallel) < 1:
+            raise ValueError(f"parallel must be 1 or greater (model {model})")
+        draft = _resolve_model_draft(entry, default_draft, backend, model)
+        configs.append(
+            ServerConfig(
+                backend=backend,
+                model=model,
+                host="127.0.0.1",
+                port=internal_port,
+                parallel=parallel,
+                disable_thinking=bool(entry.get("disable_thinking", False)),
+                draft_model=draft,
+                extra_args=list(entry.get("extra_args", [])),
+            )
+        )
+    return configs, seen
+
+
 def load_gateway_config(path: str) -> GatewayConfig:
     """ゲートウェイ設定 TOML を読み込んで検証する。
 
@@ -1924,96 +2040,17 @@ def load_gateway_config(path: str) -> GatewayConfig:
         if not (0.0 < max_memory_fraction <= 1.0):
             raise ValueError("max_memory_fraction must be in (0, 1]")
 
-    # 繰り返しループ抑制の既定注入（mlx 系のみ）。既定 1.1。0 / false / "off" / "none" で
-    # 無効化（＝注入しない＝「設定しない」選択）。< 1.0 は繰り返しを助長するので拒否する
-    # （1.0 は中立＝無効相当だが受け付ける）。
-    rp_raw = data.get("repetition_penalty", 1.1)
-    if (rp_raw is None or rp_raw is False
-            or (isinstance(rp_raw, str) and rp_raw.strip().lower() in ("off", "none", "false", ""))):
-        repetition_penalty = None
-    else:
-        repetition_penalty = float(rp_raw)
-        if repetition_penalty == 0.0:
-            repetition_penalty = None  # 0 も無効化として扱う
-        elif repetition_penalty < 1.0:
-            raise ValueError(
-                "repetition_penalty must be >= 1.0 (1.0 = neutral; < 1.0 encourages "
-                "repetition). Use 0 / false / \"off\" to disable injection."
-            )
-    # 併せて注入する参照窓（省略時は付けない＝上流の既定 20 に任せる）。
-    rcs_raw = data.get("repetition_context_size")
-    repetition_context_size = None if rcs_raw is None else int(rcs_raw)
-    if repetition_context_size is not None and repetition_context_size < 1:
-        raise ValueError("repetition_context_size must be 1 or greater")
-    # 構造化リクエスト（tools / response_format）を注入対象から外すか（既定 false）。
-    repetition_penalty_skip_structured = bool(data.get("repetition_penalty_skip_structured", False))
+    repetition_penalty, repetition_context_size, repetition_penalty_skip_structured = \
+        _parse_repetition_settings(data)
 
-    # [llama_cpp] テーブル: llama-server バイナリの自動導入設定（すべて省略可＝全自動）。
-    # 導入方法の選択肢（旧 provision）は無い——一本道なので accel / pin だけ。
-    llama = data.get("llama_cpp") or {}
-    if not isinstance(llama, dict):
-        raise ValueError("[llama_cpp] must be a table")
-    llama_accel = str(llama.get("accel", "auto"))
-    if llama_accel not in ("auto", "cuda", "vulkan", "metal", "cpu"):
-        raise ValueError("llama_cpp.accel must be auto / cuda / vulkan / metal / cpu")
-    llama_build = llama.get("pin")
-    if llama_build is not None:
-        llama_build = str(llama_build).strip() or None
+    llama_accel, llama_build = _parse_llama_cpp_table(data)
 
-    # 動画入力のフレーム展開設定。省略で 8 フレーム / 長辺 768px。
-    video_frames = int(data.get("video_frames", 8))
-    if video_frames < 1:
-        raise ValueError("video_frames must be 1 or greater")
-    video_max_edge = int(data.get("video_max_edge", 768))
-    if video_max_edge < 64:
-        raise ValueError("video_max_edge must be 64 or greater")
-    # 静止画の長辺上限（0 で無効）。極端に小さい値は事故なので 64px を下限にする。
-    image_max_edge = int(data.get("image_max_edge", 1024))
-    if image_max_edge != 0 and image_max_edge < 64:
-        raise ValueError("image_max_edge must be 0 (disabled) or 64 or greater")
+    video_frames, video_max_edge, image_max_edge = _parse_media_settings(data)
 
-    entries = data.get("models") or []
-    if not isinstance(entries, list):
-        raise ValueError("[[models]] must be an array")
-    if not entries and not dynamic:
-        raise ValueError(
-            "gateway config needs a non-empty [[models]] array (or set dynamic = true)"
-        )
-
-    configs: list[ServerConfig] = []
-    seen: set[str] = set()
-    for i, entry in enumerate(entries):
-        if not isinstance(entry, dict) or not entry.get("model"):
-            raise ValueError("each [[models]] entry needs a 'model'")
-        model = str(entry["model"])
-        if model in seen:
-            raise ValueError(f"duplicate model in gateway config: {model}")
-        seen.add(model)
-        backend = str(entry.get("backend", DEFAULT_BACKEND))
-        if backend not in BACKENDS:
-            raise ValueError(f"backend must be one of {BACKENDS} (model {model})")
-        internal_port = internal_base + i
-        if internal_port == port:
-            raise ValueError(
-                f"internal port {internal_port} collides with the public port {port}; "
-                "raise internal_base_port"
-            )
-        parallel = entry.get("parallel")
-        if parallel is not None and int(parallel) < 1:
-            raise ValueError(f"parallel must be 1 or greater (model {model})")
-        draft = _resolve_model_draft(entry, default_draft, backend, model)
-        configs.append(
-            ServerConfig(
-                backend=backend,
-                model=model,
-                host="127.0.0.1",
-                port=internal_port,
-                parallel=parallel,
-                disable_thinking=bool(entry.get("disable_thinking", False)),
-                draft_model=draft,
-                extra_args=list(entry.get("extra_args", [])),
-            )
-        )
+    configs, seen = _parse_model_entries(
+        data, dynamic=dynamic, internal_base=internal_base, public_port=port,
+        default_draft=default_draft,
+    )
 
     # dynamic 無効のときだけ default_model が事前登録に在ることを要求する
     # （dynamic 有効なら未登録でも動的ロードされる）。
