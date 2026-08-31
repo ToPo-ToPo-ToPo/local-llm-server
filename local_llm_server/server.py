@@ -19,6 +19,15 @@ from dataclasses import dataclass, field
 from .constants import BACKENDS, log_dir  # noqa: F401
 
 
+def warn(message: str) -> None:
+    """運用者向けの警告を 1 行で出す（ゲートウェイの stderr → デーモンログ）。
+
+    「起動は続けるが期待どおりではない」ことを伝えるための経路。握りつぶすと気づけず、
+    例外にすると動くはずのものが止まる、という中間の事象に使う。
+    """
+    print(f"warning: {message}", file=sys.stderr, flush=True)
+
+
 def default_backend() -> str:
     """OS に応じた既定バックエンド。
 
@@ -980,11 +989,26 @@ def build_command(config: ServerConfig) -> list[str]:
         ]
         # Gemma 4 の MTP ドラフターによる speculative decoding。draft_kind は mtp に固定する
         # （他種別＝dflash / eagle3 は今回は対象外）。draft_model="auto" は本体名から
-        # 対応ドラフターを自動選択する。本体・ドラフターとも事前 DL 必須（未取得なら案内付き
-        # エラーで起動を中止し、自動ダウンロードはしない）。
+        # 対応ドラフターを自動選択する。自動ダウンロードはしない（事前 DL 必須）。
+        #
+        # ただしドラフターが未取得でも**本体の起動は止めない**。MTP は高速化の手段でしかなく、
+        # 無くても本体は完全に動くので、ここで中止すると「速くならない」で済むはずの状況が
+        # 「モデルが使えない」に化ける。対応表を更新して配ると、まだドラフターを取得していない
+        # PC が全滅する——これは実際に 0.38.5 で起きうる（#55 の切り替え）。
+        # 警告を出して MTP 無しで起動し、`gw pull <drafter>` で後から有効化できるようにする。
+        # 取得状況は `gw list` / `gw mtp` の MTP 列（mtp_status）でいつでも確認できる。
         drafter = resolve_drafter(config.model, config.draft_model)
         if drafter:
-            ensure_cached(drafter, what="ドラフター")
+            try:
+                ensure_cached(drafter, what="ドラフター")
+            except ValueError as exc:
+                warn(
+                    f"MTP ドラフター {drafter!r} が未取得のため、{config.model!r} を "
+                    f"MTP 無効で起動します（本体は通常どおり動作します）。"
+                    f" 有効化するには `gw pull {drafter}`。詳細: {exc}"
+                )
+                drafter = None
+        if drafter:
             command += ["--draft-model", drafter, "--draft-kind", "mtp"]
     elif config.backend == "llama-cpp":
         # model は HF repo-id（org/repo[:selector]）。DL 済みキャッシュから実 GGUF を解決する
