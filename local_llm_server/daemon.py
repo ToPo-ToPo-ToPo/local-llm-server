@@ -600,35 +600,57 @@ class ModelManager:
         if self._max_resident is None and budget is None:
             return False
         while True:
-            victim_srv = None
-            victim_model = None
             with self._state:
-                running = self._running_instances_locked()
-                resident = len(running)
-                over_count = (
-                    self._max_resident is not None and resident >= self._max_resident
-                )
-                over_mem = False
-                if budget is not None:
-                    keep_mm = self._models.get(keep)
-                    need = self._footprint_locked(keep_mm) if keep_mm else 0
-                    used = sum(self._footprint_locked(m) for (m, _i) in running)
-                    over_mem = (used + need) > budget
-                if not over_count and not over_mem:
+                over, _over_mem, running, _need = self._over_capacity_locked(keep, budget)
+                if not over:
                     return True
-                candidates = [
-                    (m, i) for (m, i) in running
-                    if i.ready and i.inflight == 0 and m.config.model != keep
-                ]
-                if not candidates:
+                victim_model, victim_srv = self._pop_lru_idle_locked(running, keep)
+                if victim_model is None:
                     return False  # 退避できるアイドルが無い → 複製しない
-                victim_model, victim_inst = min(candidates, key=lambda mi: mi[1].last_used)
-                victim_srv = victim_inst.server
-                victim_model.instances.remove(victim_inst)
             victim_srv.stop()  # state ロックの外で（最長 ~10s）
-            if victim_model.dynamic and not victim_model.instances:
-                with self._state:
-                    self._models.pop(victim_model.config.model, None)
+            self._drop_if_empty_dynamic(victim_model)
+
+    def _over_capacity_locked(self, keep: str, budget: int | None):
+        """常駐数・メモリ予算の超過判定（state ロック保持下で呼ぶ）。
+
+        _make_room_for_replica と _evict_if_needed が共有する LRU 退避の判定部。
+        戻り値: (over: bool, running, need)。need は keep の概算占有バイト
+        （メモリ予算が無効なら 0。_evict_if_needed の CapacityError 文面が使う）。
+        """
+        running = self._running_instances_locked()
+        over_count = (
+            self._max_resident is not None and len(running) >= self._max_resident
+        )
+        over_mem = False
+        need = 0
+        if budget is not None:
+            keep_mm = self._models.get(keep)
+            need = self._footprint_locked(keep_mm) if keep_mm else 0
+            used = sum(self._footprint_locked(m) for (m, _i) in running)
+            over_mem = (used + need) > budget
+        return over_count or over_mem, over_mem, running, need
+
+    def _pop_lru_idle_locked(self, running, keep: str):
+        """LRU 退避の対象（ready・inflight==0・keep 以外の最古）を選んで instances から外す。
+
+        戻り値: (victim_model, victim_srv)。候補が無ければ (None, None)。
+        stop() はロック時間が長い（最長 ~10s）ので呼び出し側が state ロックの外で行う。
+        """
+        candidates = [
+            (m, i) for (m, i) in running
+            if i.ready and i.inflight == 0 and m.config.model != keep
+        ]
+        if not candidates:
+            return None, None
+        victim_model, victim_inst = min(candidates, key=lambda mi: mi[1].last_used)
+        victim_model.instances.remove(victim_inst)
+        return victim_model, victim_inst.server
+
+    def _drop_if_empty_dynamic(self, victim_model) -> None:
+        """動的登録モデルのインスタンスが空になったら登録ごと消す（stop 後の後始末）。"""
+        if victim_model.dynamic and not victim_model.instances:
+            with self._state:
+                self._models.pop(victim_model.config.model, None)
 
     def _footprint_locked(self, mm: _Model) -> int:
         """モデルの概算占有メモリ（バイト）。一度計算したらキャッシュする。0=見積もり不能。"""
@@ -660,32 +682,16 @@ class ModelManager:
             time.monotonic() + self._load_timeout if self._load_timeout else None
         )
         while True:
-            victim_srv = None
-            victim_model = None
             with self._state:
                 if self._closing:
                     raise CapacityError("gateway is shutting down")
-                running = self._running_instances_locked()
+                over, over_mem, running, need = self._over_capacity_locked(keep, budget)
                 resident = len(running)
-                over_count = (
-                    self._max_resident is not None and resident >= self._max_resident
-                )
-                over_mem = False
-                if budget is not None:
-                    keep_mm = self._models.get(keep)
-                    need = self._footprint_locked(keep_mm) if keep_mm else 0
-                    used = sum(self._footprint_locked(m) for (m, _i) in running)
-                    over_mem = (used + need) > budget
-                if not over_count and not over_mem:
+                if not over:
                     return
-                candidates = [
-                    (m, i) for (m, i) in running
-                    if i.ready and i.inflight == 0 and m.config.model != keep
-                ]
-                if candidates:
-                    victim_model, victim_inst = min(candidates, key=lambda mi: mi[1].last_used)
-                    victim_srv = victim_inst.server
-                    victim_model.instances.remove(victim_inst)
+                victim_model, victim_srv = self._pop_lru_idle_locked(running, keep)
+                if victim_model is not None:
+                    pass  # 選べた → ループ末尾で stop する
                 elif over_mem and resident == 0:
                     # 退避できる常駐インスタンスが無く、keep 単体で予算超過 → 待っても無駄。
                     raise CapacityError(
@@ -707,9 +713,7 @@ class ModelManager:
                     continue  # 起きたら再判定
             if victim_srv is not None:
                 victim_srv.stop()  # state ロックの外で（最長 ~10s）。停止後にループ再確認。
-                if victim_model.dynamic and not victim_model.instances:  # 空なら登録ごと消す
-                    with self._state:
-                        self._models.pop(victim_model.config.model, None)
+                self._drop_if_empty_dynamic(victim_model)
 
     def begin_drain(self, ttl: float = 120.0) -> dict:
         """再起動準備（drain）を試みる。アイドル確認と新規受付停止を**原子的に**行う。
@@ -997,11 +1001,6 @@ class ModelManager:
             for aid in members:
                 self._sessions.pop(aid, None)
         return len(members)
-
-    def session_counts(self) -> dict[str, int]:
-        """model_id → 在席エージェント数（status 表示用）。"""
-        with self._state:
-            return {mid: len(members) for mid, members in self._model_sessions.items()}
 
     def uptime(self) -> float:
         """起動からの経過秒数（表示用）。"""
@@ -1819,6 +1818,122 @@ def _resolve_model_draft(
     return None
 
 
+def _parse_repetition_settings(data: dict):
+    """繰り返しループ抑制の既定注入（mlx 系のみ）の設定を読む。
+
+    既定 1.1。0 / false / "off" / "none" で無効化（＝注入しない＝「設定しない」選択）。
+    < 1.0 は繰り返しを助長するので拒否する（1.0 は中立＝無効相当だが受け付ける）。
+    戻り値: (repetition_penalty, repetition_context_size, skip_structured)。
+    """
+    rp_raw = data.get("repetition_penalty", 1.1)
+    if (rp_raw is None or rp_raw is False
+            or (isinstance(rp_raw, str) and rp_raw.strip().lower() in ("off", "none", "false", ""))):
+        repetition_penalty = None
+    else:
+        repetition_penalty = float(rp_raw)
+        if repetition_penalty == 0.0:
+            repetition_penalty = None  # 0 も無効化として扱う
+        elif repetition_penalty < 1.0:
+            raise ValueError(
+                "repetition_penalty must be >= 1.0 (1.0 = neutral; < 1.0 encourages "
+                "repetition). Use 0 / false / \"off\" to disable injection."
+            )
+    # 併せて注入する参照窓（省略時は付けない＝上流の既定 20 に任せる）。
+    rcs_raw = data.get("repetition_context_size")
+    repetition_context_size = None if rcs_raw is None else int(rcs_raw)
+    if repetition_context_size is not None and repetition_context_size < 1:
+        raise ValueError("repetition_context_size must be 1 or greater")
+    # 構造化リクエスト（tools / response_format）を注入対象から外すか（既定 false）。
+    skip_structured = bool(data.get("repetition_penalty_skip_structured", False))
+    return repetition_penalty, repetition_context_size, skip_structured
+
+
+def _parse_llama_cpp_table(data: dict):
+    """[llama_cpp] テーブル: llama-server バイナリの自動導入設定（すべて省略可＝全自動）。
+
+    導入方法の選択肢（旧 provision）は無い——一本道なので accel / pin だけ。
+    戻り値: (llama_accel, llama_build)。
+    """
+    llama = data.get("llama_cpp") or {}
+    if not isinstance(llama, dict):
+        raise ValueError("[llama_cpp] must be a table")
+    llama_accel = str(llama.get("accel", "auto"))
+    if llama_accel not in ("auto", "cuda", "vulkan", "metal", "cpu"):
+        raise ValueError("llama_cpp.accel must be auto / cuda / vulkan / metal / cpu")
+    llama_build = llama.get("pin")
+    if llama_build is not None:
+        llama_build = str(llama_build).strip() or None
+    return llama_accel, llama_build
+
+
+def _parse_media_settings(data: dict):
+    """画像・動画入力の展開設定。戻り値: (video_frames, video_max_edge, image_max_edge)。"""
+    # 動画入力のフレーム展開設定。省略で 8 フレーム / 長辺 768px。
+    video_frames = int(data.get("video_frames", 8))
+    if video_frames < 1:
+        raise ValueError("video_frames must be 1 or greater")
+    video_max_edge = int(data.get("video_max_edge", 768))
+    if video_max_edge < 64:
+        raise ValueError("video_max_edge must be 64 or greater")
+    # 静止画の長辺上限（0 で無効）。極端に小さい値は事故なので 64px を下限にする。
+    image_max_edge = int(data.get("image_max_edge", 1024))
+    if image_max_edge != 0 and image_max_edge < 64:
+        raise ValueError("image_max_edge must be 0 (disabled) or 64 or greater")
+    return video_frames, video_max_edge, image_max_edge
+
+
+def _parse_model_entries(
+    data: dict, *, dynamic: bool, internal_base: int, public_port: int, default_draft,
+):
+    """[[models]] 配列を検証して ServerConfig 群に組み立てる。
+
+    戻り値: (configs, seen)。seen は登録済み model id の集合（default_model の検証に使う）。
+    """
+    entries = data.get("models") or []
+    if not isinstance(entries, list):
+        raise ValueError("[[models]] must be an array")
+    if not entries and not dynamic:
+        raise ValueError(
+            "gateway config needs a non-empty [[models]] array (or set dynamic = true)"
+        )
+
+    configs: list[ServerConfig] = []
+    seen: set[str] = set()
+    for i, entry in enumerate(entries):
+        if not isinstance(entry, dict) or not entry.get("model"):
+            raise ValueError("each [[models]] entry needs a 'model'")
+        model = str(entry["model"])
+        if model in seen:
+            raise ValueError(f"duplicate model in gateway config: {model}")
+        seen.add(model)
+        backend = str(entry.get("backend", DEFAULT_BACKEND))
+        if backend not in BACKENDS:
+            raise ValueError(f"backend must be one of {BACKENDS} (model {model})")
+        internal_port = internal_base + i
+        if internal_port == public_port:
+            raise ValueError(
+                f"internal port {internal_port} collides with the public port {public_port}; "
+                "raise internal_base_port"
+            )
+        parallel = entry.get("parallel")
+        if parallel is not None and int(parallel) < 1:
+            raise ValueError(f"parallel must be 1 or greater (model {model})")
+        draft = _resolve_model_draft(entry, default_draft, backend, model)
+        configs.append(
+            ServerConfig(
+                backend=backend,
+                model=model,
+                host="127.0.0.1",
+                port=internal_port,
+                parallel=parallel,
+                disable_thinking=bool(entry.get("disable_thinking", False)),
+                draft_model=draft,
+                extra_args=list(entry.get("extra_args", [])),
+            )
+        )
+    return configs, seen
+
+
 def load_gateway_config(path: str) -> GatewayConfig:
     """ゲートウェイ設定 TOML を読み込んで検証する。
 
@@ -1925,96 +2040,17 @@ def load_gateway_config(path: str) -> GatewayConfig:
         if not (0.0 < max_memory_fraction <= 1.0):
             raise ValueError("max_memory_fraction must be in (0, 1]")
 
-    # 繰り返しループ抑制の既定注入（mlx 系のみ）。既定 1.1。0 / false / "off" / "none" で
-    # 無効化（＝注入しない＝「設定しない」選択）。< 1.0 は繰り返しを助長するので拒否する
-    # （1.0 は中立＝無効相当だが受け付ける）。
-    rp_raw = data.get("repetition_penalty", 1.1)
-    if (rp_raw is None or rp_raw is False
-            or (isinstance(rp_raw, str) and rp_raw.strip().lower() in ("off", "none", "false", ""))):
-        repetition_penalty = None
-    else:
-        repetition_penalty = float(rp_raw)
-        if repetition_penalty == 0.0:
-            repetition_penalty = None  # 0 も無効化として扱う
-        elif repetition_penalty < 1.0:
-            raise ValueError(
-                "repetition_penalty must be >= 1.0 (1.0 = neutral; < 1.0 encourages "
-                "repetition). Use 0 / false / \"off\" to disable injection."
-            )
-    # 併せて注入する参照窓（省略時は付けない＝上流の既定 20 に任せる）。
-    rcs_raw = data.get("repetition_context_size")
-    repetition_context_size = None if rcs_raw is None else int(rcs_raw)
-    if repetition_context_size is not None and repetition_context_size < 1:
-        raise ValueError("repetition_context_size must be 1 or greater")
-    # 構造化リクエスト（tools / response_format）を注入対象から外すか（既定 false）。
-    repetition_penalty_skip_structured = bool(data.get("repetition_penalty_skip_structured", False))
+    repetition_penalty, repetition_context_size, repetition_penalty_skip_structured = \
+        _parse_repetition_settings(data)
 
-    # [llama_cpp] テーブル: llama-server バイナリの自動導入設定（すべて省略可＝全自動）。
-    # 導入方法の選択肢（旧 provision）は無い——一本道なので accel / pin だけ。
-    llama = data.get("llama_cpp") or {}
-    if not isinstance(llama, dict):
-        raise ValueError("[llama_cpp] must be a table")
-    llama_accel = str(llama.get("accel", "auto"))
-    if llama_accel not in ("auto", "cuda", "vulkan", "metal", "cpu"):
-        raise ValueError("llama_cpp.accel must be auto / cuda / vulkan / metal / cpu")
-    llama_build = llama.get("pin")
-    if llama_build is not None:
-        llama_build = str(llama_build).strip() or None
+    llama_accel, llama_build = _parse_llama_cpp_table(data)
 
-    # 動画入力のフレーム展開設定。省略で 8 フレーム / 長辺 768px。
-    video_frames = int(data.get("video_frames", 8))
-    if video_frames < 1:
-        raise ValueError("video_frames must be 1 or greater")
-    video_max_edge = int(data.get("video_max_edge", 768))
-    if video_max_edge < 64:
-        raise ValueError("video_max_edge must be 64 or greater")
-    # 静止画の長辺上限（0 で無効）。極端に小さい値は事故なので 64px を下限にする。
-    image_max_edge = int(data.get("image_max_edge", 1024))
-    if image_max_edge != 0 and image_max_edge < 64:
-        raise ValueError("image_max_edge must be 0 (disabled) or 64 or greater")
+    video_frames, video_max_edge, image_max_edge = _parse_media_settings(data)
 
-    entries = data.get("models") or []
-    if not isinstance(entries, list):
-        raise ValueError("[[models]] must be an array")
-    if not entries and not dynamic:
-        raise ValueError(
-            "gateway config needs a non-empty [[models]] array (or set dynamic = true)"
-        )
-
-    configs: list[ServerConfig] = []
-    seen: set[str] = set()
-    for i, entry in enumerate(entries):
-        if not isinstance(entry, dict) or not entry.get("model"):
-            raise ValueError("each [[models]] entry needs a 'model'")
-        model = str(entry["model"])
-        if model in seen:
-            raise ValueError(f"duplicate model in gateway config: {model}")
-        seen.add(model)
-        backend = str(entry.get("backend", DEFAULT_BACKEND))
-        if backend not in BACKENDS:
-            raise ValueError(f"backend must be one of {BACKENDS} (model {model})")
-        internal_port = internal_base + i
-        if internal_port == port:
-            raise ValueError(
-                f"internal port {internal_port} collides with the public port {port}; "
-                "raise internal_base_port"
-            )
-        parallel = entry.get("parallel")
-        if parallel is not None and int(parallel) < 1:
-            raise ValueError(f"parallel must be 1 or greater (model {model})")
-        draft = _resolve_model_draft(entry, default_draft, backend, model)
-        configs.append(
-            ServerConfig(
-                backend=backend,
-                model=model,
-                host="127.0.0.1",
-                port=internal_port,
-                parallel=parallel,
-                disable_thinking=bool(entry.get("disable_thinking", False)),
-                draft_model=draft,
-                extra_args=list(entry.get("extra_args", [])),
-            )
-        )
+    configs, seen = _parse_model_entries(
+        data, dynamic=dynamic, internal_base=internal_base, public_port=port,
+        default_draft=default_draft,
+    )
 
     # dynamic 無効のときだけ default_model が事前登録に在ることを要求する
     # （dynamic 有効なら未登録でも動的ロードされる）。

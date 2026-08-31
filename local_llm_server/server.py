@@ -950,156 +950,191 @@ def find_sibling_mmproj(model_path: str) -> str | None:
     return os.path.abspath(os.path.join(directory, candidates[0]))
 
 
-def build_command(config: ServerConfig) -> list[str]:
-    """バックエンドに応じた起動コマンドを組み立てる。
+def _build_mlx(config: ServerConfig) -> list[str]:
+    """mlx_lm.server（テキスト専用。逐次処理。並列スロットの概念なし）。"""
+    # 自動ダウンロードは行わない。事前に `hf download` 済みであることを起動前に確認する
+    # （未取得ならここで案内付き ValueError）。
+    ensure_cached(config.model)
+    command = [
+        "mlx_lm.server",
+        "--model", config.model,
+        "--host", config.host,
+        "--port", str(config.port),
+    ]
+    if config.disable_thinking:
+        command += ["--chat-template-args", '{"enable_thinking": false}']
+    return command
 
-    いずれも OpenAI 互換サーバーを立ち上げる:
-      - mlx       : mlx_lm.server（テキスト専用。逐次処理。並列スロットの概念なし）
-      - mlx-vlm   : mlx_vlm.server（vision 対応。画像入力 image_url を受けられる）
-      - llama-cpp : llama-server（--parallel で並列スロットを確保）
+
+def _build_mlx_vlm(config: ServerConfig) -> list[str]:
+    """mlx_vlm.server（vision 対応。画像入力 image_url を受けられる）。
+
+    コンソールスクリプトが無い環境もあるため `python -m` で確実に起動する。逐次処理で
+    並列スロットの概念はないため --parallel は渡さない。thinking はサーバー既定が OFF
+    （--enable-thinking を渡さなければ無効）であり、リクエスト毎の明示制御は
+    クライアントがトップレベル enable_thinking で行う（llm.py 参照）。
     """
-    if config.backend == "mlx":
-        # 自動ダウンロードは行わない。事前に `hf download` 済みであることを起動前に確認する
-        # （未取得ならここで案内付き ValueError）。
-        ensure_cached(config.model)
-        command = [
-            "mlx_lm.server",
-            "--model", config.model,
-            "--host", config.host,
-            "--port", str(config.port),
-        ]
-        if config.disable_thinking:
-            command += ["--chat-template-args", '{"enable_thinking": false}']
-    elif config.backend == "mlx-vlm":
-        # mlx_vlm の OpenAI 互換サーバー（vision 対応）。コンソールスクリプトが
-        # 無い環境もあるため `python -m` で確実に起動する。逐次処理で並列スロットの
-        # 概念はないため --parallel は渡さない。thinking はサーバー既定が OFF
-        # （--enable-thinking を渡さなければ無効）であり、リクエスト毎の明示制御は
-        # クライアントがトップレベル enable_thinking で行う（llm.py 参照）。
-        # 自動ダウンロードは行わない。本体は事前に `hf download` 済みであることを確認する。
-        ensure_cached(config.model)
-        # 直接 mlx_vlm.server を起動せず、シム経由で起動する（_mlx_vlm_shims が上流の
-        # 未修正部分を当ててから同じ引数で mlx_vlm.server を __main__ 実行する）。
-        # site-packages を書き換えると auto_update の `uv sync` で消えるため。
-        command = [
-            sys.executable, "-m", "local_llm_server._mlx_vlm_shims",
-            "--model", config.model,
-            "--host", config.host,
-            "--port", str(config.port),
-        ]
-        # Gemma 4 の MTP ドラフターによる speculative decoding。draft_kind は mtp に固定する
-        # （他種別＝dflash / eagle3 は今回は対象外）。draft_model="auto" は本体名から
-        # 対応ドラフターを自動選択する。自動ダウンロードはしない（事前 DL 必須）。
-        #
-        # ただしドラフターが未取得でも**本体の起動は止めない**。MTP は高速化の手段でしかなく、
-        # 無くても本体は完全に動くので、ここで中止すると「速くならない」で済むはずの状況が
-        # 「モデルが使えない」に化ける。対応表を更新して配ると、まだドラフターを取得していない
-        # PC が全滅する——これは実際に 0.38.5 で起きうる（#55 の切り替え）。
-        # 警告を出して MTP 無しで起動し、`gw pull <drafter>` で後から有効化できるようにする。
-        # 取得状況は `gw list` / `gw mtp` の MTP 列（mtp_status）でいつでも確認できる。
-        drafter = resolve_drafter(config.model, config.draft_model)
-        if drafter:
+    # 自動ダウンロードは行わない。本体は事前に `hf download` 済みであることを確認する。
+    ensure_cached(config.model)
+    # 直接 mlx_vlm.server を起動せず、シム経由で起動する（_mlx_vlm_shims が上流の
+    # 未修正部分を当ててから同じ引数で mlx_vlm.server を __main__ 実行する）。
+    # site-packages を書き換えると auto_update の `uv sync` で消えるため。
+    command = [
+        sys.executable, "-m", "local_llm_server._mlx_vlm_shims",
+        "--model", config.model,
+        "--host", config.host,
+        "--port", str(config.port),
+    ]
+    # Gemma 4 の MTP ドラフターによる speculative decoding。draft_kind は mtp に固定する
+    # （他種別＝dflash / eagle3 は今回は対象外）。draft_model="auto" は本体名から
+    # 対応ドラフターを自動選択する。自動ダウンロードはしない（事前 DL 必須）。
+    #
+    # ただしドラフターが未取得でも**本体の起動は止めない**。MTP は高速化の手段でしかなく、
+    # 無くても本体は完全に動くので、ここで中止すると「速くならない」で済むはずの状況が
+    # 「モデルが使えない」に化ける。対応表を更新して配ると、まだドラフターを取得していない
+    # PC が全滅する——これは実際に 0.38.5 で起きうる（#55 の切り替え）。
+    # 警告を出して MTP 無しで起動し、`gw pull <drafter>` で後から有効化できるようにする。
+    # 取得状況は `gw list` / `gw mtp` の MTP 列（mtp_status）でいつでも確認できる。
+    drafter = resolve_drafter(config.model, config.draft_model)
+    if drafter:
+        try:
+            ensure_cached(drafter, what="ドラフター")
+        except ValueError as exc:
+            warn(
+                f"MTP ドラフター {drafter!r} が未取得のため、{config.model!r} を "
+                f"MTP 無効で起動します（本体は通常どおり動作します）。"
+                f" 有効化するには `gw pull {drafter}`。詳細: {exc}"
+            )
+            drafter = None
+    if drafter:
+        command += ["--draft-model", drafter, "--draft-kind", "mtp"]
+    return command
+
+
+def _build_llama_cpp(config: ServerConfig) -> list[str]:
+    """llama-server（--parallel で並列スロットを確保）。"""
+    # model は HF repo-id（org/repo[:selector]）。DL 済みキャッシュから実 GGUF を解決する
+    # （キャッシュに無ければ ValueError。クライアントに見せる ID は repo-id のまま）。
+    model_path = resolve_gguf(config.model)
+    command = [
+        llama_server_binary(),  # プロビジョナが導入した絶対パス、無ければ PATH の "llama-server"
+        "-m", model_path,
+        "--host", config.host,
+        "--port", str(config.port),
+    ]
+    # 埋め込み MTP（Qwen3.6 等、本体 GGUF に MTP ヘッドが内蔵）。draft_model="self"/"mtp"
+    # で有効化＝別ドラフトファイル不要（--spec-type draft-mtp のみ）。この方式は llama.cpp 側で
+    # --mmproj（vision）と --parallel>1 が未対応なので、両者は付けない（付けると起動失敗する）。
+    embedded_mtp = bool(config.draft_model) and \
+        config.draft_model.strip().lower() in ("self", "mtp")
+    if config.parallel is not None and not embedded_mtp:
+        command += ["--parallel", str(config.parallel)]
+    if config.disable_thinking:
+        command += ["--chat-template-kwargs", '{"enable_thinking": false}']
+    if embedded_mtp:
+        command += ["--spec-type", "draft-mtp"]
+    else:
+        # マルチモーダル: 本体の隣に mmproj があれば自動で渡す（手動設定不要）。
+        # ユーザーが extra_args で明示制御していれば（--mmproj / --no-mmproj）尊重する。
+        if not any(a in ("--mmproj", "-mm", "--no-mmproj") for a in config.extra_args):
+            mmproj = find_sibling_mmproj(model_path)
+            if mmproj:
+                command += ["--mmproj", mmproj]
+        # 別ヘッド方式の speculative decoding（gemma4 等）。draft_model に MTP ヘッドの
+        # HF repo-id（org/repo:F16-MTP 等）を指定すると有効化（-md）。ファイル名に
+        # "mtp" を含めば MTP ヘッドとみなし --spec-type draft-mtp を付ける（それ以外は
+        # llama.cpp 既定の draft-simple）。
+        # mlx-vlm 側と同じく、ドラフトが未取得でも本体の起動は止めない（警告のみ）。
+        if config.draft_model and "-md" not in config.extra_args:
             try:
-                ensure_cached(drafter, what="ドラフター")
+                draft_path = resolve_gguf(config.draft_model)
             except ValueError as exc:
                 warn(
-                    f"MTP ドラフター {drafter!r} が未取得のため、{config.model!r} を "
-                    f"MTP 無効で起動します（本体は通常どおり動作します）。"
-                    f" 有効化するには `gw pull {drafter}`。詳細: {exc}"
+                    f"ドラフトモデル {config.draft_model!r} を解決できないため、"
+                    f"{config.model!r} を speculative decoding 無効で起動します"
+                    f"（本体は通常どおり動作します）。詳細: {exc}"
                 )
-                drafter = None
-        if drafter:
-            command += ["--draft-model", drafter, "--draft-kind", "mtp"]
-    elif config.backend == "llama-cpp":
-        # model は HF repo-id（org/repo[:selector]）。DL 済みキャッシュから実 GGUF を解決する
-        # （キャッシュに無ければ ValueError。クライアントに見せる ID は repo-id のまま）。
-        model_path = resolve_gguf(config.model)
-        command = [
-            llama_server_binary(),  # プロビジョナが導入した絶対パス、無ければ PATH の "llama-server"
-            "-m", model_path,
-            "--host", config.host,
-            "--port", str(config.port),
-        ]
-        # 埋め込み MTP（Qwen3.6 等、本体 GGUF に MTP ヘッドが内蔵）。draft_model="self"/"mtp"
-        # で有効化＝別ドラフトファイル不要（--spec-type draft-mtp のみ）。この方式は llama.cpp 側で
-        # --mmproj（vision）と --parallel>1 が未対応なので、両者は付けない（付けると起動失敗する）。
-        embedded_mtp = bool(config.draft_model) and \
-            config.draft_model.strip().lower() in ("self", "mtp")
-        if config.parallel is not None and not embedded_mtp:
-            command += ["--parallel", str(config.parallel)]
-        if config.disable_thinking:
-            command += ["--chat-template-kwargs", '{"enable_thinking": false}']
-        if embedded_mtp:
-            command += ["--spec-type", "draft-mtp"]
-        else:
-            # マルチモーダル: 本体の隣に mmproj があれば自動で渡す（手動設定不要）。
-            # ユーザーが extra_args で明示制御していれば（--mmproj / --no-mmproj）尊重する。
-            if not any(a in ("--mmproj", "-mm", "--no-mmproj") for a in config.extra_args):
-                mmproj = find_sibling_mmproj(model_path)
-                if mmproj:
-                    command += ["--mmproj", mmproj]
-            # 別ヘッド方式の speculative decoding（gemma4 等）。draft_model に MTP ヘッドの
-            # HF repo-id（org/repo:F16-MTP 等）を指定すると有効化（-md）。ファイル名に
-            # "mtp" を含めば MTP ヘッドとみなし --spec-type draft-mtp を付ける（それ以外は
-            # llama.cpp 既定の draft-simple）。
-            # mlx-vlm 側と同じく、ドラフトが未取得でも本体の起動は止めない（警告のみ）。
-            if config.draft_model and "-md" not in config.extra_args:
-                try:
-                    draft_path = resolve_gguf(config.draft_model)
-                except ValueError as exc:
-                    warn(
-                        f"ドラフトモデル {config.draft_model!r} を解決できないため、"
-                        f"{config.model!r} を speculative decoding 無効で起動します"
-                        f"（本体は通常どおり動作します）。詳細: {exc}"
-                    )
-                    draft_path = None
-                if draft_path:
-                    command += ["-md", draft_path]
-                    if "mtp" in os.path.basename(draft_path).lower():
-                        command += ["--spec-type", "draft-mtp"]
-        # 計算効率の自動チューニング（自動導入バイナリの accel に合わせる。extra_args 優先）。
-        command += auto_llama_flags(config)
-    elif config.backend == "whisper":
-        # mlx-whisper を OpenAI 互換の STT サーバ（1 モデル 1 プロセス）として起動する。
-        # 専用サーバは同梱の local_llm_server.stt_server（標準ライブラリのみ）。
-        # 本体は事前 DL 必須（未取得なら案内付き ValueError）。音声デコードに ffmpeg CLI が要る。
-        ensure_cached(config.model)
-        command = [
-            sys.executable, "-m", "local_llm_server.stt_server",
-            "--model", config.model,
-            "--host", config.host,
-            "--port", str(config.port),
-        ]
-    elif config.backend == "vllm":
-        # vLLM の OpenAI 互換 API サーバを、隔離 venv の python から起動する（→ vllm_provisioner）。
-        # model は HF repo-id。事前 DL 済みを前提に確認する（未取得は案内付き ValueError）。
-        # クライアントに見せる id を repo-id に固定するため --served-model-name も同じ id にする。
-        # 逐次でなく連続バッチングで多人数同時に強い（並列は vLLM が内部で捌く）。
-        ensure_cached(config.model)
-        command = [
-            vllm_python(), "-m", "vllm.entrypoints.openai.api_server",
-            "--model", config.model,
-            "--served-model-name", config.model,
-            "--host", config.host,
-            "--port", str(config.port),
-        ]
-    elif config.backend == "sglang":
-        # SGLang の OpenAI 互換 API サーバを、隔離 venv の python から起動する（→ sglang_provisioner）。
-        # SGLang は引数が vLLM と違い、モデルは --model-path で渡す。RadixAttention で
-        # 共有プレフィックス（システムプロンプト/ツール定義）の多い用途に強い。
-        ensure_cached(config.model)
-        command = [
-            sglang_python(), "-m", "sglang.launch_server",
-            "--model-path", config.model,
-            "--served-model-name", config.model,
-            "--host", config.host,
-            "--port", str(config.port),
-        ]
-    else:
+                draft_path = None
+            if draft_path:
+                command += ["-md", draft_path]
+                if "mtp" in os.path.basename(draft_path).lower():
+                    command += ["--spec-type", "draft-mtp"]
+    # 計算効率の自動チューニング（自動導入バイナリの accel に合わせる。extra_args 優先）。
+    return command + auto_llama_flags(config)
+
+
+def _build_whisper(config: ServerConfig) -> list[str]:
+    """mlx-whisper を OpenAI 互換の STT サーバ（1 モデル 1 プロセス）として起動する。
+
+    専用サーバは同梱の local_llm_server.stt_server（標準ライブラリのみ）。
+    本体は事前 DL 必須（未取得なら案内付き ValueError）。音声デコードに ffmpeg CLI が要る。
+    """
+    ensure_cached(config.model)
+    return [
+        sys.executable, "-m", "local_llm_server.stt_server",
+        "--model", config.model,
+        "--host", config.host,
+        "--port", str(config.port),
+    ]
+
+
+def _build_vllm(config: ServerConfig) -> list[str]:
+    """vLLM の OpenAI 互換 API サーバを、隔離 venv の python から起動する（→ vllm_provisioner）。
+
+    model は HF repo-id。事前 DL 済みを前提に確認する（未取得は案内付き ValueError）。
+    クライアントに見せる id を repo-id に固定するため --served-model-name も同じ id にする。
+    逐次でなく連続バッチングで多人数同時に強い（並列は vLLM が内部で捌く）。
+    """
+    ensure_cached(config.model)
+    return [
+        vllm_python(), "-m", "vllm.entrypoints.openai.api_server",
+        "--model", config.model,
+        "--served-model-name", config.model,
+        "--host", config.host,
+        "--port", str(config.port),
+    ]
+
+
+def _build_sglang(config: ServerConfig) -> list[str]:
+    """SGLang の OpenAI 互換 API サーバを、隔離 venv の python から起動する（→ sglang_provisioner）。
+
+    SGLang は引数が vLLM と違い、モデルは --model-path で渡す。RadixAttention で
+    共有プレフィックス（システムプロンプト/ツール定義）の多い用途に強い。
+    """
+    ensure_cached(config.model)
+    return [
+        sglang_python(), "-m", "sglang.launch_server",
+        "--model-path", config.model,
+        "--served-model-name", config.model,
+        "--host", config.host,
+        "--port", str(config.port),
+    ]
+
+
+# backend 名 → 起動コマンドビルダー。バックエンドを増やすときは、上に _build_<name> を
+# 書いてここへ 1 行足す（長大な elif 連鎖に継ぎ足さない）。BACKENDS（公開値）と揃えること。
+_COMMAND_BUILDERS = {
+    "mlx": _build_mlx,
+    "mlx-vlm": _build_mlx_vlm,
+    "llama-cpp": _build_llama_cpp,
+    "whisper": _build_whisper,
+    "vllm": _build_vllm,
+    "sglang": _build_sglang,
+}
+
+
+def build_command(config: ServerConfig) -> list[str]:
+    """バックエンドに応じた起動コマンドを組み立てる（実体は _COMMAND_BUILDERS の各関数）。
+
+    いずれも OpenAI 互換サーバーを立ち上げる。extra_args は全バックエンド共通で末尾に付く
+    （ユーザーの明示指定が自動付与より後＝優先になる）。
+    """
+    builder = _COMMAND_BUILDERS.get(config.backend)
+    if builder is None:
         raise ValueError(
             f"unknown backend: {config.backend!r} (choose from {BACKENDS})"
         )
-    return command + config.extra_args
+    return builder(config) + config.extra_args
 
 
 def is_ready(base_url: str, timeout: float = 1.0) -> bool:
@@ -1593,12 +1628,6 @@ def enable_child_tethering() -> None:
     _TETHER_READ_FD, _TETHER_WRITE_FD = os.pipe()
 
 
-def tether_read_fd() -> int | None:
-    """繋留パイプの読み取り端（未有効なら None）。ワーカー以外の随伴プロセス
-    （メニューバーアイコン等）も、この fd の EOF で「デーモンの死」を知る。"""
-    return _TETHER_READ_FD
-
-
 def _read_lock_pid(path: str) -> int | None:
     """ロックファイルに保持者が書き込んだ PID を読む（読めなければ None）。"""
     try:
@@ -1745,6 +1774,40 @@ def server_status(host: str = "127.0.0.1", port: int = 8799) -> dict | None:
     }
 
 
+def _admin_request(
+    path: str,
+    host: str,
+    port: int,
+    timeout: float,
+    body: dict | None = None,
+) -> dict | None:
+    """ゲートウェイの /admin/* を叩く共通口（body があれば POST、無ければ GET）。
+
+    gateway_admin_status / gateway_set_max_resident / gateway_drain が共有する。
+    応答しない・非 200・JSON でない場合はすべて None（呼び出し側は「未起動 or 旧版」として
+    フォールバックする）——エンドポイントごとに例外の意味を変えないことで、呼び出し側の
+    分岐を「dict か None か」だけにしている。
+    """
+    url = f"http://{host}:{port}{path}"
+    if body is None:
+        req: urllib.request.Request | str = url
+    else:
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            if resp.status != 200:
+                return None
+            data = json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
 def gateway_admin_status(
     host: str = "127.0.0.1", port: int = 8799, timeout: float = 2.0
 ) -> dict | None:
@@ -1754,15 +1817,7 @@ def gateway_admin_status(
     idle_timeout までゲートウェイ本体から取得できる（→ TUI 監視用）。応答しない・旧版で
     エンドポイントが無い場合は None を返す（呼び出し側は server_status にフォールバックできる）。
     """
-    url = f"http://{host}:{port}/admin/status"
-    try:
-        with urllib.request.urlopen(url, timeout=timeout) as resp:
-            if resp.status != 200:
-                return None
-            data = json.loads(resp.read().decode("utf-8"))
-    except (urllib.error.URLError, OSError, ValueError):
-        return None
-    return data if isinstance(data, dict) else None
+    return _admin_request("/admin/status", host, port, timeout)
 
 
 def bench_model(
@@ -1817,19 +1872,9 @@ def gateway_set_max_resident(
     サーバー側でアイドルから順に非同期退避される（＝更新でリクエストが止まらない）。反映後の
     値を含む応答 dict を返す。応答しない・エラー時は None（呼び出し側が失敗として扱う）。
     """
-    url = f"http://{host}:{port}/admin/config"
-    body = json.dumps({"max_resident": value}).encode("utf-8")
-    req = urllib.request.Request(
-        url, data=body, headers={"Content-Type": "application/json"}, method="POST"
+    return _admin_request(
+        "/admin/config", host, port, timeout, body={"max_resident": value}
     )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            if resp.status != 200:
-                return None
-            data = json.loads(resp.read().decode("utf-8"))
-    except (urllib.error.URLError, OSError, ValueError):
-        return None
-    return data if isinstance(data, dict) else None
 
 
 def gateway_drain(
@@ -1845,19 +1890,7 @@ def gateway_drain(
     "sessions": n}（何も変えない）。enable=False で解除。応答しない（未起動・旧版で
     エンドポイントが無い）ときは None。
     """
-    url = f"http://{host}:{port}/admin/drain"
-    body = json.dumps({"enable": enable}).encode("utf-8")
-    req = urllib.request.Request(
-        url, data=body, headers={"Content-Type": "application/json"}, method="POST"
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            if resp.status != 200:
-                return None
-            data = json.loads(resp.read().decode("utf-8"))
-    except (urllib.error.URLError, OSError, ValueError):
-        return None
-    return data if isinstance(data, dict) else None
+    return _admin_request("/admin/drain", host, port, timeout, body={"enable": enable})
 
 
 def gateway_log_path(port: int) -> str:

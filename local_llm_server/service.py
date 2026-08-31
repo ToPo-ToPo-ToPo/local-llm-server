@@ -129,16 +129,6 @@ WantedBy=default.target
 """
 
 
-def is_enabled() -> bool:
-    """自動起動が登録済みか（サービス定義ファイルの有無で判定）。"""
-    kind = service_kind()
-    if kind == "launchd":
-        return os.path.isfile(launchd_plist_path())
-    if kind == "systemd":
-        return os.path.isfile(systemd_unit_path())
-    return False
-
-
 def _run(cmd: list[str]) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, capture_output=True, text=True, timeout=30)
 
