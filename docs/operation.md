@@ -137,8 +137,8 @@ gw start      # 手動起動（自動起動を無効にしている場合や、g
 - **リリース手順（開発者向け）**: `pyproject.toml` の version を上げて main へマージし、タグを push する。
 
   ```bash
-  git tag v0.38.7
-  git push origin v0.38.7
+  git tag v<新バージョン>
+  git push origin v<新バージョン>
   ```
 
   各 PC の常駐デーモンが 1 時間以内にタグを検知し、アイドルの瞬間に追従・再起動する

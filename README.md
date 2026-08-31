@@ -1,7 +1,8 @@
 # local-llm-server
 
-ローカルLLM（**mlx** / **mlx-vlm** / **llama.cpp**）と音声認識（**whisper** / STT）を束ねる
-**マルチモデルゲートウェイ**。1 プロセス起動するだけで、1 つの公開ポートに複数モデルを配信する。
+ローカルLLM（**mlx** / **mlx-vlm** / **llama.cpp** / **vLLM** / **SGLang**）と音声認識
+（**whisper** / STT）を束ねる**マルチモデルゲートウェイ**。1 プロセス起動するだけで、
+1 つの公開ポートに複数モデルを配信する。
 モデルの事前登録は不要——クライアントが指定した `model` をその場でロードする。
 特徴の全体像は [docs/features.md](docs/features.md)。
 
