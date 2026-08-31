@@ -3,7 +3,7 @@
 `gw start`（cli）が裏で常駐させる実体。`server.start_gateway_background` がこのモジュールを
 新セッション（POSIX）/ DETACHED_PROCESS（Windows）の別プロセスとして spawn し、出力は
 ログへ逃がす。端末を持たず、CWD の `./gateway.toml` のゲートウェイをフォアグラウンドで実行する。
-自動更新（PyPI 新版を git で追従）が適用されると、このプロセスを新コードで execv し直す
+自動更新（リリースタグへ git で追従）が適用されると、このプロセスを新コードで execv し直す
 （execv は環境変数を引き継ぐので、下の spawn ガードは自動更新の再起動でも通る）。
 
 直接の `python -m local_llm_server` は**起動を拒否する**——起動の入口は `gw start` の

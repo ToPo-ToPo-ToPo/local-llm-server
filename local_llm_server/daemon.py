@@ -1328,7 +1328,7 @@ class _GatewayHandler(BaseHTTPRequestHandler):
             # 更新チェックをオンデマンドで温める。トレイがメニューを開くたびにここへ来るので、
             # **リスタート無しで**「更新の有無」を最新化できる（Ollama と同じく、確認は
             # 動いたまま・適用のときだけ再起動）。適用はしない（それは watcher と手動更新の
-            # 役目）。PyPI を叩きすぎないよう _UPDATE_ONDEMAND_THROTTLE 秒のスロットル付き。
+            # 役目）。タグ照会しすぎないよう _UPDATE_ONDEMAND_THROTTLE 秒のスロットル付き。
             maybe_refresh_update_state(srv)
             host, port = srv.server_address[0], srv.server_address[1]
             models = srv.manager.status()
@@ -1501,7 +1501,7 @@ class _GatewayHandler(BaseHTTPRequestHandler):
                     return
             # 新版が無くても restart_required ならここへ落ちる＝**再起動だけ**する。
             if state is not None:
-                # 見せる版は「再起動後に走る版」。取得した直後はそれが PyPI 最新、
+                # 見せる版は「再起動後に走る版」。取得した直後はそれが最新リリース、
                 # 再起動だけのときは（既に pull 済みの）ソース版。
                 state.update({"fetched": True,
                               "latest": st.latest if st.available else st.current})
@@ -1747,7 +1747,7 @@ class GatewayConfig:
     max_memory_fraction: float | None = None  # 常駐モデルの推定占有量の合計を総RAMのこの割合に制限（None で無効）
     internal_base_port: int = 9001     # 内部サーバーの割当開始ポート（動的モデルもこの続きから割り当て）
     api_key: str | None = None         # ネットワーク公開時の API キー（None/空 で認証なし）。chat と在席セッションに要求
-    auto_update: bool = True           # 常駐デーモンが PyPI 新版を検知したら git pull で自動追従する（既定 true。false で無効）
+    auto_update: bool = True           # 常駐デーモンが新しいリリースタグを検知したら追従する（既定 true。false で無効）
     tray: bool = True                  # 稼働中メニューバーにアイコンを出す（macOS のみ。false で非表示 → tray.py）
     # --- llama.cpp（llama-server）バイナリの自動導入。[llama_cpp] テーブルで設定 ---
     # 導入方法は選ばせない（管理dirの導入済みを再利用→無ければプリビルト自動DL の一本道）。
@@ -2022,7 +2022,7 @@ def load_gateway_config(path: str) -> GatewayConfig:
         print("gateway.toml: session_ttl は廃止されました（ハートビートによる生存推定を"
               "やめたため無視します）。モデルの保持時間は idle_timeout で調整してください。",
               file=sys.stderr)
-    # TUI が PyPI 新版を検知したら git pull で自動追従するか（既定 true。false で無効）。
+    # 新しいリリースタグを検知したら自動追従するか（既定 true。false で無効）。
     auto_update = bool(data.get("auto_update", True))
     tray = bool(data.get("tray", True))
     # 未登録モデルを ID 推論で動的ロードするか（既定 true）。false なら事前登録のみ（旧挙動）。
@@ -2279,7 +2279,7 @@ _UPDATE_WARMUP_INTERVAL = 60.0     # 起動直後は 1 分だけ待ってから�
 _UPDATE_CHECK_INTERVAL = 3600.0    # 以降、新版が未検知のあいだの確認周期
 _UPDATE_DRAIN_POLL_INTERVAL = 30.0  # 取得済み・再起動待ちのあいだ、空くのを待つ周期
 # オンデマンド確認（トレイのメニューを開くたび = /admin/status GET）のスロットル。
-# PyPI を叩きすぎないための最短間隔。定期チェック（1時間）より短く、確認をほぼ即時にする。
+# タグ照会しすぎないための最短間隔。定期チェック（1時間）より短く、確認をほぼ即時にする。
 _UPDATE_ONDEMAND_THROTTLE = 30.0
 
 
@@ -2342,9 +2342,9 @@ def _update_watcher(
     state: dict | None = None,
     notify=None,
 ) -> None:
-    """PyPI 新版を検知し、（auto_apply なら）作業ツリーがクリーンな時 git pull で追従する常駐スレッド。
+    """新しいリリースタグを検知し、（auto_apply なら）作業ツリーがクリーンな時に追従する常駐スレッド。
 
-    旧 TUI が担っていた自動更新（clone 運用で PyPI 新版を git で追従）をデーモン本体へ移したもの。
+    旧 TUI が担っていた自動更新（clone 運用でリリースタグへ追従）をデーモン本体へ移したもの。
     安全側の 2 段構え —— ①**取得は稼働中に先に済ませる**（`git pull`＋`uv sync`。プロセスには
     触れず、この間も通常どおりリクエストを受ける）②**再起動は drain が通ったときだけ**行う。
     `manager.begin_drain()` が「処理中 0・在席 0」の確認と新規受付停止を**原子的に**行うので、
@@ -2795,10 +2795,10 @@ def _run_gateway_locked(cfg: GatewayConfig, config_path: str | None = None) -> i
             daemon=True,
         ).start()
 
-    # 自動更新監視: PyPI 新版を検知し、作業ツリーがクリーンかつ処理中/在席が 0（idle）の
-    # 瞬間に git pull で追従する。適用できたら restart_requested を立てて下のメインループを
+    # 自動更新監視: 新しいリリースタグを検知し、作業ツリーがクリーンかつ処理中/在席が 0（idle）の
+    # 瞬間にリリースタグへ fast-forward する。適用できたら restart_requested を立てて下のメインループを
     # 抜け、finally でクリーン停止 → run_gateway が execv で新コードに置き換える。
-    # TUI 廃止に伴い、旧 TUI が担っていた「PyPI 新版を git で追従」をデーモン本体へ移した。
+    # TUI 廃止に伴い、旧 TUI が担っていた「リリースタグへ git で追従」をデーモン本体へ移した。
     # gateway.toml の auto_update=false で**適用**は無効化できるが、**チェックは常に行う**
     # ——Ollama と同じく、更新があることをトレイの更新マークで見せるため（適用はユーザーの
     # 「今すぐ更新」= /admin/update か `gw update` に任せる）。

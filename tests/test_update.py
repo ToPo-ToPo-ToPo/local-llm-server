@@ -1,4 +1,4 @@
-"""update.py（PyPI 新版検知・git 追従）のテスト。ネットワーク/git は monkeypatch で隔離。"""
+"""update.py（リリースタグ検知・git 追従）のテスト。ネットワーク/git は monkeypatch で隔離。"""
 from __future__ import annotations
 
 from pathlib import Path
@@ -25,14 +25,14 @@ def test_is_newer_handles_missing():
 # --- check（判定の分岐）----------------------------------------------------
 def test_check_offline_returns_offline(monkeypatch):
     monkeypatch.setattr(update, "installed_version", lambda: "0.21.0")
-    monkeypatch.setattr(update, "latest_pypi_version", lambda timeout=3.0: None)
+    monkeypatch.setattr(update, "latest_release_version", lambda timeout=3.0: None)
     st = update.check()
     assert st.available is False and st.can_apply is False and st.reason == "offline"
 
 
 def test_check_not_a_git_clone(monkeypatch):
     monkeypatch.setattr(update, "installed_version", lambda: "0.21.0")
-    monkeypatch.setattr(update, "latest_pypi_version", lambda timeout=3.0: "0.22.0")
+    monkeypatch.setattr(update, "latest_release_version", lambda timeout=3.0: "0.22.0")
     monkeypatch.setattr(update, "repo_root", lambda: None)
     st = update.check()
     assert st.available is True and st.can_apply is False
@@ -42,7 +42,7 @@ def test_check_not_a_git_clone(monkeypatch):
 
 def test_check_dirty_tree_holds(monkeypatch, tmp_path):
     monkeypatch.setattr(update, "installed_version", lambda: "0.21.0")
-    monkeypatch.setattr(update, "latest_pypi_version", lambda timeout=3.0: "0.22.0")
+    monkeypatch.setattr(update, "latest_release_version", lambda timeout=3.0: "0.22.0")
     monkeypatch.setattr(update, "repo_root", lambda: tmp_path)
     monkeypatch.setattr(update, "_on_default_branch", lambda root: True)
     monkeypatch.setattr(update, "_tracks_upstream", lambda root: True)
@@ -53,7 +53,7 @@ def test_check_dirty_tree_holds(monkeypatch, tmp_path):
 
 def test_check_no_upstream_holds(monkeypatch, tmp_path):
     monkeypatch.setattr(update, "installed_version", lambda: "0.21.0")
-    monkeypatch.setattr(update, "latest_pypi_version", lambda timeout=3.0: "0.22.0")
+    monkeypatch.setattr(update, "latest_release_version", lambda timeout=3.0: "0.22.0")
     monkeypatch.setattr(update, "repo_root", lambda: tmp_path)
     monkeypatch.setattr(update, "_on_default_branch", lambda root: True)
     monkeypatch.setattr(update, "_tracks_upstream", lambda root: False)
@@ -64,7 +64,7 @@ def test_check_no_upstream_holds(monkeypatch, tmp_path):
 def test_check_non_default_branch_holds(monkeypatch, tmp_path):
     # 機能ブランチ（既定ブランチでない）では、新版があっても自動適用しない（開発を邪魔しない）。
     monkeypatch.setattr(update, "installed_version", lambda: "0.21.0")
-    monkeypatch.setattr(update, "latest_pypi_version", lambda timeout=3.0: "0.22.0")
+    monkeypatch.setattr(update, "latest_release_version", lambda timeout=3.0: "0.22.0")
     monkeypatch.setattr(update, "repo_root", lambda: tmp_path)
     monkeypatch.setattr(update, "_on_default_branch", lambda root: False)
     st = update.check()
@@ -74,7 +74,7 @@ def test_check_non_default_branch_holds(monkeypatch, tmp_path):
 
 def test_check_ok_can_apply(monkeypatch, tmp_path):
     monkeypatch.setattr(update, "installed_version", lambda: "0.21.0")
-    monkeypatch.setattr(update, "latest_pypi_version", lambda timeout=3.0: "0.22.0")
+    monkeypatch.setattr(update, "latest_release_version", lambda timeout=3.0: "0.22.0")
     monkeypatch.setattr(update, "repo_root", lambda: tmp_path)
     monkeypatch.setattr(update, "_on_default_branch", lambda root: True)
     monkeypatch.setattr(update, "_tracks_upstream", lambda root: True)
@@ -89,19 +89,19 @@ def test_check_uses_source_version_over_metadata(monkeypatch, tmp_path):
     (tmp_path / "pyproject.toml").write_text(
         '[project]\nname = "local-llm-server"\nversion = "0.22.0"\n', encoding="utf-8")
     monkeypatch.setattr(update, "installed_version", lambda: "0.21.0")  # 固定メタデータは古い
-    monkeypatch.setattr(update, "latest_pypi_version", lambda timeout=3.0: "0.22.0")
+    monkeypatch.setattr(update, "latest_release_version", lambda timeout=3.0: "0.22.0")
     monkeypatch.setattr(update, "repo_root", lambda: tmp_path)
     monkeypatch.setattr(update, "_on_default_branch", lambda root: True)
     monkeypatch.setattr(update, "_tracks_upstream", lambda root: True)
     monkeypatch.setattr(update, "_working_tree_clean", lambda root: True)
     st = update.check()
     assert st.current == "0.22.0"          # ソース版を採用
-    assert st.available is False           # ソース==PyPI なので更新なし（＝ループしない）
+    assert st.available is False           # ソース==最新タグなので更新なし（＝ループしない）
 
 
 def test_check_same_version_not_available(monkeypatch, tmp_path):
     monkeypatch.setattr(update, "installed_version", lambda: "0.22.0")
-    monkeypatch.setattr(update, "latest_pypi_version", lambda timeout=3.0: "0.22.0")
+    monkeypatch.setattr(update, "latest_release_version", lambda timeout=3.0: "0.22.0")
     monkeypatch.setattr(update, "repo_root", lambda: tmp_path)
     monkeypatch.setattr(update, "_on_default_branch", lambda root: True)
     monkeypatch.setattr(update, "_tracks_upstream", lambda root: True)
@@ -162,8 +162,10 @@ def test_apply_update_pulls_over_regenerated_lock(tmp_path, monkeypatch):
     (origin / "pyproject.toml").write_text('[project]\nname = "demo"\nversion = "0.2.0"\n')
     (origin / "uv.lock").write_text("lock v2\n")     # リリースでロックも作り直される
     git(origin, "add", "-A"); git(origin, "commit", "-qm", "v0.2.0")
+    git(origin, "tag", "v0.2.0")                     # リリースタグ（これが配布の合図）
     sp.run(["git", "clone", "-q", str(origin), str(work)], capture_output=True)
     git(work, "reset", "-q", "--hard", "HEAD~1")     # 1 版遅れた状態にする
+    git(work, "tag", "-d", "v0.2.0")                 # タグも未取得の状態にする
     (work / "uv.lock").write_text("locally re-resolved\n")  # uv sync が書き換えた想定
 
     monkeypatch.setattr(update, "_find_uv", lambda: None)    # 同期はこのテストの対象外
@@ -194,6 +196,8 @@ def test_apply_update_runs_pull_and_sync(monkeypatch, tmp_path):
 
     def fake_git(root, *args, timeout=30.0):
         calls.append(("git", args))
+        if args[0] == "for-each-ref":
+            return _R(out="refs/tags/v0.1.0\nrefs/tags/v9.9.9\n")
         return _R()
 
     def fake_run(cmd, **kw):
@@ -204,12 +208,15 @@ def test_apply_update_runs_pull_and_sync(monkeypatch, tmp_path):
     monkeypatch.setattr(update.subprocess, "run", fake_run)
     ok, msg = update.apply_update(root=tmp_path)
     assert ok is True
-    # git pull --ff-only が呼ばれ、続いて uv sync が試行される（uv は絶対パス解決あり）。
-    # Windows では which("uv") が uv.exe を返すため、拡張子を除いた名前で判定する。
-    assert ("git", ("pull", "--ff-only")) in calls
-    # 再生成される成果物は pull の**前に**捨てる（残すと git が pull を拒む）。
+    # fetch --tags → 最新タグへの merge --ff-only、続いて uv sync が試行される
+    # （uv は絶対パス解決あり。Windows では which("uv") が uv.exe を返すため、
+    # 拡張子を除いた名前で判定する）。追従先はブランチ先端でなく**タグ**。
+    merge = ("git", ("merge", "--ff-only", "refs/tags/v9.9.9"))
+    assert ("git", ("fetch", "--tags", "--force", "origin")) in calls
+    assert merge in calls
+    # 再生成される成果物は ff の**前に**捨てる（残すと git が適用を拒む）。
     checkout = ("git", ("checkout", "--", "uv.lock"))
-    assert checkout in calls and calls.index(checkout) < calls.index(("git", ("pull", "--ff-only")))
+    assert checkout in calls and calls.index(checkout) < calls.index(merge)
     # uv sync は **--frozen**（ロックを更新しない）。これが無いと自動更新が自分で
     # 作業ツリーを dirty にして、次回以降の更新を永久に塞ぐ。
     assert any(
@@ -398,11 +405,11 @@ def test_mark_running_source_records_the_source_version(monkeypatch, tmp_path):
 
 
 def _stub_check(monkeypatch, tmp_path, source_version, latest):
-    """pyproject が source_version、PyPI が latest の状況を作る。"""
+    """pyproject が source_version、最新リリースタグが latest の状況を作る。"""
     (tmp_path / "pyproject.toml").write_text(
         f'[project]\nname = "x"\nversion = "{source_version}"\n', encoding="utf-8")
     monkeypatch.setattr(update, "repo_root", lambda: tmp_path)
-    monkeypatch.setattr(update, "latest_pypi_version", lambda timeout=3.0: latest)
+    monkeypatch.setattr(update, "latest_release_version", lambda timeout=3.0: latest)
     monkeypatch.setattr(update, "_on_default_branch", lambda root: True)
     monkeypatch.setattr(update, "_tracks_upstream", lambda root: True)
     monkeypatch.setattr(update, "_working_tree_clean", lambda root: True)
@@ -432,7 +439,7 @@ def test_check_no_restart_required_when_unmarked(monkeypatch, tmp_path):
 
 
 def test_check_reports_restart_required_even_when_offline(monkeypatch, tmp_path):
-    # PyPI に届かなくても、プロセスが古いことはローカルだけで分かる。
+    # タグ照会に届かなくても、プロセスが古いことはローカルだけで分かる。
     _stub_check(monkeypatch, tmp_path, "0.37.1", None)
     monkeypatch.setattr(update, "_RUNNING_SOURCE_VERSION", "0.37.0")
     st = update.check()
