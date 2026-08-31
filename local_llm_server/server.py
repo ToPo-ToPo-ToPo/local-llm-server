@@ -422,8 +422,9 @@ class ServerConfig:
 
 
 def parallel_supported(backend: str) -> bool:
-    """そのバックエンドが並列スロット指定に対応するか。"""
-    return backend == "llama-cpp"
+    """そのバックエンドが並列スロット指定に対応するか（→ BACKEND_SPECS）。"""
+    spec = BACKEND_SPECS.get(backend)
+    return spec is not None and spec.parallel
 
 
 # 思考チャネルの開始/終了マーカー（mlx-vlm へ env で渡す）。mlx-vlm は env で渡された 1 対を
@@ -884,7 +885,7 @@ def estimate_model_bytes(config: ServerConfig) -> int | None:
     呼び出し側で余裕係数を掛ける前提（→ docs/llama-cpp.md のメモリガード）。
     """
     try:
-        if config.backend == "llama-cpp":
+        if backend_spec(config.backend).gguf:
             path = resolve_gguf(config.model)
             total = os.path.getsize(path)
             mmproj = find_sibling_mmproj(path)
@@ -1111,30 +1112,55 @@ def _build_sglang(config: ServerConfig) -> list[str]:
     ]
 
 
-# backend 名 → 起動コマンドビルダー。バックエンドを増やすときは、上に _build_<name> を
-# 書いてここへ 1 行足す（長大な elif 連鎖に継ぎ足さない）。BACKENDS（公開値）と揃えること。
-_COMMAND_BUILDERS = {
-    "mlx": _build_mlx,
-    "mlx-vlm": _build_mlx_vlm,
-    "llama-cpp": _build_llama_cpp,
-    "whisper": _build_whisper,
-    "vllm": _build_vllm,
-    "sglang": _build_sglang,
+@dataclass(frozen=True)
+class BackendSpec:
+    """1 バックエンドの性質と起動方法をまとめた記述子。
+
+    バックエンドごとの知識（起動コマンド・draft_model の解釈・並列対応・GGUF か・
+    必要な自動導入）は**この表の 1 エントリ**に集約する。散在する `backend == "..."` 比較を
+    書かず、`backend_spec(name).<性質>` を参照すること——バックエンドの追加・変更時に
+    触る場所を 1 箇所にするため。真の振る舞い差（build）は関数参照で持つ（Strategy 相当）。
+    """
+    name: str
+    build: object  # Callable[[ServerConfig], list[str]] — 起動コマンド（extra_args 抜き）
+    # draft_model の解釈: "mtp"（対応表 MTP_DRAFTERS で解決 → --draft-model）、
+    # "gguf"（ドラフト GGUF のパス/HF id をそのまま -md へ）、None（speculative decoding 非対応）
+    draft_style: str | None = None
+    parallel: bool = False       # --parallel の並列スロットに対応するか
+    gguf: bool = False           # GGUF ベースか（pull / show / メモリ見積もりの分岐）
+    provisioner: str | None = None  # 起動時に必要な自動導入（"llama" / "vllm" / "sglang"）
+
+
+# バックエンドの登録簿。増やすときは _build_<name> を書いてここへ 1 行足す
+# （elif 連鎖にも、他ファイルの backend == 比較にも継ぎ足さない）。BACKENDS（公開値）と 1:1。
+BACKEND_SPECS: dict[str, BackendSpec] = {
+    s.name: s for s in (
+        BackendSpec("mlx", _build_mlx),
+        BackendSpec("mlx-vlm", _build_mlx_vlm, draft_style="mtp"),
+        BackendSpec("llama-cpp", _build_llama_cpp, draft_style="gguf",
+                    parallel=True, gguf=True, provisioner="llama"),
+        BackendSpec("whisper", _build_whisper),
+        BackendSpec("vllm", _build_vllm, provisioner="vllm"),
+        BackendSpec("sglang", _build_sglang, provisioner="sglang"),
+    )
 }
 
 
+def backend_spec(name: str) -> BackendSpec:
+    """backend 名から記述子を引く（未知の名前は案内付き ValueError）。"""
+    spec = BACKEND_SPECS.get(name)
+    if spec is None:
+        raise ValueError(f"unknown backend: {name!r} (choose from {BACKENDS})")
+    return spec
+
+
 def build_command(config: ServerConfig) -> list[str]:
-    """バックエンドに応じた起動コマンドを組み立てる（実体は _COMMAND_BUILDERS の各関数）。
+    """バックエンドに応じた起動コマンドを組み立てる（実体は BACKEND_SPECS の build）。
 
     いずれも OpenAI 互換サーバーを立ち上げる。extra_args は全バックエンド共通で末尾に付く
     （ユーザーの明示指定が自動付与より後＝優先になる）。
     """
-    builder = _COMMAND_BUILDERS.get(config.backend)
-    if builder is None:
-        raise ValueError(
-            f"unknown backend: {config.backend!r} (choose from {BACKENDS})"
-        )
-    return builder(config) + config.extra_args
+    return backend_spec(config.backend).build(config) + config.extra_args
 
 
 def is_ready(base_url: str, timeout: float = 1.0) -> bool:

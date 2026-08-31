@@ -39,6 +39,7 @@ from . import migrate
 from .daemon import load_gateway_config
 from .server import (
     MTP_DRAFTERS,
+    backend_spec,
     _hf_hub_cache,
     discover_cached_models,
     ensure_cached,
@@ -749,7 +750,7 @@ def cmd_pull(gcfg, args) -> int:
     backend = infer_backend(args.model)
     try:
         from huggingface_hub import snapshot_download
-        if backend == "llama-cpp":
+        if backend_spec(backend).gguf:
             from huggingface_hub import HfApi
             targets = plan_gguf_pull(HfApi().list_repo_files(repo), selector)
             print(f"取得: {repo}  {len(targets)} ファイル "
@@ -771,7 +772,7 @@ def cmd_pull(gcfg, args) -> int:
         return 1
     # 取得結果をサーバーと同じ基準で検証してから完了を名乗る。
     try:
-        if backend == "llama-cpp":
+        if backend_spec(backend).gguf:
             resolve_gguf(args.model)
         else:
             ensure_cached(repo)
@@ -860,7 +861,7 @@ def build_show_rows(model: str) -> list[tuple[str, str]]:
         rows.append(("キャッシュ", f"未取得（gw pull {model} で取得）"))
         return rows
     rows.append(("ディスクサイズ", _human_size(_dir_size(cache))))
-    if backend == "llama-cpp":
+    if backend_spec(backend).gguf:
         try:
             path = resolve_gguf(model)
             name = os.path.basename(path)
