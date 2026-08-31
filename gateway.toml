@@ -111,8 +111,12 @@ dynamic = true
 
 # ───────────────────────────────────────────────────────────────────────────────
 # 事前登録（任意）。parallel・llama.cpp の MTP・llama-server への個別フラグ等、ID だけでは
-# 決まらない上書きが要るモデルだけ書く。dynamic = true なら下は全て省略可（mlx-vlm の MTP と
-# 画像入力は動的ロードでも自動で効くので、それ目的の事前登録は不要）。必要なら例のコメントを外す。
+# 決まらない上書きが要るモデルだけ書く。dynamic = true なら全て省略可（mlx-vlm の MTP と
+# 画像入力は動的ロードでも自動で効くので、それ目的の事前登録は不要）。
+#
+# どのモデルをどう使うかは各 PC のユーザーが決めることなので、このテンプレートに実例は
+# 置かない（以下はすべてコメントアウトされた書式例。必要なものだけ外して自分のモデルに
+# 書き換える）。
 #
 # mlx-vlm で MTP を個別に無効化／別ドラフターを明示したいときだけ（自動で効くので通常は不要）:
 # [[models]]
@@ -120,167 +124,6 @@ dynamic = true
 # backend = "mlx-vlm"
 # draft_model = "off"       # このモデルだけ MTP を無効化（HF id を書けば別ドラフターを明示）
 #
-# ── Ternary Bonsai 27B（Prism ML の三値モデル。Qwen3.6-27B ベースの vision-language）──
-# 三値 2bit の MLX パックは **素の mlx-vlm（本リポジトリが既にピンしている 0.6.3）で動く**
-# （フォーク不要。フォークが要るのは 1bit 版のみで、それは iPhone 向け）。事前登録するのは
-# ID から決まらない上書き（MTP 無効化）を効かせるためで、動的ロードでも backend は mlx-vlm に
-# 推論される。事前に `hf download prism-ml/Ternary-Bonsai-27B-mlx-2bit`（公開リポ）で取得しておくこと。
-#   推奨サンプリング（クライアント側で指定）: temperature = 0.7 / top_p = 0.95 / top_k = 20
-#   思考（thinking）は既定OFF運用。mlx-vlm サーバは enable_thinking 未指定なら思考OFF（実測確認済み）。
-#   注意: Bonsai の公表ベンチ（三値 80.49 / FP16比 94.6%）は全て thinking mode の値。数学・コード・
-#   エージェント等の推論タスクで質を出したいリクエストだけ enable_thinking=true を送る運用にする。
-#
-#   思考チャネルの分離（thinking を出しても content を汚さない）: mlx-vlm 0.6.3 は生成テキストから
-#   reasoning を切り出して reasoning_content へ回す。その開始/終了マーカーはモデルごとに違い、
-#   gemma-4-A4B 系は「開 <|channel>thought / 閉 <channel|>」を使う（<think>…</think> とは別形式）。
-#   0.6.3 の既定マーカーには両形式が含まれるが、内部既定に依存しないよう server.py が mlx-vlm 起動時に
-#   MLX_VLM_THINKING_START_TOKEN/END_TOKEN を明示設定する。これにより gemma-4 の thought/<channel|> が
-#   content へ漏れない（旧 mlx-vlm ではこの既定が無く漏れていた＝要 0.6.3 以上、pyproject でピン済み）。
-[[models]]
-model = "prism-ml/Ternary-Bonsai-27B-mlx-2bit"
-backend = "mlx-vlm"       # 27B は vision-language。mlx-vlm なら画像入力も使える（三値パックは FP16 vision tower 同梱）
-draft_model = "off"       # DSpark drafter は Apple Silicon の batch-1 では償却できず既定無効（→ off を明示）
-# disable_thinking は mlx-vlm では build_command が参照しない（無効）。既定OFF はサーバ側の挙動で担保される
-
-# ── Bonsai 27B 1-bit（GGUF / llama.cpp 経路。軽量テキスト運用）──
-# 1bit は MLX（素の mlx）では動かない（1bit カーネル無し）が、**GGUF なら mainline llama.cpp の
-# Metal でそのまま動く**（Q1_0 は upstream にマージ済み。フォーク不要）。
-# model は `org/repo:セレクタ`。`:Q1_0` で多量子化リポから本体1ファイル（Bonsai-27B-Q1_0.gguf）を特定。
-# 取得: `hf download prism-ml/Bonsai-27B-gguf Bonsai-27B-Q1_0.gguf`
-# 画像入力を使うなら別途 mmproj を同じスナップショットへ置くと自動で --mmproj が付く:
-#   `hf download prism-ml/Bonsai-27B-gguf Bonsai-27B-mmproj-Q8_0.gguf`
-# 導入後は実プロセス起動コマンドに再ロードが要る（mmproj は起動時フラグのため、既にロード済み
-# のインスタンスには効かない。次のリクエストで自動再ロードされるのを待つか、明示的に落とす）。
-# vision 実測確認済み: 図形（青四角・赤丸）と文字（"HELLO"）を含む画像を正しく認識・記述。
-# RSS は mmproj 分だけ増える。テキストのみのリクエストには速度・精度とも影響なし
-# （mmproj はロードされるが画像が来た時だけ使われる）。
-#
-# コーディング品質は実測で三値と同等（LeetCode easy〜medium 8問、thinking ON/OFF とも 24/24）。
-# 数学等の推論タスクでの三値との差は未検証（→ 必要なら追加で比較すること）。
-#
-# ⚠ メモリの罠: --ctx-size 未指定だと llama-server は Bonsai のネイティブ最大コンテキスト
-# （262144）分の KV キャッシュを FP16 で丸ごと事前確保する。動的ロード（この事前登録なし）で
-# 実測すると RSS が本体サイズから大きく膨張する（＝「1bit だから軽い」が逆転する）。下の
-# extra_args で -c 32768 に絞れば大幅に下がる（ゲートウェイ経由の実プロセスで確認済み）。用途に応じて -c を
-# 調整すること（大きい方が要 RAM、小さい方が省 RAM）。
-[[models]]
-model = "prism-ml/Bonsai-27B-gguf:Q1_0"
-backend = "llama-cpp"
-draft_model = "off"       # DSpark drafter は使わない（Apple Silicon batch-1 で非効率。上の三値と同方針）
-extra_args = ["-c", "32768"]  # コンテキストを32Kに制限してRAM膨張を防ぐ（上の罠を参照。既定262144は不可）
-disable_thinking = true   # 既定は思考OFF。起動時の --chat-template-kwargs で正しく抑制される
-                          # （ゲートウェイ経由の実プロセスで確認済み: 無指定→抑制、明示 true→思考する）。
-                          # 思考を効かせたいリクエストだけ chat_template_kwargs={"enable_thinking": true} を送る
-
-# ── Inkling-Small（Thinking Machines。276B total / 12B active の疎 MoE。text+image+audio 入力）──
-# 公式 bf16（thinkingmachines/Inkling-Small）を自前で MLX 4bit へ変換したもの
-# （実測 4.506 bits/weight）。
-# HF にも公開: ToPo-ToPo/Inkling-Small-mlx-4bit（2bit 版もあり）。
-#
-# ⚠ mlx-vlm 0.6.9 以降が必須（pyproject でピン済み）。0.6.7/0.6.8 は Inkling を
-#   公開ローダー経路で読めず、当時は config のキー名翻訳と起動時シムで回避していた。
-#   さらに深刻なのは、当時の実装が MoE の mlp.global_scale（50件）と mlp.gate.bias（40件）を
-#   持たず、**変換時にこれらの重みを黙って落としていた**こと（形状エラーも出ない）。
-#   0.6.9 はこれらを扱い、公式 config をそのまま読む。翻訳もシムも不要になった。
-#   → 変換は scripts/convert_inkling.py（0.6.9 未満なら実行前に止まる）
-#
-# 画像入力: 実測確認済み（640x480 の画像が 204 vision トークンに展開され、
-#   青い四角＋赤い丸＋"HELLO" を正確に認識）。
-#
-# MTP（speculative decoding）: **使えない**（0.6.9 で実測）。
-#   公式 bf16 内蔵の model.mtp.* を mlx-vlm 付属の
-#   `python -m mlx_vlm.speculative.drafters.inkling_mtp.split` で切り出せるが:
-#     ① 0.6.8 までは最初の draft block で空キャッシュ（keys が None）を参照して落ちた。
-#        0.6.9 の _snapshot_cache_state 修正でクラッシュ自体は解消。
-#     ② しかし実測すると **MTP 無しより遅くなる**（採択率が低く、ドラフト生成と検証の
-#        コストだけが乗る）。
-#     ③ さらに temperature=0 でも **MTP 有無で出力が分岐する**。投機デコードは lossless で
-#        あるべきなので、巻き戻しか受理判定が正しく動いていない。速度以前に品質を保証できない。
-#   以上より切り出したドラフターはローカルからも削除した（必要なら公式 bf16 から作り直せるが、
-#   公式 bf16 の再取得が要る）。上流が ②③ を直したら再検討する。
-[[models]]
-model = "ToPo-ToPo/Inkling-Small-mlx-4bit"   # 自前変換を HF へ公開したもの（事前に hf download 済み）
-backend = "mlx-vlm"
-disable_thinking = true     # 思考 OFF（他モデルと揃える）。mlx-vlm には build_command 側で
-                            # 止める手段が無いので、ゲートウェイが reasoning_effort="none" を
-                            # リクエストへ注入する。Inkling のテンプレートは enable_thinking を
-                            # 見ず、指定が無いと必ず「Thinking effort level: 0.9」を入れるため、
-                            # これが無いと毎回ほぼ最大の思考が走る（CAD 1 課題で 3〜8 分）。
-                            # 思考させたいリクエストだけ reasoning_effort を明示すれば尊重される
-draft_model = "off"         # ← 上流バグで MTP が使えない（上記）
-
-# ── DeepSeek-V4-Flash-0731（DeepSeek の 304B 疎 MoE。テキスト専用・context 1M・MIT）──
-# 公式 FP8（deepseek-ai/DeepSeek-V4-Flash-0731・e4m3 block 128x128）を自前で MLX 4bit へ
-# 変換したもの（実測 4.339 bits/weight）。
-#
-# Inkling と違い**回避策が一切要らない**: 公式 config の model_type が mlx-vlm の実装と同じ
-# `deepseek_v4` で、`ModelConfig` に text_config フィールドが無いため汎用ローダーの
-# update_module_configs も素通りする。prompt_utils.MODEL_CONFIG にも TEXT_ONLY で登録済み。
-# 変換は `mlx_vlm.convert -q --q-bits 4 --q-group-size 64` をそのまま実行するだけでよい
-# （公式が FP8 でも、models/deepseek_v4 の sanitize が .weight/.scale の対を解いて再量子化する）。
-#
-# MTP: 公式チェックポイントに内蔵された MTP を mlx-vlm 付属の
-#   `python -m mlx_vlm.speculative.drafters.deepseek_v4_mtp.split` で切り出した bf16。
-#   Inkling の MTP は上流バグで使えなかったが、こちらは別実装なので有効化して試す。
-#   不調なら draft_model = "off" にする。
-[[models]]
-model = "ToPo-ToPo/DeepSeek-V4-Flash-0731-mlx-4bit"   # 自前変換を HF へ公開したもの（事前に hf download 済み）
-backend = "mlx-vlm"
-disable_thinking = true     # 思考 OFF（他モデルと揃える）。reasoning_effort="none" を注入する。
-                            # 未設定だと既定で思考し、CAD 1 課題の生成が Inkling(OFF) の 8〜11 倍の
-                            # 文字数になっていた（enclosure で 45,966 文字 vs 4,054 文字）
-# MTP ドラフター: **旧 DeepSeek-V4-Flash（無印）から切り出した bf16**。
-#   0731 の内蔵 MTP（mtp.0/1/2・main_proj [4096,12288] の 3 系統連結）は mlx-vlm の
-#   DeepseekV4MTPDraftModel（enorm/hnorm/e_proj/h_proj 構造）と**アーキテクチャ自体が別物**で
-#   使えない。旧 Flash の mtp.0 は上流実装と完全一致し（動作実績のある
-#   inferencerlabs/DeepSeek-V4-Flash-MTP-MLX の出所もこれ）、hidden_size も同じ 4096 なので
-#   0731 本体のドラフターとして組める（投機デコードは lossless。旧型ドラフター故に採択率が
-#   下がる可能性はあり、効果は実測で判断する）。
-#   作成: hf download deepseek-ai/DeepSeek-V4-Flash（mtp は model-00046-of-00046 に隔離）
-#         → python -m mlx_vlm.speculative.drafters.deepseek_v4_mtp.split
-#   ⚠ split.py は get_model_path 経由でリポ全体を取得するので注意（切り出し後は削除可）。
-draft_model = "off"         # ← 上流バグで実用不能（下記）。短い生成では通るので注意
-# draft_model = "/Users/octopus/mlx_models/DeepSeek-V4-Flash-MTP-bf16"
-#   ⚠ ドラフトが**棄却されたときの巻き戻し**で落ちる:
-#     models/deepseek_v4/language.py の rollback_speculative_cache が
-#     "'list' object has no attribute 'max'" を投げる（CAD 評価で 152 回発生し、
-#     全 7 課題が "no geometry produced" で失敗した）。
-#   数十トークン程度の短い生成では棄却が起きず素通りするため、疎通確認では見抜けない。
-#   実運用の長い生成では確実に踏むので off にしておくこと。
-
-# ── Qwen3.8-27B（Qwen の 27B 密モデル。vision-language・context 262k・apache-2.0）──
-# 公式 bf16（Qwen/Qwen3.8-27B）を自前で MLX 4bit へ変換したもの（実測 4.695 bits/weight）。
-# HF にも公開: ToPo-ToPo/Qwen3.8-27B-mlx-4bit（8bit・bf16 版もあり）。
-#
-# Inkling と違い**回避策が一切要らない**: 公式 config の model_type が mlx-vlm の実装と同じ
-# `qwen3_5` で、Qwen3.6-27B と config の構造が完全一致する（差は transformers_version だけ）。
-# 変換は `mlx_vlm.convert -q --q-bits 4 --q-group-size 64` をそのまま実行するだけでよい。
-#
-# 画像入力と native tool calling（finish_reason=tool_calls）を確認済み。
-[[models]]
-model = "ToPo-ToPo/Qwen3.8-27B-mlx-4bit"   # 自前変換を HF へ公開したもの（事前に hf download 済み）
-backend = "mlx-vlm"
-disable_thinking = true     # 思考 OFF（他モデルと揃える）。テンプレートは enable_thinking と
-                            # reasoning_effort の両方を見るので、ゲートウェイの注入が効く。
-                            # 思考させたいリクエストだけ enable_thinking=true を送る運用にする
-# MTP ドラフター: 公式チェックポイント内蔵の mtp.*（15 テンソル・model-00018 に隔離）を
-#   `python -m mlx_vlm.speculative.drafters.qwen3_5_mtp.split` で切り出した bf16。
-#   HF にも公開: ToPo-ToPo/Qwen3.8-27B-MTP-bf16（4bit 版もあり）。
-#   ⚠ 量子化後のリポジトリからは mtp が落ちているので、必ず公式 bf16 から切り出すこと
-#     （mlx-vlm 0.6.9 の qwen3_5 変換は model.mtp.* を出力に含めない。bf16 変換でも 0 テンソル）。
-#   Inkling・DeepSeek と違い**アーキテクチャ不一致も巻き戻しクラッシュも無い**: 実装
-#   （drafters/qwen3_5_mtp）が期待するキーと公式の mtp.* が完全一致し、1500 tokens・589 ラウンド・
-#   temperature 0.7（＝棄却あり）でも落ちない。
-#
-#   効き方は構造化出力（コード・ツール呼び出しの JSON）ほど大きく、自由文では小さい。
-#   ⚠ 伸び幅は機材・量子化・ワークロード・mlx-vlm のバージョンで変わるので、**必ず自環境で
-#     実測して判断する**こと。同環境で対照実験したところ、既知の成功ペア（Qwen3.6-27B +
-#     公式 MTP-4bit）自体が速度向上を示さなかった。伸びないときの原因は本ドラフターではなく
-#     mlx-vlm 側の MTP 経路にある。
-#   bf16 と 4bit は greedy では採択が同一（量子化で argmax がほぼ変わらない）。コードでは bf16 が
-#     わずかに上だったので、一般的な慣例どおり bf16 を採用する。
-draft_model = "ToPo-ToPo/Qwen3.8-27B-MTP-bf16"   # 事前に hf download 済み
-
 # vLLM（Linux/NVIDIA。Windows は WSL2 内で）。HF repo-id（safetensors）を指定。高スループット:
 # [[models]]
 # model = "Qwen/Qwen3-8B"
