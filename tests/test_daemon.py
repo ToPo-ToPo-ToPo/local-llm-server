@@ -98,8 +98,8 @@ def test_preregistered_auto_unlisted_does_not_break_config(tmp_path, capsys):
     # 警告して MTP 無しにするだけに留める（他のモデルは通常どおり登録される）。
     #
     # 以前は即エラー（fail-fast）にしていたが、MTP が効かないだけで済む話で全モデルを
-    # 起動不能にするのは割に合わない。動的ロード（_dynamic_draft）は元から MTP 無しに
-    # 落としていたので、事前登録だけが厳しすぎた。
+    # 起動不能にするのは割に合わない。動的ロード（_dynamic_draft）は元から静かに MTP 無しへ
+    # 落としていたので、事前登録だけが厳しすぎた。挙動をそちらに揃える。
     toml = tmp_path / "gateway.toml"
     toml.write_text(
         'draft_model = "auto"\n'
@@ -112,7 +112,9 @@ def test_preregistered_auto_unlisted_does_not_break_config(tmp_path, capsys):
     assert by_id["org/unlisted-mlx-4bit"].draft_model is None          # MTP 無しで登録
     assert by_id["ToPo-ToPo/Qwen3.6-27B-mlx-4bit"].draft_model == \
         "ToPo-ToPo/Qwen3.6-27B-MTP-bf16"                              # 他は従来どおり
-    assert "MTP 対応表に無い" in capsys.readouterr().err
+    # 警告は出さない。"auto" は「対応表に在れば使う」であって MTP を使うという宣言ではなく、
+    # そもそも MTP が存在しないモデルのほうが多数派なので、警告するとただのノイズになる。
+    assert capsys.readouterr().err == ""
 
 
 def test_dynamic_register_auto_enables_mtp_for_supported_mlx_vlm():

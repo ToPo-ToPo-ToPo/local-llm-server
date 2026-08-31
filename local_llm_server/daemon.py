@@ -64,7 +64,6 @@ from .server import (
     reap_orphan_workers,
     reclaim_stale_workers,
     resolve_drafter,
-    warn,
     set_llama_server_binary,
     set_sglang_python,
     set_vllm_python,
@@ -1783,10 +1782,14 @@ def _resolve_model_draft(
     - 個別の `draft_model` があればそれを、無ければゲートウェイ既定を継承する。
     - `""` / `"off"` / `"none"` で無効化（継承既定の打ち消しに使える）。
     - mlx-vlm のみ MTP が効くので、その場合だけ `resolve_drafter` で解決する。`"auto"` が
-      本体名から引けないときは**警告して MTP 無しにする**（動的ロードの `_dynamic_draft` と
-      同じ扱い）。ここで例外にすると、トップレベルの `draft_model = "auto"` を継承した
+      本体名から引けないときは**静かに MTP 無しにする**（動的ロードの `_dynamic_draft` と
+      同じ扱い）。`"auto"` は「対応表に在れば使う」であって MTP を使うという宣言ではなく、
+      そもそも MTP が存在しないモデルのほうが多数派なので、警告するとただのノイズになる。
+      ここで例外にするのはもっと悪く、トップレベルの `draft_model = "auto"` を継承した
       未収載モデルが 1 つ在るだけで**ゲートウェイ全体の設定読み込みが失敗する**——
       MTP が効かないだけで済む話が、全モデルを起動不能にしてしまう。
+    - 警告を出すのは「使うと宣言しているのに使えない」ときだけ（ドラフターの HF id が
+      決まっているのに未取得＝build_command 側、または MTP 非対応バックエンドへの明示指定）。
     - 他バックエンドでは無視するが、**個別に明示**されていた場合だけ「無視される」旨を警告する。
     """
     has_own = "draft_model" in entry
@@ -1799,13 +1802,7 @@ def _resolve_model_draft(
         try:
             return resolve_drafter(model, raw)
         except ValueError:
-            # 例外文には対応表の全項目が並ぶので、警告には載せない（一覧は `gw mtp`）。
-            warn(
-                f"{model!r} は MTP 対応表に無いため、MTP 無しで登録します"
-                f"（本体は通常どおり動作します）。使いたい場合は draft_model に"
-                f"ドラフターの HF id を明示してください（対応表は `gw mtp`）。"
-            )
-            return None
+            return None  # "auto" が対応表に無い → MTP なしで普通に登録する
     if backend == "llama-cpp":
         # llama.cpp のspeculative decodingはドラフト GGUF のパスを直接指定する（-md）。
         # MTP ヘッドのファイル名は build_command 側で検出して --spec-type draft-mtp を付ける。
