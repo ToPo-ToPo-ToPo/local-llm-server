@@ -267,6 +267,68 @@ def test_build_command_mlx_vlm_draft_auto(stub_cache):
     assert cmd[cmd.index("--draft-kind") + 1] == "mtp"
 
 
+def test_build_command_mtp_falls_back_when_drafter_missing(hf_cache, capsys):
+    # ドラフター未取得でも本体の起動は止めない（MTP は高速化でしかない）。警告だけ出して
+    # --draft-model を落とす。対応表を更新して配ったとき、まだ取得していない PC が
+    # 「モデルごと使えない」状態になるのを防ぐ。
+    target = "ToPo-ToPo/Qwen3.6-27B-mlx-4bit"
+    drafter = MTP_DRAFTERS[target]
+    hf_cache(target, ["config.json", "model.safetensors"])   # 本体だけ在る
+    cmd = build_command(ServerConfig("mlx-vlm", target, draft_model="auto"))
+    assert "--draft-model" not in cmd and "--draft-kind" not in cmd
+    assert cmd[cmd.index("--model") + 1] == target          # 本体は通常どおり起動する
+    err = capsys.readouterr().err
+    assert "MTP 無効で起動します" in err and drafter in err
+    assert f"gw pull {drafter}" in err                      # 有効化の手順を案内する
+
+
+def test_build_command_mtp_falls_back_for_explicit_drafter(hf_cache, capsys):
+    # 明示指定（gateway.toml の draft_model）でも同じ。設定ミスや未取得で本体が
+    # 起動不能になるより、警告付きで動くほうが実害が小さい。
+    target = "org/target-27b"
+    hf_cache(target, ["config.json", "model.safetensors"])
+    cmd = build_command(
+        ServerConfig("mlx-vlm", target, draft_model="org/missing-MTP-bf16")
+    )
+    assert "--draft-model" not in cmd
+    assert "org/missing-MTP-bf16" in capsys.readouterr().err
+
+
+def test_build_command_mtp_still_applied_when_drafter_present(hf_cache):
+    # 取得済みなら従来どおり MTP が付く（フォールバックは未取得時に限る）。
+    target = "ToPo-ToPo/Qwen3.6-27B-mlx-4bit"
+    drafter = MTP_DRAFTERS[target]
+    hf_cache(target, ["config.json", "model.safetensors"])
+    hf_cache(drafter, ["config.json", "model.safetensors"])
+    cmd = build_command(ServerConfig("mlx-vlm", target, draft_model="auto"))
+    assert cmd[cmd.index("--draft-model") + 1] == drafter
+    assert cmd[cmd.index("--draft-kind") + 1] == "mtp"
+
+
+def test_build_command_llama_draft_falls_back_when_missing(hf_cache, capsys):
+    # llama-cpp の別ヘッド方式（-md）も同じ。ドラフト GGUF が未取得でも本体は起動する。
+    hf_cache("org/m-gguf", ["m-Q4_K_M.gguf"])
+    cmd = build_command(
+        ServerConfig("llama-cpp", "org/m-gguf", draft_model="org/drafter-gguf:F16-MTP")
+    )
+    assert "-md" not in cmd and "--spec-type" not in cmd
+    assert cmd[0].endswith("llama-server")
+    err = capsys.readouterr().err
+    assert "speculative decoding 無効で起動します" in err
+    assert "org/drafter-gguf:F16-MTP" in err
+
+
+def test_build_command_llama_draft_still_applied_when_present(hf_cache):
+    # 取得済みなら従来どおり -md と MTP 判定が付く。
+    hf_cache("org/m-gguf", ["m-Q4_K_M.gguf"])
+    hf_cache("org/drafter-gguf", ["d-F16-MTP.gguf"])
+    cmd = build_command(
+        ServerConfig("llama-cpp", "org/m-gguf", draft_model="org/drafter-gguf:F16-MTP")
+    )
+    assert cmd[cmd.index("-md") + 1].endswith("d-F16-MTP.gguf")
+    assert cmd[cmd.index("--spec-type") + 1] == "draft-mtp"
+
+
 def test_mtp_status_table_and_explicit(hf_cache, tmp_path):
     # 対応表からの判定（従来どおり）。
     target = "mlx-community/gemma-4-12B-it-qat-4bit"

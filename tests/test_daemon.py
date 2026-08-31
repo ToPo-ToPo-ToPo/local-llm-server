@@ -92,6 +92,31 @@ def test_dynamic_register_infers_backend_and_allocates_port(tmp_path):
     assert mlx.config.backend == "mlx-vlm" and mlx.config.port == 9003
 
 
+def test_preregistered_auto_unlisted_does_not_break_config(tmp_path, capsys):
+    # 事前登録 [[models]] がトップレベルの draft_model="auto" を継承していて、その本体が
+    # 対応表に無い場合。ここで例外にすると**ゲートウェイ全体の設定読み込みが落ちる**ので、
+    # 警告して MTP 無しにするだけに留める（他のモデルは通常どおり登録される）。
+    #
+    # 以前は即エラー（fail-fast）にしていたが、MTP が効かないだけで済む話で全モデルを
+    # 起動不能にするのは割に合わない。動的ロード（_dynamic_draft）は元から静かに MTP 無しへ
+    # 落としていたので、事前登録だけが厳しすぎた。挙動をそちらに揃える。
+    toml = tmp_path / "gateway.toml"
+    toml.write_text(
+        'draft_model = "auto"\n'
+        '[[models]]\nmodel = "org/unlisted-mlx-4bit"\nbackend = "mlx-vlm"\n'
+        '[[models]]\nmodel = "ToPo-ToPo/Qwen3.6-27B-mlx-4bit"\nbackend = "mlx-vlm"\n',
+        encoding="utf-8",
+    )
+    cfg = gw.load_gateway_config(str(toml))
+    by_id = {m.model: m for m in cfg.models}
+    assert by_id["org/unlisted-mlx-4bit"].draft_model is None          # MTP 無しで登録
+    assert by_id["ToPo-ToPo/Qwen3.6-27B-mlx-4bit"].draft_model == \
+        "ToPo-ToPo/Qwen3.6-27B-MTP-bf16"                              # 他は従来どおり
+    # 警告は出さない。"auto" は「対応表に在れば使う」であって MTP を使うという宣言ではなく、
+    # そもそも MTP が存在しないモデルのほうが多数派なので、警告するとただのノイズになる。
+    assert capsys.readouterr().err == ""
+
+
 def test_dynamic_register_auto_enables_mtp_for_supported_mlx_vlm():
     # 事前登録なしの動的ロードでも、対応表に在る mlx-vlm モデルは MTP が自動で効く
     # （draft_model="auto" を graceful に解決）。自作 ToPo-ToPo 版も収録済み。
@@ -278,15 +303,6 @@ def test_gateway_draft_model_ignored_on_non_mlx_vlm(tmp_path):
         'draft_model = "auto"\n'
         '[[models]]\nmodel = "mlx-community/Qwen3.6-27B-4bit"\nbackend = "mlx"\n'))
     assert cfg.models[0].draft_model is None
-
-
-def test_gateway_draft_model_auto_unknown_model_fails_fast(tmp_path):
-    # mlx-vlm で auto だが MTP 対応表に無いモデル → 起動時に即エラー。
-    with pytest.raises(ValueError):
-        gw.load_gateway_config(_write(
-            tmp_path,
-            'draft_model = "auto"\n'
-            '[[models]]\nmodel = "org/unknown-model"\nbackend = "mlx-vlm"\n'))
 
 
 # --- ModelManager（フェイク LocalServer で遅延起動/LRU を検証）----------------

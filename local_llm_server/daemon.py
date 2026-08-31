@@ -1781,9 +1781,16 @@ def _resolve_model_draft(
 
     - 個別の `draft_model` があればそれを、無ければゲートウェイ既定を継承する。
     - `""` / `"off"` / `"none"` で無効化（継承既定の打ち消しに使える）。
-    - mlx-vlm のみ MTP が効くので、その場合だけ `resolve_drafter` で解決・検証する
-      （`"auto"` が本体名から引けなければ ValueError＝起動時に即エラー）。他バックエンドでは
-      無視するが、**個別に明示**されていた場合だけ「無視される」旨を警告する。
+    - mlx-vlm のみ MTP が効くので、その場合だけ `resolve_drafter` で解決する。`"auto"` が
+      本体名から引けないときは**静かに MTP 無しにする**（動的ロードの `_dynamic_draft` と
+      同じ扱い）。`"auto"` は「対応表に在れば使う」であって MTP を使うという宣言ではなく、
+      そもそも MTP が存在しないモデルのほうが多数派なので、警告するとただのノイズになる。
+      ここで例外にするのはもっと悪く、トップレベルの `draft_model = "auto"` を継承した
+      未収載モデルが 1 つ在るだけで**ゲートウェイ全体の設定読み込みが失敗する**——
+      MTP が効かないだけで済む話が、全モデルを起動不能にしてしまう。
+    - 警告を出すのは「使うと宣言しているのに使えない」ときだけ（ドラフターの HF id が
+      決まっているのに未取得＝build_command 側、または MTP 非対応バックエンドへの明示指定）。
+    - 他バックエンドでは無視するが、**個別に明示**されていた場合だけ「無視される」旨を警告する。
     """
     has_own = "draft_model" in entry
     raw = entry.get("draft_model", default_draft)
@@ -1792,7 +1799,10 @@ def _resolve_model_draft(
     if not raw:
         return None
     if backend == _MTP_BACKEND:
-        return resolve_drafter(model, raw)  # auto を解決＆未対応なら ValueError
+        try:
+            return resolve_drafter(model, raw)
+        except ValueError:
+            return None  # "auto" が対応表に無い → MTP なしで普通に登録する
     if backend == "llama-cpp":
         # llama.cpp のspeculative decodingはドラフト GGUF のパスを直接指定する（-md）。
         # MTP ヘッドのファイル名は build_command 側で検出して --spec-type draft-mtp を付ける。
