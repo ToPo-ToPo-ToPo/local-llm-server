@@ -1042,11 +1042,21 @@ def build_command(config: ServerConfig) -> list[str]:
             # HF repo-id（org/repo:F16-MTP 等）を指定すると有効化（-md）。ファイル名に
             # "mtp" を含めば MTP ヘッドとみなし --spec-type draft-mtp を付ける（それ以外は
             # llama.cpp 既定の draft-simple）。
+            # mlx-vlm 側と同じく、ドラフトが未取得でも本体の起動は止めない（警告のみ）。
             if config.draft_model and "-md" not in config.extra_args:
-                draft_path = resolve_gguf(config.draft_model)
-                command += ["-md", draft_path]
-                if "mtp" in os.path.basename(draft_path).lower():
-                    command += ["--spec-type", "draft-mtp"]
+                try:
+                    draft_path = resolve_gguf(config.draft_model)
+                except ValueError as exc:
+                    warn(
+                        f"ドラフトモデル {config.draft_model!r} を解決できないため、"
+                        f"{config.model!r} を speculative decoding 無効で起動します"
+                        f"（本体は通常どおり動作します）。詳細: {exc}"
+                    )
+                    draft_path = None
+                if draft_path:
+                    command += ["-md", draft_path]
+                    if "mtp" in os.path.basename(draft_path).lower():
+                        command += ["--spec-type", "draft-mtp"]
         # 計算効率の自動チューニング（自動導入バイナリの accel に合わせる。extra_args 優先）。
         command += auto_llama_flags(config)
     elif config.backend == "whisper":

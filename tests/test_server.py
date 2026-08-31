@@ -305,6 +305,30 @@ def test_build_command_mtp_still_applied_when_drafter_present(hf_cache):
     assert cmd[cmd.index("--draft-kind") + 1] == "mtp"
 
 
+def test_build_command_llama_draft_falls_back_when_missing(hf_cache, capsys):
+    # llama-cpp の別ヘッド方式（-md）も同じ。ドラフト GGUF が未取得でも本体は起動する。
+    hf_cache("org/m-gguf", ["m-Q4_K_M.gguf"])
+    cmd = build_command(
+        ServerConfig("llama-cpp", "org/m-gguf", draft_model="org/drafter-gguf:F16-MTP")
+    )
+    assert "-md" not in cmd and "--spec-type" not in cmd
+    assert cmd[0].endswith("llama-server")
+    err = capsys.readouterr().err
+    assert "speculative decoding 無効で起動します" in err
+    assert "org/drafter-gguf:F16-MTP" in err
+
+
+def test_build_command_llama_draft_still_applied_when_present(hf_cache):
+    # 取得済みなら従来どおり -md と MTP 判定が付く。
+    hf_cache("org/m-gguf", ["m-Q4_K_M.gguf"])
+    hf_cache("org/drafter-gguf", ["d-F16-MTP.gguf"])
+    cmd = build_command(
+        ServerConfig("llama-cpp", "org/m-gguf", draft_model="org/drafter-gguf:F16-MTP")
+    )
+    assert cmd[cmd.index("-md") + 1].endswith("d-F16-MTP.gguf")
+    assert cmd[cmd.index("--spec-type") + 1] == "draft-mtp"
+
+
 def test_mtp_status_table_and_explicit(hf_cache, tmp_path):
     # 対応表からの判定（従来どおり）。
     target = "mlx-community/gemma-4-12B-it-qat-4bit"
