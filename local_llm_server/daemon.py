@@ -615,8 +615,9 @@ class ModelManager:
         """常駐数・メモリ予算の超過判定（state ロック保持下で呼ぶ）。
 
         _make_room_for_replica と _evict_if_needed が共有する LRU 退避の判定部。
-        戻り値: (over: bool, running, need)。need は keep の概算占有バイト
-        （メモリ予算が無効なら 0。_evict_if_needed の CapacityError 文面が使う）。
+        戻り値: (over, over_mem, running, need)。over は数・メモリいずれかの超過、
+        over_mem はメモリ超過のみ、need は keep の概算占有バイト（メモリ予算が無効なら 0。
+        _evict_if_needed の CapacityError 文面が使う）。
         """
         running = self._running_instances_locked()
         over_count = (
