@@ -1593,12 +1593,6 @@ def enable_child_tethering() -> None:
     _TETHER_READ_FD, _TETHER_WRITE_FD = os.pipe()
 
 
-def tether_read_fd() -> int | None:
-    """繋留パイプの読み取り端（未有効なら None）。ワーカー以外の随伴プロセス
-    （メニューバーアイコン等）も、この fd の EOF で「デーモンの死」を知る。"""
-    return _TETHER_READ_FD
-
-
 def _read_lock_pid(path: str) -> int | None:
     """ロックファイルに保持者が書き込んだ PID を読む（読めなければ None）。"""
     try:

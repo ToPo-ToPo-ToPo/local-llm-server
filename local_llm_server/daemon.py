@@ -1002,11 +1002,6 @@ class ModelManager:
                 self._sessions.pop(aid, None)
         return len(members)
 
-    def session_counts(self) -> dict[str, int]:
-        """model_id → 在席エージェント数（status 表示用）。"""
-        with self._state:
-            return {mid: len(members) for mid, members in self._model_sessions.items()}
-
     def uptime(self) -> float:
         """起動からの経過秒数（表示用）。"""
         return time.monotonic() - self._started
