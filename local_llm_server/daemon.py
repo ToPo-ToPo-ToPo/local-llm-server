@@ -600,35 +600,57 @@ class ModelManager:
         if self._max_resident is None and budget is None:
             return False
         while True:
-            victim_srv = None
-            victim_model = None
             with self._state:
-                running = self._running_instances_locked()
-                resident = len(running)
-                over_count = (
-                    self._max_resident is not None and resident >= self._max_resident
-                )
-                over_mem = False
-                if budget is not None:
-                    keep_mm = self._models.get(keep)
-                    need = self._footprint_locked(keep_mm) if keep_mm else 0
-                    used = sum(self._footprint_locked(m) for (m, _i) in running)
-                    over_mem = (used + need) > budget
-                if not over_count and not over_mem:
+                over, _over_mem, running, _need = self._over_capacity_locked(keep, budget)
+                if not over:
                     return True
-                candidates = [
-                    (m, i) for (m, i) in running
-                    if i.ready and i.inflight == 0 and m.config.model != keep
-                ]
-                if not candidates:
+                victim_model, victim_srv = self._pop_lru_idle_locked(running, keep)
+                if victim_model is None:
                     return False  # 退避できるアイドルが無い → 複製しない
-                victim_model, victim_inst = min(candidates, key=lambda mi: mi[1].last_used)
-                victim_srv = victim_inst.server
-                victim_model.instances.remove(victim_inst)
             victim_srv.stop()  # state ロックの外で（最長 ~10s）
-            if victim_model.dynamic and not victim_model.instances:
-                with self._state:
-                    self._models.pop(victim_model.config.model, None)
+            self._drop_if_empty_dynamic(victim_model)
+
+    def _over_capacity_locked(self, keep: str, budget: int | None):
+        """常駐数・メモリ予算の超過判定（state ロック保持下で呼ぶ）。
+
+        _make_room_for_replica と _evict_if_needed が共有する LRU 退避の判定部。
+        戻り値: (over: bool, running, need)。need は keep の概算占有バイト
+        （メモリ予算が無効なら 0。_evict_if_needed の CapacityError 文面が使う）。
+        """
+        running = self._running_instances_locked()
+        over_count = (
+            self._max_resident is not None and len(running) >= self._max_resident
+        )
+        over_mem = False
+        need = 0
+        if budget is not None:
+            keep_mm = self._models.get(keep)
+            need = self._footprint_locked(keep_mm) if keep_mm else 0
+            used = sum(self._footprint_locked(m) for (m, _i) in running)
+            over_mem = (used + need) > budget
+        return over_count or over_mem, over_mem, running, need
+
+    def _pop_lru_idle_locked(self, running, keep: str):
+        """LRU 退避の対象（ready・inflight==0・keep 以外の最古）を選んで instances から外す。
+
+        戻り値: (victim_model, victim_srv)。候補が無ければ (None, None)。
+        stop() はロック時間が長い（最長 ~10s）ので呼び出し側が state ロックの外で行う。
+        """
+        candidates = [
+            (m, i) for (m, i) in running
+            if i.ready and i.inflight == 0 and m.config.model != keep
+        ]
+        if not candidates:
+            return None, None
+        victim_model, victim_inst = min(candidates, key=lambda mi: mi[1].last_used)
+        victim_model.instances.remove(victim_inst)
+        return victim_model, victim_inst.server
+
+    def _drop_if_empty_dynamic(self, victim_model) -> None:
+        """動的登録モデルのインスタンスが空になったら登録ごと消す（stop 後の後始末）。"""
+        if victim_model.dynamic and not victim_model.instances:
+            with self._state:
+                self._models.pop(victim_model.config.model, None)
 
     def _footprint_locked(self, mm: _Model) -> int:
         """モデルの概算占有メモリ（バイト）。一度計算したらキャッシュする。0=見積もり不能。"""
@@ -660,32 +682,16 @@ class ModelManager:
             time.monotonic() + self._load_timeout if self._load_timeout else None
         )
         while True:
-            victim_srv = None
-            victim_model = None
             with self._state:
                 if self._closing:
                     raise CapacityError("gateway is shutting down")
-                running = self._running_instances_locked()
+                over, over_mem, running, need = self._over_capacity_locked(keep, budget)
                 resident = len(running)
-                over_count = (
-                    self._max_resident is not None and resident >= self._max_resident
-                )
-                over_mem = False
-                if budget is not None:
-                    keep_mm = self._models.get(keep)
-                    need = self._footprint_locked(keep_mm) if keep_mm else 0
-                    used = sum(self._footprint_locked(m) for (m, _i) in running)
-                    over_mem = (used + need) > budget
-                if not over_count and not over_mem:
+                if not over:
                     return
-                candidates = [
-                    (m, i) for (m, i) in running
-                    if i.ready and i.inflight == 0 and m.config.model != keep
-                ]
-                if candidates:
-                    victim_model, victim_inst = min(candidates, key=lambda mi: mi[1].last_used)
-                    victim_srv = victim_inst.server
-                    victim_model.instances.remove(victim_inst)
+                victim_model, victim_srv = self._pop_lru_idle_locked(running, keep)
+                if victim_model is not None:
+                    pass  # 選べた → ループ末尾で stop する
                 elif over_mem and resident == 0:
                     # 退避できる常駐インスタンスが無く、keep 単体で予算超過 → 待っても無駄。
                     raise CapacityError(
@@ -707,9 +713,7 @@ class ModelManager:
                     continue  # 起きたら再判定
             if victim_srv is not None:
                 victim_srv.stop()  # state ロックの外で（最長 ~10s）。停止後にループ再確認。
-                if victim_model.dynamic and not victim_model.instances:  # 空なら登録ごと消す
-                    with self._state:
-                        self._models.pop(victim_model.config.model, None)
+                self._drop_if_empty_dynamic(victim_model)
 
     def begin_drain(self, ttl: float = 120.0) -> dict:
         """再起動準備（drain）を試みる。アイドル確認と新規受付停止を**原子的に**行う。

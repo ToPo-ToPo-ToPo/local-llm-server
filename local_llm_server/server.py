@@ -1745,6 +1745,40 @@ def server_status(host: str = "127.0.0.1", port: int = 8799) -> dict | None:
     }
 
 
+def _admin_request(
+    path: str,
+    host: str,
+    port: int,
+    timeout: float,
+    body: dict | None = None,
+) -> dict | None:
+    """ゲートウェイの /admin/* を叩く共通口（body があれば POST、無ければ GET）。
+
+    gateway_admin_status / gateway_set_max_resident / gateway_drain が共有する。
+    応答しない・非 200・JSON でない場合はすべて None（呼び出し側は「未起動 or 旧版」として
+    フォールバックする）——エンドポイントごとに例外の意味を変えないことで、呼び出し側の
+    分岐を「dict か None か」だけにしている。
+    """
+    url = f"http://{host}:{port}{path}"
+    if body is None:
+        req: urllib.request.Request | str = url
+    else:
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            if resp.status != 200:
+                return None
+            data = json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
 def gateway_admin_status(
     host: str = "127.0.0.1", port: int = 8799, timeout: float = 2.0
 ) -> dict | None:
@@ -1754,15 +1788,7 @@ def gateway_admin_status(
     idle_timeout までゲートウェイ本体から取得できる（→ TUI 監視用）。応答しない・旧版で
     エンドポイントが無い場合は None を返す（呼び出し側は server_status にフォールバックできる）。
     """
-    url = f"http://{host}:{port}/admin/status"
-    try:
-        with urllib.request.urlopen(url, timeout=timeout) as resp:
-            if resp.status != 200:
-                return None
-            data = json.loads(resp.read().decode("utf-8"))
-    except (urllib.error.URLError, OSError, ValueError):
-        return None
-    return data if isinstance(data, dict) else None
+    return _admin_request("/admin/status", host, port, timeout)
 
 
 def bench_model(
@@ -1817,19 +1843,9 @@ def gateway_set_max_resident(
     サーバー側でアイドルから順に非同期退避される（＝更新でリクエストが止まらない）。反映後の
     値を含む応答 dict を返す。応答しない・エラー時は None（呼び出し側が失敗として扱う）。
     """
-    url = f"http://{host}:{port}/admin/config"
-    body = json.dumps({"max_resident": value}).encode("utf-8")
-    req = urllib.request.Request(
-        url, data=body, headers={"Content-Type": "application/json"}, method="POST"
+    return _admin_request(
+        "/admin/config", host, port, timeout, body={"max_resident": value}
     )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            if resp.status != 200:
-                return None
-            data = json.loads(resp.read().decode("utf-8"))
-    except (urllib.error.URLError, OSError, ValueError):
-        return None
-    return data if isinstance(data, dict) else None
 
 
 def gateway_drain(
@@ -1845,19 +1861,7 @@ def gateway_drain(
     "sessions": n}（何も変えない）。enable=False で解除。応答しない（未起動・旧版で
     エンドポイントが無い）ときは None。
     """
-    url = f"http://{host}:{port}/admin/drain"
-    body = json.dumps({"enable": enable}).encode("utf-8")
-    req = urllib.request.Request(
-        url, data=body, headers={"Content-Type": "application/json"}, method="POST"
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            if resp.status != 200:
-                return None
-            data = json.loads(resp.read().decode("utf-8"))
-    except (urllib.error.URLError, OSError, ValueError):
-        return None
-    return data if isinstance(data, dict) else None
+    return _admin_request("/admin/drain", host, port, timeout, body={"enable": enable})
 
 
 def gateway_log_path(port: int) -> str:
