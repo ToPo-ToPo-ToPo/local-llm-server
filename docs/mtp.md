@@ -8,25 +8,12 @@
 
 ## 画像入力（vision）
 
-**MTP は画像入力を壊しません。** Qwen3.6-27B・gemma-4 系とも、**MTP 有効のまま画像を認識する**
-（mlx-vlm 0.6.7 実測）。
+**MTP は画像入力を壊しません。** Qwen3.6-27B・gemma-4 系とも、MTP 有効のまま画像を認識する。
 
-かつて Qwen3.6-27B（qwen3_5 系）は画像入力が必ず失敗していたが、これは **mlx-vlm 0.6.3 と
-mlx 0.32.0 の組み合わせに固有の上流バグ**で、0.6.4 以降で解消済み:
-
-- 症状: `mlx_vlm/models/qwen3_5/language.py::get_rope_index` の `attention_mask.tolist()` が
-  生成スレッドで `RuntimeError: There is no Stream(gpu, N) in current thread` になり、
-  クライアントには返らずタイムアウトする。**MTP の有無には関係しなかった**（無効でも同じ）。
-- 条件: mlx 0.31.2 では出ず、mlx 0.32.0 で出た（mlx 側の thread-local stream の扱いに依存）。
-- 解消: 0.6.4 の qwen3_5 リファクタ（position_ids をモデルへ stash せず、リクエスト毎に
-  `InputEmbeddingsFeatures` で返す）で発生しなくなった。ただし 0.6.4 自体は Qwen3.6 の
-  garble（テキストも壊れる）があるため、**0.6.5 以降**（`pyproject.toml` は 0.6.7 以上を要求）が必要。
-
-この回避策として在った `vision_model`（画像入りリクエストを gemma-4 系へ自動振り分けする設定）は
-**0.36.3 で削除した**。画像もテキストも同じモデルが受けるので、gemma-4 を画像用に常駐させる必要は
-なくなった（`max_resident` を 2 に上げる理由も 1 つ減る）。既存の `gateway.toml` に残っている
-`vision_model = ...` は、更新後の起動時に**自動で削除される**（→ [operation.md](operation.md)。
-手動なら `gw migrate`、消える内容だけ見るなら `gw migrate --dry-run`）。
+画像入りリクエストを gemma-4 系へ振り分ける `vision_model` 設定は **0.36.3 で削除した**。
+画像もテキストも同じモデルが受けるので、画像用のモデルを別に常駐させる必要はない。既存の
+`gateway.toml` に残っていれば更新後の起動時に**自動で削除される**（手動なら `gw migrate`、
+消える内容だけ見るなら `gw migrate --dry-run` → [operation.md](operation.md)）。
 
 ## 設定（`gateway.toml`）
 
@@ -143,8 +130,13 @@ ToPo-ToPo/gemma-4-31b-it-mlx-4bit
   `mtp` が落ちているので、切り出しは必ず公式 bf16 から行う）。
 - **Gemma 4（ToPo-ToPo 版）**: 各 model card 推奨の **Google 公式ドラフター
   `google/gemma-4-<size>-it-assistant`**（mlx-vlm で変換不要・サイズ固有で量子化に依らず共通）。
-  `mlx-vlm >= 0.6.3` が必要。ドラフターはサイズ間で互換性が無い（31B / 26B-A4B / E4B / E2B で別）。
-  `google/...` は gated（Gemma ライセンス）なので、自動DLには同意済みの HF トークンが要る場合がある。
+  ドラフターはサイズ間で互換性が無い（31B / 26B-A4B / E4B / E2B で別）。`google/...` は gated
+  （Gemma ライセンス）なので、自動DLには同意済みの HF トークンが要る場合がある。
+- **Qwen3.8-Flash-Next（qwen4_exp）**: ドラフター `ToPo-ToPo/Qwen3.8-Flash-Next-MTP-bf16` は
+  公開済みで、採択率 94.1%・`--draft-block-size 2` で 1.39 倍を実測（25.95 → 35.99 tok/s）。
+  ただし `qwen4_exp_mtp` は **mlx-vlm 0.7.0 以降**が要る（未リリース。本リポジトリのピンは
+  0.6.17）ため、まだ対応表には載せていない（`_EXTRA_DRAFTER_REPOS` で一覧から隠すだけ）。
+  0.7.0 が出たら対応表へ移す。
 
 一覧は `gw mtp`（引数なし）か `from local_llm_server import MTP_DRAFTERS` で参照、解決は
 `resolve_drafter(model, "auto")` で行う。未収録モデルは `draft_model` に HF id を明示する。

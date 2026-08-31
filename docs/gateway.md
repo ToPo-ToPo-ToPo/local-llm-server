@@ -194,8 +194,8 @@ OpenAI SDK からもそのまま使える（`client.audio.transcriptions.create(
 リリース手順（配る側）:
 
 ```bash
-git tag v0.38.7
-git push origin v0.38.7
+git tag v<新バージョン>
+git push origin v<新バージョン>
 ```
 
 - **トリガーはリリースタグ**（`最新タグ > いま動いているソースの版`）。照会は

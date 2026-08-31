@@ -27,7 +27,7 @@ OpenAI 互換 API（`/v1/*`）で足りているため、**Phase 1（`/api/*` �
 |---|---|---|
 | ネイティブ API `/api/chat` `/api/generate` ほか | なし | **見送り**（Ollama 用クライアントを使わないため。2026-07-24 決定） |
 | `ollama run`（ターミナル REPL） | なし | **見送り**（対話 UI は agent-corporation が担当） |
-| `ollama pull` / `rm`（進捗付き DL・削除） | ロード時に暗黙 DL のみ | Phase 2 |
+| `ollama pull` / `rm`（進捗付き DL・削除） | `gw pull` / `gw rm` / `gw show` | ✅（Phase 2 実装済み） |
 | 短いモデル名 + タグ（`qwen3:8b`） | HF リポジトリ ID 直指定 | Phase 3 |
 | Modelfile（`ollama create`） | なし | **保留**（system prompt 等はエージェント側が管理しており需要が薄い） |
 | `/v1/embeddings`（OpenAI 互換） | なし | Phase 5（RAG 用途が出てきたら） |
@@ -181,14 +181,14 @@ system prompt・生成パラメータはエージェント側（agent-corporatio
 
 ```
 Phase 0a → 0b → 0c → 0d → 0e ✅ 完了（堅牢化が先、サービス化・アイコン・更新はその上）
-Phase 2（gw pull / rm / show）─→ Phase 3（短縮モデル名）
+Phase 2（gw pull / rm / show）✅ 完了 ─→ Phase 3（短縮モデル名）
 Phase 5（Embeddings）は独立・需要が出たら
 ```
 
-- **Phase 0 は完了**。「サーバーを意識しない」体験（自動起動・自動復活・アイコン・更新）が本体だった
-- 残りは CLI の利便性（Phase 2）と名前の短縮（Phase 3）。いずれも小粒（各 1〜2 日規模）で、
-  急ぐ理由は無い——必要を感じたときにやる
-- Phase 3 は設計を先に固める（名前解決の入口を 1 箇所にすること）
+- **Phase 0 と Phase 2 は完了**。「サーバーを意識しない」体験（自動起動・自動復活・アイコン・更新）と
+  CLI の利便性（`gw pull` / `rm` / `show`）が入っている
+- 残るのは名前の短縮（Phase 3）だけ。小粒（1〜2 日規模）で急ぐ理由は無く、必要を感じたときにやる。
+  設計を先に固めること（名前解決の入口を 1 箇所にする）
 
 ## 設計上の決めごと
 
