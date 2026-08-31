@@ -259,6 +259,13 @@ def test_resolve_drafter_auto_unknown_raises():
         resolve_drafter("some/unknown-model", "auto")
 
 
+def test_command_builders_cover_all_backends():
+    # ディスパッチ表 _COMMAND_BUILDERS は公開値 BACKENDS と 1:1（バックエンド追加時の
+    # 「表に足し忘れて unknown backend になる」を防ぐ）。
+    from local_llm_server.constants import BACKENDS
+    assert set(srv._COMMAND_BUILDERS) == set(BACKENDS)
+
+
 def test_build_command_mlx_vlm_draft_auto(stub_cache):
     # build_command でも "auto" が解決され、対応ドラフター＋mtp が付く。
     target = "mlx-community/gemma-4-12B-it-qat-4bit"
