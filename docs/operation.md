@@ -134,19 +134,15 @@ gw start      # 手動起動（自動起動を無効にしている場合や、g
   コメントと並びは保ち、書き換える前に `gateway.toml.bak` を残す。手で確認・実行したいときは
   `gw migrate`（`--dry-run` で差分だけ表示）。廃止キーの一覧は `local_llm_server/migrate.py` の
   `OBSOLETE_KEYS`。
-- **リリース手順（開発者向け）**: 配布の合図は**バージョンタグの push だけ**。
+- **リリース手順（開発者向け）**: `pyproject.toml` の version を上げて main へマージし、タグを push する。
 
   ```bash
-  # ① pyproject.toml の version を上げて main へマージ（release/X.Y.Z ブランチ経由）
-  # ② タグを打って push —— これが全 PC への配布トリガー
   git tag v0.38.7
   git push origin v0.38.7
   ```
 
   各 PC の常駐デーモンが 1 時間以内にタグを検知し、アイドルの瞬間に追従・再起動する
-  （今すぐ確かめるなら各 PC で `gw update`）。main へマージしただけでは配られない
-  （追従先はブランチ先端ではなくタグ）。PyPI への公開は不要（〜0.38.6 で凍結。
-  経緯は docs/gateway.md「自動更新」）。
+  （今すぐなら各 PC で `gw update`）。
 
 - **更新の「確認」はリスタート不要**（Ollama と同じく、確認は動いたまま・**適用のときだけ**再起動）。
   定期チェックは 1 時間おきだが、それを待たずとも**メニューバーのメニューを開くたびに
