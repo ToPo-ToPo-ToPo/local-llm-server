@@ -132,11 +132,11 @@ ToPo-ToPo/gemma-4-31b-it-mlx-4bit
   `google/gemma-4-<size>-it-assistant`**（mlx-vlm で変換不要・サイズ固有で量子化に依らず共通）。
   ドラフターはサイズ間で互換性が無い（31B / 26B-A4B / E4B / E2B で別）。`google/...` は gated
   （Gemma ライセンス）なので、自動DLには同意済みの HF トークンが要る場合がある。
-- **Qwen3.8-Flash-Next（qwen4_exp）**: ドラフター `ToPo-ToPo/Qwen3.8-Flash-Next-MTP-bf16` は
-  公開済みで、採択率 94.1%・`--draft-block-size 2` で 1.39 倍を実測（25.95 → 35.99 tok/s）。
-  ただし `qwen4_exp_mtp` は **mlx-vlm 0.7.0 以降**が要る（未リリース。本リポジトリのピンは
-  0.6.17）ため、まだ対応表には載せていない（`_EXTRA_DRAFTER_REPOS` で一覧から隠すだけ）。
-  0.7.0 が出たら対応表へ移す。
+- **Qwen3.8-Flash-Next（qwen4_exp。ToPo-ToPo 版）**: 公式 bf16 内蔵の `mtp.*` を切り出した
+  `ToPo-ToPo/Qwen3.8-Flash-Next-MTP-bf16` を量子化 4bit/8bit/bf16 で共用する。ドラフターの
+  config に `block_size = 2` を焼き込んであり、これが最速（採択率 94.1%・25.95 → 35.99 tok/s の
+  1.39 倍。block-size 4 は 33.10 tok/s で劣る）。実行には `qwen4_exp_mtp` を持つ
+  **mlx-vlm 0.7.0 以降**が要る（本リポジトリのロックで担保）。
 
 一覧は `gw mtp`（引数なし）か `from local_llm_server import MTP_DRAFTERS` で参照、解決は
 `resolve_drafter(model, "auto")` で行う。未収録モデルは `draft_model` に HF id を明示する。

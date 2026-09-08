@@ -32,7 +32,7 @@ vLLM は torch+CUDA を含む**重量級パッケージ（数 GB）**なので b
 導入方法の設定項目は無い（一本道）。解決順は決定的:
 
 1. **現在の python 環境に vllm が有ればそれを使う**——extras（`uv tool install --editable
-   ".[vllm]"` / `uv add "local-llm-server[vllm]"`）で導入済みなら数 GB の再ダウンロードをしない。
+   ".[vllm]"` / `uv sync --extra vllm`）で導入済みなら数 GB の再ダウンロードをしない。
 2. 無ければ **隔離 venv（`~/.cache/local-llm-server/vllm-venv`）へ起動時に自動導入**する
    （初回のみ・要ネットワーク & GPU）。導入済み venv は再利用。本体環境を汚さない。
 

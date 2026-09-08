@@ -1,7 +1,7 @@
 """更新エンドポイント（POST /admin/update）と /admin/status の update 欄のテスト。
 
 トレイの「今すぐ更新して再起動」（Ollama の Restart to update 相当）の裏口。
-実際の git/PyPI には触れない——update.check / apply_update をスタブする。
+実際の git には触れない——update.check / apply_update をスタブする。
 """
 from __future__ import annotations
 
@@ -96,7 +96,7 @@ def test_admin_status_triggers_ondemand_check(monkeypatch):
         while time.monotonic() < deadline and not calls:
             time.sleep(0.02)
         assert calls, "オンデマンド確認が走らなかった"
-        # 直後の 2 回目はスロットルで走らない（PyPI を叩きすぎない）。
+        # 直後の 2 回目はスロットルで走らない（リモートを叩きすぎない）。
         calls.clear()
         _req(server.server_address[1], "GET", "/admin/status")
         time.sleep(0.2)

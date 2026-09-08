@@ -42,7 +42,7 @@ gw start      # 手動起動（初回は設定を自動生成。自動起動を�
 → [docs/gateway.md](docs/gateway.md)）。
 
 接続は公開ポート（既定 `http://127.0.0.1:8799/v1`）に繋いで `model` を選ぶだけ。
-接続クライアントは別パッケージ [local-llm-client](https://pypi.org/project/local-llm-client/):
+接続クライアントは別パッケージ [local-llm-client](https://github.com/ToPo-ToPo-ToPo/local-llm-client):
 
 ```python
 from local_llm_client import LLMClient

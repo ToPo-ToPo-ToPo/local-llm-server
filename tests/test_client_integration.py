@@ -1,9 +1,9 @@
 """server↔client の結線テスト（対パッケージの契約を server 側で常時検証する）。
 
-local-llm-server と local-llm-client は別リポジトリ・別 PyPI パッケージで開発する
+local-llm-server と local-llm-client は別リポジトリ・別パッケージで開発する
 （能力の隔離＝client 環境からゲートウェイを起動できない構成の強制、および
 ゲートウェイの自動更新運用のため。統合しない決定 2026-06-28 / 再確認 2026-07-09）。
-その代償である「対の変更の検出」をこのテストが担う: PyPI の local-llm-client（dev 依存）を
+その代償である「対の変更の検出」をこのテストが担う: 公開版の local-llm-client（dev 依存）を
 in-process のゲートウェイへ実 HTTP で接続し、client の公開 API が server の応答と噛み合う
 ことを検証する。実 LLM は使わない（上流は OpenAI 互換のフェイク）。
 
