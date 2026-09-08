@@ -1,6 +1,6 @@
 [project]
 name = "local-llm-server"
-version = "0.38.10"
+version = "0.38.11"
 description = "ローカルLLM（mlx / mlx-vlm / llama.cpp / vLLM / SGLang）を OpenAI 互換 API で束ねるマルチモデルゲートウェイ（サーバー）。gateway.toml のカタログを 1 ポートで配信し、model で振り分け・遅延起動・LRU 退避・MTP 高速化（Ollama 流の共有デーモン）。接続用クライアントは別パッケージ local-llm-client。"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -80,6 +80,14 @@ sglang = ["sglang ; sys_platform == 'linux'"]
 # の隔離 venv で）。
 [tool.uv]
 conflicts = [[{ extra = "vllm" }, { extra = "sglang" }]]
+# vllm / sglang は sdist からビルドしない（wheel のみ使う）。両者は CUDA 前提で、ソースビルドは
+# CUDA の無い Mac では必ず失敗する。これが無いと `uv lock --upgrade` の全面再解決で、
+# vllm の固定（torch==/torchvision== ピン）と新しい torchvision が衝突したとき uv が
+# vllm を wheel の無い太古の版（0.1.x）まで後退させ、その sdist メタデータ取得
+# （＝ビルド）で CUDA_HOME 不在エラーになって更新自体が止まる（2026-09-08 に実際に発生）。
+# wheel のみに絞れば後退はそこで打ち切られ、代わりに torchvision 側を vllm の固定に合わせて
+# 解決する。対象版は全て wheel 配布なので、Linux での実インストールにも影響しない。
+no-build-package = ["vllm", "sglang"]
 
 [dependency-groups]
 dev = [
