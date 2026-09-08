@@ -9,7 +9,7 @@ from local_llm_server.daemon import load_gateway_config
 
 def _write_cfg(tmp_path, body):
     p = tmp_path / "gateway.toml"
-    # 純ロジックのテストは自動更新を切って hermetic に保つ（起動時の PyPI HTTP / git を避ける）。
+    # 純ロジックのテストは自動更新を切って hermetic に保つ（起動時の git / HTTP を避ける）。
     if "auto_update" not in body:
         body = "auto_update = false\n" + body
     p.write_text(body, encoding="utf-8")

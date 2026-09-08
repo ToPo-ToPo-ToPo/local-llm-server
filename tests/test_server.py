@@ -375,9 +375,15 @@ def test_qwen38_mtp_pair_and_drafter_hidden():
     assert "ToPo-ToPo/Qwen3.8-27B-MTP-bf16" in srv._DRAFTER_REPOS
     # 対応表に載せない（＝auto で引かせない）ドラフターも一覧からは隠す。
     assert "ToPo-ToPo/DeepSeek-V4-Flash-MTP-bf16" in srv._DRAFTER_REPOS
+
+
+def test_qwen38_flash_next_mtp_pair():
+    # Qwen3.8-Flash-Next（qwen4_exp）も量子化 3 種が同一ドラフターへ解決し、一覧からは隠れる。
+    for bits in ("4bit", "8bit", "bf16"):
+        target = f"ToPo-ToPo/Qwen3.8-Flash-Next-mlx-{bits}"
+        assert MTP_DRAFTERS[target] == "ToPo-ToPo/Qwen3.8-Flash-Next-MTP-bf16"
+        assert resolve_drafter(target, "auto") == "ToPo-ToPo/Qwen3.8-Flash-Next-MTP-bf16"
     assert "ToPo-ToPo/Qwen3.8-Flash-Next-MTP-bf16" in srv._DRAFTER_REPOS
-    # 隠すだけで、auto の対応表には載せない（実行できないドラフターを引かせないため）。
-    assert "ToPo-ToPo/Qwen3.8-Flash-Next-mlx-4bit" not in MTP_DRAFTERS
 
 
 # --- 事前 DL 必須（自動ダウンロード無効）の検証 ----------------------------

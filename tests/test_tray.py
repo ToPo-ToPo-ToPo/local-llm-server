@@ -184,7 +184,7 @@ def test_update_menu_item_states():
     # 新版あり（パイプ通知）→ 「今すぐ更新して再起動（vX）」・クリック可
     label, clickable = update_menu_item({"kind": "update-ready", "latest": "0.37.0"}, None)
     assert clickable is True and "0.37.0" in label and "今すぐ更新" in label
-    # 最新（PyPI 版まで確認できて available=False）→ 「最新です（vX）」・**選べない**
+    # 最新（リリースタグまで確認できて available=False）→ 「最新です（vX）」・**選べない**
     label, clickable = update_menu_item(
         {"kind": None}, {"update": {"available": False, "latest": "0.36.1",
                                     "current": "0.36.1"}})

@@ -33,7 +33,7 @@
   再起動（作業ツリーがクリーンな時だけ・処理中/在席が空くのを待つ）。手動で今すぐなら `gw update`
   （→ [自動更新](gateway.md#自動更新リリースタグに-git-で追従)）。
 - 接続側は公開ポートに繋いで `model` を選ぶだけ（接続クライアントは別パッケージ
-  [local-llm-client](https://pypi.org/project/local-llm-client/)）。
+  [local-llm-client](https://github.com/ToPo-ToPo-ToPo/local-llm-client)）。
 
 ## 他 OS（Linux / Windows / Intel Mac）での動作
 
