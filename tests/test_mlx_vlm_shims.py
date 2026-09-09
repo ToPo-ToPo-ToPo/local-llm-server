@@ -82,3 +82,75 @@ def test_apc_patch_is_idempotent():
     once = apc.semantic_extra_hash
     _mlx_vlm_shims.apply()
     assert apc.semantic_extra_hash is once   # 二重ラップしない
+
+
+# ---- stream_tool_calls: ツール呼び出しの生成中トークンを流す ----------------------
+
+import sys as _sys
+import types as _types
+
+
+def _fake_openai_module(*, with_class: bool, with_func: bool):
+    """mlx_vlm.server.openai の偽物。0.7 系(クラス)か 0.6 系(関数)のどちらかを持たせる。"""
+    mod = _types.ModuleType("mlx_vlm.server.openai")
+    if with_class:
+        class ToolCallStreamState:
+            def __init__(self, tc_start, tc_end):
+                self.tc_start, self.tc_end = tc_start, tc_end
+            def feed(self, text, last=False):
+                return None  # 上流: ツール呼び出し中は捨てる
+        mod.ToolCallStreamState = ToolCallStreamState
+    if with_func:
+        def suppress_tool_call_content(full_output, in_tool_call, tc_start, delta_content):
+            return True, None  # 上流: 捨てる
+        mod.suppress_tool_call_content = suppress_tool_call_content
+    pkg_server = _types.ModuleType("mlx_vlm.server")
+    pkg_server.openai = mod
+    pkg = _types.ModuleType("mlx_vlm")
+    pkg.server = pkg_server
+    return pkg, pkg_server, mod
+
+
+def _install_fake(monkeypatch, **kw):
+    pkg, pkg_server, mod = _fake_openai_module(**kw)
+    monkeypatch.setitem(_sys.modules, "mlx_vlm", pkg)
+    monkeypatch.setitem(_sys.modules, "mlx_vlm.server", pkg_server)
+    monkeypatch.setitem(_sys.modules, "mlx_vlm.server.openai", mod)
+    return mod
+
+
+def test_stream_tool_calls_patches_07_class(monkeypatch):
+    mod = _install_fake(monkeypatch, with_class=True, with_func=False)
+    result = _mlx_vlm_shims._patch_stream_tool_calls()
+    assert result.startswith("applied (mlx-vlm 0.7")
+    st = mod.ToolCallStreamState("<tool_call>", "</tool_call>")
+    assert st.feed('<tool_call>{"name": "write_file"') == '<tool_call>{"name": "write_file"'
+    assert st.feed(None) is None
+    assert _mlx_vlm_shims._patch_stream_tool_calls().startswith("already applied")
+
+
+def test_stream_tool_calls_patches_06_function(monkeypatch):
+    mod = _install_fake(monkeypatch, with_class=False, with_func=True)
+    result = _mlx_vlm_shims._patch_stream_tool_calls()
+    assert result.startswith("applied (mlx-vlm 0.6")
+    assert mod.suppress_tool_call_content("x", False, "<tool_call>", "abc") == (False, "abc")
+
+
+def test_stream_tool_calls_reports_when_hook_missing(monkeypatch):
+    _install_fake(monkeypatch, with_class=False, with_func=False)
+    assert _mlx_vlm_shims._patch_stream_tool_calls().startswith("not applied")
+
+
+def test_apply_does_not_patch_without_env(monkeypatch):
+    mod = _install_fake(monkeypatch, with_class=True, with_func=False)
+    monkeypatch.delenv(_mlx_vlm_shims.STREAM_TOOL_CALLS_ENV, raising=False)
+    _mlx_vlm_shims.apply()
+    assert not getattr(mod.ToolCallStreamState, "_llmserver_passthrough", False)
+
+
+def test_apply_patches_with_env(monkeypatch, capsys):
+    mod = _install_fake(monkeypatch, with_class=True, with_func=False)
+    monkeypatch.setenv(_mlx_vlm_shims.STREAM_TOOL_CALLS_ENV, "1")
+    _mlx_vlm_shims.apply()
+    assert getattr(mod.ToolCallStreamState, "_llmserver_passthrough", False)
+    assert "stream_tool_calls: applied" in capsys.readouterr().err

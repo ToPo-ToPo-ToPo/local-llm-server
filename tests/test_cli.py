@@ -430,3 +430,24 @@ def test_update_handles_stopped_gateway(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(cli, "gateway_admin_status", lambda h, p, **k: None)
     assert cli.main(["update"]) == 0
     assert "already up to date" in capsys.readouterr().out
+
+
+def test_stream_tool_calls_config_default_and_override(tmp_path):
+    """stream_tool_calls: 全体既定 off、[[models]] で上書きでき、動的ロードは全体既定に従う。"""
+    gcfg = load_gateway_config(str(_write_cfg(tmp_path, """
+port = 8799
+stream_tool_calls = true
+[[models]]
+model = "a/one"
+backend = "mlx-vlm"
+[[models]]
+model = "a/two"
+backend = "mlx-vlm"
+stream_tool_calls = false
+""")))
+    assert gcfg.stream_tool_calls is True
+    by = {m.model: m for m in gcfg.models}
+    assert by["a/one"].stream_tool_calls is True
+    assert by["a/two"].stream_tool_calls is False
+    gcfg2 = load_gateway_config(str(_write_cfg(tmp_path, "port = 8799\n")))
+    assert gcfg2.stream_tool_calls is False
