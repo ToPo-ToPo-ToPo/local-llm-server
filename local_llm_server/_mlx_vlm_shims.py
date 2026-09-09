@@ -27,6 +27,7 @@ venv への直接パッチは黙って失われる。ここに置けばソース
 
 from __future__ import annotations
 
+import os
 import runpy
 import sys
 
@@ -92,10 +93,71 @@ def _patch_apc_extra_hash() -> None:
     # モジュール属性の差し替えだけで全呼び出し箇所に効く
 
 
+STREAM_TOOL_CALLS_ENV = "LOCAL_LLM_STREAM_TOOL_CALLS"
+
+
+def _patch_stream_tool_calls(log=None) -> str:
+    """ツール呼び出しの生成中トークンを捨てずに流す(環境変数 LOCAL_LLM_STREAM_TOOL_CALLS=1 のとき)。
+
+    上流の挙動(mlx-vlm 0.6/0.7): ストリーミング中に生成テキストへ <tool_call> が現れると、
+    以後の delta を content から**捨て**、生成終了後に全文を解析した tool_calls を最後の
+    1 チャンクにまとめて出す。そのため「ファイル本文を書いている最中の文字」はどのクライアント
+    にも届かない(会社リポジトリのエディタのライブ表示が成立しない)。
+
+    このパッチは「捨てる」部分だけを素通しに変える。最後の解析済み tool_calls チャンクは
+    full_output(生成全文)から作られるので従来どおり出る=ツール呼び出しの正しさは不変。
+    副作用として <tool_call>…</tool_call> の生テキストが delta.content に流れるため、
+    受け側(local-llm-client 0.8+)が本文から剥がして途中経過として扱う。知らない
+    クライアントには生 JSON が本文に見えるので、既定 off(設定 stream_tool_calls)。
+
+    上流の構造が変わるとパッチが当たらない。その場合は従来の一括挙動に戻るだけで
+    壊れはしないが、黙って劣化しないよう結果を文字列で返し、起動ログに出す。
+      - mlx-vlm 0.6.x: openai.suppress_tool_call_content(関数)を素通し版に差し替える
+      - mlx-vlm 0.7.x: openai.ToolCallStreamState(クラス)を feed が素通しの派生に差し替える
+    """
+    try:
+        from mlx_vlm.server import openai as _oa
+    except Exception as exc:  # noqa: BLE001 - mlx-vlm 無し等。起動は止めない
+        return f"not applied (mlx_vlm.server.openai unavailable: {exc})"
+
+    cls = getattr(_oa, "ToolCallStreamState", None)
+    if cls is not None:
+        if getattr(cls, "_llmserver_passthrough", False):
+            return "already applied (0.7 class)"
+
+        class _PassthroughToolCallStreamState(cls):  # type: ignore[misc,valid-type]
+            _llmserver_passthrough = True
+
+            def feed(self, text, last: bool = False):
+                # 状態(in_tool_call)は追跡しない: 呼び出し側は戻り値の本文しか使わない。
+                # None はそのまま(空 delta の抑止は呼び出し側が行う)
+                return text
+
+        _oa.ToolCallStreamState = _PassthroughToolCallStreamState
+        return "applied (mlx-vlm 0.7: ToolCallStreamState passthrough)"
+
+    fn = getattr(_oa, "suppress_tool_call_content", None)
+    if fn is not None:
+        if getattr(fn, "_llmserver_passthrough", False):
+            return "already applied (0.6 function)"
+
+        def suppress_tool_call_content(full_output, in_tool_call, tc_start, delta_content):
+            return in_tool_call, delta_content
+
+        suppress_tool_call_content._llmserver_passthrough = True  # type: ignore[attr-defined]
+        _oa.suppress_tool_call_content = suppress_tool_call_content
+        return "applied (mlx-vlm 0.6: suppress_tool_call_content passthrough)"
+
+    return "not applied (no known suppression hook in mlx_vlm.server.openai)"
+
+
 def apply() -> None:
     """既知のパッチを全て適用する。失敗しても起動は止めない。"""
     _patch_content_markers()
     _patch_apc_extra_hash()
+    if os.environ.get(STREAM_TOOL_CALLS_ENV) == "1":
+        result = _patch_stream_tool_calls()
+        print(f"[local-llm-server shim] stream_tool_calls: {result}", file=sys.stderr, flush=True)
 
 
 def main() -> None:

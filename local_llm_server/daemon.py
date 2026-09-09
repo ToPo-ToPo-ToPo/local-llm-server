@@ -198,6 +198,7 @@ class ModelManager:
         start_timeout: float = 120.0,
         dynamic: bool = False,
         default_disable_thinking: bool = False,
+        default_stream_tool_calls: bool = False,
         default_draft: str | None = None,
         default_parallel: int | None = None,
         max_memory_fraction: float | None = None,
@@ -212,6 +213,7 @@ class ModelManager:
         # 未登録モデルの動的ロード（IDからバックエンド推論。ロード時に表示へ追加・アンロードで消す）。
         self._dynamic = dynamic
         self._default_disable_thinking = default_disable_thinking
+        self._default_stream_tool_calls = default_stream_tool_calls
         # 動的ロード時の MTP ドラフター既定。None なら mlx-vlm は "auto"（対応表 MTP_DRAFTERS
         # から本体名で自動選択）を試みる。"off"/"none"/"" で無効化、明示 id でその指定を使う。
         self._default_draft = default_draft
@@ -285,6 +287,7 @@ class ModelManager:
             # 並列スロットは llama-cpp のみ有効（他は逐次処理なので付けない）。
             parallel=self._default_parallel if parallel_supported(backend) else None,
             disable_thinking=self._default_disable_thinking,
+            stream_tool_calls=self._default_stream_tool_calls,
             draft_model=self._dynamic_draft(model_id, backend),
         )
         mm = _Model(config=cfg, dynamic=True)
@@ -1742,6 +1745,7 @@ class GatewayConfig:
                                        # 流れている限り切れないので、長時間ストリーミング生成は妨げない（既定 600=10分）
     dynamic: bool = True               # 未登録モデルを ID 推論で動的ロードする（false で事前登録のみ）
     disable_thinking: bool = False     # 動的ロード時の既定（思考抑制）。事前登録は各 [[models]] が優先
+    stream_tool_calls: bool = False    # ツール呼び出しの生成中トークンを流す（mlx-vlm）。各 [[models]] で上書き可。→ ServerConfig.stream_tool_calls
     draft_model: str | None = None     # 動的ロード時の MTP 既定。None で mlx-vlm は "auto"（対応表から自動）。"off" で無効
     parallel: int | None = None        # 動的ロード時の並列スロット既定（llama-cpp のみ。他は無視）
     max_memory_fraction: float | None = None  # 常駐モデルの推定占有量の合計を総RAMのこの割合に制限（None で無効）
@@ -1890,6 +1894,7 @@ def _parse_media_settings(data: dict):
 
 def _parse_model_entries(
     data: dict, *, dynamic: bool, internal_base: int, public_port: int, default_draft,
+    default_stream_tool_calls: bool = False,
 ):
     """[[models]] 配列を検証して ServerConfig 群に組み立てる。
 
@@ -1933,6 +1938,7 @@ def _parse_model_entries(
                 port=internal_port,
                 parallel=parallel,
                 disable_thinking=bool(entry.get("disable_thinking", False)),
+                stream_tool_calls=bool(entry.get("stream_tool_calls", default_stream_tool_calls)),
                 draft_model=draft,
                 extra_args=list(entry.get("extra_args", [])),
             )
@@ -2029,6 +2035,8 @@ def load_gateway_config(path: str) -> GatewayConfig:
     dynamic = bool(data.get("dynamic", True))
     # 動的ロード時の既定 disable_thinking（事前登録の [[models]] は各自の値が優先）。
     dyn_disable_thinking = bool(data.get("disable_thinking", False))
+    # ツール呼び出しの生成中トークンを流す（mlx-vlm）。既定 off。[[models]] は各自の値が優先
+    stream_tool_calls = bool(data.get("stream_tool_calls", False))
     # ゲートウェイ全体の MTP ドラフター既定。各 [[models]] が draft_model を持たなければ
     # これを継承する（"auto" で本体名から自動選択）。個別に "" / "off" / "none" で無効化。
     default_draft = data.get("draft_model")
@@ -2055,7 +2063,7 @@ def load_gateway_config(path: str) -> GatewayConfig:
 
     configs, seen = _parse_model_entries(
         data, dynamic=dynamic, internal_base=internal_base, public_port=port,
-        default_draft=default_draft,
+        default_draft=default_draft, default_stream_tool_calls=stream_tool_calls,
     )
 
     # dynamic 無効のときだけ default_model が事前登録に在ることを要求する
@@ -2068,6 +2076,7 @@ def load_gateway_config(path: str) -> GatewayConfig:
         start_timeout=start_timeout,
         request_timeout=request_timeout,
         dynamic=dynamic, disable_thinking=dyn_disable_thinking,
+        stream_tool_calls=stream_tool_calls,
         draft_model=default_draft, parallel=default_parallel,
         max_memory_fraction=max_memory_fraction,
         internal_base_port=internal_base,
@@ -2180,6 +2189,9 @@ def apply_live_config(
     if cfg.disable_thinking != new.disable_thinking:
         note("disable_thinking", cfg.disable_thinking, new.disable_thinking)
         manager._default_disable_thinking = new.disable_thinking
+    if cfg.stream_tool_calls != new.stream_tool_calls:
+        note("stream_tool_calls", cfg.stream_tool_calls, new.stream_tool_calls)
+        manager._default_stream_tool_calls = new.stream_tool_calls
     if cfg.draft_model != new.draft_model:
         note("draft_model", cfg.draft_model, new.draft_model)
         manager._default_draft = new.draft_model
@@ -2644,6 +2656,7 @@ def _run_gateway_locked(cfg: GatewayConfig, config_path: str | None = None) -> i
         cfg.models, max_resident=cfg.max_resident, load_timeout=cfg.load_timeout,
         start_timeout=cfg.start_timeout,
         dynamic=cfg.dynamic, default_disable_thinking=cfg.disable_thinking,
+        default_stream_tool_calls=cfg.stream_tool_calls,
         default_draft=cfg.draft_model, default_parallel=cfg.parallel,
         max_memory_fraction=cfg.max_memory_fraction,
         internal_base_port=cfg.internal_base_port, public_port=cfg.port,

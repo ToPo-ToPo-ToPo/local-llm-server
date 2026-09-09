@@ -19,6 +19,7 @@ default_model = "..."       # model 省略リクエスト時のモデル（任�
 draft_model = "off"         # MTP（speculative decoding）の既定。省略時は mlx-vlm を "auto"（対応表から自動）。"off" で無効
 dynamic = true              # 未登録モデルを ID 推論で動的ロード（省略時 true。false で事前登録のみ）
 disable_thinking = false    # 動的ロード時の既定（思考抑制）。事前登録は各 [[models]] が優先
+stream_tool_calls = false   # ツール呼び出しの生成中トークンを流す（mlx-vlm）。既定 off。各 [[models]] で上書き可（下記「ツール呼び出しのストリーミング」）
 auto_update = true          # 常駐デーモンが新しいリリースタグを検知して自動追従（省略時 true。→ 下記「自動更新」）
                             # false でも新版チェックは行い、メニューバーの更新マークで知らせる（適用だけ止まる）
 tray = true                 # 稼働中メニューバーに「gw」アイコンを表示（macOS のみ。省略時 true。false で非表示）
@@ -54,6 +55,7 @@ backend = "mlx-vlm"
 | `draft_model` | mlx-vlm は `auto` | 動的ロード時の MTP 既定。省略時は mlx-vlm が対応表から自動選択、`"off"` で無効。各 `[[models]]` で上書き。→ [mtp.md](mtp.md) |
 | `dynamic` | `true` | 未登録モデルを ID 推論で動的ロードする。`false` で事前登録のみ（旧挙動） |
 | `disable_thinking` | `false` | 動的ロード時の既定。事前登録モデルは各 `[[models]]` の値が優先 |
+| `stream_tool_calls` | `false` | ツール呼び出しの**生成中トークン**を流す（mlx-vlm）。各 `[[models]]` で上書き可。有効化前に、繋ぐクライアントを local-llm-client 0.8 以降に揃えること（下記） |
 | `video_frames` | `8` | **動画入力**で 1 本から等間隔に抜くフレーム数。`video_url` をこの枚数の画像に展開して渡す |
 | `video_max_edge` | `768` | 動画フレームの縮小サイズ（長辺 px）。大きいほど精細だがトークン増 |
 | `image_max_edge` | `1024` | **静止画の長辺上限 px**（`0` で無効）。上流へ渡す前に縮小し、vision トークンの膨張を防ぐ。→ [画像入力の縮小](#画像入力の縮小image_max_edge) |
@@ -292,7 +294,7 @@ git push origin v<新バージョン>
 | 種別 | 対象 | 反映 |
 |---|---|---|
 | **即時反映（ポリシー）** | `default_model`, `image_max_edge`, `max_resident`, `request_timeout`, `idle_timeout`, `load_timeout`, `api_key` | 保存した瞬間に有効 |
-| **次回ロードから（動的既定）** | トップレベルの `draft_model`, `parallel`, `disable_thinking`, `max_memory_fraction`, `dynamic`, `start_timeout` | 既にロード済みのモデルは次にロードし直すまで旧設定のまま |
+| **次回ロードから（動的既定）** | トップレベルの `draft_model`, `parallel`, `disable_thinking`, `stream_tool_calls`, `max_memory_fraction`, `dynamic`, `start_timeout` | 既にロード済みのモデルは次にロードし直すまで旧設定のまま |
 | **要再起動（構造）** | `host`, `port`, `internal_base_port`, `[[models]]` | 稼働中は変えられない（ソケット bind 済み・内部ポート割当は起動時固定）。変更を検知しても**適用せず「要再起動」をログ警告**し、旧値のまま動き続ける |
 
 - `max_resident` の即時反映は `POST /admin/config` と同じ挙動（**busy は止めず、超過アイドルのみ非同期
@@ -424,3 +426,24 @@ class GatewaySession:
 
 > `agent_id` はエージェントごとに一意な文字列にする（PID やUUID等）。同一 `agent_id` で別 `model` を
 > `register` し直すと、旧モデルから自動的に外れる（乗り換え。旧モデルが無人になれば解放される）。
+
+## ツール呼び出しのストリーミング（`stream_tool_calls`）
+
+mlx-vlm の OpenAI 互換サーバは、ストリーミング中に生成テキストへ `<tool_call>` が現れると
+以後のトークンを content から**捨て**、生成終了後に解析した `tool_calls` を最後の 1 チャンクに
+まとめて出す。そのため「ファイル本文を書いている最中の文字」はクライアントに届かない。
+
+`stream_tool_calls = true`（トップレベル＝動的ロードの既定、または `[[models]]` 個別）にすると、
+ゲートウェイがモデルサーバー起動時に当てるシム（`_mlx_vlm_shims`）がこの「捨てる」処理を
+素通しに変え、`<tool_call>…</tool_call>` の生テキストが `delta.content` として逐次届く。
+最後の解析済み `tool_calls` チャンクは従来どおり出る（ツール呼び出しの正しさは不変）。
+
+- **受け側の対応が必要**: local-llm-client 0.8 以降は生テキストを本文から剥がし、途中経過を
+  `on_tool_args` コールバックに渡す。それ以前の版や、OpenAI SDK で直接ストリーム受信する
+  プログラムには生 JSON が本文として見えるので、繋ぐクライアントを揃えてから有効化する。
+  非ストリームの呼び出しは影響を受けない。
+- **上流追従**: パッチは mlx-vlm の内部（0.6 系 `suppress_tool_call_content` / 0.7 系
+  `ToolCallStreamState`）に依存する。当たらなかったときは従来の一括挙動に戻り、モデル
+  サーバーのログに `stream_tool_calls: not applied …` と出る。mlx-vlm が標準の差分ストリーム
+  （`delta.tool_calls[].function.arguments`）を実装したら、このパッチは外す。
+- 対象は mlx-vlm バックエンドのみ（他バックエンドでは無視）。

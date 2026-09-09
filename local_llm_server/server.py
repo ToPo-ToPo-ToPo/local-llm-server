@@ -416,6 +416,12 @@ class ServerConfig:
     # （MTP_DRAFTERS の対応表）。本体・ドラフターとも事前に `hf download` 済みである必要が
     # ある（自動ダウンロードはしない）。MTP は vision 対応の mlx-vlm バックエンドのみ対応。
     draft_model: str | None = None
+    # ツール呼び出しの生成中トークンを流す(mlx-vlm のみ)。既定 off。on にすると mlx-vlm が
+    # 捨てている <tool_call>…</tool_call> の生テキストが delta.content として逐次届く
+    # (最後の解析済み tool_calls チャンクは従来どおり)。受け側(local-llm-client 0.8+)が
+    # 本文から剥がして途中経過として使う。知らないクライアントには生 JSON が本文に見える
+    # ので、繋ぐクライアントを揃えてから有効化する。→ _mlx_vlm_shims._patch_stream_tool_calls
+    stream_tool_calls: bool = False
     extra_args: list[str] = field(default_factory=list)
 
     @property
@@ -1323,6 +1329,9 @@ class LocalServer:
                 # おく理由が無いため既定を有効側にする。ブロック数などの調整は
                 # APC_* を環境変数で渡す（ここは未設定時のみ＝ユーザー指定が優先）。
                 env.setdefault("APC_ENABLED", "1")
+                # ツール呼び出しの生成中トークンを流す(シム側が読む。→ ServerConfig.stream_tool_calls)
+                if self.config.stream_tool_calls:
+                    env["LOCAL_LLM_STREAM_TOOL_CALLS"] = "1"
                 # exact モード（gemma4 系などハイブリッド注意機構のモデルが該当。
                 # RotatingKVCache 層はブロック分割で再構成できないため、mlx-vlm は
                 # プレフィックス丸ごとのスナップショット方式に落とす）向けの既定。
