@@ -12,6 +12,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+_MAX_BOUNDARY_BYTES = 200
+_MAX_PARTS = 128
+_MAX_PART_HEADER_BYTES = 16 * 1024
+
 
 @dataclass
 class Part:
@@ -32,7 +36,8 @@ def _boundary(content_type: str) -> bytes | None:
         token = token.strip()
         if token.lower().startswith("boundary="):
             b = token[len("boundary="):].strip().strip('"')
-            return b.encode("latin-1") if b else None
+            encoded = b.encode("latin-1") if b else b""
+            return encoded if 0 < len(encoded) <= _MAX_BOUNDARY_BYTES else None
     return None
 
 
@@ -76,7 +81,10 @@ def parse(body: bytes, content_type: str) -> list[Part]:
     if idx < 0:
         return []
     idx += len(delimiter)
+    checked = 0
     while True:
+        if checked >= _MAX_PARTS:
+            break
         # 境界直後は CRLF（次パート）か "--"（終端）。
         if body[idx:idx + 2] == b"--":
             break
@@ -86,8 +94,12 @@ def parse(body: bytes, content_type: str) -> list[Part]:
         nxt = body.find(b"\r\n" + delimiter, idx)
         if nxt < 0:
             break
+        checked += 1
         segment = body[idx:nxt]
-        head, _, value = segment.partition(b"\r\n\r\n")
+        head, separator, value = segment.partition(b"\r\n\r\n")
+        if not separator or len(head) > _MAX_PART_HEADER_BYTES:
+            idx = nxt + 2 + len(delimiter)
+            continue
         headers = _parse_headers(head)
         disp = _disposition_params(headers.get("content-disposition", ""))
         name = disp.get("name")
@@ -103,8 +115,32 @@ def parse(body: bytes, content_type: str) -> list[Part]:
 
 
 def field(body: bytes, content_type: str, name: str) -> str | None:
-    """テキストフィールド 1 つの値だけを取り出す（ルータの model 抽出用）。"""
-    for part in parse(body, content_type):
-        if part.name == name and part.filename is None:
-            return part.text()
+    """テキストフィールド1つを、大きなファイルパートを複製せずに取り出す。"""
+    if "multipart/form-data" not in content_type.lower():
+        return None
+    boundary = _boundary(content_type)
+    if not body or boundary is None:
+        return None
+    delimiter = b"--" + boundary
+    idx = body.find(delimiter)
+    if idx < 0:
+        return None
+    idx += len(delimiter)
+    checked = 0
+    while checked < _MAX_PARTS:
+        if body[idx:idx + 2] == b"--":
+            break
+        if body[idx:idx + 2] == b"\r\n":
+            idx += 2
+        nxt = body.find(b"\r\n" + delimiter, idx)
+        if nxt < 0:
+            break
+        header_end = body.find(b"\r\n\r\n", idx, min(nxt, idx + _MAX_PART_HEADER_BYTES + 4))
+        if header_end >= 0:
+            headers = _parse_headers(body[idx:header_end])
+            params = _disposition_params(headers.get("content-disposition", ""))
+            if params.get("name") == name and "filename" not in params:
+                return body[header_end + 4:nxt].decode("utf-8", "replace")
+        idx = nxt + 2 + len(delimiter)
+        checked += 1
     return None

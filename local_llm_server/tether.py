@@ -63,6 +63,14 @@ def _watch_parent(fd: int, proc: subprocess.Popen) -> None:
     _shutdown_group(proc)
 
 
+def _restore_child_shutdown_signals() -> None:
+    """tether 自身が無視する停止シグナルを exec 前の子だけ既定へ戻す。"""
+    for name in ("SIGTERM", "SIGINT", "SIGHUP"):
+        sig = getattr(signal, name, None)
+        if sig is not None:
+            signal.signal(sig, signal.SIG_DFL)
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     usage = "usage: python -m local_llm_server.tether --fd N -- <cmd> [args...]"
@@ -87,7 +95,13 @@ def main(argv: list[str] | None = None) -> int:
         except (OSError, ValueError):
             pass
     try:
-        proc = subprocess.Popen(cmd)  # 同一グループ（リーダーは自分）。stdout/err は継承
+        # restore_signals=True は Python が内部で無視した SIGPIPE 等しか戻さない。
+        # tether が明示的に SIG_IGN にした SIGTERM 等は、POSIX の子で個別に戻す必要がある。
+        if os.name != "nt":
+            proc = subprocess.Popen(cmd, preexec_fn=_restore_child_shutdown_signals)
+        else:
+            proc = subprocess.Popen(cmd)
+        # 同一グループ（リーダーは自分）。stdout/err は継承
     except FileNotFoundError as exc:
         print(f"tether: backend executable not found: {exc.filename}", file=sys.stderr)
         return 127

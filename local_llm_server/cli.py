@@ -43,7 +43,6 @@ from .server import (
     _hf_hub_cache,
     discover_cached_models,
     ensure_cached,
-    find_pids_on_port,
     gateway_admin_status,
     gateway_log_path,
     gateway_set_max_resident,
@@ -52,12 +51,14 @@ from .server import (
     is_ready,
     local_connect_host,
     mtp_status,
-    pid_looks_like_ours,
+    owned_worker_pids_on_ports,
+    pid_looks_like_gateway,
     primary_lan_ip,
     read_gateway_runtime,
     resolve_gguf,
     start_gateway_background,
     stop_pid,
+    worker_pid_is_owned,
 )
 
 
@@ -86,9 +87,11 @@ def user_config_path() -> str:
 _DEFAULT_CONFIG = """\
 # local-llm-server の設定（`gw start` が初回に自動生成。編集したら保存するだけで
 # ポリシー設定は稼働中でも反映される → docs/gateway.md）
-host = "127.0.0.1"          # 別 PC から繋ぐなら "0.0.0.0"（api_key の設定を推奨）
+host = "127.0.0.1"          # 別 PC へ公開する場合は "0.0.0.0" と api_key が必須
 port = 8799                 # クライアントの base_url はここ（http://127.0.0.1:8799/v1）
 max_resident = 1            # 同時常駐モデル数の上限（超過は LRU 退避）
+max_request_workers = 32    # 同時HTTP接続数の上限
+max_media_workers = 2       # 同時画像・動画処理数の上限
 # モデルは事前登録不要。クライアントが指定した model をその場でロードする。
 """
 
@@ -393,7 +396,8 @@ def render_list(gcfg, admin: dict | None) -> str:
     view = merge_status(gcfg, admin, ready=bool(admin.get("models") is not None))
     if not view["models"]:
         return "(no models registered and none cached)"
-    rows = [[m["model"], m["backend"], m["state"], ("mtp" if m["mtp"] == "ready" else "")]
+    # 列見出しが MTP なので、利用可能な行で "mtp" を繰り返さず一目で分かる印にする。
+    rows = [[m["model"], m["backend"], m["state"], ("○" if m["mtp"] == "ready" else "")]
             for m in view["models"]]
     return _fmt_table(["MODEL", "BACKEND", "STATE", "MTP"], rows)
 
@@ -419,18 +423,20 @@ def _collect_gateway_pids(host: str, port: int, all_ports: list[int]) -> list[in
     pids: set[int] = set()
     admin = gateway_admin_status(host, port)
     if admin:
-        if isinstance(admin.get("pid"), int):
+        if isinstance(admin.get("pid"), int) and pid_looks_like_gateway(admin["pid"]):
             pids.add(admin["pid"])
         for m in admin.get("models", []):
             for p in (m.get("pids") or []):
-                if isinstance(p, int):
+                if isinstance(p, int) and worker_pid_is_owned(p):
                     pids.add(p)
-    for p in all_ports:
-        pids.update(find_pids_on_port(p))
+    pids.update(owned_worker_pids_on_ports(all_ports))
     rec = read_gateway_runtime()
-    if rec and isinstance(rec.get("pid"), int):
+    if (
+        rec and isinstance(rec.get("pid"), int)
+        and pid_looks_like_gateway(rec["pid"])
+    ):
         pids.add(rec["pid"])
-    return [pid for pid in pids if pid_looks_like_ours(pid)]
+    return sorted(pids)
 
 
 def _stop_pids(pids: list[int]) -> None:

@@ -1,6 +1,7 @@
 import http.client
 import json
 import os
+import socket
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -357,6 +358,27 @@ def test_manager_lazy_loads_once(monkeypatch):
     assert len(created) == 1 and created[0].starts == 1
 
 
+def test_manager_cleans_up_every_startup_exception(monkeypatch):
+    """OSError 等でも起動途中集合とワーカーを残さない。"""
+    created = []
+
+    class _FailServer(_FakeServer):
+        def start(self):
+            raise PermissionError("cannot execute backend")
+
+    def factory(config, log_path=None):
+        server = _FailServer(config, log_path)
+        created.append(server)
+        return server
+
+    monkeypatch.setattr(gw, "LocalServer", factory)
+    mgr = gw.ModelManager(_configs())
+    with pytest.raises(PermissionError):
+        mgr.acquire("m1")
+    assert created[0].stops == 1
+    assert not mgr._starting
+
+
 def test_manager_unknown_model_raises(monkeypatch):
     _patch_fake(monkeypatch)
     mgr = gw.ModelManager(_configs())
@@ -651,6 +673,135 @@ def test_manager_shutdown_stops_all(monkeypatch):
     assert all(not s["loaded"] for s in mgr.status())
 
 
+def test_manager_shutdown_interrupts_and_joins_replica_warmup(monkeypatch):
+    _patch_fake(monkeypatch)
+    mgr = gw.ModelManager(_configs(), _replica_grace_s=300.0)
+    mgr._maybe_spawn_replica_async("m1")
+    with mgr._state:
+        threads = list(mgr._background_threads)
+    assert len(threads) == 1 and threads[0].is_alive()
+
+    mgr.shutdown()
+
+    assert not threads[0].is_alive()
+    with mgr._state:
+        assert mgr._background_threads == set()
+        assert mgr._spawning == set()
+
+
+def test_gateway_run_cleans_tray_when_startup_fails(monkeypatch):
+    """Tray is acquired before provisioning and must be reaped if provisioning fails."""
+    import os
+    import types
+
+    from local_llm_server import daemon as daemon_mod
+    from local_llm_server import update
+
+    read_fd, write_fd = os.pipe()
+    os.close(read_fd)
+
+    class _Tray:
+        def __init__(self):
+            self.waited = False
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            self.waited = True
+            return 0
+
+    tray = _Tray()
+    monkeypatch.setattr(update, "mark_running_source", lambda: None)
+    monkeypatch.setattr(daemon_mod, "ignore_shutdown_signals", lambda: None)
+    monkeypatch.setattr(
+        daemon_mod, "_maybe_spawn_tray", lambda _cfg: (tray, write_fd)
+    )
+    monkeypatch.setattr(
+        daemon_mod,
+        "provision_llama_if_needed",
+        lambda _cfg: (_ for _ in ()).throw(RuntimeError("provision failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="provision failed"):
+        daemon_mod._run_gateway_locked(types.SimpleNamespace())
+
+    with pytest.raises(OSError):
+        os.fstat(write_fd)
+    assert tray.waited is True
+
+
+def test_gateway_resources_stop_threads_and_close_in_order(monkeypatch):
+    from local_llm_server import daemon as daemon_mod
+
+    monkeypatch.setattr(daemon_mod, "ignore_shutdown_signals", lambda: None)
+    cleared = []
+    monkeypatch.setattr(daemon_mod, "clear_gateway_runtime", lambda: cleared.append(1))
+    server_stopped = threading.Event()
+    calls = []
+
+    class _Server:
+        _update_check_done = None
+
+        def shutdown(self):
+            calls.append("server.shutdown")
+            server_stopped.set()
+
+        def server_close(self):
+            calls.append("server.close")
+
+        def detach_listen_fd(self):
+            raise AssertionError("normal shutdown must not detach")
+
+    class _Manager:
+        def shutdown(self):
+            calls.append("manager.shutdown")
+
+    resources = daemon_mod._GatewayRunResources(
+        manager=_Manager(), server=_Server(), runtime_written=True
+    )
+    watcher_exited = threading.Event()
+    resources.start_thread(
+        target=lambda: (resources.stop_event.wait(), watcher_exited.set()),
+        name="test-watcher",
+    )
+    resources.start_thread(
+        target=lambda: server_stopped.wait(),
+        name="test-server",
+        server=True,
+    )
+
+    resources.close()
+
+    assert watcher_exited.is_set()
+    assert all(not thread.is_alive() for thread in resources.threads)
+    assert calls == ["server.shutdown", "server.close", "manager.shutdown"]
+    assert cleared == [1]
+
+
+def test_gateway_resources_restart_transfers_listen_fd(monkeypatch):
+    from local_llm_server import daemon as daemon_mod
+
+    monkeypatch.setattr(daemon_mod, "ignore_shutdown_signals", lambda: None)
+    cleared = []
+    monkeypatch.setattr(daemon_mod, "clear_gateway_runtime", lambda: cleared.append(1))
+
+    class _Server:
+        _update_check_done = None
+
+        def detach_listen_fd(self):
+            return 73
+
+    resources = daemon_mod._GatewayRunResources(
+        server=_Server(), runtime_written=True, restart=True
+    )
+    resources.close()
+
+    assert os.environ[daemon_mod._LISTEN_FD_ENV] == "73"
+    assert cleared == []
+    monkeypatch.delenv(daemon_mod._LISTEN_FD_ENV)
+
+
 # --- HTTP 振り分け（実フェイク上流 + no-op LocalServer）----------------------
 
 def _make_upstream(name):
@@ -739,6 +890,29 @@ def test_gateway_unknown_model_returns_404(monkeypatch):
             u.shutdown(); u.server_close()
 
 
+def test_gateway_turns_unexpected_start_error_into_502(monkeypatch):
+    class _FailServer(_FakeServer):
+        def start(self):
+            raise PermissionError("private filesystem detail")
+
+    monkeypatch.setattr(gw, "LocalServer", _FailServer)
+    mgr = gw.ModelManager([
+        ServerConfig(backend="mlx", model="m", host="127.0.0.1", port=9001),
+    ])
+    server = gw.GatewayServer(("127.0.0.1", 0), mgr, catalog=["m"])
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        status, obj = _post(
+            server.server_address[1], "/v1/chat/completions",
+            {"model": "m", "messages": []},
+        )
+        assert status == 502
+        assert "private filesystem detail" not in json.dumps(obj)
+        assert not mgr._starting
+    finally:
+        server.shutdown(); server.server_close(); mgr.shutdown()
+
+
 def test_gateway_models_catalog(monkeypatch):
     # /v1/models は標準どおり「事前登録カタログ＋ロード中」のみ（発見一覧は TUI 専用）。
     server, mgr, ups = _start_gateway(monkeypatch)
@@ -785,6 +959,10 @@ def test_gateway_api_key_required_for_chat_and_models(monkeypatch):
         assert _get(port, "/v1/models")[0] == 401
         status, obj = _get(port, "/v1/models", headers={"Authorization": "Bearer secret"})
         assert status == 200
+        # ローカル管理操作は loopback + Host/Origin 検査で保護される。トレイ/CLI が
+        # 秘密をコマンドラインで受け渡さなくても、api_key 設定中に動く。
+        status, obj = _post(port, "/admin/config", {"max_resident": 2})
+        assert status == 200 and obj["max_resident"] == 2
     finally:
         server.shutdown(); server.server_close(); mgr.shutdown()
         for u in ups:
@@ -839,9 +1017,9 @@ def test_gateway_admin_status_none_when_down():
     assert gateway_admin_status("127.0.0.1", 6, timeout=0.5) is None
 
 
-def test_gateway_admin_is_loopback_and_keyless(monkeypatch):
-    # api_key 設定時でも、/admin/status・/admin/config はローカル（=テストは 127.0.0.1）から
-    # キー無しで使える（ループバック限定・キーではなく接続元で保護）。
+def test_gateway_admin_write_uses_local_admin_policy(monkeypatch):
+    # 管理操作は loopback + Host/Origin 検査で保護し、クライアント用 api_key は
+    # 要求しない。これによりトレイ/CLI に秘密を渡さずローカル管理を継続できる。
     server, mgr, ups = _start_gateway(monkeypatch, api_key="secret")
     try:
         port = server.server_address[1]
@@ -962,6 +1140,20 @@ def test_session_last_agent_release_frees_after_linger(monkeypatch):
     mgr.unregister_session("A")  # 最後の在席 → 猶予後にアンロード（別スレッド）
     assert _wait_unloaded(mgr, "m1")
     assert {s.config.model: s.stops for s in created}["m1"] == 1
+
+
+def test_release_timer_is_replaced_and_cancelled_on_shutdown(monkeypatch):
+    _short_linger(monkeypatch, seconds=60.0)
+    mgr = gw.ModelManager(_configs())
+    mgr._free_model_async("m1")
+    first = mgr._release_timers["m1"]
+    mgr._free_model_async("m1")
+    second = mgr._release_timers["m1"]
+    assert second is not first
+    assert first.finished.is_set()  # cancel 済みで待機スレッドは残らない
+    mgr.shutdown()
+    assert second.finished.is_set()
+    assert mgr._release_timers == {}
 
 
 def test_reregister_within_linger_cancels_unload(monkeypatch):
@@ -1167,14 +1359,20 @@ def test_reclaim_stale_workers_kills_only_ours(monkeypatch):
     from local_llm_server import server as srv_mod
     killed = []
     monkeypatch.setattr(srv_mod, "find_pids_on_port", lambda port: [111, 222, 333])
-    # 111/333 は our-worker、222 は無関係。
-    monkeypatch.setattr(srv_mod, "pid_looks_like_ours", lambda pid: pid in (111, 333))
+    # 3件ともコマンド形はbackendに見えるが、安全な台帳にある111/333だけが所有対象。
+    monkeypatch.setattr(srv_mod, "pid_looks_like_ours", lambda _pid: True)
+    monkeypatch.setattr(srv_mod, "pid_matches_record", lambda pid, rec: pid == rec.get("pid"))
+    monkeypatch.setattr(
+        srv_mod, "_load_workers_unlocked",
+        lambda: [{"pid": 111, "port": 9001}, {"pid": 333, "port": 9001}],
+    )
 
     def _stop(pid, timeout=10.0):
         killed.append(pid)
         return True
 
     monkeypatch.setattr(srv_mod, "stop_pid", _stop)
+    monkeypatch.setattr(srv_mod, "unregister_worker", lambda _pid: None)
     reclaimed = srv_mod.reclaim_stale_workers(9001)
     assert reclaimed == [111, 333]   # 無関係な 222 には手を出さない
     assert killed == [111, 333]
@@ -1191,6 +1389,98 @@ def test_load_gateway_config_parses_image_max_edge(tmp_path):
     # 0 以外で 64 未満は拒否。
     with pytest.raises(ValueError):
         gw.load_gateway_config(_write(tmp_path, "image_max_edge = 32\n"))
+
+
+@pytest.mark.parametrize("text", [
+    "port = 0\n",
+    "internal_base_port = 65536\n",
+    "request_timeout = nan\n",
+    "video_frames = 33\n",
+    "video_max_edge = 2049\n",
+    "image_max_edge = 4097\n",
+    "draft_model = true\n",
+    'auto_update = "false"\n',
+    'default_model = 42\n',
+    '[[models]]\nmodel = "m"\nextra_args = "--bad"\n',
+    "request_timout = 10\n",
+    '[[models]]\nmodel = "m"\nbacknd = "mlx"\n',
+    '[llama_cpp]\naccelleration = "metal"\n',
+])
+def test_gateway_config_rejects_unsafe_types_and_ranges(tmp_path, text):
+    with pytest.raises(ValueError):
+        gw.load_gateway_config(_write(tmp_path, text))
+
+
+def test_gateway_does_not_treat_127_prefixed_hostname_as_loopback(tmp_path):
+    with pytest.raises(ValueError, match="api_key is required"):
+        gw.load_gateway_config(_write(tmp_path, 'host = "127.attacker.example"\n'))
+
+
+def test_gateway_rejects_cross_site_and_non_json_posts(monkeypatch):
+    server, mgr, ups = _start_gateway(monkeypatch)
+    try:
+        port = server.server_address[1]
+        conn = http.client.HTTPConnection("127.0.0.1", port)
+        conn.request(
+            "POST", "/v1/chat/completions", '{}',
+            {"Content-Type": "text/plain", "Origin": "https://evil.example",
+             "Sec-Fetch-Site": "cross-site"},
+        )
+        response = conn.getresponse()
+        assert response.status == 403
+        response.read()
+        conn.close()
+
+        conn = http.client.HTTPConnection("127.0.0.1", port)
+        conn.request("POST", "/v1/chat/completions", '{}', {"Content-Type": "text/plain"})
+        response = conn.getresponse()
+        assert response.status == 415
+        response.read()
+        conn.close()
+    finally:
+        server.shutdown(); server.server_close(); mgr.shutdown()
+        for upstream in ups:
+            upstream.shutdown(); upstream.server_close()
+
+
+def test_gateway_rejects_untrusted_host_on_get(monkeypatch):
+    """GET も Host 検査し、DNS rebinding でローカル管理情報を読ませない。"""
+    server, mgr, ups = _start_gateway(monkeypatch)
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1])
+        conn.putrequest("GET", "/admin/status", skip_host=True)
+        conn.putheader("Host", "attacker.example")
+        conn.endheaders()
+        response = conn.getresponse()
+        assert response.status == 403
+        response.read()
+        conn.close()
+    finally:
+        server.shutdown(); server.server_close(); mgr.shutdown()
+        for upstream in ups:
+            upstream.shutdown(); upstream.server_close()
+
+
+def test_gateway_caps_simultaneous_connections():
+    mgr = gw.ModelManager([], dynamic=True)
+    server = gw.GatewayServer(
+        ("127.0.0.1", 0), mgr, catalog=[], max_request_workers=1,
+    )
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    first = socket.create_connection(("127.0.0.1", server.server_address[1]))
+    try:
+        # ヘッダを完了させず1本目のハンドラを保持する。
+        first.sendall(b"GET /v1/models HTTP/1.1\r\nHost: localhost\r\n")
+        assert _wait_until(lambda: server._active_conns == 1)
+        second = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=2)
+        second.request("GET", "/v1/models")
+        response = second.getresponse()
+        assert response.status == 503
+        response.read()
+        second.close()
+    finally:
+        first.close()
+        server.shutdown(); server.server_close(); mgr.shutdown()
 
 
 def test_gateway_downscales_image_before_forwarding(monkeypatch):
@@ -1252,9 +1542,11 @@ def test_load_gateway_config_rejects_unsupported_wildcards(tmp_path):
     for host in ("::", "*"):
         with pytest.raises(ValueError, match="not supported"):
             gw.load_gateway_config(_write(tmp_path, f'host = "{host}"\n' + base))
-    # "0.0.0.0" は従来どおり許可
+    # 公開bindはAPIキー必須。隔離LANでは明示的な危険opt-inも可能。
+    with pytest.raises(ValueError, match="api_key"):
+        gw.load_gateway_config(_write(tmp_path, 'host = "0.0.0.0"\n' + base))
     assert gw.load_gateway_config(
-        _write(tmp_path, 'host = "0.0.0.0"\n' + base)).host == "0.0.0.0"
+        _write(tmp_path, 'host = "0.0.0.0"\napi_key = "secret"\n' + base)).host == "0.0.0.0"
 
 
 def test_no_replica_when_no_limits_configured(monkeypatch):
@@ -1461,12 +1753,14 @@ def test_apply_live_config_max_resident_uses_setter(tmp_path):
 
 
 def test_apply_live_config_structural_change_warns_not_applied(tmp_path):
-    cfg = gw.load_gateway_config(_write(tmp_path, "port = 8799\ninternal_base_port = 9001\n"))
+    cfg = gw.load_gateway_config(_write(
+        tmp_path, 'api_key = "secret"\nport = 8799\ninternal_base_port = 9001\n'))
     server, mgr = _live_server(cfg)
     bound_port = server.server_address[1]
     try:
         new = gw.load_gateway_config(_write(
-            tmp_path, 'host = "0.0.0.0"\nport = 9999\ninternal_base_port = 9500\n'))
+            tmp_path, 'host = "0.0.0.0"\napi_key = "secret"\n'
+            'port = 9999\ninternal_base_port = 9500\n'))
         changed, restart = gw.apply_live_config(server, mgr, cfg, new)
         # 構造設定は「要再起動」に積まれるだけで、稼働中の bind は変わらない。
         assert "port" in restart and "host" in restart and "internal_base_port" in restart
@@ -1702,7 +1996,10 @@ def test_gateway_expands_video_before_forwarding(monkeypatch):
     monkeypatch.setattr(gw, "LocalServer",
                         lambda config, log_path=None: _FakeServer(config, log_path))
     # ffmpeg を呼ばずにフレームを返す（3 枚）。
-    monkeypatch.setattr(gw.video, "extract_frames", lambda url, n, edge: [b"f1", b"f2", b"f3"])
+    monkeypatch.setattr(
+        gw.video, "extract_frames",
+        lambda url, n, edge, **_kw: [b"f1", b"f2", b"f3"],
+    )
     configs = [ServerConfig(backend="mlx-vlm", model="m", host="127.0.0.1",
                             port=up.server_address[1])]
     mgr = gw.ModelManager(configs, dynamic=False)
@@ -1727,7 +2024,7 @@ def test_gateway_video_extract_failure_returns_400(monkeypatch):
     monkeypatch.setattr(gw, "LocalServer",
                         lambda config, log_path=None: _FakeServer(config, log_path))
 
-    def boom(url, n, edge):
+    def boom(url, n, edge, **_kw):
         raise gw.video.VideoError("no ffmpeg")
 
     monkeypatch.setattr(gw.video, "extract_frames", boom)

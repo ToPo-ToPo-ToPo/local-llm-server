@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import io
+import hashlib
 import os
 import tarfile
 import zipfile
@@ -14,6 +15,31 @@ import zipfile
 import pytest
 
 from local_llm_server import provisioner as pv
+
+
+def test_download_rejects_declared_oversized_archive(tmp_path, monkeypatch):
+    class _Response:
+        headers = {"Content-Length": str(pv._MAX_ARCHIVE_BYTES + 1)}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_a):
+            return False
+
+        def read(self, _size=-1):
+            raise AssertionError("oversized response must be rejected before reading")
+
+    monkeypatch.setattr(pv.urllib.request, "urlopen", lambda *_a, **_k: _Response())
+    with pytest.raises(pv.ProvisionError, match="unexpectedly large"):
+        pv._download("https://example.com/llama.tar.gz", str(tmp_path / "archive"))
+
+
+def test_ensure_rejects_malformed_build_before_path_use(monkeypatch):
+    monkeypatch.setattr(pv, "detect_os", lambda: "macos")
+    monkeypatch.setattr(pv, "detect_arch", lambda: "arm64")
+    with pytest.raises(pv.ProvisionError, match="must look like"):
+        pv.ensure_llama_server(build="../../escape", accel="metal")
 
 
 # --- 検出 --------------------------------------------------------------------
@@ -198,6 +224,32 @@ def test_extract_zip(tmp_path):
         zf.writestr("bin/llama-server.exe", "x")
     pv._extract(str(archive), str(tmp_path / "out"))
     assert (tmp_path / "out" / "bin" / "llama-server.exe").exists()
+
+
+def test_extract_rejects_path_traversal_and_links(tmp_path):
+    bad_zip = tmp_path / "bad.zip"
+    with zipfile.ZipFile(bad_zip, "w") as zf:
+        zf.writestr("../escape", "x")
+    with pytest.raises(pv.ProvisionError):
+        pv._extract(str(bad_zip), str(tmp_path / "zip-out"))
+
+    bad_tar = tmp_path / "bad.tar.gz"
+    with tarfile.open(bad_tar, "w:gz") as tf:
+        info = tarfile.TarInfo("bin/link")
+        info.type = tarfile.SYMTYPE
+        info.linkname = "../../escape"
+        tf.addfile(info)
+    with pytest.raises(pv.ProvisionError):
+        pv._extract(str(bad_tar), str(tmp_path / "tar-out"))
+
+
+def test_archive_digest_must_match(tmp_path):
+    archive = tmp_path / "asset.zip"
+    archive.write_bytes(b"trusted bytes")
+    digest = hashlib.sha256(b"trusted bytes").hexdigest()
+    pv._verify_digest(str(archive), digest)
+    with pytest.raises(pv.ProvisionError):
+        pv._verify_digest(str(archive), "0" * 64)
 
 
 # --- 総点検で見つかった不具合の回帰テスト ------------------------------------------

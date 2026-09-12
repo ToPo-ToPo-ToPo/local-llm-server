@@ -120,15 +120,10 @@ def _porcelain(update_mod, monkeypatch, text: str):
     monkeypatch.setattr(update_mod, "_git", lambda root, *a, **k: _R())
 
 
-def test_working_tree_clean_ignores_regenerated_lock(monkeypatch, tmp_path):
-    """uv.lock だけの差分は「クリーン」。他のファイルが変わっていれば dirty のまま。
-
-    `uv sync` / `uv run` は解決をやり直して uv.lock を書き換えることがある（uv の版差・
-    リリース時のロック作り直し漏れ）。これを dirty と数えると、普通に使っているだけで
-    **自動更新が永久に止まり、更新マークが消えなくなる**——実際に起きた不具合の回帰ガード。
-    """
+def test_working_tree_clean_protects_lock_changes(monkeypatch, tmp_path):
+    """uv.lock も正当な依存更新成果なので、自動更新が暗黙に破棄しない。"""
     _porcelain(update, monkeypatch, " M uv.lock\n")
-    assert update._working_tree_clean(tmp_path) is True
+    assert update._working_tree_clean(tmp_path) is False
     # 手で触った WIP は従来どおり守る（uv.lock と一緒でも dirty）。
     _porcelain(update, monkeypatch, " M uv.lock\n M local_llm_server/daemon.py\n")
     assert update._working_tree_clean(tmp_path) is False
@@ -140,12 +135,8 @@ def test_working_tree_clean_ignores_regenerated_lock(monkeypatch, tmp_path):
     assert update._working_tree_clean(tmp_path) is True
 
 
-def test_apply_update_pulls_over_regenerated_lock(tmp_path, monkeypatch):
-    """実際の git クローンで、uv.lock だけ汚れていても ff pull が通る（E2E）。
-
-    クリーン判定を緩めるだけでは足りない: git は「ローカルの変更が上書きされる」と
-    pull 自体を拒むので、apply_update は pull の前に成果物を捨てる必要がある。
-    """
+def test_apply_update_preserves_modified_lock(tmp_path, monkeypatch):
+    """実際のgit cloneでも、変更済みuv.lockを消さず更新を拒否する。"""
     import subprocess as sp
 
     def git(cwd, *args):
@@ -168,13 +159,11 @@ def test_apply_update_pulls_over_regenerated_lock(tmp_path, monkeypatch):
     git(work, "tag", "-d", "v0.2.0")                 # タグも未取得の状態にする
     (work / "uv.lock").write_text("locally re-resolved\n")  # uv sync が書き換えた想定
 
-    monkeypatch.setattr(update, "_find_uv", lambda: None)    # 同期はこのテストの対象外
-    assert update._working_tree_clean(work) is True
+    assert update._working_tree_clean(work) is False
     ok, _msg = update.apply_update(root=work)
-    assert ok is True
-    assert update._source_version(work) == "0.2.0"           # 追従できた
-    assert (work / "uv.lock").read_text() == "lock v2\n"     # 取り込んだロックに置き換わる
-    assert git(work, "status", "--porcelain").stdout == ""   # 汚れも残らない
+    assert ok is False
+    assert update._source_version(work) == "0.1.0"
+    assert (work / "uv.lock").read_text() == "locally re-resolved\n"
 
 
 # --- apply_update（git 呼び出しは monkeypatch）-----------------------------
@@ -214,9 +203,7 @@ def test_apply_update_runs_pull_and_sync(monkeypatch, tmp_path):
     merge = ("git", ("merge", "--ff-only", "refs/tags/v9.9.9"))
     assert ("git", ("fetch", "--tags", "--force", "origin")) in calls
     assert merge in calls
-    # 再生成される成果物は ff の**前に**捨てる（残すと git が適用を拒む）。
-    checkout = ("git", ("checkout", "--", "uv.lock"))
-    assert checkout in calls and calls.index(checkout) < calls.index(merge)
+    assert not any(c[0] == "git" and c[1][0] == "checkout" for c in calls)
     # uv sync は **--frozen**（ロックを更新しない）。これが無いと自動更新が自分で
     # 作業ツリーを dirty にして、次回以降の更新を永久に塞ぐ。
     assert any(
@@ -224,6 +211,28 @@ def test_apply_update_runs_pull_and_sync(monkeypatch, tmp_path):
         and "--frozen" in c[1]
         for c in calls
     )
+
+
+def test_apply_update_reports_dependency_sync_failure(monkeypatch, tmp_path):
+    monkeypatch.setattr(update, "_working_tree_clean", lambda _root: True)
+
+    class _R:
+        def __init__(self, rc=0, out="", err=""):
+            self.returncode, self.stdout, self.stderr = rc, out, err
+
+    def fake_git(_root, *args, **_kwargs):
+        if args[0] == "for-each-ref":
+            return _R(out="refs/tags/v99.0.0\n")
+        return _R(out="updated")
+
+    monkeypatch.setattr(update, "_git", fake_git)
+    monkeypatch.setattr(update, "_find_uv", lambda: "/usr/bin/uv")
+    monkeypatch.setattr(
+        update.subprocess, "run", lambda *_a, **_k: _R(rc=1, err="lock mismatch"),
+    )
+    ok, message = update.apply_update(root=tmp_path)
+    assert ok is False
+    assert "uv sync" in message and "lock mismatch" in message
 
 
 def test_apply_update_reports_pull_failure(monkeypatch, tmp_path):

@@ -8,8 +8,8 @@
 動画入力が `video_max_edge` でフレームを縮小するのと同じ発想で、静止画も上流へ渡す前に
 **長辺 `max_edge` に収まるよう縮小**する（拡大はしない）。バックエンド非依存（mlx-vlm /
 llama-cpp どちらでも効く）。対象は data URL（`data:image/...;base64,...`）と、トップレベル
-`images=[...]` の base64 文字列。リモート URL（http/https）は上流が自分で取得するため対象外
-（ゲートウェイが代理取得すると SSRF/プライバシー面の別懸念が出る）。
+`images=[...]` の base64 文字列。リモート URL（http/https）は SSRF 検査と容量上限を
+適用してゲートウェイが1回だけ取得し、data URL に置き換えてから上流へ渡す。
 """
 from __future__ import annotations
 
@@ -18,12 +18,20 @@ import binascii
 import io
 import re
 
+from . import net_safety
+
 # data URL のヘッダを緩く拾う（`data:image/png;base64,....`）。base64 以外の稀な形は対象外。
 _DATA_URL_RE = re.compile(r"^data:(image/[\w.+-]+)?;base64,(.*)$", re.IGNORECASE | re.DOTALL)
 
 # PIL.format → data URL の mime。JPEG は screenshot 的な線画/文字を劣化させにくいよう PNG を優先し、
 # 元が JPEG のときだけ JPEG のまま返す（写真のペイロード肥大を避ける）。
 _FMT_MIME = {"PNG": "image/png", "JPEG": "image/jpeg", "WEBP": "image/webp"}
+_MAX_IMAGE_BYTES = 32 * 1024 * 1024
+_MAX_IMAGE_PIXELS = 40_000_000
+
+
+class ImageError(ValueError):
+    """安全上の上限を超えた画像入力。"""
 
 
 def _resize_encoded(raw: bytes, max_edge: int) -> bytes | None:
@@ -32,16 +40,22 @@ def _resize_encoded(raw: bytes, max_edge: int) -> bytes | None:
     PIL が無い環境（Pillow 未導入）では import 失敗を握って None を返し、ゲートウェイ自体は
     そのまま動かす（最適化が効かないだけ）。
     """
+    if len(raw) > _MAX_IMAGE_BYTES:
+        raise ImageError(f"image payload is too large (> {_MAX_IMAGE_BYTES} bytes)")
     try:
         from PIL import Image
     except Exception:  # noqa: BLE001 - Pillow 未導入なら縮小せず素通し
         return None
     try:
         img = Image.open(io.BytesIO(raw))
+        w, h = img.size
+        if w <= 0 or h <= 0 or w * h > _MAX_IMAGE_PIXELS:
+            raise ImageError(f"decoded image is too large (> {_MAX_IMAGE_PIXELS} pixels)")
         img.load()
+    except ImageError:
+        raise
     except Exception:  # noqa: BLE001 - 壊れた/未対応画像は素通し（上流に委ねる）
         return None
-    w, h = img.size
     longest = max(w, h)
     if longest <= max_edge:
         return None  # 既に十分小さい
@@ -51,7 +65,7 @@ def _resize_encoded(raw: bytes, max_edge: int) -> bytes | None:
     if fmt not in _FMT_MIME:
         fmt = "PNG"
     try:
-        resized = img.resize(new_size, Image.LANCZOS)
+        resized = img.resize(new_size, Image.Resampling.LANCZOS)
         buf = io.BytesIO()
         if fmt == "JPEG":
             # JPEG は alpha 非対応。RGBA/P はの RGB に落としてから保存する。
@@ -65,13 +79,13 @@ def _resize_encoded(raw: bytes, max_edge: int) -> bytes | None:
     return buf.getvalue()
 
 
-def _mime_for(raw: bytes) -> str:
+def _mime_for(raw: bytes) -> str | None:
     try:
         from PIL import Image
         fmt = (Image.open(io.BytesIO(raw)).format or "PNG").upper()
-        return _FMT_MIME.get(fmt, "image/png")
+        return _FMT_MIME.get(fmt)
     except Exception:  # noqa: BLE001
-        return "image/png"
+        return None
 
 
 def _shrink_data_url(value: str, max_edge: int) -> str | None:
@@ -79,20 +93,43 @@ def _shrink_data_url(value: str, max_edge: int) -> str | None:
     m = _DATA_URL_RE.match(value.strip())
     if not m:
         return None
+    if len(m.group(2)) > ((_MAX_IMAGE_BYTES + 2) // 3) * 4:
+        raise ImageError(f"image data URL is too large (> {_MAX_IMAGE_BYTES} bytes)")
     try:
-        raw = base64.b64decode(m.group(2), validate=False)
+        raw = base64.b64decode(m.group(2), validate=True)
     except (binascii.Error, ValueError):
         return None
     small = _resize_encoded(raw, max_edge)
     if small is None:
         return None
-    mime = m.group(1) or _mime_for(small)
+    mime = m.group(1) or _mime_for(small) or "image/png"
     return f"data:{mime};base64," + base64.b64encode(small).decode("ascii")
+
+
+def _secure_remote_image(value: str, max_edge: int) -> str | None:
+    """外部画像をSSRF検査付きで取得し、上流が再取得しないdata URLへ変換する。"""
+    if not value.startswith(("http://", "https://")):
+        return None
+    try:
+        raw = net_safety.fetch_remote(value, _MAX_IMAGE_BYTES, timeout=30.0)
+    except net_safety.RemoteFetchError as exc:
+        raise ImageError(str(exc)) from exc
+    original_mime = _mime_for(raw)
+    if original_mime is None:
+        raise ImageError("remote media is not a supported image")
+    small = _resize_encoded(raw, max_edge)
+    encoded = small if small is not None else raw
+    mime = _mime_for(encoded) or original_mime
+    return f"data:{mime};base64," + base64.b64encode(encoded).decode("ascii")
+
+
+def _shrink_or_secure_url(value: str, max_edge: int) -> str | None:
+    return _secure_remote_image(value, max_edge) or _shrink_data_url(value, max_edge)
 
 
 def _shrink_bare_or_data(value: str, max_edge: int) -> str | None:
     """トップレベル images=[...] 用。data URL か生 base64 のどちらでも縮小を試みる。"""
-    out = _shrink_data_url(value, max_edge)
+    out = _shrink_or_secure_url(value, max_edge)
     if out is not None:
         return out
     if value.startswith("data:"):
@@ -120,12 +157,12 @@ def _shrink_part(part: dict, max_edge: int) -> bool:
         if isinstance(v, dict):
             url = v.get("url")
             if isinstance(url, str):
-                new = _shrink_data_url(url, max_edge)
+                new = _shrink_or_secure_url(url, max_edge)
                 if new is not None:
                     v["url"] = new
                     return True
         elif isinstance(v, str):
-            new = _shrink_data_url(v, max_edge)
+            new = _shrink_or_secure_url(v, max_edge)
             if new is not None:
                 part[key] = new
                 return True
@@ -136,7 +173,8 @@ def downscale_image_parts(payload: dict, max_edge: int) -> bool:
     """payload 内の画像を長辺 max_edge に縮小する（in-place）。1 つでも縮小したら True。
 
     max_edge <= 0 は無効（何もしない）。data URL / トップレベル images の base64 が対象。
-    リモート URL は対象外（上流が取得する）。壊れた画像・未対応形式・Pillow 未導入は素通し。
+    リモート URL は安全検査付きで取得し data URL 化する。壊れたインライン画像・
+    未対応形式・Pillow 未導入は素通し（リモート応答は画像でなければ拒否）。
     """
     if not max_edge or max_edge <= 0:
         return False
@@ -161,8 +199,22 @@ def downscale_image_parts(payload: dict, max_edge: int) -> bool:
             elif isinstance(item, dict):
                 url = item.get("url")
                 if isinstance(url, str):
-                    new = _shrink_data_url(url, max_edge)
+                    new = _shrink_or_secure_url(url, max_edge)
                     if new is not None:
                         item["url"] = new
                         changed = True
     return changed
+
+
+def request_has_image(payload: dict) -> bool:
+    """画像のデコード/取得を伴うリクエストかを安価に判定する。"""
+    if isinstance(payload.get("images"), list) and payload["images"]:
+        return True
+    for msg in payload.get("messages", []) or []:
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if isinstance(content, list) and any(
+            isinstance(part, dict) and "image" in str(part.get("type", ""))
+            for part in content
+        ):
+            return True
+    return False

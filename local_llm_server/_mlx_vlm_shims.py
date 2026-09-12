@@ -87,7 +87,7 @@ def _patch_apc_extra_hash() -> None:
                      if k not in ("embeddings", "masks")}
         return original(media=media, **kwargs)
 
-    semantic_extra_hash._llmserver_patched = True
+    semantic_extra_hash._llmserver_patched = True  # type: ignore[attr-defined]
     _apc.semantic_extra_hash = semantic_extra_hash
     # ar.py は `from .. import apc as _apc` のモジュール参照経由で呼ぶため、
     # モジュール属性の差し替えだけで全呼び出し箇所に効く

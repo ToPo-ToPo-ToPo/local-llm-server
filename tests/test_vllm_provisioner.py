@@ -69,7 +69,7 @@ def test_auto_creates_venv_and_installs(tmp_path, monkeypatch):
         return state["installed"]
 
     def marking_run(cmd, capture_output=False, timeout=None):
-        if "install" in cmd and "vllm" in cmd:
+        if "install" in cmd and any(x.startswith("vllm==") for x in cmd):
             state["installed"] = True
             installed.append(cmd)
         return _ok(0)
@@ -77,7 +77,7 @@ def test_auto_creates_venv_and_installs(tmp_path, monkeypatch):
     py = vp.ensure_vllm(create_venv=fake_create, run=marking_run,
                         importable=fake_importable)
     assert created["dir"].endswith("vllm-venv")
-    assert any("vllm" in c for c in installed)
+    assert any(any(x.startswith("vllm==") for x in c) for c in installed)
     assert py == vp.venv_python(created["dir"])
 
 

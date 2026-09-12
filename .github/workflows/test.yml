@@ -46,3 +46,32 @@ jobs:
         # -rf で失敗一覧を、--tb=short で短いトレースバックを出す（-q の進捗バーだけだと
         # GitHub のログ取得が末尾を取りこぼし、失敗内容が分からなくなることがあるため）。
         run: uv run pytest -rf --tb=short
+
+  quality:
+    runs-on: ubuntu-latest
+    name: security and static checks
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - name: Sync (dev deps)
+        run: uv sync --dev --frozen
+      - name: Critical lint checks
+        run: uv run ruff check --select E9,F63,F7,F82 local_llm_server tests
+      - name: Type-check package
+        run: >-
+          uv run mypy --ignore-missing-imports --follow-imports=skip --check-untyped-defs
+          local_llm_server
+      - name: High-severity security scan
+        run: uv run bandit -r local_llm_server -q -lll
+      - name: Dependency vulnerability audit
+        run: |
+          uv export --frozen --no-dev --no-hashes -o /tmp/local-llm-server-requirements.txt
+          uv run pip-audit -r /tmp/local-llm-server-requirements.txt --no-deps --disable-pip
+      - name: Product-code coverage floor
+        run: |
+          uv run coverage run -m pytest -q
+          uv run coverage report

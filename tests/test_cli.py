@@ -80,7 +80,9 @@ backend = "mlx-vlm"
     # draft_model 無しは従来どおり対応表任せ（drafter は渡らない）。
     assert seen["org/Plain-27B-mlx-4bit"] is None
     assert by["org/Plain-27B-mlx-4bit"]["mtp"] is None
-    assert "mtp" in cli.render_list(gcfg, {"available": []})
+    rendered = cli.render_list(gcfg, {"available": []})
+    assert "MTP" in rendered and "○" in rendered
+    assert "mtp" not in rendered
 
 
 def test_merge_status_mtp_ignores_disabled_draft_model(tmp_path, monkeypatch):
@@ -194,8 +196,8 @@ def test_stop_dispatch_only_kills_our_pids(tmp_path, monkeypatch):
     _use_cfg(tmp_path, monkeypatch)
     monkeypatch.setattr(cli, "read_gateway_runtime", lambda: None)
     monkeypatch.setattr(cli, "gateway_admin_status", lambda h, p: None)
-    monkeypatch.setattr(cli, "find_pids_on_port", lambda p: [900, 901] if p == 8799 else [])
-    monkeypatch.setattr(cli, "pid_looks_like_ours", lambda pid: pid == 900)  # 901 は無関係
+    monkeypatch.setattr(cli, "owned_worker_pids_on_ports",
+                        lambda ports: [900] if 8799 in ports else [])
     killed = []
     monkeypatch.setattr(cli, "stop_pid", lambda pid, **k: killed.append(pid))
     assert cli.main(["stop"]) == 0
@@ -241,8 +243,9 @@ def test_stop_collects_pids_from_admin_and_record(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "gateway_admin_status",
                         lambda h, p: {"pid": 100,
                                       "models": [{"model": "m", "pids": [201, 202]}]})
-    monkeypatch.setattr(cli, "find_pids_on_port", lambda p: [])
-    monkeypatch.setattr(cli, "pid_looks_like_ours", lambda pid: True)
+    monkeypatch.setattr(cli, "pid_looks_like_gateway", lambda pid: pid == 100)
+    monkeypatch.setattr(cli, "worker_pid_is_owned", lambda pid: pid in (201, 202))
+    monkeypatch.setattr(cli, "owned_worker_pids_on_ports", lambda ports: [])
     killed = []
     monkeypatch.setattr(cli, "stop_pid", lambda pid, **k: killed.append(pid))
     assert cli.main(["stop"]) == 0

@@ -54,7 +54,7 @@ def test_auto_creates_venv_and_installs(tmp_path, monkeypatch):
         os.makedirs(os.path.dirname(sp.venv_python(venv_dir)), exist_ok=True)
 
     def marking_run(cmd, capture_output=False, timeout=None):
-        if "install" in cmd and "sglang" in cmd:
+        if "install" in cmd and any(x.startswith("sglang==") for x in cmd):
             state["installed"] = True
             installed.append(cmd)
         return _ok(0)
@@ -62,7 +62,7 @@ def test_auto_creates_venv_and_installs(tmp_path, monkeypatch):
     py = sp.ensure_sglang(create_venv=fake_create, run=marking_run,
                           importable=lambda p, run: state["installed"])
     assert created["dir"].endswith("sglang-venv")
-    assert any("sglang" in c for c in installed)
+    assert any(any(x.startswith("sglang==") for x in c) for c in installed)
     assert py == sp.venv_python(created["dir"])
 
 

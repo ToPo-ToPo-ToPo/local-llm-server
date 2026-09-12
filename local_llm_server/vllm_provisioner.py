@@ -50,7 +50,7 @@ def ensure_vllm(
 ) -> str:
     """vLLM を起動できる python の絶対パスを返す（必要なら隔離 venv へ導入する）。→ _venv_backend。"""
     return _venv_backend.ensure_backend(
-        package="vllm", import_name="vllm", venv_dir=vllm_venv_dir(),
+        package="vllm==0.28.0", import_name="vllm", venv_dir=vllm_venv_dir(),
         human_name="vLLM", unavailable=VllmUnavailable,
         gpu_check=gpu_available, require_gpu=require_gpu,
         run=run, create_venv=create_venv, importable=importable,
