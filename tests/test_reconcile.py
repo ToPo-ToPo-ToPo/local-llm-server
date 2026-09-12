@@ -173,6 +173,10 @@ def test_process_marker_requires_executable_or_module_position(monkeypatch):
 
 
 def test_stop_process_tree_reports_unconfirmed_death(monkeypatch):
+    # Exercise the signal-based POSIX branch even when this test runs on the
+    # Windows CI worker.  The taskkill branch has its own test below.
+    monkeypatch.setattr(process_control.os, "name", "posix")
+
     class _Proc:
         pid = 8123
 
@@ -196,6 +200,10 @@ def test_stop_process_tree_reports_unconfirmed_death(monkeypatch):
 
 
 def test_stop_process_tree_confirms_exit_after_forced_kill(monkeypatch):
+    # Exercise the signal-based POSIX branch even when this test runs on the
+    # Windows CI worker.  The taskkill branch has its own test below.
+    monkeypatch.setattr(process_control.os, "name", "posix")
+
     class _Proc:
         pid = 8124
 
