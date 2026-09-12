@@ -6,14 +6,28 @@
 from __future__ import annotations
 
 import os
+import stat
 
 import pytest
 
+from local_llm_server import server as srv_mod
 from local_llm_server.server import (
     GatewayAlreadyRunning,
     GatewayLock,
     _read_lock_pid,
 )
+
+
+def test_runtime_dir_rejects_symlink(tmp_path, monkeypatch):
+    if os.name == "nt":
+        pytest.skip("POSIX ownership/symlink semantics")
+    monkeypatch.setattr(srv_mod.tempfile, "gettempdir", lambda: str(tmp_path))
+    target = tmp_path / "other"
+    target.mkdir()
+    path = tmp_path / f"local-llm-server-{os.getuid()}"
+    path.symlink_to(target, target_is_directory=True)
+    with pytest.raises(OSError, match="real directory"):
+        srv_mod.runtime_dir()
 
 
 def test_second_acquire_is_refused(tmp_path):
@@ -69,6 +83,9 @@ def test_runtime_record_roundtrip_and_stale(tmp_path, monkeypatch):
     server.write_gateway_runtime("127.0.0.1", 8799, os.getpid(), str(tmp_path), "now")
     rec = server.read_gateway_runtime()
     assert rec and rec["host"] == "127.0.0.1" and rec["port"] == 8799
+    if os.name != "nt":
+        assert stat.S_IMODE(os.stat(server.runtime_dir()).st_mode) == 0o700
+        assert stat.S_IMODE(os.stat(server.gateway_runtime_path()).st_mode) == 0o600
     # 使われていない（＝死んだ）PID の記録は None（クラッシュで残った記録を掴まない）。
     dead = _find_free_pid()
     server.write_gateway_runtime("127.0.0.1", 8799, dead, str(tmp_path), "now")
@@ -76,6 +93,16 @@ def test_runtime_record_roundtrip_and_stale(tmp_path, monkeypatch):
     # 正常終了時の clear で消える。
     server.write_gateway_runtime("127.0.0.1", 8799, os.getpid(), str(tmp_path), "now")
     server.clear_gateway_runtime()
+    assert server.read_gateway_runtime() is None
+
+
+def test_runtime_record_rejects_missing_process_fingerprint(tmp_path, monkeypatch):
+    from local_llm_server import server
+
+    monkeypatch.setattr(server.tempfile, "gettempdir", lambda: str(tmp_path))
+    server._atomic_write_json(server.gateway_runtime_path(), {
+        "host": "127.0.0.1", "port": 8799, "pid": os.getpid(),
+    })
     assert server.read_gateway_runtime() is None
 
 

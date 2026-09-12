@@ -12,9 +12,9 @@ Ollama がメニューバーのアイコンで「動いている」を伝える�
   - 状態（接続先 URL・ロード中モデル）は**メニューを開くたびに**取得する（常駐中の
     ポーリングは無い——CPU を使うのはメニューを開いたときとパイプイベントのときだけ）。
     開く動作は取得を**待たない**: menuWillOpen で表示直前にキャッシュから即描画し、
-    取得は裏でキャッシュを更新するだけ（鮮度は次に開いたときに反映）。**開いている
-    メニューは決していじらない**——開いたメニューを作り直すとクリックの action 送出と
-    競合してクリックを飲み込むため（実測。起動時とオープン毎に温めるので実用上ほぼ最新）
+    取得は裏でキャッシュを更新する。**開いているメニュー全体は作り直さず**、安全に変更できる
+    更新項目の title/action だけをその場で反映する——removeAllItems で作り直すとクリックの
+    action 送出と競合してクリックを飲み込むため（実測。モデル行は次のオープン時に反映）
   - できる操作は ログを開く / ゲートウェイを停止（gw stop 相当）の 2 つだけ。
     「アイコンだけ隠す」は置かない——**アイコンの有無＝デーモンの生死**という対応を
     例外なく保つ（隠せると「動いているのに出ていない」状態が生まれ、対応が崩れる）
@@ -68,8 +68,9 @@ _UPDATE_MARK = "⬆"
 # 「押したのに無反応」に見えないための確実な視覚フィードバック。通知と違い権限に依らない）。
 _UPDATING_TITLE = "更新中…"
 
-# 状態取得のタイムアウト（裏スレッドなので UI は固まらないが、長すぎる保持は避ける）。
-_STATUS_TIMEOUT_S = 1.0
+# トレイの取得は UI 外で行う。更新タグ確認（サーバー側 timeout=3秒）も同じ応答へ含めるため、
+# 通常の status 取得より余裕を持たせる。メニュー自体はキャッシュから即座に開くので固まらない。
+_STATUS_TIMEOUT_S = 5.0
 # 「今すぐ更新」は未取得なら git pull + 依存同期が走る（数十秒〜数分）ので長めに待つ。
 _UPDATE_TIMEOUT_S = 600.0
 
@@ -161,7 +162,12 @@ def update_menu_item(merged: dict, admin: dict | None) -> tuple[str, bool]:
     upd = (admin or {}).get("update") or {}
     if merged.get("kind"):
         latest = merged.get("latest")
-        hold = _HOLD_REASONS.get(upd.get("reason")) if upd.get("available") else None
+        reason = upd.get("reason")
+        hold = (
+            _HOLD_REASONS.get(reason)
+            if upd.get("available") and isinstance(reason, str)
+            else None
+        )
         if hold:
             return (f"更新あり（v{latest}）— {hold}" if latest
                     else f"更新あり — {hold}", True)
@@ -295,10 +301,9 @@ def run_app(host: str, port: int, fd: int | None) -> int:
     base_title = "" if icon is not None else _FALLBACK_TITLE
 
     # 状態キャッシュ: メニューは**開く前**（menuWillOpen）にキャッシュから組み立てる。
-    # 開いている最中のメニューは絶対にいじらない——開いたメニューを removeAllItems で
-    # 作り直すと、クリックの action 送出と競合してクリックが飲み込まれる（実測）。
-    # そこで取得は「キャッシュ更新だけ」の裏処理にし、鮮度は次に開いたときに反映する
-    # （起動時とオープン毎に温めるので、実用上ほぼ最新。ラグも定期処理も無い）。
+    # 開いている最中のメニューを removeAllItems で作り直すと、クリックの action 送出と
+    # 競合してクリックが飲み込まれる（実測）。そこで全体の鮮度は次に開いたときに反映し、
+    # 更新項目だけを属性変更でその場に反映する（起動時とオープン毎に温め、定期処理は無い）。
     fetch_state: dict = {"admin": None, "fetched_once": False, "inflight": False}
 
     class _TrayDelegate(NSObject):
@@ -306,7 +311,7 @@ def run_app(host: str, port: int, fd: int | None) -> int:
 
         def menuWillOpen_(self, menu) -> None:  # noqa: N815 - ObjC セレクタ命名
             _rebuild_menu(menu)   # 表示直前・キャッシュから即描画（ここは安全＝まだ非表示）
-            _refresh_cache()      # 裏でキャッシュだけ更新（開いたメニューには触れない）
+            _refresh_cache()      # 裏で取得（更新項目だけは再構築せずその場で反映）
 
         def openLog_(self, _sender) -> None:  # noqa: N815
             subprocess.Popen(["/usr/bin/open", gateway_log_path(port)])
@@ -341,13 +346,19 @@ def run_app(host: str, port: int, fd: int | None) -> int:
             # （アイコンが出ていれば空、アイコン欠落時は "gw"）。
             button.setTitle_(_UPDATE_MARK if update_info.get("kind") else base_title)
 
+        def applyUpdateState_(self, _arg) -> None:  # noqa: N815
+            # 開いているメニューを removeAllItems で再構築するとクリックを飲み込む。
+            # 更新項目 1 個の属性だけを差し替えれば、初回取得の結果をその場で見せつつ
+            # action/target は保てる（モデル行などの全体再構築は次回オープン時のまま）。
+            _apply_update_state()
+
     delegate = _TrayDelegate.alloc().init()
 
     def _refresh_cache() -> None:
-        """裏スレッドで状態を取得し、**キャッシュだけ**更新する（メニューには触れない）。
+        """裏スレッドで状態を取得し、キャッシュと更新項目を反映する。
 
-        UI を一切いじらないので、開いているメニューのクリックと競合しない。取得結果は
-        次に開いたときの _rebuild_menu が読む。連打で取得を積まないよう in-flight は 1 本。
+        メニュー全体は作り直さず、更新項目だけをメインスレッドで属性変更するのでクリックと
+        競合しない。モデル行等は次の _rebuild_menu が読む。連打で取得を積まないよう in-flight は 1 本。
         """
         if fetch_state["inflight"]:
             return
@@ -355,32 +366,57 @@ def run_app(host: str, port: int, fd: int | None) -> int:
 
         def _work() -> None:
             try:
-                admin = gateway_admin_status(host, port, timeout=_STATUS_TIMEOUT_S)
+                admin = gateway_admin_status(
+                    host, port, timeout=_STATUS_TIMEOUT_S, refresh_updates=True,
+                )
                 fetch_state["admin"] = admin
                 # 成功した取得だけを「一度取得できた」と数える。デーモン起動直後は
                 # トレイが先に出ていてゲートウェイはまだ準備中（自動導入など）のことが
                 # あり、失敗を既成事実にすると「未ロード」と嘘の断言をしてしまう。
                 if admin is not None:
                     fetch_state["fetched_once"] = True
+                    delegate.performSelectorOnMainThread_withObject_waitUntilDone_(
+                        "applyUpdateState:", None, False)
             finally:
                 fetch_state["inflight"] = False
 
         threading.Thread(target=_work, daemon=True).start()
 
-    def _add_info(menu, text: str) -> None:
+    def _add_info(menu, text: str):
         # 情報行（クリック不可・グレー表示）。autoenablesItems=False にしたので、
         # グレーにするには明示的に disabled にする（アクション項目は enabled のまま）。
         item = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
             text, None, "")
         item.setEnabled_(False)
         menu.addItem_(item)
+        return item
 
-    def _add_action(menu, text: str, selector: str) -> None:
+    def _add_action(menu, text: str, selector: str):
         item = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
             text, selector, ""
         )
         item.setTarget_(delegate)
         menu.addItem_(item)
+        return item
+
+    update_item_state: dict = {"item": None}
+
+    def _apply_update_state() -> None:
+        """取得済みの更新状態を、メニュー再構築なしで更新項目とアイコンへ反映する。"""
+        admin = fetch_state["admin"]
+        if admin is None:
+            return
+        merged = merge_update_info(update_info, admin)
+        update_info.update(merged)
+        button.setTitle_(_UPDATE_MARK if merged.get("kind") else base_title)
+        item = update_item_state.get("item")
+        if item is None:
+            return
+        label, clickable = update_menu_item(merged, admin)
+        item.setTitle_(label)
+        item.setEnabled_(clickable)
+        item.setAction_("updateNow:" if clickable else None)
+        item.setTarget_(delegate if clickable else None)
 
     def _rebuild_menu(menu) -> None:
         """キャッシュ済みの状態からメニューを組み直す（ネットワークに触れない・即時）。"""
@@ -405,9 +441,10 @@ def run_app(host: str, port: int, fd: int | None) -> int:
         button.setTitle_(_UPDATE_MARK if merged.get("kind") else base_title)
         label, clickable = update_menu_item(merged, admin)
         if clickable:
-            _add_action(menu, label, "updateNow:")
+            update_item_state["item"] = _add_action(menu, label, "updateNow:")
         else:
-            _add_info(menu, label)  # 「最新です（vX）」＝グレー・非クリック
+            # 「最新です（vX）」＝グレー・非クリック
+            update_item_state["item"] = _add_info(menu, label)
         _add_action(menu, "ログを開く", "openLog:")
         _add_action(menu, "ゲートウェイを停止", "stopGateway:")
 

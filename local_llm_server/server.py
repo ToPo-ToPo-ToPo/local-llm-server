@@ -1,22 +1,122 @@
 from __future__ import annotations
 
-import glob
-import json
 import os
-import platform
-import signal
+import platform  # noqa: F401 - compatibility seam for callers/tests
 import subprocess
 import sys
-import tempfile
+import tempfile  # noqa: F401 - compatibility seam used by runtime-dir callers/tests
 import threading
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
-from dataclasses import dataclass, field
+import urllib.request  # noqa: F401 - compatibility seam for health-query tests
+from typing import TextIO
+
+from . import gateway_runtime as _gateway_runtime
+from . import model_catalog as _model_catalog
+from . import process_control as _process_control
+from . import server_health as _server_health
+from .backend_core import (  # noqa: F401 - public compatibility exports
+    DEFAULT_BACKEND,
+    BackendSpec,
+    ServerConfig,
+    BACKEND_SPECS as _CORE_BACKEND_SPECS,
+    default_backend,
+    infer_backend,
+    parallel_supported,
+)
+from .backend_runtime import (  # noqa: F401 - public compatibility exports
+    _PROVISIONED,
+    llama_provision_info,
+    llama_server_binary,
+    provisioned,
+    set_llama_server_binary,
+    set_provisioned,
+    set_sglang_python,
+    set_vllm_python,
+    sglang_provision_info,
+    sglang_python,
+    vllm_provision_info,
+    vllm_python,
+)
 
 # 起動可能なバックエンド一覧は同梱の constants から取得（OpenAI互換APIの公開値）。
 from .constants import BACKENDS, log_dir  # noqa: F401
+from .gateway_runtime import (  # noqa: F401 - compatibility re-exports
+    _WORKERS_FILE_LOCK,
+    LOG_ROTATION_COUNT,
+    GatewayAlreadyRunning,
+    GatewayLock,
+    _admin_request,
+    _atomic_write_json,
+    _flock_exclusive_nb,
+    _flock_unlock,
+    _load_workers_unlocked,
+    _read_lock_pid,
+    _save_workers_unlocked,
+    bench_model,
+    clear_gateway_runtime,
+    daemon_log_path,
+    enable_child_tethering,
+    gateway_admin_status,
+    gateway_drain,
+    gateway_lock_path,
+    gateway_log_path,
+    gateway_runtime_path,
+    gateway_set_max_resident,
+    ignore_shutdown_signals,
+    local_connect_host,
+    owned_worker_pids_on_ports,
+    pid_is_alive,
+    primary_lan_ip,
+    prune_server_logs,
+    read_gateway_runtime,
+    reap_orphan_workers,
+    register_worker,
+    rotate_log,
+    runtime_dir,
+    server_status,
+    unregister_worker,
+    worker_pid_is_owned,
+    workers_state_path,
+    write_gateway_runtime,
+)
+from .model_catalog import (  # noqa: F401 - compatibility re-exports
+    _DISCOVER_CACHE,
+    _DRAFTER_REPOS,
+    _EXTRA_DRAFTER_REPOS,
+    MTP_DRAFTERS,
+    _blocking_incomplete,
+    _dir_weight_bytes,
+    _hf_hub_cache,
+    _is_generative_repo,
+    _snapshot_weights_complete,
+    looks_like_local_path,
+    resolve_drafter,
+    thinking_markers,
+)
+
+
+def start_gateway_background(
+    cwd: str,
+    host: str = "127.0.0.1",
+    port: int = 8799,
+    *,
+    start_timeout: float = 120.0,
+) -> int:
+    """Compatibility facade that forwards replaceable runtime dependencies."""
+    return _gateway_runtime.start_gateway_background(
+        cwd,
+        host,
+        port,
+        start_timeout=start_timeout,
+        _find_pids=find_pids_on_port,
+        _admin_status=gateway_admin_status,
+        _connect_host=local_connect_host,
+        _looks_like_gateway=pid_looks_like_gateway,
+        _log_path=gateway_log_path,
+        _rotate=rotate_log,
+        _prune=prune_server_logs,
+        _ready=is_ready,
+    )
 
 
 def warn(message: str) -> None:
@@ -28,102 +128,11 @@ def warn(message: str) -> None:
     print(f"warning: {message}", file=sys.stderr, flush=True)
 
 
-def default_backend() -> str:
-    """OS に応じた既定バックエンド。
-
-    Apple Silicon の macOS なら mlx-vlm（vision 対応）を既定にする。既定モデルの
-    Qwen3.6 はマルチモーダルなので、1プロセスでテキストも画像も扱え、画像・動画
-    入力がそのまま動く。テキスト専用で軽くしたい場合は backend="mlx" を選ぶ。
-    それ以外（Linux / Windows / Intel Mac）は llama.cpp を既定にする。
-    """
-    if sys.platform == "darwin" and platform.machine() == "arm64":
-        return "mlx-vlm"
-    return "llama-cpp"
-
-
-# サーバー未起動・バックエンド未指定のときに使う既定バックエンド（OSで自動判定）
-DEFAULT_BACKEND = default_backend()
-
-
-# ── プロビジョン済みランタイムの登録簿（プロセス内で唯一の可変状態） ──
-# 起動時にプロビジョナが解決した実行体（llama-server バイナリ / vLLM・SGLang の python）と
-# その素性を、kind（= BackendSpec.provisioner の値: "llama" / "vllm" / "sglang"）で持つ。
-# 書き込みは set_provisioned() の 1 箇所だけ。未登録時は各 getter がフォールバックを返す
-# （PATH の "llama-server" / sys.executable）——単体テスト等の素通しを保つため。
-_PROVISIONED: dict[str, dict] = {}
-
-
-def set_provisioned(kind: str, info: dict | None) -> None:
-    """起動時にプロビジョナが解決したランタイムを登録する（None で解除）。
-
-    info は kind ごとの素性 dict（llama: {"binary", "build", "accel"} /
-    vllm・sglang: {"python"}）。/admin/status がそのまま表示に使う。
-    """
-    if info is None:
-        _PROVISIONED.pop(kind, None)
-    else:
-        _PROVISIONED[kind] = dict(info)
-
-
-def provisioned(kind: str) -> dict | None:
-    """kind のプロビジョン結果（未導入は None）。/admin/status・TUI が表示に使う。"""
-    return _PROVISIONED.get(kind)
-
-
-def set_llama_server_binary(
-    path: str | None, *, build: str | None = None, accel: str | None = None,
-) -> None:
-    """起動時にプロビジョナが解決した llama-server の絶対パス（と素性）を登録する。"""
-    set_provisioned(
-        "llama",
-        None if path is None else {"binary": path, "build": build, "accel": accel},
-    )
-
-
-def llama_server_binary() -> str:
-    """build_command が使う llama-server コマンド（未プロビジョン時は PATH 探索の名前）。"""
-    return ((provisioned("llama") or {}).get("binary")) or "llama-server"
-
-
-def llama_provision_info() -> dict | None:
-    """導入済み llama.cpp の素性（未導入は None）。/admin/status・TUI が表示に使う。"""
-    return provisioned("llama")
-
-
-def set_vllm_python(path: str | None) -> None:
-    """起動時にプロビジョナが解決した vLLM 用 python のパスを登録する。"""
-    set_provisioned("vllm", None if path is None else {"python": path})
-
-
-def vllm_python() -> str:
-    """build_command が使う vLLM 用 python（未プロビジョン時は現在の python）。"""
-    return ((provisioned("vllm") or {}).get("python")) or sys.executable
-
-
-def vllm_provision_info() -> dict | None:
-    """導入済み vLLM の素性（未導入は None）。/admin/status・TUI が表示に使う。"""
-    return provisioned("vllm")
-
-
-def set_sglang_python(path: str | None) -> None:
-    """起動時にプロビジョナが解決した SGLang 用 python のパスを登録する。"""
-    set_provisioned("sglang", None if path is None else {"python": path})
-
-
-def sglang_python() -> str:
-    """build_command が使う SGLang 用 python（未プロビジョン時は現在の python）。"""
-    return ((provisioned("sglang") or {}).get("python")) or sys.executable
-
-
-def sglang_provision_info() -> dict | None:
-    """導入済み SGLang の素性（未導入は None）。/admin/status・TUI が表示に使う。"""
-    return provisioned("sglang")
-
-
 def _physical_cores() -> int:
     """物理コア数（ハイパースレッド/E コアを除く。取れなければ論理コア数）。"""
     try:
         import psutil
+
         n = psutil.cpu_count(logical=False)
         if n:
             return int(n)
@@ -160,733 +169,69 @@ def auto_llama_flags(config: "ServerConfig") -> list[str]:
     return []
 
 
-# STT（音声→テキスト）モデルの id 判定に使う語。whisper 系は id に "mlx" を含む
-# （例 mlx-community/whisper-large-v3-mlx）ため、mlx-vlm 判定より先に見る必要がある。
-_STT_HINTS = ("whisper", "parakeet")
-
-
-def infer_backend(model: str) -> str:
-    """登録の無いモデル ID からバックエンドを推論する（動的ロード用）。
-
-    - STT（id に 'whisper'/'parakeet' を含む）→ whisper（音声→テキスト）
-    - GGUF（id に 'gguf' を含む）→ llama-cpp
-    - mlx（id に 'mlx' を含む。例 `mlx-community/...`・`*-MLX-*`）→ mlx-vlm（vision 兼テキスト）
-    - それ以外 → OS 既定（Apple Silicon: mlx-vlm / 他: llama-cpp）
-    """
-    low = model.lower()
-    # whisper 系は "...-mlx" を含むので、mlx-vlm より先に STT へ振り分ける。
-    if any(h in low for h in _STT_HINTS):
-        return "whisper"
-    if "gguf" in low:
-        return "llama-cpp"
-    if "mlx" in low:
-        return "mlx-vlm"
-    return default_backend()
-
-# POSIX（macOS / Linux）か。プロセスグループ操作（killpg / setsid）の可否に使う。
-_POSIX = os.name == "posix"
-
-
-def install_shutdown_handlers() -> None:
-    """SIGTERM / SIGHUP を Ctrl+C と同じ KeyboardInterrupt に変換する。
-
-    既定では Python は SIGTERM を受け取ると finally を実行せずに即終了するため、
-    `kill <pid>` やターミナルを閉じた（SIGHUP）ときに、自動起動した LLM サーバーが
-    孫プロセスとして置き去りになる。これらのシグナルを KeyboardInterrupt として
-    送出することで、各エントリポイントの既存 try/finally（= server.stop()）を必ず通す。
-    シグナルハンドラはメインスレッドからのみ登録できる（それ以外では黙って無視）。
-    """
-    def _raise_keyboard_interrupt(signum, frame):  # noqa: ANN001
-        raise KeyboardInterrupt
-
-    for name in ("SIGTERM", "SIGHUP"):
-        sig = getattr(signal, name, None)  # SIGHUP は Windows に無い
-        if sig is None:
-            continue
-        try:
-            signal.signal(sig, _raise_keyboard_interrupt)
-        except (ValueError, OSError):
-            pass  # メインスレッド以外などでは登録できない
-
-
-def _signal_process_tree(proc: subprocess.Popen, *, kill: bool) -> None:
-    """proc とその子孫（プロセスグループ）へ終了シグナルを送る。
-
-    POSIX では start() が start_new_session=True で子を独立したプロセスグループに
-    しているため、killpg でグループ全体へ一括送信できる。これによりバックエンドが
-    内部で起こすワーカー等の孫プロセスも取りこぼさない。Windows には killpg が無い
-    ので proc 自身を terminate / kill する。
-    """
-    if proc.poll() is not None:
-        return  # 既に終了している
-    if _POSIX:
-        sig = signal.SIGKILL if kill else signal.SIGTERM
-        try:
-            os.killpg(os.getpgid(proc.pid), sig)
-            return
-        except (ProcessLookupError, PermissionError, OSError):
-            pass  # グループ送信に失敗したら単体送信にフォールバック
-    if kill:
-        proc.kill()
-    else:
-        proc.terminate()
-
-
-def find_pids_on_port(port: int) -> list[int]:
-    """指定ポートを LISTEN しているプロセスの PID 一覧を返す（macOS / Linux / Windows）。
-
-    POSIX は lsof、Windows は netstat を使う。該当ツールが無い等で特定できなければ
-    空リストを返す（呼び出し側で案内する）。
-    """
-    if _POSIX:
-        return _find_pids_lsof(port)
-    if os.name == "nt":
-        return _find_pids_netstat(port)
-    return []
-
-
-def _find_pids_lsof(port: int) -> list[int]:
-    """lsof で LISTEN 中の PID を引く（macOS / Linux）。"""
-    try:
-        # プロトコルとポートは 1 つの -i セレクタにまとめる。-iTCP と -i:PORT を
-        # 分けると lsof は両者を OR 解釈し、全 TCP プロセスにマッチしてしまう。
-        result = subprocess.run(
-            ["lsof", "-t", f"-iTCP:{port}", "-sTCP:LISTEN"],
-            capture_output=True, text=True, timeout=5,
-        )
-    except (FileNotFoundError, subprocess.SubprocessError):
-        return []
-    pids: list[int] = []
-    for token in result.stdout.split():
-        try:
-            pids.append(int(token))
-        except ValueError:
-            pass
-    return pids
-
-
-def _find_pids_netstat(port: int) -> list[int]:
-    """netstat -ano で LISTENING 中の PID を引く（Windows）。
-
-    出力の各行は「Proto  ローカルアドレス  外部アドレス  状態  PID」。ローカルアドレスの
-    ポート（末尾 `:<port>`）が一致し、状態が LISTENING の行から PID 列を集める
-    （0.0.0.0 / [::] / 127.0.0.1 などホスト表記の違いはポート一致で吸収する）。
-    """
-    try:
-        result = subprocess.run(
-            ["netstat", "-ano", "-p", "tcp"],
-            capture_output=True, text=True, timeout=5,
-        )
-    except (FileNotFoundError, subprocess.SubprocessError):
-        return []
-    pids: list[int] = []
-    for line in result.stdout.splitlines():
-        parts = line.split()
-        if len(parts) < 5 or parts[0].upper() != "TCP":
-            continue
-        local, state, pid = parts[1], parts[3], parts[4]
-        if state.upper() != "LISTENING":
-            continue
-        if local.rsplit(":", 1)[-1] != str(port):
-            continue
-        try:
-            p = int(pid)
-        except ValueError:
-            continue
-        if p and p not in pids:
-            pids.append(p)
-    return pids
-
-
-# このパッケージが起動するプロセスのコマンドラインに現れる目印。TUI の停止/終了処理が
-# 「ポートを LISTEN しているだけの無関係なプロセス」を巻き添えにしないための判定に使う。
-_OUR_CMD_MARKERS = (
-    "local_llm_server", "local-llm-server", "llama-server", "mlx_lm", "mlx_vlm",
-)
-
-
-def pid_looks_like_ours(pid: int) -> bool:
-    """PID がこのパッケージ由来（ゲートウェイ / モデルサーバー）のプロセスに見えるか。
-
-    ポート番号だけを頼りに stop すると、たまたま同じポートで動いている別プロジェクトの
-    サーバーを殺してしまう。コマンドラインに目印が含まれるものだけ「ours」と判定する。
-    判定不能（プロセス消滅・権限なし・psutil 不在）は False（手を出さない）。
-    """
-    try:
-        import psutil
-        cmd = " ".join(psutil.Process(pid).cmdline())
-    except Exception:  # noqa: BLE001 - 判定できないものは殺さない側に倒す
-        return False
-    return any(m in cmd for m in _OUR_CMD_MARKERS)
-
-
-def stop_pid(pid: int, timeout: float = 10.0) -> bool:
-    """PID（とその子/プロセスグループ）を停止する（macOS / Linux / Windows）。
-
-    POSIX はプロセスグループへ SIGTERM→（猶予後）SIGKILL、Windows は taskkill /T /F で
-    ツリーごと止める。停止を試みたら True、対象が既にいなければ False。
-    """
-    if os.name == "nt":
-        return _stop_pid_windows(pid)
-    if not _POSIX:
-        return False
-    try:
-        pgid = os.getpgid(pid)
-    except ProcessLookupError:
-        return False
-
-    def _alive() -> bool:
-        try:
-            os.kill(pid, 0)
-            return True
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            return True
-
-    try:
-        os.killpg(pgid, signal.SIGTERM)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return False  # 権限が無い（他ユーザーの）プロセスには手を出さない
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if not _alive():
-            return True
-        time.sleep(0.2)
-    try:
-        os.killpg(pgid, signal.SIGKILL)  # 猶予内に終わらなければ強制終了
-    except (ProcessLookupError, PermissionError):
-        pass
-    return True
-
-
-def _stop_pid_windows(pid: int) -> bool:
-    """taskkill でプロセスツリー（/T）を強制終了する（Windows）。
-
-    モデルサーバーはゲートウェイの子プロセスなので /T で一緒に止まる。対象が既に
-    いない / taskkill が無いときは False。
-    """
-    try:
-        result = subprocess.run(
-            ["taskkill", "/PID", str(pid), "/T", "/F"],
-            capture_output=True, text=True, timeout=10,
-        )
-    except (FileNotFoundError, subprocess.SubprocessError):
-        return False
-    return result.returncode == 0
+# Process policy has one canonical implementation.  The names remain exported
+# here so existing callers keep the same API while gateway layers import the
+# dependency-free module directly.
+_POSIX = _process_control.POSIX
+install_shutdown_handlers = _process_control.install_shutdown_handlers
+_signal_process_tree = _process_control.signal_process_tree
+_stop_process_tree = _process_control.stop_process_tree
+find_pids_on_port = _process_control.find_pids_on_port
+pid_looks_like_ours = _process_control.pid_looks_like_ours
+pid_looks_like_gateway = _process_control.pid_looks_like_gateway
+_process_fingerprint = _process_control.process_fingerprint
+pid_matches_record = _process_control.pid_matches_record
+stop_pid = _process_control.stop_pid
+_stop_pid_windows = _process_control._stop_pid_windows
 
 
 def reclaim_stale_workers(port: int, timeout: float = 6.0) -> list[int]:
     """port を LISTEN している「このパッケージ由来の」孤児ワーカーを止めて回収する。
 
     ゲートウェイがワーカーを起動する直前に呼ぶ。前回のクラッシュや `kill -9` で取り残された
-    モデルサーバー（`_OUR_CMD_MARKERS` にマッチ）がそのポートを掴んでいると、新しいワーカーが
+    モデルサーバー（台帳指紋と正規コマンドが一致）がそのポートを掴んでいると、新しいワーカーが
     bind できず起動失敗→502 になり、加えて GPU メモリを無駄に占有し続ける。ここで止めてから
     起動することで衝突を防ぎメモリを解放する。**無関係な別プロセスには手を出さない**
     （`pid_looks_like_ours` で選別し、判定不能なものは残す）。停止した PID の一覧を返す。
     """
+    with _WORKERS_FILE_LOCK:
+        records = [e for e in _load_workers_unlocked() if e.get("port") == port]
     reclaimed: list[int] = []
     for pid in find_pids_on_port(port):
         # 自分自身（ゲートウェイ本体）は絶対に殺さない。内部ワーカーは別プロセスなので、
         # ここに現れる our-worker は孤児だけ。万一 self が現れても手を出さない安全弁。
         if pid == os.getpid():
             continue
-        if pid_looks_like_ours(pid) and stop_pid(pid, timeout=timeout):
+        record = next((e for e in records if e.get("pid") == pid), None)
+        if (
+            record is not None
+            and pid_matches_record(pid, record)
+            and pid_looks_like_ours(pid)
+            and stop_pid(pid, timeout=timeout)
+        ):
             reclaimed.append(pid)
+            unregister_worker(pid)
     return reclaimed
 
 
-@dataclass
-class ServerConfig:
-    """起動するローカルLLMサーバーの設定。"""
-
-    backend: str  # "mlx" | "llama-cpp"
-    model: str
-    host: str = "127.0.0.1"
-    port: int = 8080
-    parallel: int | None = None  # 同時処理スロット数（llama.cpp のみ）
-    disable_thinking: bool = False  # Qwen3 系の思考モードを無効化して起動
-    # speculative decoding 用ドラフター。今回は公式対応する
-    # Gemma 4 の MTP（Multi-Token Prediction）ドラフターに限定する。
-    # draft_model にドラフターの HF id / パス（例
-    # mlx-community/gemma-4-E4B-it-qat-assistant-bf16）を指定すると、本体の出力を
-    # 変えずに高速化する。"auto" にすると本体名から対応ドラフターを自動選択する
-    # （MTP_DRAFTERS の対応表）。本体・ドラフターとも事前に `hf download` 済みである必要が
-    # ある（自動ダウンロードはしない）。MTP は vision 対応の mlx-vlm バックエンドのみ対応。
-    draft_model: str | None = None
-    # ツール呼び出しの生成中トークンを流す(mlx-vlm のみ)。既定 off。on にすると mlx-vlm が
-    # 捨てている <tool_call>…</tool_call> の生テキストが delta.content として逐次届く
-    # (最後の解析済み tool_calls チャンクは従来どおり)。受け側(local-llm-client 0.8+)が
-    # 本文から剥がして途中経過として使う。知らないクライアントには生 JSON が本文に見える
-    # ので、繋ぐクライアントを揃えてから有効化する。→ _mlx_vlm_shims._patch_stream_tool_calls
-    stream_tool_calls: bool = False
-    extra_args: list[str] = field(default_factory=list)
-
-    @property
-    def base_url(self) -> str:
-        return f"http://{self.host}:{self.port}/v1"
-
-
-def parallel_supported(backend: str) -> bool:
-    """そのバックエンドが並列スロット指定に対応するか（→ BACKEND_SPECS）。"""
-    spec = BACKEND_SPECS.get(backend)
-    return spec is not None and spec.parallel
-
-
-# 思考チャネルの開始/終了マーカー（mlx-vlm へ env で渡す）。mlx-vlm は env で渡された 1 対を
-# 最優先で試し、続けて内蔵既定（<|channel>thought / <think> / <|START_THINKING|>）を試す。
-# 既定は gemma-4-A4B 系の形式。内蔵既定のどれとも違う形式のモデルだけここに書く。
-# 判定はモデル ID の部分一致（小文字化）——ローカルパス登録でも効かせるため。
-_THINKING_MARKERS = (
-    # Inkling（Thinking Machines）: 思考は
-    #   <|content_thinking|>…<|end_message|><|message_model|><|content_text|>本文<|end_message|>
-    # の形で出る。この形式は mlx-vlm の内蔵既定に無く、既定のままだと思考が丸ごと
-    # content に漏れる（実測確認済み）。
-    # 終端に <|end_message|> 単体を使ってはいけない: 本文の終端でもあるため、思考 OFF
-    # （reasoning_effort="none"）のときに**本文全体が思考と誤判定**され content が空になる。
-    # 思考ブロックの直後にだけ現れる 2 トークン列を終端にすると両方で正しく割れる。
-    ("inkling", ("<|content_thinking|>", "<|end_message|><|message_model|>")),
-)
-_DEFAULT_THINKING_MARKERS = ("<|channel>thought", "<channel|>")
-
-
-def thinking_markers(model: str) -> tuple[str, str]:
-    """モデル ID から思考チャネルのマーカー対を引く（未収載は gemma-4 形式の既定）。"""
-    lowered = model.lower()
-    for needle, markers in _THINKING_MARKERS:
-        if needle in lowered:
-            return markers
-    return _DEFAULT_THINKING_MARKERS
-
-
-# 本体（target）→ 対応する MTP ドラフター（assistant）の内蔵対応表。
-# mlx-community のペアで、いずれも実機で検証済み。draft_model = "auto" のときに
-# 本体名から対応ドラフターを引く（明示指定すればここを介さない）。未収載のモデルを
-# auto にした場合はエラーで明示指定を促す（MTP 自体は非収載でも明示すれば使える）。
-# Gemma 4 が中心だが、Qwen3.6 も MTP 方式で動作確認済み（mlx_vlm --draft-kind mtp）。
-MTP_DRAFTERS = {
-    "mlx-community/gemma-4-E4B-it-qat-4bit":
-        "mlx-community/gemma-4-E4B-it-qat-assistant-bf16",
-    "mlx-community/gemma-4-12B-it-qat-4bit":
-        "mlx-community/gemma-4-12B-it-qat-assistant-4bit",
-    "mlx-community/gemma-4-26B-A4B-it-qat-4bit":
-        "mlx-community/gemma-4-26B-A4B-it-qat-assistant-nvfp4",
-    "mlx-community/gemma-4-31B-it-qat-4bit":
-        "mlx-community/gemma-4-31B-it-qat-assistant-bf16",
-    # 非QAT 8bit（26B-A4B）。ドラフターは非QAT の assistant-bf16。
-    "mlx-community/gemma-4-26b-a4b-it-8bit":
-        "mlx-community/gemma-4-26B-A4B-it-assistant-bf16",
-    # Qwen3.6-27B（既定モデル）の MTP ドラフター。
-    "mlx-community/Qwen3.6-27B-4bit":
-        "mlx-community/Qwen3.6-27B-MTP-4bit",
-    # 自作 ToPo-ToPo 版の Qwen3.6-27B（既定運用）。ドラフターは Qwen3.8-27B と同じ手順で、
-    # 公式 bf16 チェックポイント内蔵の mtp.* を切り出した自作 MTP ヘッド
-    # （量子化後のリポからは mtp が落ちるので必ず公式 bf16 から切り出す）。量子化違いは
-    # 同一ドラフターで共用できる。mlx-community/Qwen3.6-27B-MTP-4bit も使えるが、
-    # 実測では bf16 の方が採択率が高い（コード生成で 95.2%）。
-    "ToPo-ToPo/Qwen3.6-27B-mlx-4bit": "ToPo-ToPo/Qwen3.6-27B-MTP-bf16",
-    "ToPo-ToPo/Qwen3.6-27B-mlx-8bit": "ToPo-ToPo/Qwen3.6-27B-MTP-bf16",
-    "ToPo-ToPo/Qwen3.6-27B-mlx-bf16": "ToPo-ToPo/Qwen3.6-27B-MTP-bf16",
-    # Qwen3.8-27B（自作 ToPo-ToPo 版）。ドラフターは公式 bf16 チェックポイント内蔵の mtp.* を
-    # 切り出した自作 MTP ヘッド（量子化後のリポからは mtp が落ちるので必ず公式 bf16 から切り出す）。
-    # 量子化違いは同一ドラフターで共用できる（greedy では bf16 と 4bit で採択が一致する）。
-    "ToPo-ToPo/Qwen3.8-27B-mlx-4bit": "ToPo-ToPo/Qwen3.8-27B-MTP-bf16",
-    "ToPo-ToPo/Qwen3.8-27B-mlx-8bit": "ToPo-ToPo/Qwen3.8-27B-MTP-bf16",
-    "ToPo-ToPo/Qwen3.8-27B-mlx-bf16": "ToPo-ToPo/Qwen3.8-27B-MTP-bf16",
-    # Qwen3.8-Flash-Next（qwen4_exp。自作 ToPo-ToPo 版）。ドラフターは公式 bf16 内蔵の mtp.* を
-    # 切り出した自作 MTP ヘッド（block_size=2 を config に焼き込み済み。実測でこれが最速:
-    # 25.95 → 35.99 tok/s の 1.39 倍・採択率 94.1%）。量子化違いは同一ドラフターで共用。
-    # 実行には qwen4_exp_mtp を持つ mlx-vlm >= 0.7.0 が必要（pyproject のロックで担保）。
-    "ToPo-ToPo/Qwen3.8-Flash-Next-mlx-4bit": "ToPo-ToPo/Qwen3.8-Flash-Next-MTP-bf16",
-    "ToPo-ToPo/Qwen3.8-Flash-Next-mlx-8bit": "ToPo-ToPo/Qwen3.8-Flash-Next-MTP-bf16",
-    "ToPo-ToPo/Qwen3.8-Flash-Next-mlx-bf16": "ToPo-ToPo/Qwen3.8-Flash-Next-MTP-bf16",
-    # 自作 ToPo-ToPo 版 gemma 4。各 model card が推奨する Google 公式 MTP ドラフター
-    # google/gemma-4-<size>-it-assistant を使う（mlx-vlm で変換不要・サイズ固有で量子化に依らず共通。
-    # mlx-vlm >= 0.6.3 が必要）。
-    "ToPo-ToPo/gemma-4-31b-it-mlx-4bit": "google/gemma-4-31B-it-assistant",
-    "ToPo-ToPo/gemma-4-31b-it-mlx-8bit": "google/gemma-4-31B-it-assistant",
-    "ToPo-ToPo/gemma-4-31b-it-mlx-bf16": "google/gemma-4-31B-it-assistant",
-    "ToPo-ToPo/gemma-4-31b-it-qat-mlx-4bit": "google/gemma-4-31B-it-assistant",
-    "ToPo-ToPo/gemma-4-26B-A4B-it-mlx-4bit": "google/gemma-4-26B-A4B-it-assistant",
-    "ToPo-ToPo/gemma-4-26B-A4B-it-mlx-8bit": "google/gemma-4-26B-A4B-it-assistant",
-    "ToPo-ToPo/gemma-4-26B-A4B-it-mlx-bf16": "google/gemma-4-26B-A4B-it-assistant",
-    "ToPo-ToPo/gemma-4-26B-A4B-it-qat-mlx-4bit": "google/gemma-4-26B-A4B-it-assistant",
-    "ToPo-ToPo/gemma-4-E4B-it-qat-mlx-4bit": "google/gemma-4-E4B-it-assistant",
-    "ToPo-ToPo/gemma-4-E2B-it-qat-mlx-4bit": "google/gemma-4-E2B-it-assistant",
-}
-
-
-# 対応表（MTP_DRAFTERS）には載せないが、ドラフターであることが分かっている repo。
-# 対応表に載せると draft_model="auto" が引いてしまうので載せられない——けれど発見一覧には
-# 出したくない、というものをここに書く（例: 上流バグで実用不能なため gateway.toml では
-# off にしている DeepSeek-V4-Flash の MTP ヘッド）。
-_EXTRA_DRAFTER_REPOS = frozenset({
-    "ToPo-ToPo/DeepSeek-V4-Flash-MTP-bf16",
-})
-
-# MTP ドラフター（speculative decoding 用の補助モデル）の repo-id 集合。これ自体は
-# 単体のチャットモデルとして使うものではないので、発見一覧（discover_cached_models）には
-# 「使えるモデル」として出さない。`org/repo:selector` 形式のドラフターは repo 部分で判定する。
-_DRAFTER_REPOS = frozenset(
-    [v.split(":", 1)[0] for v in MTP_DRAFTERS.values()]
-) | _EXTRA_DRAFTER_REPOS
-
-
-def resolve_drafter(model: str, draft_model: str | None) -> str | None:
-    """draft_model を解決する。
-
-    - None / 空 … ドラフター無し（speculative decodingを使わない）。
-    - "auto"   … 本体名 model から対応する MTP ドラフター（Gemma 4 / Qwen3.6）を
-                 内蔵表で引く。未収載なら ValueError（HF id を明示するよう促す）。
-    - それ以外 … その値（ドラフターの HF id / パス）をそのまま使う。
-    """
-    if not draft_model:
-        return None
-    if draft_model != "auto":
-        return draft_model
-    drafter = MTP_DRAFTERS.get(model)
-    if drafter is None:
-        known = ", ".join(sorted(MTP_DRAFTERS))
-        raise ValueError(
-            f'draft_model="auto" に対応するドラフターが見つかりません（model={model!r}）。'
-            f" 自動対応している本体: {known}。"
-            " 他のモデルでは draft_model にドラフターの HF id を明示してください。"
-        )
-    return drafter
-
-
-def _hf_hub_cache() -> str:
-    """HuggingFace Hub のキャッシュ（models--org--name/snapshots/...）ルートを返す。"""
-    if os.environ.get("HF_HUB_CACHE"):
-        return os.environ["HF_HUB_CACHE"]
-    home = os.environ.get("HF_HOME") or os.path.expanduser("~/.cache/huggingface")
-    return os.path.join(home, "hub")
-
-
 def resolve_gguf(model: str) -> str:
-    """llama.cpp の `model`（HF repo-id）を DL 済みキャッシュの実 GGUF パスに解決する。
-
-    `model` は必ず **HF repo-id（`org/repo[:セレクタ]`）**で指定する（実ファイルパスは非対応）。
-    HF キャッシュ（`hf download` 済み）から該当 GGUF を探して返す。`-hf` の自動DLには依存しない
-    （トークン不要・401 回避）。次の場合はいずれも ValueError（取得方法を案内）:
-
-    - repo-id 形式でない（実パス等）／キャッシュに無い／該当 GGUF が無い。
-    - `org/repo` に GGUF が複数あって 1 つに定まらない（`:セレクタ` で絞る）。
-
-    `org/repo:selector` はファイル名の一部（量子化名や `F16-MTP` 等）。セレクタ無しのときは mmproj と
-    MTP ヘッドを除いた「本体」GGUF を選ぶ。
-    """
-    spec = model.strip()
-    repo, _sep, selector = spec.partition(":")
-    if looks_like_local_path(repo) or repo.count("/") != 1 or not all(repo.split("/")):
-        raise ValueError(
-            f"model は HF repo-id（org/repo[:量子化名]）で指定してください（実パス非対応）: {model!r}"
-        )
-    org, name = repo.split("/", 1)
-    cache_dir = os.path.join(_hf_hub_cache(), f"models--{org}--{name}", "snapshots")
-    if not os.path.isdir(cache_dir):
-        raise ValueError(
-            f"'{repo}' がローカルキャッシュにありません。先に取得してください: "
-            f"hf download {repo} <ファイル名.gguf>"
-        )
-    ggufs: list[str] = []
-    for root, _dirs, files in os.walk(cache_dir):
-        for f in files:
-            if f.lower().endswith(".gguf"):
-                ggufs.append(os.path.join(root, f))
-    if selector:
-        matched = [g for g in ggufs if selector.lower() in os.path.basename(g).lower()]
-    else:
-        # 本体＝mmproj でも MTP ヘッドでもないもの
-        matched = [
-            g for g in ggufs
-            if "mmproj" not in os.path.basename(g).lower()
-            and "mtp" not in os.path.basename(g).lower()
-        ]
-    # 複数スナップショットが同じ blob を指すことがあるので実体で重複排除する。ただし返すのは
-    # スナップショット側のパス（実ファイル名が残り、隣の mmproj を検出できる）。
-    by_blob: dict[str, str] = {}
-    for g in sorted(matched):
-        by_blob.setdefault(os.path.realpath(g), g)
-    pool = sorted(by_blob.values())
-    if not pool:
-        hint = f"（セレクタ '{selector}' に一致なし）" if selector else ""
-        raise ValueError(
-            f"'{model}' に該当する GGUF がキャッシュにありません{hint}。"
-            f"hf download {repo} <ファイル名.gguf> で取得してください。"
-        )
-    if len(pool) > 1:
-        names = sorted(os.path.basename(g) for g in pool)
-        raise ValueError(
-            f"'{model}' に複数の GGUF が該当します {names}。"
-            f"'{repo}:<量子化名など>' でファイルを 1 つに絞ってください。"
-        )
-    return pool[0]
-
-
-def _snapshot_weights_complete(snap: str) -> bool:
-    """スナップショットの重みが実体（シンボリックリンク先）まで揃っているか。
-
-    `model.safetensors.index.json` があるときは **weight_map が要求する全シャード**を
-    確認する。1 つでも欠けていれば未完了とみなす（歯抜けのまま「重みが 1 つはある」で
-    通すと、ロードして初めて落ちる）。index を持たないリポジトリ（単一 safetensors や
-    whisper 系の *.npz）は、重みが 1 つ以上あることをもって完了とする。
-    """
-    index = os.path.join(snap, "model.safetensors.index.json")
-    if os.path.isfile(index):
-        try:
-            with open(index, encoding="utf-8") as fh:
-                shards = set(json.load(fh).get("weight_map", {}).values())
-        except Exception:  # noqa: BLE001 壊れた index は「index 無し」として扱う
-            shards = set()
-        if shards:
-            return all(
-                os.path.exists(os.path.realpath(os.path.join(snap, s))) for s in shards
-            )
-    return any(
-        os.path.exists(os.path.realpath(f))
-        for pattern in ("*.safetensors", "*.npz")
-        for f in glob.glob(os.path.join(snap, pattern))
-    )
-
-
-def _blocking_incomplete(blobs_dir: str) -> list[str]:
-    """「取得途中」と判断すべき `*.incomplete` だけを返す。
-
-    hf は `<sha>.<乱数>.incomplete` に書いてから `<sha>` へ確定させるが、**中断して
-    再試行が成功しても前回の .incomplete が消えずに残ることがある**。残骸の有無だけで
-    判定すると、完全に取得できているモデルが永久に「キャッシュにありません」になる
-    （実際に起きた）。よって **対応する確定 blob が無いものだけ**を取得途中とみなす。
-    """
-    out = []
-    for f in glob.glob(os.path.join(blobs_dir, "*.incomplete")):
-        sha = os.path.basename(f).split(".", 1)[0]
-        if not os.path.exists(os.path.join(blobs_dir, sha)):
-            out.append(f)
-    return out
+    """互換用ファサード。キャッシュ探索の実装は model_catalog に置く。"""
+    return _model_catalog.resolve_gguf(model, cache_root=_hf_hub_cache())
 
 
 def ensure_cached(repo: str, *, what: str = "モデル") -> str:
-    """mlx 系（mlx / mlx-vlm）の HF repo-id がローカルキャッシュに**完全に**存在するか検証する。
-
-    本サーバーは自動ダウンロードを行わない（事前に `hf download` 済みであることを要求する）。
-    起動前にここで存在を確認し、無ければ取得方法を案内して ValueError を送出する
-    （llama-cpp の resolve_gguf と同じ「事前 DL 必須」ポリシー）。返り値は確認したスナップショット
-    ディレクトリ（実ファイルパス指定時はそのパス）。
-
-    次のいずれも「未取得」とみなしてエラーにする:
-      - スナップショットが存在しない。
-      - ダウンロードが途中（確定 blob の無い *.incomplete が blobs/ に残っている）。
-        確定 blob が既にある .incomplete は**再試行が成功した後の残骸**なので無視する。
-      - 重み（*.safetensors / *.npz）の実体がキャッシュに揃っていない。index がある
-        場合は全シャードを要求する。
-    """
-    spec = repo.strip()
-    # 実ファイル/ディレクトリパス指定（repo-id ではない）はそのパスの存在のみ確認する。
-    if looks_like_local_path(spec):
-        path = os.path.expanduser(spec)
-        if not os.path.exists(path):
-            raise ValueError(f"{what}のパスが見つかりません: {repo!r}")
-        return path
-    if spec.count("/") != 1 or not all(spec.split("/")):
-        raise ValueError(
-            f"{what}は HF repo-id（org/repo）で指定してください: {repo!r}"
-        )
-    org, name = spec.split("/", 1)
-    base = os.path.join(_hf_hub_cache(), f"models--{org}--{name}")
-    snap_root = os.path.join(base, "snapshots")
-    # ダウンロードが途中なら「未取得」と同じ扱い（DL 停滞の主症状）。ただし確定 blob が
-    # 既にある .incomplete は再試行成功後の残骸なので数えない（_blocking_incomplete）。
-    incomplete = _blocking_incomplete(os.path.join(base, "blobs"))
-    snaps = sorted(glob.glob(os.path.join(snap_root, "*"))) if os.path.isdir(snap_root) else []
-    if not snaps or incomplete:
-        raise ValueError(
-            f"{what} '{repo}' がローカルキャッシュにありません（自動ダウンロードは無効）。"
-            f" 先に取得してください: hf download {spec}"
-        )
-    # 重みの実体（シンボリックリンク先まで）が揃っているスナップショットを選ぶ。
-    # whisper 系の mlx リポジトリは *.npz で重みを持つものがあるため両方を許容する。
-    complete = [s for s in snaps if _snapshot_weights_complete(s)]
-    if not complete:
-        raise ValueError(
-            f"{what} '{repo}' の重み（*.safetensors / *.npz）がキャッシュに揃っていません。"
-            f" 取得し直してください: hf download {spec}"
-        )
-    return complete[0]
+    """互換用ファサード。従来どおり server 側のキャッシュ設定を尊重する。"""
+    return _model_catalog.ensure_cached(repo, what=what, cache_root=_hf_hub_cache())
 
 
 def mtp_status(model: str, drafter: str | None = None) -> str | None:
-    """model の MTP（Multi-Token Prediction による高速化）の利用可否を返す。
-
-    使うドラフターが決まるかと、それがローカルに在るかで判定する:
-
-    - "ready"     … ドラフターが手元にある。そのまま MTP が効く。
-    - "available" … ドラフターは決まるが未取得。`hf download <drafter>` で有効化できる。
-    - None        … MTP なし（明示指定も対応表の項目も無い）。
-
-    `drafter` は gateway.toml で **明示指定された（＝解決済みの）** draft_model。指定があれば
-    対応表より優先する——対応表は `draft_model="auto"` 用の内蔵ペア表でしかないので、これを
-    見ないと「gateway.toml で明示指定してあるのに一覧では MTP 非対応に見える」ことになる。
-    無効化（off/none/""）は呼び出し側で解決済み＝None で渡ってくる前提。
-
-    一覧表示（discover_cached_models / merge_status / TUI）から呼ぶ。ドラフターの有無確認に
-    ensure_cached を使う（自動 DL はしない方針と一貫）。
-    """
-    drafter = drafter or MTP_DRAFTERS.get(model)
-    if not drafter:
-        return None
-    if looks_like_local_path(drafter):
-        # ローカルパス指定のドラフター（HF キャッシュではない実ディレクトリ）は重みを直接見る。
-        return "ready" if _dir_weight_bytes(os.path.expanduser(drafter.strip())) else "available"
-    try:
-        ensure_cached(drafter, what="ドラフター")
-        return "ready"
-    except ValueError:
-        return "available"
-
-
-_DISCOVER_CACHE: dict = {"t": -1e9, "v": []}
-
-# チャット/生成に使わない（埋め込み・STT・分類・エンコーダ）モデルタイプ。発見一覧から除く。
-_NON_CHAT_MODEL_TYPES = frozenset({
-    "bert", "roberta", "xlm-roberta", "distilbert", "deberta", "deberta-v2",
-    "mpnet", "camembert", "electra", "albert", "nomic_bert",
-    "whisper", "wav2vec2", "clip", "siglip", "t5", "mt5",
-})
-
-
-def _is_generative_repo(snap_root: str) -> bool:
-    """スナップショット内の config.json を見て、生成（チャット）系モデルかを判定する。
-
-    埋め込み（e5/MiniLM 等）・STT（whisper）・分類器など非チャットのモデルを発見一覧から
-    除くためのフィルタ。config.json が読めなければ True（取りこぼしを避ける＝控えめに除外）。
-    """
-    cfg_path = None
-    for sroot, _d, files in os.walk(snap_root):
-        if "config.json" in files:
-            cfg_path = os.path.join(sroot, "config.json")
-            break
-    if not cfg_path:
-        return True
-    try:
-        with open(cfg_path, encoding="utf-8") as fh:
-            cfg = json.load(fh)
-    except (OSError, ValueError):
-        return True
-    model_type = str(cfg.get("model_type", "")).lower()
-    if model_type in _NON_CHAT_MODEL_TYPES:
-        return False
-    archs = cfg.get("architectures") or []
-    if not archs:
-        return True  # アーキ不明なら除外しない
-    return any(
-        a.endswith(("ForCausalLM", "ForConditionalGeneration")) for a in archs
-    )
+    """互換用ファサード。"""
+    return _model_catalog.mtp_status(model, drafter, cache_root=_hf_hub_cache())
 
 
 def discover_cached_models(ttl: float = 10.0) -> list[dict]:
-    """HF キャッシュにある**実行可能なチャットモデル**を列挙する（発見用）。
-
-    LM Studio / Ollama のように「いま手元で動かせる候補」をクライアントに見せるための一覧。
-    ロード済みかどうかに関わらず、ダウンロード済みモデルを `{"id", "backend", "mtp"}` のリストで
-    返す（`mtp` は "ready" / "available" / None＝mtp_status）。MTP ドラフター自体は単体で使う
-    モデルではないので一覧からは除外する（_DRAFTER_REPOS）。判定はヒューリスティック:
-
-    - GGUF を含む repo → llama-cpp。本体（mmproj / MTP ヘッドを除く）が 1 つなら `org/repo`、
-      複数あれば `org/repo:<ファイル名>` を量子化ごとに列挙（そのままロードできる形）。
-    - `config.json` ＋ 重み（`.safetensors` / `.npz`）を持ち、生成系アーキ（`*ForCausalLM` /
-      `*ForConditionalGeneration`）の repo → mlx 系（mlx-vlm で動的ロード）。埋め込み・STT・
-      分類などの非チャットモデルは除外する（`_is_generative_repo`）。
-
-    `ttl` 秒は結果をキャッシュする（`/admin/status` の毎秒ポーリングで毎回走査しないため）。
-    """
-    now = time.monotonic()
-    if now - _DISCOVER_CACHE["t"] < ttl:
-        return list(_DISCOVER_CACHE["v"])
-    root = _hf_hub_cache()
-    out: list[dict] = []
-    seen: set[str] = set()
-    if os.path.isdir(root):
-        for entry in sorted(os.listdir(root)):
-            if not entry.startswith("models--") or entry.count("--") < 2:
-                continue
-            _, org, name = entry.split("--", 2)
-            repo = f"{org}/{name}"
-            # MTP ドラフターは「使えるモデル」ではないので一覧に出さない。
-            if repo in _DRAFTER_REPOS:
-                continue
-            snap_root = os.path.join(root, entry, "snapshots")
-            if not os.path.isdir(snap_root):
-                continue
-            files = [f for _r, _d, fs in os.walk(snap_root) for f in fs]
-            ggufs = [f for f in files if f.lower().endswith(".gguf")]
-            if ggufs:
-                bodies = [
-                    f for f in ggufs
-                    if "mmproj" not in f.lower() and "mtp" not in f.lower()
-                ]
-                if not bodies:
-                    continue  # mmproj / MTP ヘッドだけの repo は本体ではない
-                if len(bodies) == 1:
-                    cands = [repo]
-                else:
-                    cands = [f"{repo}:{os.path.splitext(f)[0]}" for f in sorted(bodies)]
-                backend = "llama-cpp"
-            elif (
-                "config.json" in files
-                and any(f.endswith((".safetensors", ".npz")) for f in files)
-                # 生成系（チャット）または STT（whisper）を対象にする。埋め込み・分類器などの
-                # 非チャット・非STT モデルは除外する（_is_generative_repo）。
-                and (_is_generative_repo(snap_root) or infer_backend(repo) == "whisper")
-            ):
-                cands = [repo]
-                backend = infer_backend(repo)  # whisper → STT、mlx → mlx-vlm、他は OS 既定
-            else:
-                continue
-            # MTP（高速化）の利用可否を本体ごとに付与する（ドラフターが揃っていれば "ready"）。
-            mtp = mtp_status(repo)
-            for c in cands:
-                if c not in seen:
-                    seen.add(c)
-                    out.append({"id": c, "backend": backend, "mtp": mtp})
-    _DISCOVER_CACHE["t"] = now
-    _DISCOVER_CACHE["v"] = out
-    return list(out)
-
-
-def looks_like_local_path(spec: str) -> bool:
-    """model / draft_model の指定が HF repo-id ではなくローカルパスか。
-
-    POSIX の絶対・相対・チルダに加えて **Windows のドライブレターと逆スラッシュ**も見る
-    （`C:\\models\\x` / `C:/models/x` / `\\\\server\\share`）。ここを POSIX 限定にしていたため、
-    Windows ではローカル変換物の登録がすべて repo-id 扱いになり、メモリ見積もりが
-    None（＝ガード無効）に落ちていた。
-    """
-    spec = spec.strip()
-    if spec.startswith(("/", "./", "../", "~", "\\")):
-        return True
-    # C:\... / C:/...（ドライブレター）
-    return len(spec) >= 3 and spec[1] == ":" and spec[2] in ("\\", "/")
-
-
-def _dir_weight_bytes(directory: str) -> int:
-    """ディレクトリ直下の重みファイル（*.safetensors / *.npz）の合計バイト数。
-
-    ローカル変換物（HF キャッシュではない実ディレクトリ）の占有見積もりに使う。
-    tokenizer.json 等の小物は数えない（下限寄りの見積もりという方針は repo-id 側と同じ）。
-    """
-    total = 0
-    if not os.path.isdir(directory):
-        return 0
-    for pattern in ("*.safetensors", "*.npz"):
-        for path in glob.glob(os.path.join(directory, pattern)):
-            try:
-                total += os.path.getsize(path)
-            except OSError:
-                pass
-    return total
+    """互換用ファサード。"""
+    return _model_catalog.discover_cached_models(ttl, cache_root=_hf_hub_cache())
 
 
 def estimate_model_bytes(config: ServerConfig) -> int | None:
@@ -904,9 +249,7 @@ def estimate_model_bytes(config: ServerConfig) -> int | None:
             path = resolve_gguf(config.model)
             total = os.path.getsize(path)
             mmproj = find_sibling_mmproj(path)
-            if mmproj and not any(
-                a in ("--no-mmproj",) for a in config.extra_args
-            ):
+            if mmproj and not any(a in ("--no-mmproj",) for a in config.extra_args):
                 total += os.path.getsize(mmproj)
             if config.draft_model:
                 try:
@@ -923,7 +266,9 @@ def estimate_model_bytes(config: ServerConfig) -> int | None:
         if looks_like_local_path(spec):
             total = _dir_weight_bytes(os.path.expanduser(spec))
             if config.draft_model and looks_like_local_path(config.draft_model):
-                total += _dir_weight_bytes(os.path.expanduser(config.draft_model.strip()))
+                total += _dir_weight_bytes(
+                    os.path.expanduser(config.draft_model.strip())
+                )
             return total or None
         # HF repo-id: models--org--name/snapshots/<hash>/ の合計（blob 実体で重複排除）
         repo = spec
@@ -958,7 +303,8 @@ def find_sibling_mmproj(model_path: str) -> str | None:
     if not directory or not os.path.isdir(directory):
         return None
     candidates = sorted(
-        name for name in os.listdir(directory)
+        name
+        for name in os.listdir(directory)
         if "mmproj" in name.lower() and name.lower().endswith(".gguf")
     )
     if not candidates:
@@ -973,9 +319,12 @@ def _build_mlx(config: ServerConfig) -> list[str]:
     ensure_cached(config.model)
     command = [
         "mlx_lm.server",
-        "--model", config.model,
-        "--host", config.host,
-        "--port", str(config.port),
+        "--model",
+        config.model,
+        "--host",
+        config.host,
+        "--port",
+        str(config.port),
     ]
     if config.disable_thinking:
         command += ["--chat-template-args", '{"enable_thinking": false}']
@@ -996,10 +345,15 @@ def _build_mlx_vlm(config: ServerConfig) -> list[str]:
     # 未修正部分を当ててから同じ引数で mlx_vlm.server を __main__ 実行する）。
     # site-packages を書き換えると auto_update の `uv sync` で消えるため。
     command = [
-        sys.executable, "-m", "local_llm_server._mlx_vlm_shims",
-        "--model", config.model,
-        "--host", config.host,
-        "--port", str(config.port),
+        sys.executable,
+        "-m",
+        "local_llm_server._mlx_vlm_shims",
+        "--model",
+        config.model,
+        "--host",
+        config.host,
+        "--port",
+        str(config.port),
     ]
     # Gemma 4 の MTP ドラフターによる speculative decoding。draft_kind は mtp に固定する
     # （他種別＝dflash / eagle3 は今回は対象外）。draft_model="auto" は本体名から
@@ -1034,15 +388,22 @@ def _build_llama_cpp(config: ServerConfig) -> list[str]:
     model_path = resolve_gguf(config.model)
     command = [
         llama_server_binary(),  # プロビジョナが導入した絶対パス、無ければ PATH の "llama-server"
-        "-m", model_path,
-        "--host", config.host,
-        "--port", str(config.port),
+        "-m",
+        model_path,
+        "--host",
+        config.host,
+        "--port",
+        str(config.port),
     ]
     # 埋め込み MTP（Qwen3.6 等、本体 GGUF に MTP ヘッドが内蔵）。draft_model="self"/"mtp"
     # で有効化＝別ドラフトファイル不要（--spec-type draft-mtp のみ）。この方式は llama.cpp 側で
     # --mmproj（vision）と --parallel>1 が未対応なので、両者は付けない（付けると起動失敗する）。
-    embedded_mtp = bool(config.draft_model) and \
-        config.draft_model.strip().lower() in ("self", "mtp")
+    draft_model = config.draft_model
+    embedded_mtp = (
+        bool(draft_model)
+        and draft_model is not None
+        and draft_model.strip().lower() in ("self", "mtp")
+    )
     if config.parallel is not None and not embedded_mtp:
         command += ["--parallel", str(config.parallel)]
     if config.disable_thinking:
@@ -1087,10 +448,15 @@ def _build_whisper(config: ServerConfig) -> list[str]:
     """
     ensure_cached(config.model)
     return [
-        sys.executable, "-m", "local_llm_server.stt_server",
-        "--model", config.model,
-        "--host", config.host,
-        "--port", str(config.port),
+        sys.executable,
+        "-m",
+        "local_llm_server.stt_server",
+        "--model",
+        config.model,
+        "--host",
+        config.host,
+        "--port",
+        str(config.port),
     ]
 
 
@@ -1103,11 +469,17 @@ def _build_vllm(config: ServerConfig) -> list[str]:
     """
     ensure_cached(config.model)
     return [
-        vllm_python(), "-m", "vllm.entrypoints.openai.api_server",
-        "--model", config.model,
-        "--served-model-name", config.model,
-        "--host", config.host,
-        "--port", str(config.port),
+        vllm_python(),
+        "-m",
+        "vllm.entrypoints.openai.api_server",
+        "--model",
+        config.model,
+        "--served-model-name",
+        config.model,
+        "--host",
+        config.host,
+        "--port",
+        str(config.port),
     ]
 
 
@@ -1119,50 +491,45 @@ def _build_sglang(config: ServerConfig) -> list[str]:
     """
     ensure_cached(config.model)
     return [
-        sglang_python(), "-m", "sglang.launch_server",
-        "--model-path", config.model,
-        "--served-model-name", config.model,
-        "--host", config.host,
-        "--port", str(config.port),
+        sglang_python(),
+        "-m",
+        "sglang.launch_server",
+        "--model-path",
+        config.model,
+        "--served-model-name",
+        config.model,
+        "--host",
+        config.host,
+        "--port",
+        str(config.port),
     ]
 
 
-@dataclass(frozen=True)
-class BackendSpec:
-    """1 バックエンドの性質と起動方法をまとめた記述子。
+_COMMAND_BUILDERS = {
+    "mlx": _build_mlx,
+    "mlx-vlm": _build_mlx_vlm,
+    "llama-cpp": _build_llama_cpp,
+    "whisper": _build_whisper,
+    "vllm": _build_vllm,
+    "sglang": _build_sglang,
+}
 
-    バックエンドごとの知識（起動コマンド・draft_model の解釈・並列対応・GGUF か・
-    必要な自動導入）は**この表の 1 エントリ**に集約する。散在する `backend == "..."` 比較を
-    書かず、`backend_spec(name).<性質>` を参照すること——バックエンドの追加・変更時に
-    触る場所を 1 箇所にするため。真の振る舞い差（build）は関数参照で持つ（Strategy 相当）。
-    """
-    name: str
-    build: object  # Callable[[ServerConfig], list[str]] — 起動コマンド（extra_args 抜き）
-    # draft_model の解釈: "mtp"（対応表 MTP_DRAFTERS で解決 → --draft-model）、
-    # "gguf"（ドラフト GGUF のパス/HF id をそのまま -md へ）、None（speculative decoding 非対応）
-    draft_style: str | None = None
-    parallel: bool = False       # --parallel の並列スロットに対応するか
-    gguf: bool = False           # GGUF ベースか（pull / show / メモリ見積もりの分岐）
-    provisioner: str | None = None  # 起動時に必要な自動導入（"llama" / "vllm" / "sglang"）
-
-
-# バックエンドの登録簿。増やすときは _build_<name> を書いてここへ 1 行足す
-# （elif 連鎖にも、他ファイルの backend == 比較にも継ぎ足さない）。BACKENDS（公開値）と 1:1。
+# Public compatibility descriptors retain their historical ``build`` strategy,
+# while lower gateway layers consume dependency-free metadata from backend_core.
 BACKEND_SPECS: dict[str, BackendSpec] = {
-    s.name: s for s in (
-        BackendSpec("mlx", _build_mlx),
-        BackendSpec("mlx-vlm", _build_mlx_vlm, draft_style="mtp"),
-        BackendSpec("llama-cpp", _build_llama_cpp, draft_style="gguf",
-                    parallel=True, gguf=True, provisioner="llama"),
-        BackendSpec("whisper", _build_whisper),
-        BackendSpec("vllm", _build_vllm, provisioner="vllm"),
-        BackendSpec("sglang", _build_sglang, provisioner="sglang"),
+    name: BackendSpec(
+        name=spec.name,
+        build=_COMMAND_BUILDERS[name],
+        draft_style=spec.draft_style,
+        parallel=spec.parallel,
+        gguf=spec.gguf,
+        provisioner=spec.provisioner,
     )
+    for name, spec in _CORE_BACKEND_SPECS.items()
 }
 
 
 def backend_spec(name: str) -> BackendSpec:
-    """backend 名から記述子を引く（未知の名前は案内付き ValueError）。"""
     spec = BACKEND_SPECS.get(name)
     if spec is None:
         raise ValueError(f"unknown backend: {name!r} (choose from {BACKENDS})")
@@ -1175,92 +542,18 @@ def build_command(config: ServerConfig) -> list[str]:
     いずれも OpenAI 互換サーバーを立ち上げる。extra_args は全バックエンド共通で末尾に付く
     （ユーザーの明示指定が自動付与より後＝優先になる）。
     """
-    return backend_spec(config.backend).build(config) + config.extra_args
+    builder = backend_spec(config.backend).build
+    assert builder is not None
+    return builder(config) + config.extra_args
 
 
-def is_ready(base_url: str, timeout: float = 1.0) -> bool:
-    """OpenAI互換サーバーが応答可能かを判定する。
-
-    401/403 も「起動して応答している」と判定する（api_key を設定したゲートウェイは
-    /v1/models にキーを要求するため。ここで False にすると TUI の自己ヘルスチェック
-    （起動判定・常駐ポーリング）が、正常起動したゲートウェイを「応答なし」と誤判定してしまう）。
-    """
-    try:
-        with urllib.request.urlopen(f"{base_url}/models", timeout=timeout) as resp:
-            return resp.status == 200
-    except urllib.error.HTTPError as exc:
-        return exc.code in (401, 403)  # 認証は要求されたが、サーバー自体は稼働中
-    except (urllib.error.URLError, OSError):
-        return False
-
-
-def list_models(base_url: str, timeout: float = 5.0) -> list[str]:
-    """サーバーが公開する全モデル id を /v1/models から返す（取得失敗時は []）。
-
-    単一モデルサーバーはロード済みの1件を返す。一方、複数モデルを束ねるルーター型
-    サーバーはカタログとして多数を並べる（先頭が必ずしもアクティブとは限らない）ので、
-    モデルの提供有無は「リストに含まれるか」で判定する（→ model_available）。
-    """
-    try:
-        with urllib.request.urlopen(f"{base_url}/models", timeout=timeout) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-    except (urllib.error.URLError, OSError, ValueError):
-        return []
-    items = data.get("data") if isinstance(data, dict) else None
-    if not isinstance(items, list):
-        return []
-    out: list[str] = []
-    for it in items:
-        if isinstance(it, dict):
-            mid = it.get("id")
-            if isinstance(mid, str) and mid:
-                out.append(mid)
-    return out
-
-
-def running_model(base_url: str, timeout: float = 5.0) -> str | None:
-    """起動中サーバーの代表モデル（/v1/models の最初の id）を返す。取得不可は None。
-
-    注意: ルーター型（多モデル）サーバーでは先頭が必ずしもアクティブとは限らない。
-    設定モデルが使えるかの判定には model_available（リスト全体を見る）を使うこと。
-    """
-    models = list_models(base_url, timeout)
-    return models[0] if models else None
-
-
-def model_available(base_url: str, model: str | None, timeout: float = 5.0) -> bool | None:
-    """設定モデル model がサーバーで提供されているかを返す。
-
-    - True  … /v1/models のいずれかと一致（単一モデル一致／ルーターのカタログに存在）
-    - False … モデル一覧は取れたが、その中に一致が無い
-    - None  … 判定不能（model 未指定、または一覧を取得できない）→ 警告しない
-    """
-    if not model:
-        return None
-    models = list_models(base_url, timeout)
-    if not models:
-        return None
-    return any(models_match(m, model) for m in models)
-
-
-def models_match(a: str | None, b: str | None) -> bool:
-    """2つのモデル名が同じものを指すかを大まかに判定する。
-
-    パス指定とリポジトリ名のゆれ（例 /abs/path/Foo と org/Foo）を吸収するため、
-    末尾要素（basename）を小文字で比較する。
-    """
-    if not a or not b:
-        return True  # どちらか不明なら警告しない（誤検知を避ける）
-    if a == b:
-        return True
-    base = lambda s: s.rstrip("/").split("/")[-1].lower()  # noqa: E731
-    return base(a) == base(b)
-
-
-def parse_host_port(base_url: str, default_port: int = 8080) -> tuple[str, int]:
-    """base_url（例 http://127.0.0.1:8080/v1）から host と port を取り出す。"""
-    parsed = urllib.parse.urlparse(base_url)
-    return parsed.hostname or "127.0.0.1", parsed.port or default_port
+# Health queries are likewise implemented once and re-exported for compatibility.
+is_ready = _server_health.is_ready
+list_models = _server_health.list_models
+running_model = _server_health.running_model
+model_available = _server_health.model_available
+models_match = _server_health.models_match
+parse_host_port = _server_health.parse_host_port
 
 
 class LocalServer:
@@ -1269,7 +562,11 @@ class LocalServer:
     def __init__(self, config: ServerConfig, log_path: str) -> None:
         self.config = config
         self._proc: subprocess.Popen | None = None
-        self._log_file = None
+        self._log_file: TextIO | None = None
+        self._lifecycle = threading.Condition()
+        self._stop_lock = threading.Lock()
+        self._starting = False
+        self._stop_requested = False
         # サーバーの大量ログ（INFO/Stream finished 等）で対話画面が乱れないよう、
         # 標準出力・標準エラーはこのログファイルへ逃がす（端末には流さない）。
         # 必須引数——省略時に一時ファイルへ逃がすフォールバックは、誰にも掃除されない
@@ -1294,12 +591,16 @@ class LocalServer:
         return self._proc is not None and self._proc.poll() is None
 
     def start(self) -> None:
-        if self._proc is not None:
-            raise RuntimeError("server already started")
-        # ログパス（ゲートウェイの daemon_log_path 等）は親ディレクトリが
-        # 無いことがあるので作る（log_dir は呼び出し側が作る設計）。
-        os.makedirs(os.path.dirname(self.log_path) or ".", exist_ok=True)
+        with self._lifecycle:
+            if self._proc is not None or self._starting:
+                raise RuntimeError("server already started")
+            self._starting = True
+            self._stop_requested = False
+        cancelled = False
         try:
+            # ログパス（ゲートウェイの daemon_log_path 等）は親ディレクトリが
+            # 無いことがあるので作る（log_dir は呼び出し側が作る設計）。
+            os.makedirs(os.path.dirname(self.log_path) or ".", exist_ok=True)
             self._log_file = open(self.log_path, "a", encoding="utf-8")
             # 自動ダウンロードを完全に無効化する hard guard。バックエンド（mlx_lm / mlx_vlm /
             # transformers / tokenizers / ドラフター）はキャッシュのみを参照し、未取得ファイルが
@@ -1353,12 +654,17 @@ class LocalServer:
             # 繋留が有効（デーモン内）なら、ワーカーを tether ラッパー越しに起動する。
             # ラッパーはデーモンの死（パイプ EOF）を検知して自分のグループごと終了する
             # ので、デーモンが kill -9 で死んでもモデルサーバーが孤児として残らない。
-            if _POSIX and _TETHER_READ_FD is not None:
+            if _POSIX and _gateway_runtime._TETHER_READ_FD is not None:
                 cmd = [
-                    sys.executable, "-m", "local_llm_server.tether",
-                    "--fd", str(_TETHER_READ_FD), "--", *cmd,
+                    sys.executable,
+                    "-m",
+                    "local_llm_server.tether",
+                    "--fd",
+                    str(_gateway_runtime._TETHER_READ_FD),
+                    "--",
+                    *cmd,
                 ]
-                extra["pass_fds"] = (_TETHER_READ_FD,)
+                extra["pass_fds"] = (_gateway_runtime._TETHER_READ_FD,)
             self._proc = subprocess.Popen(
                 cmd,
                 stdout=self._log_file,
@@ -1377,6 +683,28 @@ class LocalServer:
                 f"バックエンド実行ファイルが見つかりません: {exc.filename}。"
                 " mlx_lm / mlx_vlm / llama.cpp がインストール・PATH 上にあるか確認してください。"
             ) from exc
+        except Exception:
+            # build_command/Popen/台帳更新のどこで失敗しても、開いたログと起動済みの子を残さない。
+            with self._lifecycle:
+                self._starting = False
+                self._lifecycle.notify_all()
+            try:
+                self.stop(grace=0.0)
+            except Exception as cleanup_exc:  # noqa: BLE001 - 元の起動例外を保持する
+                warn(f"failed to clean up a partially started worker: {cleanup_exc}")
+            raise
+        finally:
+            with self._lifecycle:
+                if self._starting:
+                    self._starting = False
+                    cancelled = self._stop_requested
+                    self._lifecycle.notify_all()
+        if cancelled:
+            # A concurrent shutdown waited for the spawn transaction to finish.
+            # Participate in cleanup as well; _stop_lock makes duplicate callers
+            # harmless and start() never reports success after cancellation.
+            self.stop(grace=0.0)
+            raise RuntimeError("server start cancelled by shutdown")
 
     def _close_log(self) -> None:
         if self._log_file is not None:
@@ -1415,26 +743,39 @@ class LocalServer:
         全プロセスを畳むので graceful は不要で、mlx/Metal の終了時クリーンアップ（数秒かかる
         ことがある）を待たずカーネルに即回収させた方が、TUI の quit が目に見えて速くなる。
         """
-        if self._proc is None:
-            self._close_log()
-            return
-        proc = self._proc
-        if grace <= 0:
-            _signal_process_tree(proc, kill=True)  # 即 SIGKILL（全体終了・graceful 不要）
-        else:
-            _signal_process_tree(proc, kill=False)  # SIGTERM を送って grace 秒待つ
+        with self._lifecycle:
+            if self._starting:
+                self._stop_requested = True
+                while self._starting:
+                    self._lifecycle.wait()
+        with self._stop_lock:
+            proc = self._proc
+            if proc is None:
+                self._close_log()
+                return
             try:
-                proc.wait(timeout=grace)
-            except subprocess.TimeoutExpired:
-                # 終わらなければグループ全体へ SIGKILL で強制終了
-                _signal_process_tree(proc, kill=True)
-        try:
-            proc.wait(timeout=5)  # SIGKILL 後の回収を見届ける（ゾンビを残さない）
-        except subprocess.TimeoutExpired:
-            pass
-        self._proc = None
-        self._close_log()
-        unregister_worker(proc.pid)  # 正常に停止できた分は台帳から消す
+                stopped = _stop_process_tree(
+                    proc,
+                    grace=max(grace, 0.0),
+                    kill_timeout=5.0,
+                )
+            except Exception as exc:  # noqa: BLE001 - preserve ownership for retry
+                stopped = False
+                warn(f"failed to stop worker pid {proc.pid}: {exc}")
+            finally:
+                # The child inherited its own fd. Closing the parent's copy is safe
+                # even when termination failed and prevents a descriptor leak here.
+                self._close_log()
+            if stopped:
+                with self._lifecycle:
+                    if self._proc is proc:
+                        self._proc = None
+                unregister_worker(proc.pid)
+            else:
+                warn(
+                    f"worker pid {proc.pid} did not exit after termination; "
+                    "keeping its ownership ledger entry for startup reconciliation"
+                )
 
     def __enter__(self) -> "LocalServer":
         self.start()
@@ -1443,630 +784,3 @@ class LocalServer:
 
     def __exit__(self, *exc: object) -> None:
         self.stop()
-
-
-# --- マルチモデルゲートウェイ（daemon）用ヘルパ -----------------------------
-def ignore_shutdown_signals() -> None:
-    """SIGTERM / SIGHUP / SIGINT を一旦無視（SIG_IGN）にする。
-
-    後始末（配下のサーバー停止など）の最中に再度シグナルが届いても中断されないよう、
-    クリーンアップ開始時に呼ぶ。停止時の killpg や端末クローズで複数シグナルが連続して
-    届いても、停止処理を最後までやり切って孫プロセスを残さないための保険。
-    install_shutdown_handlers() の対（同じくメインスレッドからのみ有効）。
-    """
-    for name in ("SIGTERM", "SIGHUP", "SIGINT"):
-        sig = getattr(signal, name, None)  # SIGHUP は Windows に無い
-        if sig is None:
-            continue
-        try:
-            signal.signal(sig, signal.SIG_IGN)
-        except (ValueError, OSError):
-            pass  # メインスレッド以外などでは登録できない
-
-
-def daemon_log_path(port: int) -> str:
-    """ゲートウェイが起動するモデルサーバーのログ保存先（ポート別の固定パス）。
-
-    ログ表示から参照できるよう、ランダムな tempfile ではなくポートで決まる固定パスにする。
-    場所は `log_dir()`（cwd 非依存）——起動したディレクトリに `./.local-llm-server` を
-    作らない。同じポートのサーバーは同じログに追記する。
-    """
-    return os.path.join(log_dir(), f"server-{port}.log")
-
-
-class GatewayAlreadyRunning(RuntimeError):
-    """このマシンで既にゲートウェイが起動している（単一起動ガードが二重起動を拒否）。
-
-    保持者の PID（読めれば）とロックファイルのパスを添える。呼び出し側はこれを捕まえて
-    「既に起動済み」を明示エラーとして返す（黙って 2 個目を立てて乱立させない）。
-    """
-
-    def __init__(self, pid: int | None, path: str) -> None:
-        self.pid = pid
-        self.path = path
-        who = f"pid {pid}" if pid else "unknown pid"
-        super().__init__(
-            f"a local-llm-server gateway is already running on this machine ({who}); "
-            f"stop it before starting another (single-instance lock: {path})"
-        )
-
-
-def gateway_lock_path() -> str:
-    """マシン内で 1 つだけゲートウェイを許すロックファイルのパス（cwd 非依存の固定パス）。
-
-    **どのディレクトリから起動しても同じ 1 個**のロックを見るよう、temp ディレクトリ配下の
-    固定名にする（ログの `log_dir()` と同じく cwd 非依存）。これで
-    「別ディレクトリから（開発ツール等が）勝手に 2 個目を起動する」ケースも 1 本に束ねられる。
-    ポートに依存しないので、port を変えても二重には立たない（＝マシンにつき 1 ゲートウェイ）。
-    """
-    return os.path.join(tempfile.gettempdir(), "local-llm-server-gateway.lock")
-
-
-def gateway_runtime_path() -> str:
-    """稼働中ゲートウェイの接続先（host/port/pid/cwd）を書く固定パス（cwd 非依存）。
-
-    単一起動（`GatewayLock`）でマシンに 1 ゲートウェイなので、この 1 ファイルを読めば
-    **どのディレクトリからでも**「いま動いているゲートウェイ」の host/port を特定できる
-    （`gw status` / `gw stop` を gateway.toml の無い場所から打つため）。ロックの隣に置く。
-    """
-    return os.path.join(tempfile.gettempdir(), "local-llm-server-gateway.json")
-
-
-def write_gateway_runtime(host: str, port: int, pid: int, cwd: str, started_at: str) -> None:
-    """稼働中ゲートウェイの接続先をランタイム記録に書く（デーモンが起動時に呼ぶ）。
-
-    書き込みは best-effort（失敗しても稼働は妨げない）。単一起動なので上書きで良い。
-    """
-    rec = {"host": host, "port": port, "pid": pid, "cwd": cwd, "started_at": started_at}
-    try:
-        path = gateway_runtime_path()
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        with open(path, "w", encoding="utf-8") as fh:
-            json.dump(rec, fh)
-    except OSError:
-        pass
-
-
-def read_gateway_runtime() -> dict | None:
-    """ランタイム記録を読む（無い・壊れている・PID が生きていなければ None）。
-
-    クラッシュで残った stale 記録を掴まないよう、記録の PID が生存しているときだけ返す
-    （PID 生存は下限の健全性チェック。最終的な疎通は呼び出し側が /admin/status で確認する）。
-    """
-    try:
-        with open(gateway_runtime_path(), encoding="utf-8") as fh:
-            rec = json.load(fh)
-    except (OSError, ValueError):
-        return None
-    if not isinstance(rec, dict) or "host" not in rec or "port" not in rec:
-        return None
-    pid = rec.get("pid")
-    if isinstance(pid, int) and not pid_is_alive(pid):
-        return None  # クラッシュで残った stale 記録（保持者が居ない）
-    return rec
-
-
-def pid_is_alive(pid: int) -> bool:
-    """PID が生存しているか（cross-platform・非破壊）。
-
-    `os.kill(pid, 0)` は POSIX の生存確認だが、**Windows では sig 0 でも TerminateProcess を
-    呼んで対象を kill してしまう**ため使えない。core 依存の psutil で判定する（psutil が無い等で
-    判定不能なら、保守的に「生きている」＝ True を返す —— 生きている記録を誤って捨てない）。
-    """
-    try:
-        import psutil
-        return psutil.pid_exists(pid)
-    except Exception:  # noqa: BLE001 - psutil 不在・判定不能は「生きている可能性」に倒す
-        return True
-
-
-def clear_gateway_runtime() -> None:
-    """ランタイム記録を消す（デーモンの正常終了時に呼ぶ。best-effort）。"""
-    try:
-        os.remove(gateway_runtime_path())
-    except OSError:
-        pass
-
-
-# --- ワーカー台帳と孤児掃除（startup reconciliation） --------------------------
-def workers_state_path() -> str:
-    """起動中モデルサーバー（ワーカー）の PID 台帳のパス（cwd 非依存の固定パス）。
-
-    LocalServer が起動時に {pid, port, model} を記録し、正常停止時に消す。デーモンが
-    `kill -9` 等で死ぬと消されないまま残り、それが**次回起動時の孤児掃除
-    （reap_orphan_workers）の手掛かり**になる。ロック・ランタイム記録の隣に置く。
-    """
-    return os.path.join(tempfile.gettempdir(), "local-llm-server-workers.json")
-
-
-_WORKERS_FILE_LOCK = threading.Lock()  # 複数スレッドの同時ロード/退避から台帳を守る
-
-
-def _load_workers_unlocked() -> list[dict]:
-    """台帳を読む（無い・壊れているは空扱い。_WORKERS_FILE_LOCK 保持下で呼ぶ）。"""
-    try:
-        with open(workers_state_path(), encoding="utf-8") as fh:
-            data = json.load(fh)
-    except (OSError, ValueError):
-        return []
-    entries = data.get("workers") if isinstance(data, dict) else None
-    if not isinstance(entries, list):
-        return []
-    return [e for e in entries if isinstance(e, dict)]
-
-
-def _save_workers_unlocked(entries: list[dict]) -> None:
-    """台帳を書く（tmp → rename の原子的置換。best-effort・失敗しても稼働は妨げない）。"""
-    path = workers_state_path()
-    tmp = f"{path}.tmp-{os.getpid()}"
-    try:
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump({"workers": entries}, fh)
-        os.replace(tmp, path)
-    except OSError:
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
-
-
-def register_worker(pid: int, port: int, model: str) -> None:
-    """起動したワーカーを台帳に記録する（LocalServer.start が呼ぶ）。"""
-    with _WORKERS_FILE_LOCK:
-        entries = [e for e in _load_workers_unlocked() if e.get("pid") != pid]
-        entries.append({"pid": pid, "port": port, "model": model})
-        _save_workers_unlocked(entries)
-
-
-def unregister_worker(pid: int) -> None:
-    """停止したワーカーを台帳から消す（LocalServer.stop が呼ぶ）。"""
-    with _WORKERS_FILE_LOCK:
-        _save_workers_unlocked(
-            [e for e in _load_workers_unlocked() if e.get("pid") != pid]
-        )
-
-
-def reap_orphan_workers() -> list[int]:
-    """前回のゲートウェイが残した孤児ワーカーを回収する（デーモン起動時に呼ぶ）。
-
-    crash-only 設計の要: **起動処理 = 復旧処理**。前回が `kill -9` やクラッシュで死ぬと
-    台帳が残るので、記録された PID のうち「まだ生きていて、かつこのパッケージ由来に見える
-    （pid_looks_like_ours）」ものだけをプロセスグループごと止める。無関係なプロセス
-    （PID 再利用等）には手を出さない。処理後は台帳を空にし、停止した PID の一覧を返す。
-    ポート単位の後追い回収（reclaim_stale_workers）はこれの backstop として残る。
-    """
-    with _WORKERS_FILE_LOCK:
-        entries = _load_workers_unlocked()
-        _save_workers_unlocked([])
-    victims = [
-        e["pid"] for e in entries
-        if isinstance(e.get("pid"), int) and pid_looks_like_ours(e["pid"])
-    ]
-    # stop_pid は 1 件あたり最長 ~10s 待つため並列に止める。
-    threads = [threading.Thread(target=stop_pid, args=(pid,)) for pid in victims]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-    return victims
-
-
-# --- 子プロセスの親への繋留（tether） -----------------------------------------
-# デーモンだけが書き込み端を握るパイプ。ワーカーは読み取り端を継承し、EOF（＝デーモンの
-# 死。kill -9 でも OS が確実に閉じる）を検知したら自分のグループごと終了する（tether.py）。
-_TETHER_READ_FD: int | None = None
-_TETHER_WRITE_FD: int | None = None
-
-
-def enable_child_tethering() -> None:
-    """以後の LocalServer.start が起動するワーカーをこのプロセスへ繋留する（POSIX のみ）。
-
-    デーモン（run_gateway）が起動時に 1 回呼ぶ。書き込み端はこのプロセスが生きている間
-    ずっと握り続ける——閉じることが「死の通知」なので、明示的な close はどこにも要らない
-    （プロセス終了時に OS が閉じる。os.pipe は CLOEXEC なので自動更新の execv でも閉じるが、
-    その時点でワーカーは全て停止済み）。Windows は対象外（0a の起動時掃除が受け皿）。
-    """
-    global _TETHER_READ_FD, _TETHER_WRITE_FD
-    if not _POSIX or _TETHER_READ_FD is not None:
-        return
-    _TETHER_READ_FD, _TETHER_WRITE_FD = os.pipe()
-
-
-def _read_lock_pid(path: str) -> int | None:
-    """ロックファイルに保持者が書き込んだ PID を読む（読めなければ None）。"""
-    try:
-        with open(path, encoding="utf-8") as fh:
-            return int(fh.read().strip())
-    except (OSError, ValueError):
-        return None
-
-
-class GatewayLock:
-    """ゲートウェイの単一起動を保証する OS レベルの排他ロック（flock / msvcrt）。
-
-    プロセス生存中だけ握る advisory ロック。プロセスが（クラッシュ・SIGKILL 含め）終われば
-    OS が自動解放するので、古い PID ファイルが残っても stale ロックにはならない（＝手動の
-    生存判定が要らない）。`acquire()` は取得できなければ `GatewayAlreadyRunning` を投げる。
-    """
-
-    def __init__(self, path: str | None = None) -> None:
-        self._path = path or gateway_lock_path()
-        self._fd: int | None = None
-
-    def acquire(self) -> "GatewayLock":
-        os.makedirs(os.path.dirname(self._path) or ".", exist_ok=True)
-        fd = os.open(self._path, os.O_RDWR | os.O_CREAT, 0o644)
-        try:
-            _flock_exclusive_nb(fd)
-        except OSError as exc:  # 既に他プロセスが握っている（EWOULDBLOCK 等）
-            pid = _read_lock_pid(self._path)
-            os.close(fd)
-            raise GatewayAlreadyRunning(pid, self._path) from exc
-        # 取得できた → 自分の PID を記録（失敗した取得者がこれを読んで相手を示す）。
-        # Windows のロックは番兵オフセットへ seek した状態なので、書き込み前に必ず先頭へ戻す。
-        try:
-            os.lseek(fd, 0, os.SEEK_SET)
-            os.ftruncate(fd, 0)
-            os.write(fd, f"{os.getpid()}\n".encode())
-        except OSError:
-            pass  # PID 記録は best-effort（ロック自体は取れている）
-        self._fd = fd
-        return self
-
-    def release(self) -> None:
-        """ロックを解放する（プロセス終了時にも OS が自動解放するが明示的に返す）。
-
-        ファイル自体は消さない（消すと「解放→別プロセスが再作成」の隙に取り違えが起きる）。
-        残った PID は次の取得失敗時にしか読まれず、その時は必ず生きた保持者が上書き済み。
-        """
-        if self._fd is not None:
-            fd, self._fd = self._fd, None
-            try:
-                _flock_unlock(fd)
-            except OSError:
-                pass
-            finally:
-                os.close(fd)
-
-    def __enter__(self) -> "GatewayLock":
-        return self.acquire()
-
-    def __exit__(self, *_exc) -> None:
-        self.release()
-
-
-# --- プラットフォーム別のファイルロック実装 -----------------------------------
-# POSIX は fcntl.flock、Windows は msvcrt.locking を使う。どちらも「他プロセスが
-# 握っていれば即エラー（非ブロッキング）」で、プロセス終了時に OS が自動解放する。
-#
-# Windows の msvcrt.locking は POSIX の flock（advisory）と違い**強制ロック**で、
-# ロックした領域は他ハンドルからの読み書きもブロックされる。そのため保持者 PID は
-# ファイル先頭に書き、ロックは PID データと重ならない**高オフセットの番兵 1 バイト**に掛ける
-# （EOF を越えた領域もロック可）。こうすれば _read_lock_pid が先頭の PID を普通に読める。
-_LOCK_SENTINEL_OFFSET = 1 << 30  # 1 GiB 目。PID 文字列（先頭数バイト）と絶対に重ならない
-if os.name == "nt":  # pragma: no cover - Windows 専用パス
-    import msvcrt
-
-    def _flock_exclusive_nb(fd: int) -> None:
-        os.lseek(fd, _LOCK_SENTINEL_OFFSET, os.SEEK_SET)
-        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
-
-    def _flock_unlock(fd: int) -> None:
-        os.lseek(fd, _LOCK_SENTINEL_OFFSET, os.SEEK_SET)
-        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
-else:
-    import fcntl
-
-    def _flock_exclusive_nb(fd: int) -> None:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-
-    def _flock_unlock(fd: int) -> None:
-        fcntl.flock(fd, fcntl.LOCK_UN)
-
-
-def local_connect_host(bind_host: str) -> str:
-    """bind 用ホストから、同一マシンでの自己接続に使うホストを求める。
-
-    0.0.0.0 / :: / 空（ワイルドカード bind）は、そのアドレス宛の直接接続が不可搬なため
-    （特に macOS）ループバック 127.0.0.1 で叩く。特定 IP に bind したときはその IP をそのまま
-    使う。TUI/CLI の状態確認・ヘルスチェックなど「自分自身のゲートウェイ」への接続に使う。
-    """
-    if bind_host in ("0.0.0.0", "::", "", "*"):
-        return "127.0.0.1"
-    return bind_host
-
-
-def primary_lan_ip() -> str | None:
-    """このマシンの主要な LAN IP（外向きインターフェースのアドレス）。取得不能なら None。
-
-    実際には通信せず、UDP ソケットの接続先選択でルーティング表からローカル側 IP を得る
-    （リモートのクライアントが指す base_url を案内するために使う）。
-    """
-    import socket
-
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(("8.8.8.8", 80))  # 実送信はしない。ローカル側アドレスの決定だけ
-        return s.getsockname()[0]
-    except OSError:
-        return None
-    finally:
-        s.close()
-
-
-def server_status(host: str = "127.0.0.1", port: int = 8799) -> dict | None:
-    """ポートで動いているローカルサーバーの状態をまとめて返す（TUI の状態表示用）。
-
-    応答もせず LISTEN しているプロセスも無ければ None。応答可否・PID 一覧・提供モデル・
-    ログパス（存在すれば）を1つの dict にまとめる。PID は POSIX で lsof が使えるときのみ
-    （取得不能でも応答していれば ready=True で報告する）。
-    """
-    base_url = f"http://{host}:{port}/v1"
-    ready = is_ready(base_url)
-    pids = find_pids_on_port(port)
-    if not ready and not pids:
-        return None
-    log = daemon_log_path(port)
-    return {
-        "host": host,
-        "port": port,
-        "base_url": base_url,
-        "ready": ready,
-        "pids": pids,
-        "models": list_models(base_url) if ready else [],
-        "log_path": log if os.path.exists(log) else None,
-    }
-
-
-def _admin_request(
-    path: str,
-    host: str,
-    port: int,
-    timeout: float,
-    body: dict | None = None,
-) -> dict | None:
-    """ゲートウェイの /admin/* を叩く共通口（body があれば POST、無ければ GET）。
-
-    gateway_admin_status / gateway_set_max_resident / gateway_drain が共有する。
-    応答しない・非 200・JSON でない場合はすべて None（呼び出し側は「未起動 or 旧版」として
-    フォールバックする）——エンドポイントごとに例外の意味を変えないことで、呼び出し側の
-    分岐を「dict か None か」だけにしている。
-    """
-    url = f"http://{host}:{port}{path}"
-    if body is None:
-        req: urllib.request.Request | str = url
-    else:
-        req = urllib.request.Request(
-            url,
-            data=json.dumps(body).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            if resp.status != 200:
-                return None
-            data = json.loads(resp.read().decode("utf-8"))
-    except (urllib.error.URLError, OSError, ValueError):
-        return None
-    return data if isinstance(data, dict) else None
-
-
-def gateway_admin_status(
-    host: str = "127.0.0.1", port: int = 8799, timeout: float = 2.0
-) -> dict | None:
-    """ゲートウェイの GET /admin/status を取得する（常駐モデルのライブ状態＋運用方針）。
-
-    server_status と違い、各モデルの loaded / inflight（処理中数）や max_resident /
-    idle_timeout までゲートウェイ本体から取得できる（→ TUI 監視用）。応答しない・旧版で
-    エンドポイントが無い場合は None を返す（呼び出し側は server_status にフォールバックできる）。
-    """
-    return _admin_request("/admin/status", host, port, timeout)
-
-
-def bench_model(
-    model: str,
-    base_url: str = "http://127.0.0.1:8799/v1",
-    *,
-    api_key: str | None = None,
-    max_tokens: int = 128,
-    timeout: float = 180.0,
-) -> dict:
-    """モデルに短文生成を投げ、生成スループット（tok/s）を測る（チューニング効果の確認用）。
-
-    非ストリームで `max_tokens` トークンを生成させ、応答の usage.completion_tokens を
-    実測秒数で割る。初回はモデルロード込みなので、TUI 側は「2 回目」を測るとよい。
-    戻り値: {"model", "tokens", "seconds", "tok_per_s"}。失敗は RuntimeError。
-    """
-    body = json.dumps({
-        "model": model,
-        "messages": [{"role": "user",
-                      "content": "Write a short story about the sea."}],
-        "max_tokens": max_tokens,
-        "temperature": 0.0,
-        "stream": False,
-    }).encode("utf-8")
-    headers = {"Content-Type": "application/json"}
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-    req = urllib.request.Request(f"{base_url}/chat/completions", data=body,
-                                 headers=headers)
-    t0 = time.monotonic()
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-    except (urllib.error.URLError, OSError, ValueError) as exc:
-        raise RuntimeError(f"bench request failed: {exc}") from exc
-    seconds = time.monotonic() - t0
-    tokens = int((data.get("usage") or {}).get("completion_tokens") or 0)
-    tps = tokens / seconds if seconds > 0 else 0.0
-    return {"model": model, "tokens": tokens, "seconds": round(seconds, 2),
-            "tok_per_s": round(tps, 1)}
-
-
-def gateway_set_max_resident(
-    value: int | None,
-    host: str = "127.0.0.1",
-    port: int = 8799,
-    timeout: float = 5.0,
-) -> dict | None:
-    """稼働中のゲートウェイに POST /admin/config で max_resident を変更させる（TUI 操作用）。
-
-    value は 1 以上の整数、または None（無制限）。稼働中（busy）のモデルは止めず、超過分は
-    サーバー側でアイドルから順に非同期退避される（＝更新でリクエストが止まらない）。反映後の
-    値を含む応答 dict を返す。応答しない・エラー時は None（呼び出し側が失敗として扱う）。
-    """
-    return _admin_request(
-        "/admin/config", host, port, timeout, body={"max_resident": value}
-    )
-
-
-def gateway_drain(
-    enable: bool = True,
-    host: str = "127.0.0.1",
-    port: int = 8799,
-    timeout: float = 5.0,
-) -> dict | None:
-    """稼働中のゲートウェイに POST /admin/drain で再起動準備を要求する（TUI の自動更新用）。
-
-    enable=True: ゲートウェイが原子的に「処理中 0・在席 0」を確認し、満たせば新規受付を
-    止めて {"draining": True} を返す。busy なら {"draining": False, "inflight": n,
-    "sessions": n}（何も変えない）。enable=False で解除。応答しない（未起動・旧版で
-    エンドポイントが無い）ときは None。
-    """
-    return _admin_request("/admin/drain", host, port, timeout, body={"enable": enable})
-
-
-def gateway_log_path(port: int) -> str:
-    """バックグラウンド起動したゲートウェイ本体（公開ポート）の出力ログ保存先。
-
-    モデルサーバーの daemon_log_path（server-<port>.log）と別に、ゲートウェイ自身の
-    起動ログを gateway-<port>.log に逃がす（`gw log` が参照する）。場所は `log_dir()` の
-    固定パス —— cwd 非依存なので、CLI がどこから実行されてもデーモンが書く場所と一致する。
-    """
-    return os.path.join(log_dir(), f"gateway-{port}.log")
-
-
-# ログを残す世代数（Ollama の LogRotationCount と同じ 5）。
-LOG_ROTATION_COUNT = 5
-
-
-def rotate_log(path: str, keep: int = LOG_ROTATION_COUNT) -> None:
-    """`x.log` を `x-1.log` へ押し出し、keep 世代を超えた分を捨てる（Ollama 方式）。
-
-    追記のみだと際限なく伸びるので、**起動のたびに**世代を繰り上げる。サイズ監視はしない
-    ——書かれるのは起動・停止・モデルのロード/破棄といったイベント行だけで、リクエスト
-    ごとには書かないため、世代数の上限だけで十分に頭打ちになる。
-    ローテーションに失敗しても起動は止めない（そのまま追記に落ちるだけ）。
-    """
-    if keep < 1 or not os.path.exists(path):
-        return
-    root, ext = os.path.splitext(path)
-    try:
-        oldest = f"{root}-{keep}{ext}"
-        if os.path.exists(oldest):
-            os.remove(oldest)
-        for i in range(keep - 1, 0, -1):
-            src = f"{root}-{i}{ext}"
-            if os.path.exists(src):
-                os.replace(src, f"{root}-{i + 1}{ext}")
-        os.replace(path, f"{root}-1{ext}")
-    except OSError:
-        pass
-
-
-def prune_server_logs(directory: str | None = None, keep: int = LOG_ROTATION_COUNT) -> None:
-    """古い `server-<port>.log` を新しい順に keep 個だけ残して削除する。
-
-    モデルサーバーのログはポート番号がファイル名に入る（`daemon_log_path`）ので、
-    ゲートウェイ本体のように世代を押し出せない——ポートが変わるたびに**別ファイルが増える**。
-    そこで世代管理ではなく「新しい順に keep 個」で頭打ちにする。呼ぶのは**ゲートウェイ起動時
-    だけ**：この時点ではモデルサーバーは 1 つも走っておらず、書き込み中のログを消す危険がない。
-    """
-    directory = directory or log_dir()
-    try:
-        logs = [
-            os.path.join(directory, n)
-            for n in os.listdir(directory)
-            if n.startswith("server-") and n.endswith(".log")
-        ]
-        # mtime の新しい順。keep 個より後ろ（古い方）を落とす。
-        for stale in sorted(logs, key=os.path.getmtime, reverse=True)[keep:]:
-            os.remove(stale)
-    except OSError:
-        pass
-
-
-def start_gateway_background(
-    cwd: str,
-    host: str = "127.0.0.1",
-    port: int = 8799,
-    *,
-    start_timeout: float = 120.0,
-) -> int:
-    """ゲートウェイをデタッチした別プロセスで常駐起動し、応答可能になるまで待つ。
-
-    ターミナルを占有しない常駐起動（Ollama 流）。cwd の ./gateway.toml を読む
-    ヘッドレスワーカー（`python -m local_llm_server` = __main__）を、新セッション（POSIX）/
-    DETACHED_PROCESS（Windows）で起動して端末・親から切り離し、出力は gateway_log_path に
-    逃がす。応答可能になったら PID を返す。既に起動済みなら何もせず既存 PID（不明なら 0）を返す。
-    起動失敗は RuntimeError、時間内に応答しなければ TimeoutError。
-    """
-    base_url = f"http://{host}:{port}/v1"
-    existing = find_pids_on_port(port)
-    if is_ready(base_url):
-        return existing[0] if existing else 0
-    if existing:
-        # ポートは埋まっているのに応答しない。うちのプロセス（起動途中など）なら既存扱い、
-        # 無関係なプロセスなら「起動済み」と偽らず明示エラーにする（黙って成功を返すと
-        # ゲートウェイが一度も立たないまま全リクエストが失敗し続ける）。
-        if any(pid_looks_like_ours(p) for p in existing):
-            return existing[0]
-        raise RuntimeError(
-            f"port {port} is in use by an unrelated process (pid {existing}) that does not "
-            f"respond as a gateway; stop it or change `port` in gateway.toml"
-        )
-
-    # ログは log_dir() の固定パス（cwd 非依存）。デーモンの cwd（設定のある場所）が
-    # どこでも同じ場所に書く——起動したディレクトリに ./.local-llm-server を作らない。
-    log_path = gateway_log_path(port)
-    os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
-    # 起動のたびに世代を繰り上げ、併せて古いモデルサーバーのログも刈る（ここが唯一の
-    # 「モデルサーバーが 1 つも走っていない」と言える地点）。
-    rotate_log(log_path)
-    prune_server_logs()
-    log_file = open(log_path, "a", encoding="utf-8")
-    popen_kwargs: dict = {
-        "cwd": cwd,
-        "stdin": subprocess.DEVNULL,
-        "stdout": log_file,
-        "stderr": subprocess.STDOUT,
-        # 正規 spawn の内部マーク。__main__ はこれが無い直接の `python -m local_llm_server`
-        # を拒否する（起動の入口を `gw start` の 1 本に固定する）。
-        "env": {**os.environ, "LOCAL_LLM_GW_LAUNCHER": "cli"},
-    }
-    if os.name == "nt":
-        # 端末から切り離し、新プロセスグループにする（stop の taskkill /T と対）。
-        popen_kwargs["creationflags"] = (
-            subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
-        )
-    else:
-        popen_kwargs["start_new_session"] = True  # setsid: 端末/親から独立
-    try:
-        # ヘッドレスワーカー（__main__）を起動。裏起動は出力をログへ逃がす非 TTY なので
-        # TUI を出さずゲートウェイ本体だけを回す。
-        proc = subprocess.Popen(
-            [sys.executable, "-m", "local_llm_server"], **popen_kwargs
-        )
-    finally:
-        log_file.close()  # fd は子へ複製済み。親側は閉じてよい
-    deadline = time.monotonic() + start_timeout
-    while time.monotonic() < deadline:
-        if proc.poll() is not None:
-            raise RuntimeError(
-                f"gateway exited early (code {proc.returncode}); see {log_path}"
-            )
-        if is_ready(base_url):
-            return proc.pid
-        time.sleep(0.5)
-    raise TimeoutError(f"gateway not ready within {start_timeout:g}s; see {log_path}")

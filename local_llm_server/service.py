@@ -49,9 +49,9 @@ def gw_executable() -> str:
         path = os.path.abspath(argv0)
         if os.access(path, os.X_OK):
             return path
-    path = shutil.which("gw")
-    if path:
-        return os.path.abspath(path)
+    resolved = shutil.which("gw")
+    if resolved:
+        return os.path.abspath(resolved)
     raise RuntimeError(
         "gw 実行ファイルが見つかりません。`make install` で導入してから gw enable してください"
     )

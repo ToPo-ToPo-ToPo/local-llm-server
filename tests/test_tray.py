@@ -39,10 +39,12 @@ def test_icon_is_static_with_no_periodic_work():
     import re
     open_body = re.search(r"def menuWillOpen_.*?(?=\n        def )", src, re.S).group(0)
     assert "gateway_admin_status" not in open_body  # 開く動作は取得を待たない
-    # 開いているメニューは触らない: 開いたメニューを作り直すとクリックを飲み込む（実測）。
-    # 非同期からメニューを差し替える applyStatus: 経路が復活したら落ちる。
+    # 開いているメニューは作り直さない: removeAllItems はクリックを飲み込む（実測）。
+    # 更新項目だけは in-place で反映し、初回確認に二度の操作が要らないようにする。
     assert "applyStatus" not in src
-    assert "performSelectorOnMainThread" in src  # showUpdateMark（ボタン題字）だけには使う
+    assert "applyUpdateState_" in src
+    assert "refresh_updates=True" in src
+    assert "performSelectorOnMainThread" in src  # ボタン題字・更新項目はメインスレッドで触る
     # 自動有効化を切る（既定 True だとアクション項目まで無効化されクリック無反応・実測）。
     # 情報行は明示 disabled。これらが欠けたらクリックが死ぬので回帰ガードにする。
     assert "setAutoenablesItems_(False)" in src

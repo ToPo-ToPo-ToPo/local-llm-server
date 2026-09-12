@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 import io
+import pytest
 
 from PIL import Image
 
@@ -72,10 +73,34 @@ def test_top_level_images_dict_url():
     assert max(_dims_of_data_url(payload["images"][0]["url"])) == 1568
 
 
-def test_remote_url_untouched():
+def test_remote_url_is_fetched_and_replaced(monkeypatch):
+    raw = base64.b64decode(_data_url(400, 300).split(",", 1)[1])
+    monkeypatch.setattr(image.net_safety, "fetch_remote", lambda *_a, **_k: raw)
     payload = {"messages": [{"role": "user", "content": [
         {"type": "image_url", "image_url": {"url": "https://example.com/x.png"}}]}]}
-    assert image.downscale_image_parts(payload, 1568) is False
+    assert image.downscale_image_parts(payload, 1568) is True
+    assert payload["messages"][0]["content"][0]["image_url"]["url"].startswith("data:image/png")
+
+
+def test_private_remote_image_is_rejected(monkeypatch):
+    monkeypatch.setattr(
+        image.net_safety.socket, "getaddrinfo",
+        lambda *_a, **_k: [(2, 1, 6, "", ("169.254.169.254", 80))],
+    )
+    payload = {"messages": [{"role": "user", "content": [
+        {"type": "image_url", "image_url": {"url": "http://metadata.local/secret"}}]}]}
+    with pytest.raises(image.ImageError):
+        image.downscale_image_parts(payload, 1568)
+
+
+def test_remote_non_image_is_rejected(monkeypatch):
+    monkeypatch.setattr(
+        image.net_safety, "fetch_remote", lambda *_a, **_k: b"<html>not an image</html>",
+    )
+    payload = {"messages": [{"role": "user", "content": [
+        {"type": "image_url", "image_url": {"url": "https://example.com/x"}}]}]}
+    with pytest.raises(image.ImageError, match="supported image"):
+        image.downscale_image_parts(payload, 1568)
 
 
 def test_disabled_when_max_edge_zero():

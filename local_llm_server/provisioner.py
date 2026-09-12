@@ -18,6 +18,7 @@ PATH は汚さない。PATH に既に llama-server があるなら `provision = 
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import platform
 import re
@@ -32,6 +33,7 @@ _REPO = "ggml-org/llama.cpp"
 _RELEASES_API = f"https://api.github.com/repos/{_REPO}/releases"
 # Releases のダウンロード URL。<build> はタグ（例 "b9946"）、<name> はアセット名。
 _DL_URL = f"https://github.com/{_REPO}/releases/download/{{build}}/{{name}}"
+_MAX_ARCHIVE_BYTES = 4 * 1024 * 1024 * 1024
 
 # llama-server 実行ファイル名（OS 依存）。
 _EXE = "llama-server.exe" if os.name == "nt" else "llama-server"
@@ -195,11 +197,67 @@ def _find_llama_server(root: str) -> str | None:
 
 
 def _download(url: str, dest: str, timeout: float = 300.0) -> None:
-    """url を dest へダウンロードする（親ディレクトリは作成）。"""
+    """url を容量上限付きで dest へダウンロードする。"""
     os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
     req = urllib.request.Request(url, headers={"User-Agent": "local-llm-server"})
     with urllib.request.urlopen(req, timeout=timeout) as resp, open(dest, "wb") as fh:
-        shutil.copyfileobj(resp, fh)
+        raw_length = resp.headers.get("Content-Length")
+        if raw_length:
+            try:
+                declared = int(raw_length)
+            except ValueError as exc:
+                raise ProvisionError("llama.cpp archive has invalid Content-Length") from exc
+            if declared < 0 or declared > _MAX_ARCHIVE_BYTES:
+                raise ProvisionError("llama.cpp archive is unexpectedly large")
+        copied = 0
+        while True:
+            chunk = resp.read(min(1024 * 1024, _MAX_ARCHIVE_BYTES + 1 - copied))
+            if not chunk:
+                break
+            copied += len(chunk)
+            if copied > _MAX_ARCHIVE_BYTES:
+                raise ProvisionError("llama.cpp archive is unexpectedly large")
+            fh.write(chunk)
+
+
+def _asset_digest(build: str, name: str, timeout: float = 10.0) -> str:
+    """GitHub Release API が公開するアセットの sha256 digest を取得する。"""
+    req = urllib.request.Request(
+        f"{_RELEASES_API}/tags/{build}",
+        headers={"Accept": "application/vnd.github+json", "User-Agent": "local-llm-server"},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        release = json.load(resp)
+    for asset in release.get("assets", []):
+        if asset.get("name") == name:
+            digest = asset.get("digest")
+            if isinstance(digest, str) and digest.startswith("sha256:"):
+                return digest.removeprefix("sha256:").lower()
+            break
+    raise ProvisionError(f"llama.cpp release asset {name} に sha256 digest がありません")
+
+
+def _verify_digest(path: str, expected: str) -> None:
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+    actual = digest.hexdigest()
+    if actual != expected.lower():
+        raise ProvisionError(
+            f"llama.cpp archive の sha256 が一致しません（expected {expected}, got {actual}）"
+        )
+
+
+def _safe_archive_path(dest: str, name: str) -> str:
+    normalized = name.replace("\\", "/")
+    if normalized.startswith("/") or any(p == ".." for p in normalized.split("/")):
+        raise ProvisionError(f"archive contains unsafe path: {name}")
+    target = os.path.realpath(os.path.join(dest, normalized))
+    root = os.path.realpath(dest)
+    if os.path.commonpath((root, target)) != root:
+        raise ProvisionError(f"archive path escapes destination: {name}")
+    return target
 
 
 def _extract(archive: str, dest: str) -> None:
@@ -207,15 +265,24 @@ def _extract(archive: str, dest: str) -> None:
     os.makedirs(dest, exist_ok=True)
     if archive.endswith(".zip"):
         with zipfile.ZipFile(archive) as zf:
-            zf.extractall(dest)
+            for zip_member in zf.infolist():
+                _safe_archive_path(dest, zip_member.filename)
+                mode = zip_member.external_attr >> 16
+                if (mode & 0o170000) == 0o120000:
+                    raise ProvisionError(f"archive contains a symbolic link: {zip_member.filename}")
+            zf.extractall(dest)  # nosec B202 - 全memberを直前に検証済み
     else:
         with tarfile.open(archive) as tf:
-            # filter="data" はパストラバーサル等を弾く（信頼できない DL 物の安全な展開）。
-            # Python 3.12+ で追加。古い版では TypeError になるのでフォールバックする。
+            members = tf.getmembers()
+            for tar_member in members:
+                _safe_archive_path(dest, tar_member.name)
+                if tar_member.issym() or tar_member.islnk() or tar_member.isdev():
+                    raise ProvisionError(f"archive contains an unsafe special entry: {tar_member.name}")
+            # 検証済みでリンク/デバイスを含まないため、3.11を含む全対応Pythonで安全に展開できる。
             try:
-                tf.extractall(dest, filter="data")
-            except TypeError:
-                tf.extractall(dest)
+                tf.extractall(dest, members=members, filter="data")  # nosec B202 - 検証済み
+            except TypeError:  # Python 3.11の古いパッチ版
+                tf.extractall(dest, members=members)  # nosec B202 - リンクを含め全memberを検証済み
 
 
 def _verify(binary: str, timeout: float = 15.0) -> bool:
@@ -241,6 +308,7 @@ def ensure_llama_server(
     build: str | None = None,
     download=_download,
     verify=_verify,
+    asset_digest=None,
 ) -> tuple[str, dict]:
     """起動に使う llama-server の絶対パスと素性 {"build", "accel"} を返す（必要なら自動導入する）。
 
@@ -270,6 +338,9 @@ def ensure_llama_server(
                 f"[llama_cpp] pin でビルド番号を固定すると照会せずに起動できる。"
             ) from exc
 
+    if not isinstance(build, str) or not re.fullmatch(r"b\d+", build):
+        raise ProvisionError(f"llama.cpp build must look like b9946 (got {build!r})")
+
     target = install_dir(build, os_name, arch, accel)
     existing = _find_llama_server(target)
     if existing and verify(existing):
@@ -280,6 +351,11 @@ def ensure_llama_server(
     archive = os.path.join(managed_root(), name)
     try:
         download(url, archive)
+        # 本番のGitHub取得経路はRelease APIのdigestを必須にする。差し替えdownloadは
+        # テスト／社内ミラー用途なので、呼び出し側がproviderを渡した場合だけ検証する。
+        digest_provider = _asset_digest if download is _download else asset_digest
+        if digest_provider is not None:
+            _verify_digest(archive, digest_provider(build, name))
         _extract(archive, target)
     except Exception as exc:  # noqa: BLE001 - まとめて ProvisionError に包む
         raise ProvisionError(

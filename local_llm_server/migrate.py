@@ -88,6 +88,7 @@ def migrate_text(text: str) -> tuple[str, list[str]]:
         key = m.group(2) if m else None
 
         if key in OBSOLETE_KEYS:
+            assert m is not None
             version, why = OBSOLETE_KEYS[key]
             if not _value_is_self_contained(m.group(4)):
                 notes.append(
@@ -104,6 +105,7 @@ def migrate_text(text: str) -> tuple[str, list[str]]:
             continue
 
         if key in RENAMED_KEYS:
+            assert m is not None
             new_key, version = RENAMED_KEYS[key]
             out.append(f"{m.group(1)}{new_key}{m.group(3)}{m.group(4)}")
             notes.append(f"改名: {key} -> {new_key}（{version}）")

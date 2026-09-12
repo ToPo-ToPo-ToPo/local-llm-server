@@ -221,6 +221,16 @@ def test_resolve_drafter_auto_qwen36():
     )
 
 
+def test_topo_qwen36_mtp_pair_and_drafter_hidden():
+    """ToPo-ToPo の Qwen3.6 MLX 3量子化を自作 bf16 MTPへ登録している。"""
+    drafter = "ToPo-ToPo/Qwen3.6-27B-MTP-bf16"
+    for bits in ("4bit", "8bit", "bf16"):
+        target = f"ToPo-ToPo/Qwen3.6-27B-mlx-{bits}"
+        assert MTP_DRAFTERS[target] == drafter
+        assert resolve_drafter(target, "auto") == drafter
+    assert drafter in srv._DRAFTER_REPOS
+
+
 def test_build_command_mlx_no_draft_support(stub_cache):
     # テキスト専用 mlx には MTP を渡さない（mlx-vlm のみ対応）。
     cmd = build_command(ServerConfig("mlx", "m", draft_model="d"))
@@ -527,6 +537,24 @@ def test_local_server_redirects_output_to_log(monkeypatch, tmp_path):
     assert "NOISE" not in out.getvalue() and "NOISE" not in err.getvalue()  # 端末へは出さない
 
 
+def test_local_server_log_directory_failure_leaves_no_partial_state(monkeypatch, tmp_path):
+    from local_llm_server import LocalServer, ServerConfig
+    from local_llm_server import server as srv_mod
+
+    def fail_makedirs(*_a, **_k):
+        raise PermissionError("read-only log directory")
+
+    monkeypatch.setattr(srv_mod.os, "makedirs", fail_makedirs)
+    server = LocalServer(
+        ServerConfig("mlx", "dummy", "127.0.0.1", 9),
+        log_path=str(tmp_path / "logs" / "srv.log"),
+    )
+    with pytest.raises(PermissionError):
+        server.start()
+    assert server.pid is None
+    assert server._log_file is None
+
+
 def test_install_shutdown_handlers_converts_sigterm(monkeypatch):
     # SIGTERM を KeyboardInterrupt に変換して、各エントリポイントの finally（stop）を通す。
     import os
@@ -590,6 +618,147 @@ def test_stop_kills_process_group(tmp_path):
         assert not alive(grand), "grandchild process leaked after stop()"
     finally:
         srv_mod.build_command = orig
+
+
+def test_stop_force_kills_descendant_after_parent_exits(tmp_path, monkeypatch):
+    """A TERM-ignoring grandchild must not survive after its direct parent exits."""
+    import signal
+    import sys
+    import time
+
+    from local_llm_server import server as srv_mod
+
+    if os.name != "posix":
+        pytest.skip("POSIX process-group semantics")
+    pidfile = tmp_path / "stubborn.pid"
+    child_code = (
+        "import signal,time;"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN);"
+        "time.sleep(300)"
+    )
+    parent_code = (
+        "import subprocess,sys,time;"
+        f"p=subprocess.Popen([sys.executable,'-c',{child_code!r}]);"
+        f"open({str(pidfile)!r},'w').write(str(p.pid));"
+        "time.sleep(300)"
+    )
+    monkeypatch.setattr(
+        srv_mod, "build_command", lambda _cfg: [sys.executable, "-c", parent_code]
+    )
+    monkeypatch.setattr(srv_mod, "register_worker", lambda *_a: None)
+    monkeypatch.setattr(srv_mod, "unregister_worker", lambda *_a: None)
+    server = srv_mod.LocalServer(
+        srv_mod.ServerConfig("mlx", "dummy"), str(tmp_path / "worker.log")
+    )
+    server.start()
+    try:
+        for _ in range(100):
+            if pidfile.exists():
+                break
+            time.sleep(0.02)
+        child_pid = int(pidfile.read_text())
+        server.stop(grace=0.1)
+        assert not srv_mod.pid_is_alive(child_pid)
+        assert server._proc is None
+    finally:
+        if server._proc is not None:
+            try:
+                os.killpg(os.getpgid(server._proc.pid), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+def test_stop_keeps_process_and_ledger_when_death_is_unconfirmed(
+    tmp_path, monkeypatch
+):
+    from local_llm_server import server as srv_mod
+
+    class _Proc:
+        pid = 5151
+
+        def poll(self):
+            return None
+
+    server = srv_mod.LocalServer(
+        srv_mod.ServerConfig("mlx", "dummy"), str(tmp_path / "worker.log")
+    )
+    proc = _Proc()
+    server._proc = proc
+    server._log_file = open(server.log_path, "a", encoding="utf-8")
+    removed = []
+    monkeypatch.setattr(srv_mod, "_stop_process_tree", lambda *_a, **_k: False)
+    monkeypatch.setattr(srv_mod, "unregister_worker", removed.append)
+
+    server.stop(grace=0.0)
+
+    assert server._proc is proc
+    assert server._log_file is None
+    assert removed == []
+
+
+def test_stop_during_start_cancels_and_reaps_spawn(tmp_path, monkeypatch):
+    import threading
+    import time
+
+    from local_llm_server import server as srv_mod
+
+    building = threading.Event()
+    allow_spawn = threading.Event()
+
+    def _build(_config):
+        building.set()
+        assert allow_spawn.wait(timeout=5)
+        return ["fake-backend"]
+
+    class _Proc:
+        pid = 5252
+        returncode = None
+
+        def poll(self):
+            return None
+
+    proc = _Proc()
+    monkeypatch.setattr(srv_mod, "build_command", _build)
+    monkeypatch.setattr(srv_mod.subprocess, "Popen", lambda *a, **k: proc)
+    monkeypatch.setattr(srv_mod, "register_worker", lambda *_a: None)
+    removed = []
+    monkeypatch.setattr(srv_mod, "unregister_worker", removed.append)
+    stopped = []
+    monkeypatch.setattr(
+        srv_mod,
+        "_stop_process_tree",
+        lambda p, **_k: stopped.append(p.pid) or True,
+    )
+    server = srv_mod.LocalServer(
+        srv_mod.ServerConfig("mlx", "dummy"), str(tmp_path / "worker.log")
+    )
+    start_errors = []
+
+    def _start():
+        try:
+            server.start()
+        except Exception as exc:  # noqa: BLE001 - asserted below
+            start_errors.append(exc)
+
+    starter = threading.Thread(target=_start)
+    stopper = threading.Thread(target=lambda: server.stop(grace=0.0))
+    starter.start()
+    assert building.wait(timeout=5)
+    stopper.start()
+    for _ in range(100):
+        if server._stop_requested:
+            break
+        time.sleep(0.01)
+    allow_spawn.set()
+    starter.join(timeout=5)
+    stopper.join(timeout=5)
+
+    assert not starter.is_alive() and not stopper.is_alive()
+    assert len(start_errors) == 1
+    assert "cancelled" in str(start_errors[0])
+    assert server._proc is None
+    assert stopped == [5252]
+    assert removed == [5252]
 
 
 def test_find_pids_on_port_filters_to_listener():
@@ -878,6 +1047,77 @@ def test_start_gateway_background_marks_spawn_env(tmp_path, monkeypatch):
     env = calls["kwargs"]["env"]
     assert env["LOCAL_LLM_GW_LAUNCHER"] == "cli"
     assert "PATH" in env  # os.environ を引き継いだ上でマークを足している
+
+
+def test_background_start_timeout_reaps_only_spawned_process(tmp_path, monkeypatch):
+    from local_llm_server import gateway_runtime as runtime
+
+    class _Proc:
+        pid = 4243
+        returncode = None
+
+        def poll(self):
+            return None
+
+    proc = _Proc()
+    monkeypatch.setattr(runtime.subprocess, "Popen", lambda *a, **k: proc)
+    stopped = []
+    clock = iter([0.0, 0.0, 1.0])
+    with pytest.raises(TimeoutError, match="4243"):
+        runtime.start_gateway_background(
+            str(tmp_path),
+            port=18800,
+            start_timeout=0.5,
+            _find_pids=lambda _port: [],
+            _admin_status=lambda *_a: None,
+            _log_path=lambda _port: str(tmp_path / "gateway.log"),
+            _rotate=lambda _path: None,
+            _prune=lambda: None,
+            _ready=lambda _url: False,
+            _stop_spawned=lambda p, **k: stopped.append((p, k)) or True,
+            _sleep=lambda _delay: None,
+            _monotonic=lambda: next(clock),
+        )
+    assert stopped == [(proc, {"grace": 0.0, "kill_timeout": 5.0})]
+
+
+def test_background_start_waits_for_existing_gateway_admin(tmp_path):
+    from local_llm_server import gateway_runtime as runtime
+
+    statuses = iter([None, None, {"pid": 91}])
+    clock = iter([0.0, 0.0, 0.1])
+    pid = runtime.start_gateway_background(
+        str(tmp_path),
+        port=18801,
+        start_timeout=1.0,
+        _find_pids=lambda _port: [91],
+        _admin_status=lambda *_a: next(statuses),
+        _looks_like_gateway=lambda candidate: candidate == 91,
+        _pid_alive=lambda _pid: True,
+        _log_path=lambda _port: str(tmp_path / "gateway.log"),
+        _sleep=lambda _delay: None,
+        _monotonic=lambda: next(clock),
+    )
+    assert pid == 91
+
+
+def test_background_start_does_not_claim_hung_existing_gateway(tmp_path):
+    from local_llm_server import gateway_runtime as runtime
+
+    clock = iter([0.0, 0.0, 1.0])
+    with pytest.raises(TimeoutError, match="existing gateway"):
+        runtime.start_gateway_background(
+            str(tmp_path),
+            port=18802,
+            start_timeout=0.5,
+            _find_pids=lambda _port: [92],
+            _admin_status=lambda *_a: None,
+            _looks_like_gateway=lambda candidate: candidate == 92,
+            _pid_alive=lambda _pid: True,
+            _log_path=lambda _port: str(tmp_path / "gateway.log"),
+            _sleep=lambda _delay: None,
+            _monotonic=lambda: next(clock),
+        )
 
 
 def test_auto_llama_flags_gpu_offloads_all_layers(hf_cache, monkeypatch):

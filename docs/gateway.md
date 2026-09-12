@@ -42,7 +42,8 @@ backend = "mlx-vlm"
 |---|---|---|
 | `host` | `127.0.0.1` | bind ホスト。既定はローカルのみ。別PCから繋ぐなら `"0.0.0.0"`（全IF公開）か特定の IPv4 アドレス。IPv6（`"::"`）は非対応（→ [別PCから接続する](#別pcから接続するネットワーク公開)） |
 | `port` | `8799` | 公開ポート（クライアントの `base_url` はここ） |
-| `api_key` | なし | ネットワーク公開時の認証キー。設定するとクライアントは `Authorization: Bearer <key>` を要求される（省略/空で認証なし） |
+| `api_key` | なし | ネットワーク公開時は必須。クライアントは `Authorization: Bearer <key>` を要求される |
+| `allow_unauthenticated_remote` | `false` | 隔離された信頼済みLANでのみ使う危険なopt-in。`true`なら非loopbackでのAPIキー省略を許可 |
 | `max_resident` | 無制限 | 同時に常駐させるモデル数のハード上限。超過は LRU で退避 |
 | `max_memory_fraction` | なし | 常駐モデルの推定占有量の合計を総RAMのこの割合（`0<x≤1`）に制限。超えるロードは退避→不足なら 503。→ [llama-cpp.md](llama-cpp.md#メモリガードmax_memory_fraction) |
 | `parallel` | なし | 動的ロード時の並列スロット既定（**llama-cpp のみ**。mlx 系は無視）。各 `[[models]]` で上書き。→ [llama-cpp.md](llama-cpp.md#並列スロットparallel) |
@@ -56,9 +57,11 @@ backend = "mlx-vlm"
 | `dynamic` | `true` | 未登録モデルを ID 推論で動的ロードする。`false` で事前登録のみ（旧挙動） |
 | `disable_thinking` | `false` | 動的ロード時の既定。事前登録モデルは各 `[[models]]` の値が優先 |
 | `stream_tool_calls` | `false` | ツール呼び出しの**生成中トークン**を流す（mlx-vlm）。各 `[[models]]` で上書き可。有効化前に、繋ぐクライアントを local-llm-client 0.8 以降に揃えること（下記） |
-| `video_frames` | `8` | **動画入力**で 1 本から等間隔に抜くフレーム数。`video_url` をこの枚数の画像に展開して渡す |
-| `video_max_edge` | `768` | 動画フレームの縮小サイズ（長辺 px）。大きいほど精細だがトークン増 |
-| `image_max_edge` | `1024` | **静止画の長辺上限 px**（`0` で無効）。上流へ渡す前に縮小し、vision トークンの膨張を防ぐ。→ [画像入力の縮小](#画像入力の縮小image_max_edge) |
+| `video_frames` | `8` | **動画入力**で 1 本から等間隔に抜くフレーム数（1〜32）。`video_url` をこの枚数の画像に展開して渡す |
+| `video_max_edge` | `768` | 動画フレームの縮小サイズ（長辺 64〜2048px）。大きいほど精細だがトークン増 |
+| `image_max_edge` | `1024` | **静止画の長辺上限 px**（64〜4096、`0` で無効）。上流へ渡す前に縮小し、vision トークンの膨張を防ぐ。→ [画像入力の縮小](#画像入力の縮小image_max_edge) |
+| `max_request_workers` | `32` | 同時に処理するHTTP接続数。超過は503としてメモリ・スレッド枯渇を防ぐ |
+| `max_media_workers` | `2` | 同時に取得・展開する画像／動画数 |
 | `[llama_cpp]` | 全自動 | `llama-server` の自動導入テーブル。`accel`（auto/cuda/vulkan/metal/cpu）・`pin`（ビルド番号）。導入方法の選択肢は無い（常に自動導入）。→ [llama-cpp.md](llama-cpp.md#自動導入llama_cpp) |
 
 `[[models]]` は 1 モデル 1 エントリ。`model`（HuggingFace ID）と `backend`（`mlx` / `mlx-vlm` /
@@ -106,9 +109,9 @@ backend = "mlx-vlm"
   （このパッケージ由来と判定できるものだけ）を、新しいワーカーを起動する直前に停止して回収する。
   ポート衝突による起動失敗（502）と、孤児が GPU メモリを掴んだままになる無駄を防ぐ。**無関係な
   別プロセス・ゲートウェイ自身には一切手を出さない**。
-- **単一起動（1 マシン 1 ゲートウェイ）**: 起動時に OS レベルの排他ロック（`flock`）を取り、
+- **単一起動（1 マシン 1 ゲートウェイ）**: 起動時に OS レベルの排他ロックを取り、
   既にゲートウェイが動いていれば **2 個目を立てずに明示エラーで終了する**（終了コード 3、保持者の
-  PID をログに出す）。ロックは **cwd 非依存の固定パス**（temp ディレクトリ）なので、別ディレクトリや
+  PID をログに出す）。ロックは **cwd 非依存の固定パス**（ユーザー別の0700 tempディレクトリ）なので、別ディレクトリや
   別ポートから起動しても束ねられる（開発ツール等が裏で勝手に起動しても乱立しない）。ロックは
   プロセス生存中だけ握り、クラッシュ・`kill` を含む終了で OS が自動解放するため stale にならない。
 - **画像入力の縮小（`image_max_edge`）**: 長辺がこの px を超える画像は、上流へ渡す前に縮小する
@@ -120,7 +123,7 @@ backend = "mlx-vlm"
   `max_resident`・`request_timeout`・`idle_timeout`・`load_timeout`・`api_key`
   と動的ロードの既定（`draft_model`・`parallel`・`disable_thinking`・`max_memory_fraction`・
   `dynamic`・`start_timeout`）。動的ロード既定は**次回ロードから**有効。一方 `host`・`port`・
-  `internal_base_port`・`[[models]]` はソケット bind 済み等で稼働中に変えられないため、変更を
+  `internal_base_port`・`[[models]]`・`max_request_workers`・`max_media_workers`・`tray` はソケット bind 済み等で稼働中に変えられないため、変更を
   検知しても**適用せず「要再起動」をログ警告**する（サーバーは旧値のまま動き続ける）。編集途中の
   不正な TOML は無視して現行設定を維持する。反映内容は標準エラー（`gw log` で見えるログ）に出る。
   → [ホットリロードの反映範囲](#ホットリロードの反映範囲)
@@ -144,7 +147,8 @@ MTP（speculative decoding）による高速化は [mtp.md](mtp.md) を参照。
 - **モデル ID**: whisper 系の mlx repo（例 `mlx-community/whisper-large-v3-turbo`、
   `mlx-community/whisper-large-v3-mlx`、`kaiinui/kotoba-whisper-v2.0-mlx`）。ID に `whisper` /
   `parakeet` を含めば動的ロードで自動的に whisper バックエンドへ振り分けられる。
-- **要件**: 音声デコードに **ffmpeg CLI**（PATH 上）が要る（`brew install ffmpeg`）。本体重みは他の
+- **要件**: 音声デコードに ffmpeg を使う。PATH 上のシステム版を優先し、無ければ
+  依存の `imageio-ffmpeg` 同梱版を使うため、macOS/Linux/Windows とも別途導入は必須ではない。本体重みは他の
   mlx 同様に事前 DL 必須（`hf download <repo>`。ゲートウェイは `HF_HUB_OFFLINE=1` で起動するため、
   未取得だとロード時にエラー）。
 
@@ -176,9 +180,10 @@ OpenAI SDK からもそのまま使える（`client.audio.transcriptions.create(
 桁で遅いので、画像 1 枚で数十秒待つことになる。長辺を縮めるとトークン数はおおむね比例して減り、
 応答時間もそれに追随する（縮小の効果は自分の環境で実測して決めること）。
 
-- 対象は **data URL**（`data:image/...;base64,...`）と、トップレベル `images=[...]` の base64。
-- **リモート URL（http/https）は対象外** —— 上流が自分で取得するため。ゲートウェイが代理取得すると
-  SSRF やプライバシーの別問題が出るので、あえて触らない。
+- 対象は **data URL**（`data:image/...;base64,...`）、トップレベル `images=[...]` の base64、
+  および **リモート URL（http/https）**。リモート画像は公開IPだけにDNS固定し、
+  リダイレクトも再検査、32 MiB上限で1回だけ取得して data URL に置き換える。
+  これにより上流バックエンドの再取得と SSRF（loopback/プライベート/リンクローカル）を防ぐ。
 - 壊れた画像・未対応形式・Pillow 未導入は**素通し**（縮小が効かないだけで、リクエストは通る）。
 - 動画フレームの展開（`video_max_edge`）の**後**に走るので、抽出済みフレームは既に小さく無変更。
 - ホットリロード対応（保存した瞬間に反映）。
@@ -295,7 +300,7 @@ git push origin v<新バージョン>
 |---|---|---|
 | **即時反映（ポリシー）** | `default_model`, `image_max_edge`, `max_resident`, `request_timeout`, `idle_timeout`, `load_timeout`, `api_key` | 保存した瞬間に有効 |
 | **次回ロードから（動的既定）** | トップレベルの `draft_model`, `parallel`, `disable_thinking`, `stream_tool_calls`, `max_memory_fraction`, `dynamic`, `start_timeout` | 既にロード済みのモデルは次にロードし直すまで旧設定のまま |
-| **要再起動（構造）** | `host`, `port`, `internal_base_port`, `[[models]]` | 稼働中は変えられない（ソケット bind 済み・内部ポート割当は起動時固定）。変更を検知しても**適用せず「要再起動」をログ警告**し、旧値のまま動き続ける |
+| **要再起動（構造）** | `host`, `port`, `internal_base_port`, `[[models]]`, `max_request_workers`, `max_media_workers`, `tray` | 稼働中は変えられない（ソケット bind 済み等）。変更を検知しても**適用せず「要再起動」をログ警告**し、旧値のまま動き続ける |
 
 - `max_resident` の即時反映は `POST /admin/config` と同じ挙動（**busy は止めず、超過アイドルのみ非同期
   LRU 退避**。→ [max_resident をライブで変える](#max_resident-をライブで変える)）。
@@ -320,9 +325,9 @@ git push origin v<新バージョン>
 1. **ネットワークに bind する** — `gateway.toml` で `host = "0.0.0.0"`（全インターフェース）にする。
    起動ログ（`gw log`）に、リモートのクライアントが指す
    `reachable from LAN: http://<このPCのIP>:8799/v1` が表示される。
-2. **API キーを設定する（推奨）** — `api_key = "<長めのランダム文字列>"` を設定する。クライアントは
-   リクエストに `Authorization: Bearer <key>` を付ける必要があり、無い/不一致なら **401**。未設定なら認証
-   なし（＝LAN 上の誰でも叩ける）。
+2. **API キーを設定する（必須）** — `api_key = "<長めのランダム文字列>"` を設定する。クライアントは
+   リクエストに `Authorization: Bearer <key>` を付ける必要があり、無い/不一致なら **401**。隔離済みLANで
+   意図的に無認証にする場合だけ `allow_unauthenticated_remote = true` を併記する。
 3. **クライアント側** — 各クライアントの `base_url` を `http://<ゲートウェイPCのIP>:8799/v1` にし、API キーを
    設定していれば `Authorization: Bearer <key>` を送るようにする（OpenAI 互換クライアントの `api_key`
    相当）。
@@ -333,15 +338,16 @@ git push origin v<新バージョン>
 
 - **内部のモデルサーバーは常に `127.0.0.1` のまま**で、外部に晒されない。公開されるのは公開ポート
   （ゲートウェイ）だけ。
-- **`/admin/status` と `/admin/config`（状態・設定変更・複製制御）は同一マシン限定**（ループバック、
+- **`/admin/status` / `/admin/config` / `/admin/drain` / `/admin/update` は同一マシン限定**（ループバック、
   または特定 IP に bind した場合はその IP からの自己接続も可）。リモートからは **403**。
   `max_resident` の変更や状態監視はゲートウェイPC本体（`gw` CLI）からだけ行える。
+- ブラウザ経由のリクエストは Host / Origin / `Sec-Fetch-Site` も検査し、DNS rebinding と
+  cross-site の管理操作を拒否する。
 - **chat（`/v1/*`）と在席セッション（`/admin/sessions/*`）は API キーで保護**（設定時）。在席セッションは
   クライアントプロトコルの一部なのでリモートからも使えるが、キーが要る。
 - API キーの比較はタイミング安全（`hmac.compare_digest`）。キーはログに出さない。
 
-> 公開（`host` が非ループバック）かつ `api_key` 未設定のときは、起動時に**警告**を出す。信頼できる閉じた
-> LAN 以外では必ず `api_key` を設定すること。
+> 公開（`host` が非ループバック）かつ `api_key` 未設定は設定エラーとして起動を拒否する。
 
 ## 在席ベースの即時アンロード
 

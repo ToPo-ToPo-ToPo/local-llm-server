@@ -50,7 +50,7 @@ def ensure_sglang(
 ) -> str:
     """SGLang を起動できる python の絶対パスを返す（必要なら隔離 venv へ導入する）。→ _venv_backend。"""
     return _venv_backend.ensure_backend(
-        package="sglang", import_name="sglang", venv_dir=sglang_venv_dir(),
+        package="sglang==0.5.2", import_name="sglang", venv_dir=sglang_venv_dir(),
         human_name="SGLang", unavailable=SglangUnavailable,
         gpu_check=gpu_available, require_gpu=require_gpu,
         run=run, create_venv=create_venv, importable=importable,

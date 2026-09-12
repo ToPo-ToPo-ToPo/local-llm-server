@@ -88,8 +88,8 @@ def ensure_backend(
             create_venv(vdir)
         else:
             venv.create(vdir, with_pip=True)
-        run([py, "-m", "pip", "install", "--upgrade", "pip"],
-            capture_output=True, timeout=300)
+        # venv 付属の pip をそのまま使う。毎回「現時点の最新 pip」へ無条件に
+        # 更新すると再現性を失い、その更新失敗も従来は見逃していた。
         proc = run([py, "-m", "pip", "install", package],
                    capture_output=True, timeout=3600)
         if getattr(proc, "returncode", 1) != 0:

@@ -44,6 +44,26 @@ def test_admin_status_includes_update_state():
         server.shutdown(); server.server_close(); mgr.shutdown()
 
 
+def test_cross_site_update_request_is_rejected(monkeypatch):
+    called = threading.Event()
+    server, mgr = _start_bare_gateway()
+    server.request_restart = called
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1])
+        conn.request(
+            "POST", "/admin/update", "{}",
+            {"Content-Type": "text/plain", "Origin": "https://evil.example",
+             "Sec-Fetch-Site": "cross-site"},
+        )
+        response = conn.getresponse()
+        assert response.status == 403
+        response.read()
+        assert not called.is_set()
+        conn.close()
+    finally:
+        server.shutdown(); server.server_close(); mgr.shutdown()
+
+
 def test_refresh_update_state_updates_without_apply(monkeypatch):
     """refresh_update_state は check() の結果を state に反映するが、適用はしない。"""
     from local_llm_server import update as upd_mod
@@ -101,6 +121,32 @@ def test_admin_status_triggers_ondemand_check(monkeypatch):
         _req(server.server_address[1], "GET", "/admin/status")
         time.sleep(0.2)
         assert calls == []
+    finally:
+        server.shutdown(); server.server_close(); mgr.shutdown()
+
+
+def test_admin_status_can_wait_for_fresh_update_state(monkeypatch):
+    """トレイ指定では確認結果を同じ応答へ載せ、二度の操作を不要にする。"""
+    from local_llm_server.server import gateway_admin_status
+
+    def _refresh(state):
+        state.update({"available": True, "current": "0.38.12", "latest": "0.39.0",
+                      "reason": "ok", "restart_required": False})
+
+    monkeypatch.setattr(gw, "refresh_update_state", _refresh)
+    server, mgr = _start_bare_gateway()
+    try:
+        server.update_state = {"available": False, "current": "0.38.12",
+                               "latest": None, "fetched": False, "reason": None}
+        server._last_update_check = 0.0
+        server._update_check_inflight = False
+        obj = gateway_admin_status(
+            "127.0.0.1", server.server_address[1], timeout=1.0,
+            refresh_updates=True,
+        )
+        assert obj is not None
+        assert obj["update"]["available"] is True
+        assert obj["update"]["latest"] == "0.39.0"
     finally:
         server.shutdown(); server.server_close(); mgr.shutdown()
 

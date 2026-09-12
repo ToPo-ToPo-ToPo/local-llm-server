@@ -130,7 +130,7 @@ def test_client_video_flows_through_gateway_expansion(monkeypatch):
     # 対パッケージの動画契約: client の respond(videos=...) が video_url を送り、gateway が
     # ffmpeg でフレーム展開して上流へ渡す（client 0.7.0 + server の動画入力の噛み合わせ）。
     monkeypatch.setattr(gw.video, "extract_frames",
-                        lambda url, n, edge: [b"f1", b"f2"])  # ffmpeg を呼ばない
+                        lambda url, n, edge, **_kw: [b"f1", b"f2"])  # ffmpeg を呼ばない
     server, mgr, upstream, base = _start_gateway(monkeypatch)
     client = llc.LLMClient(model="itest-model", base_url=base, stream=False)
     try:

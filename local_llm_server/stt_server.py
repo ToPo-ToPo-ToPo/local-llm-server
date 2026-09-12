@@ -24,13 +24,19 @@ from __future__ import annotations
 import argparse
 import functools
 import json
+import math
 import os
+import re
 import sys
 import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import cast
 
 from . import multipart
+
+_MAX_AUDIO_BODY_BYTES = 32 * 1024 * 1024
+_RESPONSE_FORMATS = {"json", "text", "verbose_json", "srt", "vtt"}
 
 # mlx_whisper.transcribe は毎回 load_model() でディスクからモデルを読み直す（キャッシュ無し）。
 # 単一モデルを常駐させる本サーバでは無駄なので、モジュール属性を lru_cache で包んで
@@ -46,7 +52,7 @@ def _backend_module():
     """
     import importlib
     t = importlib.import_module("mlx_whisper.transcribe")
-    t.load_model = functools.lru_cache(maxsize=1)(t.load_model)
+    t.load_model = functools.lru_cache(maxsize=1)(t.load_model)  # type: ignore[attr-defined]
     return t
 
 
@@ -121,9 +127,10 @@ class _Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         path = self.path.split("?", 1)[0].rstrip("/")
         if path.endswith("/models"):
+            server = cast("_Server", self.server)
             self._send_json(200, {
                 "object": "list",
-                "data": [{"id": self.server.model, "object": "model"}],
+                "data": [{"id": server.model, "object": "model"}],
             })
             return
         self._send_json(404, {"error": f"GET {self.path} not supported"})
@@ -143,6 +150,9 @@ class _Handler(BaseHTTPRequestHandler):
         except ValueError:
             self._send_json(400, {"error": "invalid Content-Length"})
             return
+        if length < 0 or length > _MAX_AUDIO_BODY_BYTES:
+            self._send_json(413, {"error": "audio request body is too large"})
+            return
         body = self.rfile.read(length) if length > 0 else b""
         ctype = self.headers.get("Content-Type", "")
         parts = multipart.parse(body, ctype)
@@ -152,6 +162,9 @@ class _Handler(BaseHTTPRequestHandler):
             return
         fields = {p.name: p.text() for p in parts if p.filename is None}
         response_format = (fields.get("response_format") or "json").lower()
+        if response_format not in _RESPONSE_FORMATS:
+            self._send_json(400, {"error": "unsupported response_format"})
+            return
         options: dict = {"task": task}
         if fields.get("language"):
             options["language"] = fields["language"]
@@ -159,25 +172,36 @@ class _Handler(BaseHTTPRequestHandler):
             options["initial_prompt"] = fields["prompt"]
         if fields.get("temperature"):
             try:
-                options["temperature"] = float(fields["temperature"])
+                temperature = float(fields["temperature"])
             except ValueError:
-                pass
+                self._send_json(400, {"error": "temperature must be a number"})
+                return
+            if not math.isfinite(temperature):
+                self._send_json(400, {"error": "temperature must be finite"})
+                return
+            options["temperature"] = temperature
 
-        suffix = os.path.splitext(audio.filename or "")[1] or ".wav"
+        suffix = os.path.splitext(audio.filename or "")[1]
+        if not re.fullmatch(r"\.[A-Za-z0-9]{1,10}", suffix):
+            suffix = ".audio"
         tmp_path = None
         try:
             with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as fh:
                 fh.write(audio.value)
                 tmp_path = fh.name
-            mod = _backend_module()
             # 同一プロセス内で mlx の呼び出しを直列化する（Metal コンテキストを複数
             # スレッドから同時に叩かない。ゲートウェイは並列 acquire を許すため）。
-            with self.server.lock:
+            server = cast("_Server", self.server)
+            with server.lock:
+                # warm-up と同じロック内でモジュール/モデルを取得する。lru_cache は
+                # 同時キャッシュミス時の二重実行を防がないため、外に置くと二重ロードになる。
+                mod = _backend_module()
                 result = mod.transcribe(
-                    tmp_path, path_or_hf_repo=self.server.model, **options
+                    tmp_path, path_or_hf_repo=server.model, **options
                 )
-        except Exception as exc:  # noqa: BLE001 モデル/デコード失敗をそのまま 500 で返す
-            self._send_json(500, {"error": f"transcription failed: {exc}"})
+        except Exception as exc:  # noqa: BLE001 - 内部パス等はリモートへ返さない
+            print(f"[stt_server] transcription failed: {exc}", file=sys.stderr, flush=True)
+            self._send_json(500, {"error": "transcription failed"})
             return
         finally:
             if tmp_path:
@@ -192,10 +216,34 @@ class _Handler(BaseHTTPRequestHandler):
 class _Server(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, addr, model: str) -> None:
+    def __init__(self, addr, model: str, max_workers: int = 2) -> None:
         super().__init__(addr, _Handler)
         self.model = model
         self.lock = threading.Lock()  # mlx 呼び出しの直列化用
+        self._request_slots = threading.BoundedSemaphore(max_workers)
+
+    def process_request(self, request, client_address):
+        if not self._request_slots.acquire(blocking=False):
+            try:
+                request.sendall(
+                    b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n"
+                    b"Content-Length: 0\r\n\r\n"
+                )
+            except OSError:
+                pass
+            self.close_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._request_slots.release()
+            raise
+
+    def shutdown_request(self, request):
+        try:
+            super().shutdown_request(request)
+        finally:
+            self._request_slots.release()
 
 
 def _ensure_ffmpeg_on_path() -> None:
@@ -242,15 +290,16 @@ def _ensure_ffmpeg_on_path() -> None:
     print(f"[stt_server] 同梱 ffmpeg を使用（imageio-ffmpeg）: {exe}", file=sys.stderr, flush=True)
 
 
-def _warm(model: str) -> None:
+def _warm(server: _Server) -> None:
     """バックグラウンドでモデルを事前ロードする（初回リクエストの待ち時間を減らす）。
 
     失敗しても握りつぶす（未 DL・重み不整合などは実リクエスト時に 500 で表面化する）。
     サーバの bind/受付はこれを待たない。
     """
     try:
-        mod = _backend_module()
-        mod.load_model(model)  # lru_cache 済み。以降の transcribe が即使う
+        with server.lock:
+            mod = _backend_module()
+            mod.load_model(server.model)  # lru_cache 済み。以降の transcribe が即使う
     except Exception as exc:  # noqa: BLE001
         print(f"[stt_server] warm-up skipped: {exc}", file=sys.stderr, flush=True)
 
@@ -267,7 +316,7 @@ def main(argv: list[str] | None = None) -> int:
     _ensure_ffmpeg_on_path()
 
     server = _Server((args.host, args.port), args.model)
-    threading.Thread(target=_warm, args=(args.model,), daemon=True).start()
+    threading.Thread(target=_warm, args=(server,), daemon=True).start()
     print(f"[stt_server] serving {args.model} on {args.host}:{args.port}",
           file=sys.stderr, flush=True)
     try:

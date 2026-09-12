@@ -87,3 +87,20 @@ def test_wrapper_group_survives_until_child_exits():
         assert rc == 0
     finally:
         os.close(w)
+
+
+def test_sigterm_reaches_backend_without_ten_second_kill_delay():
+    """tetherが無視するSIGTERMを実バックエンドは継承しない。"""
+    r, w = os.pipe()
+    proc = _spawn_tethered(r, [sys.executable, "-c", "import time; time.sleep(300)"])
+    os.close(r)
+    try:
+        time.sleep(0.5)
+        started = time.monotonic()
+        os.killpg(proc.pid, 15)
+        proc.wait(timeout=3)
+        assert time.monotonic() - started < 3
+    finally:
+        os.close(w)
+        if proc.poll() is None:
+            os.killpg(proc.pid, 9)

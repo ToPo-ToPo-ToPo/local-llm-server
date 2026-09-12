@@ -60,6 +60,10 @@ dependencies = [
     # 爆発を防ぐ。mlx-vlm は Apple Silicon でこれを間接的に入れるが、llama.cpp 運用（他 OS）でも
     # 効かせたいので全 OS の直接依存にする。未導入環境では縮小せず素通しする実装にしてある。
     "pillow>=10",
+    # torch が間接依存で入れる古い setuptools には macOS の sdist 作成時の
+    # パストラバーサル脆弱性がある。Apple Silicon 実行環境は修正版以上へ引き上げる。
+    # Linux のvLLMは setuptools<81 を要求するため、OSマーカーで分離する。
+    "setuptools>=83 ; sys_platform == 'darwin'",
     # メニューバー常駐アイコン（tray.py。Ollama 流の「動いていることが見える」）。macOS のみ。
     # rumps は使わない——非推奨 API 依存で最新 macOS では表示されない。AppKit を直接使う。
     "pyobjc-framework-Cocoa>=10 ; sys_platform == 'darwin'",
@@ -72,8 +76,8 @@ dependencies = [
 # 両方使いたいときは各 backend の provision='auto'（隔離 venv・別環境）を使う。
 # 環境マーカーで Linux 以外では解決対象から外す（Mac/Win にネイティブ wheel が無い）。
 [project.optional-dependencies]
-vllm = ["vllm ; sys_platform == 'linux'"]
-sglang = ["sglang ; sys_platform == 'linux'"]
+vllm = ["vllm==0.28.0 ; sys_platform == 'linux'"]
+sglang = ["sglang==0.5.2 ; sys_platform == 'linux'"]
 
 # vLLM と SGLang は同一環境に共存できない（torch/flashinfer のピンが食い違う）。排他 extras
 # として宣言し、uv が両者を1つの解決に混ぜない／同時 install を拒む（両立は各 provision='auto'
@@ -92,6 +96,11 @@ no-build-package = ["vllm", "sglang"]
 [dependency-groups]
 dev = [
     "pytest>=8.0",
+    "coverage[toml]>=7.6",
+    "ruff>=0.12",
+    "mypy>=1.17",
+    "bandit>=1.8",
+    "pip-audit>=2.9",
     # 結線テスト用（tests/test_client_integration.py）。対リポジトリで開発する公開クライアントを
     # 公開版で取り込み、server の変更が client の公開 API を壊していないかを常時検証する
     # （リポジトリ統合はしない決定 2026-06-28 / 再確認 2026-07-09。その代償をこのテストが担う）。
@@ -105,7 +114,7 @@ Repository = "https://github.com/ToPo-ToPo-ToPo/local-llm-server"
 gw = "local_llm_server.cli:main"
 
 [build-system]
-requires = ["setuptools>=77"]
+requires = ["setuptools>=83"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
@@ -117,3 +126,10 @@ local_llm_server = ["assets/*.png"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.coverage.run]
+source = ["local_llm_server"]
+
+[tool.coverage.report]
+fail_under = 70
+show_missing = true
