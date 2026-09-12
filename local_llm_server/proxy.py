@@ -26,10 +26,51 @@ import json
 import select
 import socket
 import threading
-from typing import Any
+import time
+from typing import Any, Callable
 
 # クライアント切断をこの間隔（秒）で監視する。
 _CLIENT_POLL_S = 0.25
+_BUSY_CLOSE_TIMEOUT_S = 0.5
+_BUSY_RESPONSE = (
+    b"HTTP/1.0 503 Service Unavailable\r\n"
+    b"Connection: close\r\nContent-Length: 0\r\n\r\n"
+)
+
+
+def reject_overloaded_connection(
+    request: socket.socket,
+    close_request: Callable[[socket.socket], None],
+) -> None:
+    """Send a reliable 503 and close an accepted connection gracefully.
+
+    In particular, Winsock can surface an immediate close as WSAECONNABORTED at
+    the client before it observes the small response.  Half-close the sending
+    side first, then briefly drain the peer until it acknowledges the response
+    by closing.  The absolute deadline keeps an overloaded accept loop from
+    being held indefinitely by a client that continues to send data.
+    """
+    try:
+        request.sendall(_BUSY_RESPONSE)
+        try:
+            request.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+        deadline = time.monotonic() + _BUSY_CLOSE_TIMEOUT_S
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                request.settimeout(remaining)
+                if not request.recv(8192):
+                    break
+            except (OSError, TimeoutError):
+                break
+    except OSError:
+        pass
+    finally:
+        close_request(request)
 
 
 def _client_disconnected(sock: Any) -> bool:

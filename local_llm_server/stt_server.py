@@ -34,6 +34,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import cast
 
 from . import multipart
+from .proxy import reject_overloaded_connection
 
 _MAX_AUDIO_BODY_BYTES = 32 * 1024 * 1024
 _RESPONSE_FORMATS = {"json", "text", "verbose_json", "srt", "vtt"}
@@ -224,14 +225,7 @@ class _Server(ThreadingHTTPServer):
 
     def process_request(self, request, client_address):
         if not self._request_slots.acquire(blocking=False):
-            try:
-                request.sendall(
-                    b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n"
-                    b"Content-Length: 0\r\n\r\n"
-                )
-            except OSError:
-                pass
-            self.close_request(request)
+            reject_overloaded_connection(request, self.close_request)
             return
         try:
             super().process_request(request, client_address)

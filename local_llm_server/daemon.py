@@ -59,6 +59,7 @@ from .gateway_manager import (
 from .gateway_manager import (
     _Session as _Session,
 )
+from .proxy import reject_overloaded_connection
 from .server import (
     DEFAULT_BACKEND,
     GatewayAlreadyRunning,
@@ -241,14 +242,7 @@ class GatewayServer(ThreadingHTTPServer):
         # accept スレッド側で数える（ワーカースレッド開始後に数えると、開始前の隙間が
         # quiesce の判定から漏れる）。減算は shutdown_request（全経路で 1 回呼ばれる）。
         if not self._request_slots.acquire(blocking=False):
-            try:
-                request.sendall(
-                    b"HTTP/1.0 503 Service Unavailable\r\n"
-                    b"Connection: close\r\nContent-Length: 0\r\n\r\n"
-                )
-            except OSError:
-                pass
-            self.close_request(request)
+            reject_overloaded_connection(request, self.close_request)
             return
         with self._conns_cv:
             self._active_conns += 1
