@@ -137,3 +137,10 @@ def test_real_table_drops_vision_model(tmp_path):
     assert "vision_model" not in text
     assert text == 'max_resident = 2\ndynamic = true\n'
     assert any("vision_model" in n for n in notes)
+
+
+def test_real_table_drops_auto_update(tmp_path):
+    path = _write(tmp_path, "auto_update = true\ntray = true\n")
+    notes = migrate.migrate_file(path)
+    assert open(path, encoding="utf-8").read() == "tray = true\n"
+    assert any("auto_update" in note and "0.38.15" in note for note in notes)

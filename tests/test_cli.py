@@ -9,9 +9,6 @@ from local_llm_server.daemon import load_gateway_config
 
 def _write_cfg(tmp_path, body):
     p = tmp_path / "gateway.toml"
-    # 純ロジックのテストは自動更新を切って hermetic に保つ（起動時の git / HTTP を避ける）。
-    if "auto_update" not in body:
-        body = "auto_update = false\n" + body
     p.write_text(body, encoding="utf-8")
     return p
 
@@ -267,63 +264,30 @@ def test_max_dispatch_rejects_bad_value(tmp_path, monkeypatch):
     assert cli.main(["max", "none"]) == 2     # 無制限の指定は off の 1 形だけ（別名なし）
 
 
-# --- デーモンの自動更新ウォッチャー ---------------------------------------
-def test_update_watcher_fetches_then_restarts_on_drain(monkeypatch):
-    # 新版あり・適用可能なら稼働中に取得（apply_update）し、drain 成功で restart_requested。
+# --- デーモンの更新通知ウォッチャー ---------------------------------------
+def test_update_watcher_only_notifies(monkeypatch):
+    # 新版があっても常駐処理は確認・通知だけ。適用と再起動は手動経路に限定する。
     import threading
     from local_llm_server import daemon, update
 
     st = update.UpdateStatus(current="0.1.0", latest="0.2.0", available=True,
                              can_apply=True, reason="ok")
     monkeypatch.setattr(update, "check", lambda timeout=3.0: st)
-    applied = {}
     monkeypatch.setattr(update, "apply_update",
-                        lambda *a, **k: (applied.setdefault("ok", True), "done"))
-
-    class _Mgr:
-        pass
-
-    class _Srv:
-        def quiesce_for_restart(self, timeout=5.0):
-            return True  # idle → 静止成功（accept 停止済み・接続 0）
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            AssertionError("background watcher must not apply updates")))
+    monkeypatch.setattr(update, "running_source_version", lambda: "0.1.0")
 
     stop = threading.Event()
-    restart = threading.Event()
+    state = {}
+    notes = []
     calls = {"n": 0}
     monkeypatch.setattr(stop, "wait", lambda timeout=None: (calls.__setitem__("n", calls["n"] + 1) or calls["n"] > 1))
 
-    daemon._update_watcher(_Mgr(), _Srv(), stop, restart)
-    assert applied.get("ok") is True       # 取得は先に済ませる
-    assert restart.is_set()                # drain が通ったので再起動
-
-
-def test_update_watcher_holds_when_busy(monkeypatch):
-    # 取得は済ませても、drain が通らない（busy）あいだは再起動を保留する（生成を殺さない）。
-    import threading
-    from local_llm_server import daemon, update
-
-    st = update.UpdateStatus(current="0.1.0", latest="0.2.0", available=True,
-                             can_apply=True, reason="ok")
-    monkeypatch.setattr(update, "check", lambda timeout=3.0: st)
-    applied = {}
-    monkeypatch.setattr(update, "apply_update",
-                        lambda *a, **k: (applied.setdefault("ok", True), "done"))
-
-    class _Mgr:
-        pass
-
-    class _Srv:
-        def quiesce_for_restart(self, timeout=5.0):
-            return False  # busy（受信中・生成中の接続あり）→ 静止失敗・accept 再開済み
-
-    stop = threading.Event()
-    restart = threading.Event()
-    calls = {"n": 0}
-    monkeypatch.setattr(stop, "wait", lambda timeout=None: (calls.__setitem__("n", calls["n"] + 1) or calls["n"] > 3))
-
-    daemon._update_watcher(_Mgr(), _Srv(), stop, restart)
-    assert applied.get("ok") is True       # 取得は済ませる（稼働中に先に pull）
-    assert not restart.is_set()            # だが busy のあいだは再起動しない
+    daemon._update_watcher(stop, state=state, notify=notes.append)
+    assert notes == ["update-available 0.2.0"]
+    assert state["available"] is True
+    assert state["running"] == "0.1.0"
 
 
 def test_run_gateway_reexecs_on_restart_code(monkeypatch):

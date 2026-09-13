@@ -346,7 +346,7 @@ def enable_child_tethering() -> None:
 
     デーモン（run_gateway）が起動時に 1 回呼ぶ。書き込み端はこのプロセスが生きている間
     ずっと握り続ける——閉じることが「死の通知」なので、明示的な close はどこにも要らない
-    （プロセス終了時に OS が閉じる。os.pipe は CLOEXEC なので自動更新の execv でも閉じるが、
+    （プロセス終了時に OS が閉じる。os.pipe は CLOEXEC なので手動更新の execv でも閉じるが、
     その時点でワーカーは全て停止済み）。Windows は対象外（0a の起動時掃除が受け皿）。
     """
     global _TETHER_READ_FD, _TETHER_WRITE_FD
@@ -637,7 +637,7 @@ def gateway_drain(
     port: int = 8799,
     timeout: float = 5.0,
 ) -> dict | None:
-    """稼働中のゲートウェイに POST /admin/drain で再起動準備を要求する（TUI の自動更新用）。
+    """稼働中のゲートウェイに POST /admin/drain で再起動準備を要求する。
 
     enable=True: ゲートウェイが原子的に「処理中 0・在席 0」を確認し、満たせば新規受付を
     止めて {"draining": True} を返す。busy なら {"draining": False, "inflight": n,

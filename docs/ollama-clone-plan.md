@@ -49,7 +49,7 @@ OpenAI 互換 API（`/v1/*`）で足りているため、**Phase 1（`/api/*` �
 状態はメニューを開いた瞬間に取得。`tray = false` で無効化）、
 0e = 更新 UX（新版検知でアイコンが「gw ⬆」に変わり、メニューの「今すぐ更新して再起動」
 → POST /admin/update で一度閉じて更新して再起動。検知は update watcher が常時行い
-（auto_update=false でも表示だけはする）、通知はトレイ専用パイプへのプッシュ）。
+（更新の適用は常に手動で、常駐処理は表示だけを行う）、通知はトレイ専用パイプへのプッシュ）。
 テスト: `tests/test_reconcile.py` / `test_tether.py` / `test_service.py` / `test_tray.py`。
 
 Ollama が「サーバーを意識せず使える」のは、常駐を OS に委任しているから。同じく

@@ -102,7 +102,7 @@ def ensure_user_config() -> str:
     無ければ自動生成する: editable インストール元のクローンに例（gateway.toml）があれば
     それを**1 回だけ複製**し、無ければ最小の既定を書く。以降の編集・参照は常に
     user_config_path の 1 ファイルだけ（クローン側の例は二度と読まない —— 読む場所を
-    2 つにしない。リポジトリを汚さないので自動更新のクリーン判定も妨げない）。
+    2 つにしない。リポジトリを汚さないので手動更新のクリーン判定も妨げない）。
     """
     path = user_config_path()
     if os.path.isfile(path):
@@ -933,8 +933,8 @@ def cmd_show(gcfg, args) -> int:
 def cmd_update(gcfg, args) -> int:
     """新しいリリースタグがあれば追従し、稼働中デーモンを再起動する（手動トリガ）。
 
-    自動更新は稼働中デーモンが裏で行う（idle 時に自動適用）。このコマンドは「今すぐ確認・適用」
-    したいとき用。ソース更新後、稼働中デーモンを止めて start し直す（新コードで立ち上がる）。
+    稼働中デーモンが裏で行うのは確認と通知だけ。このコマンドを明示的に実行したときに
+    初めてソースを適用し、稼働中デーモンを止めて start し直す（新コードで立ち上がる）。
 
     取ってくるものが無くても、**稼働中デーモンが古いコードのまま**なら再起動する。editable
     運用では `git pull` した瞬間にソース版だけが上がり、更新判定は「もう最新」と結論する一方、
@@ -958,7 +958,7 @@ def cmd_update(gcfg, args) -> int:
         print("already up to date" if st.reason == "ok" else f"no update: {st.reason}")
         return 0
     if not st.can_apply:
-        print(f"update available but cannot auto-apply: {st.reason}", file=sys.stderr)
+        print(f"update available but cannot apply: {st.reason}", file=sys.stderr)
         return 1
     ok, msg = update.apply_update()
     if not ok:

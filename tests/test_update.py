@@ -62,7 +62,7 @@ def test_check_no_upstream_holds(monkeypatch, tmp_path):
 
 
 def test_check_non_default_branch_holds(monkeypatch, tmp_path):
-    # 機能ブランチ（既定ブランチでない）では、新版があっても自動適用しない（開発を邪魔しない）。
+    # 機能ブランチ（既定ブランチでない）では、新版があっても手動適用を拒否する（開発を邪魔しない）。
     monkeypatch.setattr(update, "installed_version", lambda: "0.21.0")
     monkeypatch.setattr(update, "latest_release_version", lambda timeout=3.0: "0.22.0")
     monkeypatch.setattr(update, "repo_root", lambda: tmp_path)
@@ -121,7 +121,7 @@ def _porcelain(update_mod, monkeypatch, text: str):
 
 
 def test_working_tree_clean_protects_lock_changes(monkeypatch, tmp_path):
-    """uv.lock も正当な依存更新成果なので、自動更新が暗黙に破棄しない。"""
+    """uv.lock も正当な依存更新成果なので、手動更新が暗黙に破棄しない。"""
     _porcelain(update, monkeypatch, " M uv.lock\n")
     assert update._working_tree_clean(tmp_path) is False
     # 手で触った WIP は従来どおり守る（uv.lock と一緒でも dirty）。
@@ -204,7 +204,7 @@ def test_apply_update_runs_pull_and_sync(monkeypatch, tmp_path):
     assert ("git", ("fetch", "--tags", "--force", "origin")) in calls
     assert merge in calls
     assert not any(c[0] == "git" and c[1][0] == "checkout" for c in calls)
-    # uv sync は **--frozen**（ロックを更新しない）。これが無いと自動更新が自分で
+    # uv sync は **--frozen**（ロックを更新しない）。これが無いと手動更新が自分で
     # 作業ツリーを dirty にして、次回以降の更新を永久に塞ぐ。
     assert any(
         c[0] == "run" and Path(c[1][0]).stem == "uv" and c[1][1] == "sync"
@@ -256,7 +256,7 @@ def test_apply_update_no_repo(monkeypatch):
 
 # --- tool venv の依存入れ直し（refresh_tool_env） -----------------------------
 # make install（uv tool install --editable）導入では、コードは git pull で即反映される
-# 一方、依存の追加は tool venv に入らない。自動更新がこれを取りこぼすと
+# 一方、依存の追加は tool venv に入らない。手動更新がこれを取りこぼすと
 # 「コードだけ新しく依存が古い」静かな機能欠けになる（実例: pyobjc 不在でトレイ不表示）。
 def test_tool_env_root_detects_uv_tools_python(monkeypatch):
     monkeypatch.setattr(update.sys, "prefix",
@@ -274,7 +274,7 @@ def test_tool_env_root_uses_prefix_not_resolved_executable(monkeypatch, tmp_path
 
     venv の bin/python は uv 管理の素の CPython への symlink であり、旧実装の
     `Path(sys.executable).resolve()` は venv の**外**へ解決されて None を返していた。
-    その結果、自動更新の依存入れ直し（refresh_tool_env）が本番で一度も走らず、
+    その結果、手動更新の依存入れ直し（refresh_tool_env）が本番で一度も走らず、
     「コードだけ新しく依存が古い」静かな機能欠けを防ぐ仕組み自体が死んでいた。
     sys.prefix（稼働中 venv のルート）で判定することを、実 symlink で検証する。
     """
@@ -332,7 +332,7 @@ def test_refresh_tool_env_skips_when_deps_unchanged(monkeypatch, tmp_path):
     """依存（uv.lock + pyproject）が前回と同一なら再インストールしない。
 
     無条件の --reinstall は ~5 秒かかり、zero-drop restart で accept キューに並んだ
-    接続の待ち時間の支配項だった。自動更新の大半はコードだけの変更なので、この
+    接続の待ち時間の支配項だった。手動更新の大半はコードだけの変更なので、この
     スキップで再起動の窓が ~1〜2 秒になる。
     """
     env_root = tmp_path / "toolenv"; env_root.mkdir()

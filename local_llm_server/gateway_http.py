@@ -263,8 +263,8 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
         if path.endswith("/admin/config"):
             self._handle_config_update(srv, payload)
             return
-        # 再起動準備（drain）。自動更新が「アイドル確認＋新規受付停止」を原子的に行うために
-        # 使う（→ ModelManager.begin_drain）。ローカルの管理操作なので loopback 限定。
+        # 再起動準備（drain）。管理クライアンが「アイドル確認＋新規受付停止」を
+        # 原子的に行うために使う（→ ModelManager.begin_drain）。ローカルの管理操作なので loopback 限定。
         if path.endswith("/admin/drain"):
             if not self._require_loopback():
                 return
@@ -356,7 +356,7 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
     def _handle_update_now(self, srv) -> None:
         """POST /admin/update: 新版を適用して再起動する（Ollama の「再起動して更新」相当）。
 
-        自動更新が既にソースを追従済み（update_state.fetched）なら再起動だけを要求する。
+        別の手動経路が既にソースを追従済み（update_state.fetched）なら再起動だけを要求する。
         未取得なら、その場で check → apply（git pull + 依存同期。数十秒かかることがある）
         してから再起動を要求する。drain（アイドル待ち）は**しない**——ユーザーが明示的に
         「今すぐ」を選んだ操作なので、処理中のリクエストより更新を優先する。
@@ -399,7 +399,7 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
                     send_error(
                         self,
                         409,
-                        f"update available but cannot auto-apply: {st.reason}",
+                        f"update available but cannot apply: {st.reason}",
                     )
                     return
                 try:

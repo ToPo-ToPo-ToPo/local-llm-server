@@ -5,20 +5,15 @@ from __future__ import annotations
 import sys
 import threading
 import time
-from typing import Protocol
-
-
-class RestartableGateway(Protocol):
-    def quiesce_for_restart(self) -> bool: ...
 
 
 def refresh_update_state(state: dict) -> None:
     """update.check() を 1 回だけ実行して update_state を更新する（**適用はしない**）。
 
     「更新の有無」を最新化する純粋な確認。オンデマンド（トレイのメニューを開いたとき）に
-    リスタート無しで呼ぶための小片。取得や再起動は一切しない——それは _update_watcher と
+    リスタート無しで呼ぶための小片。取得や再起動は一切しない——それは
     手動更新（/admin/update）の役目。ネットワーク I/O は失敗しても握りつぶす。
-    fetched（取得済み・再起動待ち）フラグは watcher が立てたものを消さない（触らない）。
+    fetched（取得済み・再起動待ち）フラグは手動経路が立てたものを消さない（触らない）。
     """
     from . import update
 
@@ -76,38 +71,24 @@ def maybe_refresh_update_state(
 
 
 def update_watcher(
-    manager: object,
-    server: RestartableGateway,
     stop: threading.Event,
-    restart_requested: threading.Event,
     *,
-    auto_apply: bool = True,
     state: dict | None = None,
     notify=None,
     warmup_interval: float = 60.0,
     check_interval: float = 3600.0,
-    drain_poll_interval: float = 30.0,
 ) -> None:
-    """新しいリリースタグを検知し、（auto_apply なら）作業ツリーがクリーンな時に追従する常駐スレッド。
+    """新しいリリースタグを確認し、利用可能ならトレイへ通知する。
 
-    旧 TUI が担っていた自動更新（clone 運用でリリースタグへ追従）をデーモン本体へ移したもの。
-    安全側の 2 段構え —— ①**取得は稼働中に先に済ませる**（`git pull`＋`uv sync`。プロセスには
-    触れず、この間も通常どおりリクエストを受ける）②**再起動は drain が通ったときだけ**行う。
-    `manager.begin_drain()` が「処理中 0・在席 0」の確認と新規受付停止を**原子的に**行うので、
-    確認と再起動の隙に生成が滑り込んで強制終了される余地が無い。busy なら何も止めずに保留し、
-    空いた瞬間に再起動する。ネットワーク I/O・git は失敗しても握りつぶす（稼働は妨げない）。
-
-    未検知のあいだは 1 時間おき、取得済みで再起動待ちのあいだは 30 秒おきに drain を再試行する。
-
-    **チェック自体は auto_apply=false でも行う**（適用はしない）——Ollama と同じく
-    「更新がある」ことをトレイの更新マークで見せるため。検知状態は `state`
-    （server.update_state。/admin/status に載る）へ書き、`notify`（トレイへの通知線）に
-    `update-available <ver>` / `update-ready <ver>` を 1 版につき 1 回だけ流す。
+    このスレッドは確認専用で、ソース取得・依存同期・再起動は一切行わない。更新を適用できる
+    経路は、ユーザーが明示的に実行する ``gw update`` とトレイの更新操作だけに限定する。
+    検知状態は ``state``（``/admin/status`` に掲載）へ書き、``notify`` には同じ種類と版を重複させず
+    ``update-available <ver>`` または ``update-ready <ver>`` を送る。ネットワーク障害は
+    稼働中の推論へ影響させない。
     """
     from . import update
 
-    fetched = False  # ソースは新版へ追従済みで、あとは drain が通れば再起動するだけ
-    notified: str | None = None  # この版は通知済み（毎時間チカチカ再通知しない）
+    notified: str | None = None  # この種類＋版は通知済み（毎時間再通知しない）
     first = True
 
     def _tell(kind: str, latest: str | None) -> None:
@@ -120,62 +101,27 @@ def update_watcher(
         except Exception:  # noqa: BLE001 - 通知はおまけ（トレイ不在等で失敗しても続行）
             pass
 
-    while not stop.wait(
-        warmup_interval
-        if first
-        else (drain_poll_interval if fetched else check_interval)
-    ):
+    while not stop.wait(warmup_interval if first else check_interval):
         first = False
-        if not fetched:
-            try:
-                st = update.check(timeout=3.0)
-            except Exception as exc:  # noqa: BLE001 - 監視スレッドは落とさない
-                print(f"Auto-update: check failed ({exc}).", file=sys.stderr)
-                continue
-            if state is not None:
-                state.update(
-                    {
-                        "available": bool(st.available),
-                        "current": st.current,
-                        "latest": st.latest,
-                        "reason": st.reason,
-                    }
-                )
-            if not st.available:
-                continue  # オフライン・最新
-            if not (auto_apply and st.can_apply):
-                # 自動適用しない（auto_update=false）／できない（dirty で WIP を守る等）。
-                # 更新マークだけ出して、適用はユーザーの「今すぐ更新」（/admin/update）に任せる。
-                _tell("update-available", st.latest)
-                continue
-            # 取得は稼働中に先に済ませる（プロセスには触れない。ここでは再起動しない）。
-            try:
-                ok, msg = update.apply_update()
-            except Exception as exc:  # noqa: BLE001
-                print(f"Auto-update: fetch skipped ({exc}).", file=sys.stderr)
-                continue
-            if not ok:
-                print(f"Auto-update: not applied ({msg}).", file=sys.stderr)
-                continue
-            fetched = True
-            if state is not None:
-                state["fetched"] = True
-            _tell("update-ready", st.latest)
-            print(
-                f"Auto-update: fetched ({msg}); will restart on new code when idle.",
-                file=sys.stderr,
+        try:
+            st = update.check(timeout=3.0)
+        except Exception as exc:  # noqa: BLE001 - 監視スレッドは落とさない
+            print(f"Update check failed ({exc}).", file=sys.stderr)
+            continue
+        if state is not None:
+            state.update(
+                {
+                    "available": bool(st.available),
+                    "current": st.current,
+                    "latest": st.latest,
+                    "reason": st.reason,
+                    "restart_required": bool(st.restart_required),
+                    "running": update.running_source_version(),
+                }
             )
-        # ソース追従済み。accept を止めて処理中の接続が掃けた（quiesce 成功）ときだけ再起動する。
-        # Listen ソケットは開いたままなので、この後に来た接続は 503 にも接続拒否にもならず
-        # accept キューで待ち、execv 後の新イメージがソケットごと引き継いで処理する
-        # （＝再起動の窓に投げられたリクエストを 1 つも落とさない）。
-        # 在席セッションは見ない: 在席は「解放を早める」だけの存在で、更新を塞ぐ権限を
-        # 持たせない（release を送れず落ちたエージェントの置き去りが残っても更新は進む）。
-        if server.quiesce_for_restart():
-            print(
-                "Auto-update: idle; restarting the gateway on new code...",
-                file=sys.stderr,
-            )
-            restart_requested.set()
-            return
-        # busy（受信中・生成中の接続あり）→ 何も止めずに保留（次周期で再試行）。
+        if st.available:
+            _tell("update-available", st.latest)
+        elif st.restart_required:
+            # 手動 git pull 等でソースだけが先に新しくなった場合も、
+            # 「再起動すれば反映できる」ことをアイコンで通知する。
+            _tell("update-ready", st.current or st.latest)

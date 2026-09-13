@@ -95,7 +95,6 @@ class GatewayConfig:
     allow_unauthenticated_remote: bool = (
         False  # 明示的に危険なLAN無認証公開を許す場合のみtrue
     )
-    auto_update: bool = True  # 常駐デーモンが新しいリリースタグを検知したら追従する（既定 true。false で無効）
     tray: bool = True  # 稼働中メニューバーにアイコンを出す（macOS のみ。false で非表示 → tray.py）
     # CLI-only provenance. It is not a TOML setting and is excluded from equality/repr.
     _config_dir: str | None = field(default=None, repr=False, compare=False)
@@ -522,8 +521,10 @@ def load_gateway_config(path: str, *, default_backend: str) -> GatewayConfig:
             "やめたため無視します）。モデルの保持時間は idle_timeout で調整してください。",
             file=sys.stderr,
         )
-    # 新しいリリースタグを検知したら自動追従するか（既定 true。false で無効）。
-    auto_update = _strict_bool(data.get("auto_update", True), "auto_update")
+    # 0.38.15 で更新適用を手動操作だけに限定した。旧設定は移行前／読み取り専用設定でも
+    # 起動を妨げないよう型だけ検証して受け入れるが、値にかかわらず適用には使わない。
+    if "auto_update" in data:
+        _strict_bool(data["auto_update"], "auto_update")
     tray = _strict_bool(data.get("tray", True), "tray")
     # 未登録モデルを ID 推論で動的ロードするか（既定 true）。false なら事前登録のみ（旧挙動）。
     dynamic = _strict_bool(data.get("dynamic", True), "dynamic")
@@ -602,7 +603,6 @@ def load_gateway_config(path: str, *, default_backend: str) -> GatewayConfig:
         internal_base_port=internal_base,
         api_key=api_key,
         allow_unauthenticated_remote=allow_unauthenticated_remote,
-        auto_update=auto_update,
         tray=tray,
         llama_accel=llama_accel,
         llama_build=llama_build,
