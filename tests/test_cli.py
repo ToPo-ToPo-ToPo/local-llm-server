@@ -339,6 +339,18 @@ def test_migrate_dispatch_reports_up_to_date(tmp_path, monkeypatch, capsys):
     assert "変更なし" in capsys.readouterr().out
 
 
+def test_migrate_reports_removed_auto_update_without_deleting_it(
+    tmp_path, monkeypatch, capsys
+):
+    p = _use_cfg(tmp_path, monkeypatch, "auto_update = true\nport = 8799\n")
+    before = p.read_text(encoding="utf-8")
+    assert cli.main(["migrate"]) == 2
+    captured = capsys.readouterr()
+    assert "auto_update was removed" in captured.err
+    assert "delete" in captured.err
+    assert p.read_text(encoding="utf-8") == before
+
+
 def test_start_migrates_config_before_launch(tmp_path, monkeypatch):
     # 起動系は設定を読む前に移行する（更新後に `gw start` するだけで新スキーマに揃う）。
     p = _use_cfg(tmp_path, monkeypatch, 'vision_model = "org/vis"\nport = 8799\n')

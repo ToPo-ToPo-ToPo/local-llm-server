@@ -1391,9 +1391,10 @@ def test_load_gateway_config_parses_image_max_edge(tmp_path):
         gw.load_gateway_config(_write(tmp_path, "image_max_edge = 32\n"))
 
 
-def test_load_gateway_config_accepts_but_ignores_legacy_auto_update(tmp_path):
-    cfg = gw.load_gateway_config(_write(tmp_path, "auto_update = true\n"))
-    assert not hasattr(cfg, "auto_update")
+@pytest.mark.parametrize("value", ["true", "false", '"false"'])
+def test_load_gateway_config_rejects_removed_auto_update(tmp_path, value):
+    with pytest.raises(ValueError, match=r"auto_update was removed.*delete"):
+        gw.load_gateway_config(_write(tmp_path, f"auto_update = {value}\n"))
 
 
 @pytest.mark.parametrize("text", [
@@ -1404,7 +1405,6 @@ def test_load_gateway_config_accepts_but_ignores_legacy_auto_update(tmp_path):
     "video_max_edge = 2049\n",
     "image_max_edge = 4097\n",
     "draft_model = true\n",
-    'auto_update = "false"\n',
     'default_model = 42\n',
     '[[models]]\nmodel = "m"\nextra_args = "--bad"\n',
     "request_timout = 10\n",

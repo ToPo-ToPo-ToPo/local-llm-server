@@ -153,7 +153,6 @@ _TOP_LEVEL_CONFIG_KEYS = {
     "internal_base_port",
     "api_key",
     "allow_unauthenticated_remote",
-    "auto_update",
     "tray",
     "llama_cpp",
     "video_frames",
@@ -442,6 +441,11 @@ def load_gateway_config(path: str, *, default_backend: str) -> GatewayConfig:
     """
     with open(path, "rb") as fh:
         data = tomllib.load(fh)
+    if "auto_update" in data:
+        raise ValueError(
+            "auto_update was removed in 0.38.15; delete this setting "
+            "(release checks are automatic, but applying updates is always manual)"
+        )
     _reject_unknown_keys(data, _TOP_LEVEL_CONFIG_KEYS, "top-level")
 
     host = data.get("host", "127.0.0.1")
@@ -521,10 +525,6 @@ def load_gateway_config(path: str, *, default_backend: str) -> GatewayConfig:
             "やめたため無視します）。モデルの保持時間は idle_timeout で調整してください。",
             file=sys.stderr,
         )
-    # 0.38.15 で更新適用を手動操作だけに限定した。旧設定は移行前／読み取り専用設定でも
-    # 起動を妨げないよう型だけ検証して受け入れるが、値にかかわらず適用には使わない。
-    if "auto_update" in data:
-        _strict_bool(data["auto_update"], "auto_update")
     tray = _strict_bool(data.get("tray", True), "tray")
     # 未登録モデルを ID 推論で動的ロードするか（既定 true）。false なら事前登録のみ（旧挙動）。
     dynamic = _strict_bool(data.get("dynamic", True), "dynamic")
