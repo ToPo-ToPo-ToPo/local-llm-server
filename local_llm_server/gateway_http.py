@@ -10,7 +10,6 @@ from __future__ import annotations
 import hmac
 import json
 import sys
-import threading
 import urllib.parse
 from http.server import BaseHTTPRequestHandler
 
@@ -213,7 +212,7 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
                 # キャッシュにある DL 済みモデル（TUI が未ロード候補として一覧する）。
                 "available": discover_cached_models(),
                 # 新版の検知状態（update watcher が更新。トレイの更新マーク・gw status 用）。
-                # fetched=true はソース追従済みで再起動待ちだけが残っている状態。
+                # 確認・通知専用で、HTTP から更新を適用することはない。
                 "update": dict(getattr(srv, "update_state", None) or {}),
             }
             send_json(self, 200, data)
@@ -225,10 +224,19 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
         path = self._route_path()
         if not self._require_safe_browser_context():
             return
+        # 更新の適用経路は、設定・Git・依存関係のエラーを同じターミナルへ返せる
+        # `gw update` の一本だけにする。旧トレイが使っていた管理 API は意図的に廃止。
+        if path.endswith("/admin/update"):
+            send_error(
+                self,
+                404,
+                "POST /admin/update was removed; run `gw update` in a terminal",
+            )
+            return
         # 認可はボディを読む前に判定する（未認証のリモートに巨大ボディを読み込まされない）。
         # 管理系はローカル接続 + 上の Host/Origin 検査で保護する。これによりトレイへ
         # api_key をコマンドラインで渡さずに済む。クライアント向けは API キーを要求する。
-        if path.endswith(("/admin/config", "/admin/drain", "/admin/update")):
+        if path.endswith(("/admin/config", "/admin/drain")):
             if not self._require_loopback():
                 return
         elif not self._require_api_key():
@@ -280,13 +288,6 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
                     200,
                     {"object": "gateway.drain", "draining": False, "ok": True},
                 )
-            return
-        # 「今すぐ更新して再起動」（トレイの更新メニュー / Ollama の Restart to update 相当）。
-        # ローカルの管理操作なので loopback 限定。
-        if path.endswith("/admin/update"):
-            if not self._require_loopback():
-                return
-            self._handle_update_now(srv)
             return
         if path.endswith("/admin/sessions/register"):
             self._handle_session_register(srv, payload)
@@ -352,83 +353,6 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
             body = self._maybe_inject_repetition(srv, model, payload, body)
             body = self._maybe_disable_thinking(srv, model, payload, body)
         self._acquire_and_forward(srv, model, body)
-
-    def _handle_update_now(self, srv) -> None:
-        """POST /admin/update: 新版を適用して再起動する（Ollama の「再起動して更新」相当）。
-
-        別の手動経路が既にソースを追従済み（update_state.fetched）なら再起動だけを要求する。
-        未取得なら、その場で check → apply（git pull + 依存同期。数十秒かかることがある）
-        してから再起動を要求する。drain（アイドル待ち）は**しない**——ユーザーが明示的に
-        「今すぐ」を選んだ操作なので、処理中のリクエストより更新を優先する。
-        応答を返し切ってから再起動する（応答が途中で切れないよう少しだけ遅らせる）。
-
-        取ってくるものが無くても、**走っているコードがディスク上のソースより古ければ
-        再起動する**（restart_required。editable 運用で別経路の `git pull` が入った後の
-        状態）。ここで up-to-date と答えて何もしないと、`gw update` なら直る状態が
-        トレイからは直せず、更新マークを押しても消えないままになる（→ cmd_update と同じ挙動）。
-        """
-        request_restart = getattr(srv, "request_restart", None)
-        if request_restart is None:
-            send_error(
-                self, 503, "restart is not available (gateway not fully started)"
-            )
-            return
-        state = getattr(srv, "update_state", None)
-        if not (state and state.get("fetched")):
-            from . import update
-
-            try:
-                st = update.check(timeout=5.0)
-            except Exception as exc:  # noqa: BLE001 - ネットワーク不調は 502 で返す
-                send_error(self, 502, f"update check failed: {exc}")
-                return
-            if not st.available and not st.restart_required:
-                send_json(
-                    self,
-                    200,
-                    {
-                        "object": "gateway.update",
-                        "status": "up-to-date",
-                        "current": st.current,
-                        "latest": st.latest,
-                    },
-                )
-                return
-            if st.available:
-                if not st.can_apply:
-                    send_error(
-                        self,
-                        409,
-                        f"update available but cannot apply: {st.reason}",
-                    )
-                    return
-                try:
-                    ok, msg = update.apply_update()
-                except Exception as exc:  # noqa: BLE001
-                    ok, msg = False, str(exc)
-                if not ok:
-                    send_error(self, 500, f"update failed: {msg}")
-                    return
-            # 新版が無くても restart_required ならここへ落ちる＝**再起動だけ**する。
-            if state is not None:
-                # 見せる版は「再起動後に走る版」。取得した直後はそれが最新リリース、
-                # 再起動だけのときは（既に pull 済みの）ソース版。
-                state.update(
-                    {
-                        "fetched": True,
-                        "latest": st.latest if st.available else st.current,
-                    }
-                )
-        send_json(
-            self,
-            200,
-            {
-                "object": "gateway.update",
-                "status": "restarting",
-                "latest": (state or {}).get("latest"),
-            },
-        )
-        threading.Timer(0.5, request_restart).start()
 
     def _maybe_inject_repetition(self, srv, model, payload: dict, body: bytes) -> bytes:
         """mlx / mlx-vlm 宛のリクエストに repetition_penalty（+任意で context_size）を付与する。

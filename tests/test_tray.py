@@ -5,7 +5,6 @@ GUI（rumps）は起動しない——メニュー行の整形（純粋関数）
 """
 from __future__ import annotations
 
-import json
 import sys
 
 from local_llm_server import tray as tray_mod
@@ -13,7 +12,7 @@ from local_llm_server.tray import (
     format_rows,
     merge_update_info,
     parse_update_event,
-    update_menu_item,
+    update_menu_label,
 )
 
 
@@ -49,11 +48,10 @@ def test_icon_is_static_with_no_periodic_work():
     # 情報行は明示 disabled。これらが欠けたらクリックが死ぬので回帰ガードにする。
     assert "setAutoenablesItems_(False)" in src
     assert "setEnabled_(False)" in src
-    # いつでもアイコンから更新できる: 新版未検知でも「更新を確認」を常設する。
-    assert "更新を確認" in src
-    # 更新を押したら即フィードバック: アイコン横に「更新中…」を出す（通知に依らない）。
-    assert tray_mod._UPDATING_TITLE == "更新中…"
-    assert "setTitle_(_UPDATING_TITLE)" in src and "resetTitle_" in src
+    # アイコンは通知専用で、更新の適用はターミナルの `gw update` だけ。
+    assert "ターミナルで gw update" in src
+    assert "updateNow_" not in src
+    assert "/admin/update" not in src
     # 更新マークは上げるだけでなく**降ろす**（更新後も ⬆ が残る不具合の回帰ガード）。
     # 題字を無条件に _UPDATE_MARK へ固定する書き方に戻したら落ちる。
     assert "setTitle_(_UPDATE_MARK if merged.get(\"kind\") else base_title)" in src
@@ -75,7 +73,6 @@ def test_menu_action_items_are_enabled_and_wired():
 
     class _D(NSObject):
         def openLog_(self, s): pass
-        def updateNow_(self, s): pass
         def stopGateway_(self, s): pass
 
     d = _D.alloc().init()
@@ -84,14 +81,14 @@ def test_menu_action_items_are_enabled_and_wired():
     info = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("info", None, "")
     info.setEnabled_(False)
     menu.addItem_(info)
-    for title, sel in (("更新を確認", "updateNow:"), ("ログを開く", "openLog:"),
+    for title, sel in (("ログを開く", "openLog:"),
                        ("ゲートウェイを停止", "stopGateway:")):
         it = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, sel, "")
         it.setTarget_(d)
         menu.addItem_(it)
     menu.update()
     assert menu.itemAtIndex_(0).isEnabled() is False  # 情報行はグレー
-    for i in (1, 2, 3):  # アクション項目はすべて有効・配線済み
+    for i in (1, 2):  # アクション項目はすべて有効・配線済み
         it = menu.itemAtIndex_(i)
         assert it.isEnabled() is True, f"{it.title()} が無効（クリック不可）"
         assert it.target() is not None and it.action() is not None
@@ -127,14 +124,14 @@ def test_parse_update_event():
     assert parse_update_event("update-ready") is None  # 版なしは不正
 
 
-def test_merge_update_info_prefers_fetched():
-    """admin の fetched（取得済み）はパイプ通知より優先。available は kind 未設定時のみ補完。"""
+def test_merge_update_info_prefers_restart_required():
+    """admin の要再起動状態はパイプ通知より優先。available は kind 未設定時のみ補完。"""
     # パイプ通知だけ
     m = merge_update_info({"kind": "update-available", "latest": "0.36.0"}, None)
     assert m["kind"] == "update-available"
-    # admin が fetched なら update-ready に昇格
+    # ソース取得済みでプロセスだけ古ければ update-ready に昇格
     m = merge_update_info({"kind": "update-available", "latest": None},
-                          {"update": {"fetched": True, "latest": "0.36.0"}})
+                          {"update": {"restart_required": True, "current": "0.36.0"}})
     assert m == {"kind": "update-ready", "latest": "0.36.0"}
     # admin が available でも、通知済みの kind は上書きしない
     m = merge_update_info({"kind": "update-ready", "latest": "0.36.0"},
@@ -149,11 +146,11 @@ def test_merge_update_info_clears_stale_mark():
 
     パイプ通知は 1 版 1 回のプッシュなので、通知の後に別経路（`gw update` / 手元の
     `git pull`）で更新されると kind が残り続ける。デーモンが「更新なし」と確認できた
-    （latest を引けて available/fetched/restart_required のどれでもない）ら降ろす。
+    （latest を引けて available/restart_required のどちらでもない）ら降ろす。
     """
     m = merge_update_info(
         {"kind": "update-available", "latest": "0.38.2"},
-        {"update": {"available": False, "fetched": False, "restart_required": False,
+        {"update": {"available": False, "restart_required": False,
                     "current": "0.38.2", "latest": "0.38.2"}},
     )
     assert m["kind"] is None and m["latest"] is None
@@ -177,46 +174,55 @@ def test_merge_update_info_marks_restart_required():
                     "current": "0.38.2", "latest": "0.38.2", "running": "0.38.1"}},
     )
     assert m["kind"] == "update-ready" and m["latest"] == "0.38.2"
-    label, clickable = update_menu_item(m, {"update": {"restart_required": True}})
-    assert clickable is True and "今すぐ更新" in label
+    label = update_menu_label(m, {"update": {"restart_required": True}})
+    assert label == "再起動が必要（v0.38.2）— ターミナルで gw update"
 
 
-def test_update_menu_item_states():
-    """更新項目の出し分け: 新版あり=クリック可 / 最新=非クリック / 未確認=クリック可。"""
-    # 新版あり（パイプ通知）→ 「今すぐ更新して再起動（vX）」・クリック可
-    label, clickable = update_menu_item({"kind": "update-ready", "latest": "0.37.0"}, None)
-    assert clickable is True and "0.37.0" in label and "今すぐ更新" in label
+def test_update_menu_label_states():
+    """更新項目は状態を説明するだけで、すべてクリック不可。"""
+    # 新版あり（パイプ通知）→ 版と唯一の適用コマンドを案内
+    label = update_menu_label({"kind": "update-ready", "latest": "0.37.0"}, None)
+    assert label == "再起動が必要（v0.37.0）— ターミナルで gw update"
+    label = update_menu_label(
+        {"kind": "update-available", "latest": "0.37.0"}, None)
+    assert label == "更新あり（v0.37.0）— ターミナルで gw update"
     # 最新（リリースタグまで確認できて available=False）→ 「最新です（vX）」・**選べない**
-    label, clickable = update_menu_item(
+    label = update_menu_label(
         {"kind": None}, {"update": {"available": False, "latest": "0.36.1",
-                                    "current": "0.36.1"}})
-    assert clickable is False and label == "最新です（v0.36.1）"
-    # 未確認/オフライン（latest を引けていない）→ 断言せず「更新を確認」・クリック可
-    label, clickable = update_menu_item({"kind": None}, {"update": {"available": False,
-                                                                    "latest": None}})
-    assert clickable is True and label == "更新を確認"
-    # admin 情報がまだ無い（初回オープン前）→ 「更新を確認」
-    label, clickable = update_menu_item({"kind": None}, None)
-    assert clickable is True and label == "更新を確認"
+                                     "current": "0.36.1"}})
+    assert label == "最新です（v0.36.1）"
+    # 未確認/オフライン（latest を引けていない）→ 最新とは断言しない
+    label = update_menu_label({"kind": None}, {"update": {"available": False,
+                                                            "latest": None}})
+    assert label == "更新状態を確認できません"
+    # admin 情報がまだ無い（初回オープン前）も情報行
+    label = update_menu_label({"kind": None}, None)
+    assert label == "更新状態を確認できません"
 
 
-def test_update_menu_item_explains_why_it_is_held():
+def test_update_menu_label_explains_why_it_is_held():
     """新版はあるのに適用できないときは、**理由**をメニューに出す。
 
-    「今すぐ更新して再起動」と言い続けて押しても何も起きない（＝マークが消えない）
-    のが一番わかりにくいので、保留の理由を見せる。押して再確認はできる（状態は最大
-    30 秒古く、その間に解消していることがある）。
+    `gw update` が失敗する理由をあらかじめアイコンから読めるようにする。
     """
     admin = {"update": {"available": True, "latest": "0.38.3", "current": "0.38.2",
                         "reason": "dirty"}}
-    label, clickable = update_menu_item({"kind": "update-available", "latest": "0.38.3"},
-                                        admin)
-    assert label == "更新あり（v0.38.3）— 未コミットの変更があるため保留"
-    assert clickable is True
-    # 適用できる（reason=ok）ときは従来どおり「今すぐ更新して再起動」。
+    label = update_menu_label({"kind": "update-available", "latest": "0.38.3"}, admin)
+    assert label == "更新あり（v0.38.2 → v0.38.3）— 未コミットの変更があるため保留"
+    # 適用できる（reason=ok）ときは唯一の適用コマンドを案内する。
     admin["update"]["reason"] = "ok"
-    label, _ = update_menu_item({"kind": "update-available", "latest": "0.38.3"}, admin)
-    assert label == "今すぐ更新して再起動（v0.38.3）"
+    label = update_menu_label(
+        {"kind": "update-available", "latest": "0.38.3"}, admin)
+    assert label == "更新あり（v0.38.2 → v0.38.3）— ターミナルで gw update"
+
+
+def test_update_menu_label_shows_running_and_source_versions_when_restart_is_needed():
+    label = update_menu_label(
+        {"kind": "update-ready", "latest": "0.38.3"},
+        {"update": {"restart_required": True, "running": "0.38.2",
+                    "current": "0.38.3", "latest": "0.38.3"}},
+    )
+    assert label == "再起動が必要（v0.38.2 → v0.38.3）— ターミナルで gw update"
 
 
 def test_daemon_spawns_tray_before_provisioning():
@@ -263,61 +269,3 @@ def test_tray_config_default_and_override(tmp_path):
     assert load_gateway_config(str(p)).tray is True
     p.write_text('host = "127.0.0.1"\nport = 8799\ntray = false\n', encoding="utf-8")
     assert load_gateway_config(str(p)).tray is False
-
-
-# --- アイコンからの更新（_post_update_now の結果ハンドリング） -----------------
-def _fake_resp(payload: dict):
-    import io
-
-    class _R(io.BytesIO):
-        def __enter__(self): return self
-        def __exit__(self, *a): self.close()
-    return _R(json.dumps(payload).encode())
-
-
-def test_update_now_notifies_up_to_date(monkeypatch):
-    """最新だったら通知で知らせる（メニューは閉じているため）。再起動はしない。"""
-    notes = []
-    monkeypatch.setattr(tray_mod, "_notify", lambda t, m: notes.append((t, m)))
-    monkeypatch.setattr(tray_mod.urllib.request, "urlopen",
-                        lambda req, timeout=0: _fake_resp(
-                            {"status": "up-to-date", "current": "0.35.1"}))
-    tray_mod._post_update_now("127.0.0.1", 8799)
-    assert notes and "最新" in notes[0][1] and "0.35.1" in notes[0][1]
-
-
-def test_update_now_notifies_restarting(monkeypatch):
-    notes = []
-    monkeypatch.setattr(tray_mod, "_notify", lambda t, m: notes.append((t, m)))
-    monkeypatch.setattr(tray_mod.urllib.request, "urlopen",
-                        lambda req, timeout=0: _fake_resp(
-                            {"status": "restarting", "latest": "0.36.0"}))
-    tray_mod._post_update_now("127.0.0.1", 8799)
-    assert notes and "0.36.0" in notes[0][1]
-
-
-def test_update_now_notifies_http_error(monkeypatch):
-    """409（dirty tree 等）はエラー本文を通知に載せる。"""
-    import io
-
-    notes = []
-    monkeypatch.setattr(tray_mod, "_notify", lambda t, m: notes.append((t, m)))
-
-    def _raise(req, timeout=0):
-        raise tray_mod.urllib.error.HTTPError(
-            "u", 409, "Conflict", {}, io.BytesIO(json.dumps(
-                {"error": "作業ツリーに未コミットの変更があります"}).encode()))
-    monkeypatch.setattr(tray_mod.urllib.request, "urlopen", _raise)
-    tray_mod._post_update_now("127.0.0.1", 8799)
-    assert notes and "未コミット" in notes[0][1]
-
-
-def test_update_now_notifies_connection_failure(monkeypatch):
-    notes = []
-    monkeypatch.setattr(tray_mod, "_notify", lambda t, m: notes.append((t, m)))
-
-    def _raise(req, timeout=0):
-        raise OSError("connection refused")
-    monkeypatch.setattr(tray_mod.urllib.request, "urlopen", _raise)
-    tray_mod._post_update_now("127.0.0.1", 8799)
-    assert notes and "接続" in notes[0][1]

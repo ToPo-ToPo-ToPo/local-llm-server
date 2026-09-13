@@ -19,7 +19,7 @@ Ollama がメニューバーのアイコンで「動いている」を伝える�
     「アイコンだけ隠す」は置かない——**アイコンの有無＝デーモンの生死**という対応を
     例外なく保つ（隠せると「動いているのに出ていない」状態が生まれ、対応が崩れる）
 
-更新も Ollama と同じ体験（更新マーク → ワンクリックで閉じて更新して再起動）:
+更新は通知と適用の責務を分ける:
   - デーモンの update watcher が新版を検知すると、専用パイプに
     `update-available <ver>` を書く。トレイはそれを受けてアイコンの隣に「⬆」を出す
     ——**プッシュ通知なのでここでもポーリングは増えない**
@@ -27,13 +27,9 @@ Ollama がメニューバーのアイコンで「動いている」を伝える�
   - **マークは降ろす側もある**: 通知は 1 版につき 1 回のプッシュなので、通知の後に別経路で
     更新が済むと（`gw update`・手元の `git pull`）マークだけが残る。メニューを開くたびの
     /admin/status で「更新なし」と確認できたら降ろす（→ merge_update_info）
-  - メニューには**常に**更新項目がある: 新版検知済みなら「今すぐ更新して再起動」、
-    そうでなければ「更新を確認」。どちらも同じ POST /admin/update を叩き、デーモンが
-    確認→（あれば）取得して自分を execv で新コードに置き換える。旧トレイはパイプ EOF で
-    消え、新デーモンが素のアイコンのトレイを出し直す——「一度閉じて更新して再起動」。
-    最新だった・失敗した場合は macOS 通知で知らせる（メニューは閉じているため）。
-    押した瞬間からアイコン横に「更新中…」を出す——適用は数十秒〜数分かかるので、
-    確実に見える表示で「押したのに無反応」を防ぐ（通知と違い権限に依らない）
+  - メニューの更新項目は表示専用。新版があれば版と「ターミナルで gw update」を示す。
+    クリックによる適用や再起動は行わない。更新を適用する入口を `gw update` の一本に固定し、
+    設定エラー・Git エラー・依存同期エラーを必ず同じターミナルへ返す
 
 GUI は **pyobjc（AppKit）で直接**実装する。rumps は使わない——rumps 0.4 は 10.10 で
 非推奨になった `NSStatusItem.setTitle_/setImage_` に依存しており、最新 macOS
@@ -43,13 +39,10 @@ GUI は **pyobjc（AppKit）で直接**実装する。rumps は使わない—�
 """
 from __future__ import annotations
 
-import json
 import os
 import subprocess
 import sys
 import threading
-import urllib.error
-import urllib.request
 
 from .server import (
     gateway_admin_status,
@@ -64,15 +57,9 @@ _ICON_PATH = os.path.join(os.path.dirname(__file__), "assets", "tray-icon.png")
 # アイコンが読めないときの予備の題字と、更新検知時にアイコンの隣へ出す印。
 _FALLBACK_TITLE = "gw"
 _UPDATE_MARK = "⬆"
-# 更新の適用中にアイコンの隣へ出す表示（git pull + 依存入れ直しで数十秒〜数分かかる間、
-# 「押したのに無反応」に見えないための確実な視覚フィードバック。通知と違い権限に依らない）。
-_UPDATING_TITLE = "更新中…"
-
 # トレイの取得は UI 外で行う。更新タグ確認（サーバー側 timeout=3秒）も同じ応答へ含めるため、
 # 通常の status 取得より余裕を持たせる。メニュー自体はキャッシュから即座に開くので固まらない。
 _STATUS_TIMEOUT_S = 5.0
-# 「今すぐ更新」は未取得なら git pull + 依存同期が走る（数十秒〜数分）ので長めに待つ。
-_UPDATE_TIMEOUT_S = 600.0
 
 
 def format_rows(admin: dict | None, host: str, port: int) -> list[str]:
@@ -105,21 +92,18 @@ def merge_update_info(info: dict, admin: dict | None) -> dict:
     """パイプ通知（info）と /admin/status の update 欄を統合する（純粋関数・テスト可能）。
 
     どちらか一方しか届いていなくても更新マークを出せるようにする（通知はプッシュ、
-    admin はメニューを開いた瞬間の確認、の 2 経路）。fetched（取得済み）が最優先。
+    admin はメニューを開いた瞬間の確認、の 2 経路）。restart_required（取得済み）が最優先。
 
     **マークを降ろすのもここの仕事**: パイプ通知は 1 版につき 1 回のプッシュなので、通知の
     あとに別経路で更新が済んでも（`gw update`・手元の `git pull`・別ターミナルでの適用）
     通知由来の kind は残り続ける。デーモンが「更新なし」と確認できたとき——リリースタグまで
-    引けて（latest あり）fetched も restart_required も available も無いとき——は kind を
-    降ろす。これが無いと**更新後もマークと「今すぐ更新して再起動」が消えない**。
+    引けて（latest あり）restart_required も available も無いとき——は kind を
+    降ろす。これが無いと**更新後もマークが消えない**。
     latest を引けていない（オフライン・未確認）ときは断言せず、通知をそのまま残す。
     """
     upd = (admin or {}).get("update") or {}
     merged = dict(info)
-    if upd.get("fetched"):
-        merged["kind"] = "update-ready"
-        merged["latest"] = upd.get("latest") or merged.get("latest")
-    elif upd.get("restart_required"):
+    if upd.get("restart_required"):
         # 取ってくるものは無いが、走っているコードがディスク上のソースより古い
         # （pull 済み・未再起動）。再起動だけで新版になるので、見せる版はソース版＝current。
         merged["kind"] = "update-ready"
@@ -137,7 +121,7 @@ def merge_update_info(info: dict, admin: dict | None) -> dict:
 
 # 新版はあるのに手動適用できない理由（UpdateStatus.reason）→ メニューに出す短い説明。
 # マークが出たまま消えないとき、**なぜ消えないのか**をアイコンから読めるようにする
-# （黙って「今すぐ更新して再起動」を出し続けると、押しても何も起きない謎の項目になる）。
+# （更新できない状態で `gw update` を案内するだけでは、失敗理由が分からないため）。
 _HOLD_REASONS = {
     "dirty": "未コミットの変更があるため保留",
     "not-on-default-branch": "既定ブランチではないため保留",
@@ -146,22 +130,33 @@ _HOLD_REASONS = {
 }
 
 
-def update_menu_item(merged: dict, admin: dict | None) -> tuple[str, bool]:
-    """更新メニュー項目の (ラベル, クリック可能か) を決める（純粋関数・テスト可能）。
+def update_menu_label(merged: dict, admin: dict | None) -> str:
+    """表示専用の更新メニュー行を決める（純粋関数・テスト可能）。
 
     更新の有無はデーモンの定期チェックで分かっているので、状態で出し分ける:
-    - 新版あり           → ("今すぐ更新して再起動（vX）", True)   クリックで適用・再起動
-    - 新版あり・適用不可  → ("更新あり（vX）— …のため保留", True)  理由つき（押せば再確認）
-    - 最新（確認済み）    → ("最新です（vX）", False)             グレー・選べない
-    - 未確認/オフライン  → ("更新を確認", True)                  クリックで確認を促す
+    - 新版あり           → "更新あり（vX）— ターミナルで gw update"
+    - 新版あり・適用不可  → "更新あり（vX）— …のため保留"
+    - 取得済み・未再起動  → "再起動が必要（vX）— ターミナルで gw update"
+    - 最新（確認済み）    → "最新です（vX）"
+    - 未確認/オフライン  → "更新状態を確認できません"
 
     「最新」と断言するのはリリースタグまで引けた（latest がある）ときだけ。まだ一度も
-    確認できていない・オフライン（latest が無い）のときは断言せず「更新を確認」を残す。
-    適用不可でもクリックは殺さない——状態は最大 30 秒古く、その間に解消していることがある。
+    確認できていない・オフライン（latest が無い）のときは「最新」と断言しない。
+    この項目は常に情報表示だけで、適用は `gw update` からのみ行う。
     """
     upd = (admin or {}).get("update") or {}
     if merged.get("kind"):
         latest = merged.get("latest")
+        source = (
+            upd.get("running")
+            if merged.get("kind") == "update-ready"
+            else upd.get("current")
+        )
+        versions = (
+            f"v{source} → v{latest}"
+            if source and latest and source != latest
+            else (f"v{latest}" if latest else None)
+        )
         reason = upd.get("reason")
         hold = (
             _HOLD_REASONS.get(reason)
@@ -169,14 +164,17 @@ def update_menu_item(merged: dict, admin: dict | None) -> tuple[str, bool]:
             else None
         )
         if hold:
-            return (f"更新あり（v{latest}）— {hold}" if latest
-                    else f"更新あり — {hold}", True)
-        return (f"今すぐ更新して再起動（v{latest}）" if latest
-                else "今すぐ更新して再起動", True)
+            return (f"更新あり（{versions}）— {hold}" if versions
+                    else f"更新あり — {hold}")
+        if merged.get("kind") == "update-ready":
+            return (f"再起動が必要（{versions}）— ターミナルで gw update" if versions
+                    else "再起動が必要 — ターミナルで gw update")
+        return (f"更新あり（{versions}）— ターミナルで gw update" if versions
+                else "更新あり — ターミナルで gw update")
     if upd.get("latest") and not upd.get("available"):
         cur = upd.get("current")
-        return (f"最新です（v{cur}）" if cur else "最新です", False)
-    return ("更新を確認", True)
+        return f"最新です（v{cur}）" if cur else "最新です"
+    return "更新状態を確認できません"
 
 
 def _watch_pipe(fd: int, on_event) -> None:
@@ -206,59 +204,6 @@ def _stop_gateway() -> None:
     pid = rec.get("pid") if rec else None
     if isinstance(pid, int):
         threading.Thread(target=stop_pid, args=(pid,), daemon=True).start()
-
-
-def _notify(title: str, message: str) -> None:
-    """macOS 通知を出す（best-effort）。権限が無い/ヘッドレスでも黙って無視する。
-
-    メニューはクリックで閉じてしまうため、更新結果（最新だった・失敗した）の
-    視覚フィードバックはメニュー外＝通知で返す。更新が実際に走る場合はアイコンが
-    消えて出直すこと自体がフィードバックになる。
-    """
-    try:
-        subprocess.Popen(
-            ["osascript", "-e",
-             f"display notification {json.dumps(message)} with title {json.dumps(title)}"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-    except OSError:
-        pass
-
-
-def _post_update_now(host: str, port: int) -> str | None:
-    """POST /admin/update: 更新の確認と適用（Ollama の Restart to update 相当）。
-
-    デーモンが（新版があれば git pull + 依存入れ直しをして）自分を新コードで再起動する。
-    最新だった・適用できなかった場合は通知で知らせる（メニューは閉じているため）。
-    デーモンの返した status（"up-to-date" / "restarting"。失敗時は None）を返す
-    ——呼び出し側が「最新だった」ときに古い更新マークを降ろすのに使う。
-    """
-    req = urllib.request.Request(
-        f"http://{host}:{port}/admin/update",
-        data=b"{}", headers={"Content-Type": "application/json"}, method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=_UPDATE_TIMEOUT_S) as resp:
-            data = json.loads(resp.read() or b"{}")
-    except urllib.error.HTTPError as exc:
-        try:
-            reason = json.loads(exc.read() or b"{}").get("error", "")
-        except (ValueError, OSError):
-            reason = ""
-        _notify("gw の更新", reason or f"更新できませんでした（HTTP {exc.code}）")
-        return None
-    except OSError:
-        _notify("gw の更新", "ゲートウェイに接続できませんでした")
-        return None
-    status = data.get("status")
-    if status == "up-to-date":
-        cur = data.get("current")
-        _notify("gw の更新", f"最新です（v{cur}）" if cur else "最新です")
-    elif status == "restarting":
-        latest = data.get("latest")
-        _notify("gw の更新",
-                f"更新して再起動します（v{latest}）" if latest else "更新して再起動します")
-    return status if isinstance(status, str) else None
 
 
 def run_app(host: str, port: int, fd: int | None) -> int:
@@ -319,37 +264,11 @@ def run_app(host: str, port: int, fd: int | None) -> int:
         def stopGateway_(self, _sender) -> None:  # noqa: N815
             _stop_gateway()
 
-        def updateNow_(self, _sender) -> None:  # noqa: N815
-            # 押した瞬間にアイコン横へ「更新中…」を出す（このハンドラはメインスレッド）。
-            # 適用は数十秒〜数分かかるので、これが無いと「押しても無反応」に見える。
-            button.setTitle_(_UPDATING_TITLE)
-
-            def _work() -> None:
-                status = _post_update_now(host, port)  # POST（適用が走れば長い）＋結果通知
-                if status == "up-to-date":
-                    # 更新は無かった＝古い通知でマークだけが残っていた状態。ここで
-                    # 降ろす（次にメニューを開くまで ⬆ が残り続けないように）。
-                    update_info["kind"], update_info["latest"] = None, None
-                # 更新が走った場合はこの直後にデーモンが再起動し、パイプ EOF で
-                # このトレイごと消える（＝完了の合図）。最新だった・失敗した場合は
-                # 消えないので「更新中…」を消して元に戻す。
-                delegate.performSelectorOnMainThread_withObject_waitUntilDone_(
-                    "resetTitle:", None, False)
-
-            threading.Thread(target=_work, daemon=True).start()
-
         def showUpdateMark_(self, _arg) -> None:  # noqa: N815
             button.setTitle_(_UPDATE_MARK)  # アイコンの隣に ⬆ を添える
 
-        def resetTitle_(self, _arg) -> None:  # noqa: N815
-            # 「更新中…」を消す。更新待ちが残っていれば ⬆、無ければ素の題字
-            # （アイコンが出ていれば空、アイコン欠落時は "gw"）。
-            button.setTitle_(_UPDATE_MARK if update_info.get("kind") else base_title)
-
         def applyUpdateState_(self, _arg) -> None:  # noqa: N815
-            # 開いているメニューを removeAllItems で再構築するとクリックを飲み込む。
-            # 更新項目 1 個の属性だけを差し替えれば、初回取得の結果をその場で見せつつ
-            # action/target は保てる（モデル行などの全体再構築は次回オープン時のまま）。
+            # 開いているメニューを再構築せず、更新情報行だけを差し替える。
             _apply_update_state()
 
     delegate = _TrayDelegate.alloc().init()
@@ -412,11 +331,10 @@ def run_app(host: str, port: int, fd: int | None) -> int:
         item = update_item_state.get("item")
         if item is None:
             return
-        label, clickable = update_menu_item(merged, admin)
-        item.setTitle_(label)
-        item.setEnabled_(clickable)
-        item.setAction_("updateNow:" if clickable else None)
-        item.setTarget_(delegate if clickable else None)
+        item.setTitle_(update_menu_label(merged, admin))
+        item.setEnabled_(False)
+        item.setAction_(None)
+        item.setTarget_(None)
 
     def _rebuild_menu(menu) -> None:
         """キャッシュ済みの状態からメニューを組み直す（ネットワークに触れない・即時）。"""
@@ -433,18 +351,12 @@ def run_app(host: str, port: int, fd: int | None) -> int:
             for row in format_rows(admin, host, port):
                 _add_info(menu, row)
         menu.addItem_(AppKit.NSMenuItem.separatorItem())
-        # 更新項目は状態で出し分ける（update_menu_item）。新版あり／未確認はクリック可
-        # （updateNow: で確認→適用→再起動）、最新（確認済み）はグレーの情報行にして
-        # 選べないようにする——押しても「最新です」と言うだけの空クリックを無くす。
+        # 更新項目は状態で出し分ける（update_menu_label）が、常にグレーの情報行。
+        # 適用操作は `gw update` のみに固定し、アイコンは確認・通知だけを担う。
         # 更新マークはここで上げ**下げ**する（メインスレッドなので直接更新してよい）。
         # 降ろす側が無いと、更新が済んでもマークが残り続ける。
         button.setTitle_(_UPDATE_MARK if merged.get("kind") else base_title)
-        label, clickable = update_menu_item(merged, admin)
-        if clickable:
-            update_item_state["item"] = _add_action(menu, label, "updateNow:")
-        else:
-            # 「最新です（vX）」＝グレー・非クリック
-            update_item_state["item"] = _add_info(menu, label)
+        update_item_state["item"] = _add_info(menu, update_menu_label(merged, admin))
         _add_action(menu, "ログを開く", "openLog:")
         _add_action(menu, "ゲートウェイを停止", "stopGateway:")
 

@@ -37,7 +37,6 @@ import threading
 import time
 from dataclasses import dataclass, field, fields
 from http.server import ThreadingHTTPServer
-from typing import Callable
 
 from . import gateway_config as _gateway_config
 from . import gateway_updates as _gateway_updates
@@ -214,17 +213,13 @@ class GatewayServer(ThreadingHTTPServer):
         self.refresh_update_state = lambda *, wait=False: maybe_refresh_update_state(
             self, wait=wait
         )
-        # Update control is part of the server's real interface.  Initialising it
-        # here avoids a partially constructed object whose attributes depend on
-        # _run_gateway_locked having reached a later phase.
+        # 更新状態は確認・通知専用。適用は CLI の `gw update` だけが行う。
         self.update_state: dict[str, object] = {
             "available": False,
             "current": None,
             "latest": None,
-            "fetched": False,
             "reason": None,
         }
-        self.request_restart: Callable[[], None] | None = None
         self._last_update_check = 0.0
         self._update_check_inflight = False
         self._update_check_done: threading.Event | None = None
@@ -1016,7 +1011,7 @@ def _run_gateway_session(
             file=sys.stderr,
         )
     print(
-        "  admin (/admin/status, /admin/config, /admin/update): localhost only",
+        "  admin (/admin/status, /admin/config, /admin/drain): localhost only",
         file=sys.stderr,
     )
     for c in cfg.models:
@@ -1110,18 +1105,16 @@ def _run_gateway_session(
             args=(server, manager, cfg, config_path, stop_reaper),
         )
 
-    # 更新監視は確認と通知だけを行う。ソース取得・依存同期・再起動は、ユーザーが明示的に
-    # 「今すぐ更新」または `gw update` を実行したときだけ行う。
+    # 更新監視は確認と通知だけを行う。ソース取得・依存同期・再起動は、ユーザーが
+    # ターミナルで `gw update` を明示的に実行したときだけ行う。
     restart_requested = threading.Event()
-    # 検知状態と再起動要求を HTTP ハンドラ（/admin/status・/admin/update）から使えるようにする。
+    # 検知状態を HTTP ハンドラ（/admin/status）から参照できるようにする。
     server.update_state = {
         "available": False,
         "current": None,
         "latest": None,
-        "fetched": False,
         "reason": None,
     }
-    server.request_restart = restart_requested.set
     # オンデマンド確認（/admin/status GET から）のスロットル用。0.0 = 未確認なので、
     # 最初のメニューオープンで即チェックが走る（起動直後から「更新の有無」が正しく出る）。
     server._last_update_check = 0.0
