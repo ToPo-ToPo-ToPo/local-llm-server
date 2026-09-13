@@ -996,6 +996,16 @@ def cmd_migrate(gcfg, args) -> int:
     except OSError as exc:
         print(f"移行に失敗しました: {exc}", file=sys.stderr)
         return 1
+    # auto_update のように「黙って消さず、ユーザーに明示的な削除を求める」
+    # 廃止キーが残っていれば、変更なしを「最新」と誤報しない。通常移行後も
+    # スキーマ全体を検証する。dry-run で自動移行予定がある場合だけは、古い
+    # キーがファイルに残ったままなので検証を後回しにする。
+    if not args.dry_run or not notes:
+        try:
+            load_gateway_config(path)
+        except (OSError, ValueError, tomllib.TOMLDecodeError) as exc:
+            print(f"設定エラー: {exc}", file=sys.stderr)
+            return 2
     if not notes:
         print(f"{path} は最新のスキーマです（変更なし）")
         return 0

@@ -139,8 +139,8 @@ def test_real_table_drops_vision_model(tmp_path):
     assert any("vision_model" in n for n in notes)
 
 
-def test_real_table_drops_auto_update(tmp_path):
+def test_migration_preserves_auto_update_so_loader_can_reject_it(tmp_path):
     path = _write(tmp_path, "auto_update = true\ntray = true\n")
     notes = migrate.migrate_file(path)
-    assert open(path, encoding="utf-8").read() == "tray = true\n"
-    assert any("auto_update" in note and "0.38.15" in note for note in notes)
+    assert open(path, encoding="utf-8").read() == "auto_update = true\ntray = true\n"
+    assert notes == []
