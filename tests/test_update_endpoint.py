@@ -1,8 +1,4 @@
-"""更新エンドポイント（POST /admin/update）と /admin/status の update 欄のテスト。
-
-トレイの「今すぐ更新して再起動」（Ollama の Restart to update 相当）の裏口。
-実際の git には触れない——update.check / apply_update をスタブする。
-"""
+"""通知専用の /admin/status と、廃止した更新エンドポイントのテスト。"""
 from __future__ import annotations
 
 import http.client
@@ -35,7 +31,7 @@ def _start_bare_gateway():
 def test_admin_status_includes_update_state():
     server, mgr = _start_bare_gateway()
     try:
-        server.update_state = {"available": True, "latest": "9.9.9", "fetched": False}
+        server.update_state = {"available": True, "latest": "9.9.9"}
         status, obj = _req(server.server_address[1], "GET", "/admin/status")
         assert status == 200
         assert obj["update"]["available"] is True
@@ -44,22 +40,20 @@ def test_admin_status_includes_update_state():
         server.shutdown(); server.server_close(); mgr.shutdown()
 
 
-def test_cross_site_update_request_is_rejected(monkeypatch):
-    called = threading.Event()
+def test_admin_update_endpoint_is_removed(monkeypatch):
+    """HTTP 経由では更新できず、適用は `gw update` の一本だけ。"""
+    from local_llm_server import update as upd_mod
+
+    monkeypatch.setattr(
+        upd_mod,
+        "apply_update",
+        lambda: (_ for _ in ()).throw(AssertionError("must not apply over HTTP")),
+    )
     server, mgr = _start_bare_gateway()
-    server.request_restart = called
     try:
-        conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1])
-        conn.request(
-            "POST", "/admin/update", "{}",
-            {"Content-Type": "text/plain", "Origin": "https://evil.example",
-             "Sec-Fetch-Site": "cross-site"},
-        )
-        response = conn.getresponse()
-        assert response.status == 403
-        response.read()
-        assert not called.is_set()
-        conn.close()
+        status, obj = _req(server.server_address[1], "POST", "/admin/update")
+        assert status == 404
+        assert "gw update" in obj["error"]
     finally:
         server.shutdown(); server.server_close(); mgr.shutdown()
 
@@ -75,12 +69,10 @@ def test_refresh_update_state_updates_without_apply(monkeypatch):
     # apply_update が呼ばれたら失敗させる（確認だけのはず）。
     monkeypatch.setattr(upd_mod, "apply_update",
                         lambda: (_ for _ in ()).throw(AssertionError("must not apply")))
-    state = {"available": False, "current": None, "latest": None,
-             "fetched": True, "reason": None}
+    state = {"available": False, "current": None, "latest": None, "reason": None}
     gw.refresh_update_state(state)
     assert state["available"] is True
     assert state["current"] == "0.36.1" and state["latest"] == "0.37.0"
-    assert state["fetched"] is True  # watcher が立てたフラグは触らない
     # 「走っているコードの版」と「要再起動」も公開する（editable 運用の穴の検知用）。
     assert state["running"] == "0.36.1" and state["restart_required"] is False
 
@@ -107,7 +99,7 @@ def test_admin_status_triggers_ondemand_check(monkeypatch):
     server, mgr = _start_bare_gateway()
     try:
         server.update_state = {"available": False, "current": "0.36.1",
-                               "latest": None, "fetched": False, "reason": None}
+                               "latest": None, "reason": None}
         server._last_update_check = 0.0
         server._update_check_inflight = False
         _req(server.server_address[1], "GET", "/admin/status")
@@ -137,7 +129,7 @@ def test_admin_status_can_wait_for_fresh_update_state(monkeypatch):
     server, mgr = _start_bare_gateway()
     try:
         server.update_state = {"available": False, "current": "0.38.12",
-                               "latest": None, "fetched": False, "reason": None}
+                               "latest": None, "reason": None}
         server._last_update_check = 0.0
         server._update_check_inflight = False
         obj = gateway_admin_status(
@@ -147,109 +139,6 @@ def test_admin_status_can_wait_for_fresh_update_state(monkeypatch):
         assert obj is not None
         assert obj["update"]["available"] is True
         assert obj["update"]["latest"] == "0.39.0"
-    finally:
-        server.shutdown(); server.server_close(); mgr.shutdown()
-
-
-def test_update_now_when_up_to_date(monkeypatch):
-    """新版が無ければ up-to-date を返して何もしない（再起動しない）。"""
-    from local_llm_server import update as upd_mod
-
-    monkeypatch.setattr(upd_mod, "check", lambda timeout=3.0: types.SimpleNamespace(
-        available=False, can_apply=False, current="1.0", latest="1.0", reason="ok",
-        restart_required=False))
-    server, mgr = _start_bare_gateway()
-    try:
-        restarted = threading.Event()
-        server.request_restart = restarted.set
-        server.update_state = {"fetched": False}
-        status, obj = _req(server.server_address[1], "POST", "/admin/update")
-        assert status == 200 and obj["status"] == "up-to-date"
-        assert not restarted.wait(1.0), "must not restart when up to date"
-    finally:
-        server.shutdown(); server.server_close(); mgr.shutdown()
-
-
-def test_update_now_restarts_when_process_is_stale(monkeypatch):
-    """新版は無いが走っているコードが古い（restart_required）なら、**再起動だけ**する。
-
-    editable 運用で別経路の `git pull` が入った後の状態。ここで up-to-date と答えて
-    何もしないと、トレイの更新マークを押しても状態が変わらず消えないままになる
-    （`gw update` は同じ状況で再起動する。挙動を揃える）。
-    """
-    from local_llm_server import update as upd_mod
-
-    monkeypatch.setattr(upd_mod, "check", lambda timeout=3.0: types.SimpleNamespace(
-        available=False, can_apply=True, current="0.38.2", latest="0.38.2",
-        reason="ok", restart_required=True))
-    monkeypatch.setattr(upd_mod, "apply_update",
-                        lambda: (_ for _ in ()).throw(AssertionError("must not pull")))
-    server, mgr = _start_bare_gateway()
-    try:
-        restarted = threading.Event()
-        server.request_restart = restarted.set
-        server.update_state = {"fetched": False}
-        status, obj = _req(server.server_address[1], "POST", "/admin/update")
-        assert status == 200 and obj["status"] == "restarting"
-        assert obj["latest"] == "0.38.2"     # 再起動後に走るソース版
-        assert restarted.wait(3.0), "stale process must be restarted"
-    finally:
-        server.shutdown(); server.server_close(); mgr.shutdown()
-
-
-def test_update_now_restarts_when_already_fetched():
-    """手動経路が取得済み（fetched）なら、適用はせず再起動だけを要求する。"""
-    server, mgr = _start_bare_gateway()
-    try:
-        restarted = threading.Event()
-        server.request_restart = restarted.set
-        server.update_state = {"fetched": True, "latest": "9.9.9"}
-        status, obj = _req(server.server_address[1], "POST", "/admin/update")
-        assert status == 200 and obj["status"] == "restarting"
-        assert obj["latest"] == "9.9.9"
-        assert restarted.wait(3.0), "restart must be requested after the response"
-    finally:
-        server.shutdown(); server.server_close(); mgr.shutdown()
-
-
-def test_update_now_applies_then_restarts(monkeypatch):
-    """未取得なら check → apply してから再起動を要求する（応答は restarting）。"""
-    from local_llm_server import update as upd_mod
-
-    applied = []
-    monkeypatch.setattr(upd_mod, "check", lambda timeout=3.0: types.SimpleNamespace(
-        available=True, can_apply=True, current="1.0", latest="2.0", reason="ok"))
-    monkeypatch.setattr(upd_mod, "apply_update",
-                        lambda: (applied.append(True) or (True, "pulled")))
-    server, mgr = _start_bare_gateway()
-    try:
-        restarted = threading.Event()
-        server.request_restart = restarted.set
-        server.update_state = {"fetched": False, "latest": None}
-        status, obj = _req(server.server_address[1], "POST", "/admin/update")
-        assert status == 200 and obj["status"] == "restarting"
-        assert applied == [True]
-        assert server.update_state["fetched"] is True
-        assert restarted.wait(3.0)
-    finally:
-        server.shutdown(); server.server_close(); mgr.shutdown()
-
-
-def test_update_now_refuses_dirty_tree(monkeypatch):
-    """適用できない（dirty tree 等）ときは 409 で理由を返し、再起動しない。"""
-    from local_llm_server import update as upd_mod
-
-    monkeypatch.setattr(upd_mod, "check", lambda timeout=3.0: types.SimpleNamespace(
-        available=True, can_apply=False, current="1.0", latest="2.0",
-        reason="working tree is dirty"))
-    server, mgr = _start_bare_gateway()
-    try:
-        restarted = threading.Event()
-        server.request_restart = restarted.set
-        server.update_state = {"fetched": False}
-        status, obj = _req(server.server_address[1], "POST", "/admin/update")
-        assert status == 409
-        assert not restarted.wait(0.8)
     finally:
         server.shutdown(); server.server_close(); mgr.shutdown()
 
