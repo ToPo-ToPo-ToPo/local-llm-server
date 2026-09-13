@@ -1,18 +1,17 @@
-"""リリースタグ（git tag）の検知と、ソースの自動更新（git クローン運用向け）。
+"""リリースタグ（git tag）の検知と、手動更新（git クローン運用向け）。
 
 このリポジトリは **GitHub から clone して `uv run gw`** で動かす。そのため
 バージョンアップが手作業になりがち。ここでは「リモートに新しいバージョンタグ
 （vX.Y.Z）が出たら検知し、作業ツリーがクリーンなら fast-forward で追従する」ための
-小さな道具を提供する。常駐デーモン（daemon._run_gateway_locked の更新ウォッチャー）が
-idle 時にこれを使い、適用後は run_gateway が reexec_daemon で自分自身を新コードに
-置き換える（手動なら `gw update`）。
+小さな道具を提供する。常駐デーモンは確認と通知にだけ使う。ソース取得・依存同期・再起動は
+`gw update` またはメニューバーの更新操作から明示的に実行する。
 
 リリースは「バージョン上げを main へマージ → `git tag vX.Y.Z && git push origin vX.Y.Z`」。
 
 方針（安全側）:
   - **git クローン & upstream 追跡ブランチ & 作業ツリーがクリーンな時だけ**適用する
     （開発中の PC＝未コミット変更がある場合は適用せず「保留」を表示。WIP を壊さない）。
-    uv.lock も正当な依存更新作業として保護し、差分があれば自動更新しない。
+    uv.lock も正当な依存更新作業として保護し、差分があれば手動更新も中断する。
   - ネットワーク I/O は短いタイムアウトで、失敗しても常に None/False を返す（オフラインでも
     起動を妨げない）。
   - 適用はブランチ先端でなく**タグへの fast-forward**。タグ後に main へ積まれた
@@ -113,7 +112,7 @@ def repo_root() -> Path | None:
 
     パッケージソース（local_llm_server/__init__.py）の 2 つ上に `.git` と `pyproject.toml`
     があれば「編集可能な git クローン」とみなす。git clone を伴わない導入（アーカイブ展開等）は
-    `.git` が無いので None（＝自動更新の対象外）。
+    `.git` が無いので None（＝ソース更新の対象外）。
     """
     try:
         import local_llm_server
@@ -130,7 +129,7 @@ def _find_uv() -> str | None:
     """uv 実行ファイルを探す（PATH → 標準の導入先の順。無ければ None）。
 
     launchd / systemd 配下のデーモンは PATH が最小（/usr/bin:/bin 等）で、`uv` が
-    PATH に居ないことがある。その環境でも自動更新の依存同期が黙って失敗しないよう、
+    PATH に居ないことがある。その環境でも手動更新の依存同期が黙って失敗しないよう、
     標準の導入先を直接当たる。
     """
     import os
@@ -154,7 +153,7 @@ def tool_env_root() -> Path | None:
 
     `make install` の標準導入では gw は `~/.local/share/uv/tools/local-llm-server/` の
     venv で動く。この venv の依存は `uv sync`（プロジェクト venv 用）では更新されず、
-    `uv tool install --reinstall` でしか入れ直せない——自動更新が依存の追加を
+    `uv tool install --reinstall` でしか入れ直せない——手動更新が依存の追加を
     取りこぼさないための判定に使う。`uv run gw`（プロジェクト venv）なら None。
 
     判定は sys.prefix（稼働中 venv のルート）で行う。sys.executable を resolve() すると
@@ -206,7 +205,7 @@ def refresh_tool_env(root: Path | None, timeout: float = 600.0) -> tuple[bool, s
 
     **依存が変わっていなければスキップする**: `uv tool install --reinstall` は無条件だと
     ~5 秒かかり、zero-drop restart で accept キューに並んだ接続の待ち時間の支配項になる。
-    自動更新の大半はコードだけの変更なので、uv.lock + pyproject.toml のハッシュを venv 内の
+    手動更新の大半はコードだけの変更なので、uv.lock + pyproject.toml のハッシュを venv 内の
     マーカーと比べ、同一なら入れ直さない（マーカーは成功時にのみ書く。無い・読めない・
     ハッシュ不能のときは安全側＝従来どおり再インストール）。
     """
@@ -323,9 +322,9 @@ def _default_branch(root: Path) -> str | None:
 def _on_default_branch(root: Path) -> bool:
     """現在のブランチが origin の既定ブランチ（main）か。
 
-    自動更新は**既定ブランチにいるときだけ**行う。開発用の機能ブランチでは `git pull --ff-only`
+    リリース更新は**既定ブランチにいるときだけ**行う。開発用の機能ブランチでは `git pull --ff-only`
     してもリリース（main）は取り込まれず版が上がらないので、放置すると再起動ループになる。
-    さらに「開発中の別ブランチを勝手に触らない」という直感にも合う（機能ブランチでは自動更新
+    さらに「開発中の別ブランチを勝手に触らない」という直感にも合う（機能ブランチではリリース更新
     しない）。既定を特定できないときは main/master 名で保守的に判定する。
     """
     cur = _current_branch(root)
@@ -359,7 +358,7 @@ def _dirty_paths(root: Path) -> list[str] | None:
 def _working_tree_clean(root: Path) -> bool:
     """未コミットの変更（追跡ファイル）が無いか。開発中 PC の WIP を守るためのガード。
 
-    uv.lock も依存更新の正当な作業成果なので例外扱いしない。自動更新は追跡ファイルに
+    uv.lock も依存更新の正当な作業成果なので例外扱いしない。手動更新も追跡ファイルに
     1つでも差分があれば停止し、ユーザーの変更を暗黙に破棄しない。
     """
     paths = _dirty_paths(root)
@@ -375,7 +374,7 @@ class UpdateStatus:
     current: str | None       # 稼働中（＝チェックアウト中のソース）バージョン
     latest: str | None        # リモートの最新リリースタグの版
     available: bool           # 最新リリースが現行より新しい
-    can_apply: bool           # 既定ブランチ & git クローン & クリーン & upstream 追跡（＝自動適用してよい）
+    can_apply: bool           # 既定ブランチ & git クローン & クリーン & upstream 追跡（＝手動適用可）
     # "ok" / "not-a-git-clone" / "not-on-default-branch" / "no-upstream" / "dirty" / "offline"
     reason: str
     # ディスク上のソースが、走っているプロセスが読み込んだコードより新しい（＝再起動すれば
@@ -384,10 +383,10 @@ class UpdateStatus:
 
 
 def check(timeout: float = 10.0) -> UpdateStatus:
-    """現行と最新リリースタグを比べ、自動適用できるかまで含めて判定する（副作用なし）。
+    """現行と最新リリースタグを比べ、手動適用できるかまで含めて判定する（副作用なし）。
 
     現行版はクローンの pyproject.toml（ソース）から取る。editable インストールで固定される
-    メタデータ版ではなく、pull で上がる版を見る（→ 再起動ループを防ぐ）。自動適用は**既定
+    メタデータ版ではなく、pull で上がる版を見る（→ 再起動ループを防ぐ）。手動適用は**既定
     ブランチ（main）でクリーン & upstream 追跡**のときだけ。機能ブランチや WIP は触らない。
 
     `restart_required` は「取ってくるものは無いが、走っているプロセスが古い」ケース。
@@ -426,7 +425,7 @@ def apply_update(root: Path | None = None, timeout: float = 120.0) -> tuple[bool
     """
     root = root or repo_root()
     if root is None:
-        return False, "git クローン運用ではありません（自動更新の対象外）"
+        return False, "git クローン運用ではありません（ソース更新の対象外）"
     if not _working_tree_clean(root):
         return False, "作業ツリーに未コミットの変更があります"
     try:
@@ -478,8 +477,8 @@ def apply_update(root: Path | None = None, timeout: float = 120.0) -> tuple[bool
 def reexec_daemon() -> None:
     """現在の Python でゲートウェイ本体を再 exec する（更新後、新コードを読み込むため）。
 
-    デーモン（`python -m local_llm_server`）が idle 時に自動更新を適用したあと、自分自身を
-    新コードで置き換えるために呼ぶ。呼ぶ前に**単一起動ロックの解放を済ませておくこと**
+    デーモン（`python -m local_llm_server`）が手動更新を適用したあと、自分自身を新コードで置き換えるために呼ぶ。
+    呼ぶ前に**単一起動ロックの解放を済ませておくこと**
     （execv は開いた fd を引き継ぐため、握ったままだと再取得で自分自身と衝突する）。
     公開ポートの Listen ソケットは**閉じずに** fd を環境変数（GW_LISTEN_FD）で引き継ぐ——
     新イメージは bind し直さず採用するので衝突せず、再起動の窓に accept キューへ並んだ

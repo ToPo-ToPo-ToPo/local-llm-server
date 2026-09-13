@@ -198,7 +198,7 @@ def test_update_now_restarts_when_process_is_stale(monkeypatch):
 
 
 def test_update_now_restarts_when_already_fetched():
-    """自動更新が取得済み（fetched）なら、適用はせず再起動だけを要求する。"""
+    """手動経路が取得済み（fetched）なら、適用はせず再起動だけを要求する。"""
     server, mgr = _start_bare_gateway()
     try:
         restarted = threading.Event()
@@ -255,28 +255,30 @@ def test_update_now_refuses_dirty_tree(monkeypatch):
 
 
 def test_watcher_notifies_when_not_applying(monkeypatch):
-    """auto_apply=false（auto_update=false 相当）でも検知・通知はする（適用はしない）。
+    """常駐ウォッチャーは検知・通知だけを行い、適用はしない。
 
     同じ版の再通知はしない（毎時間マークをチカチカさせない）。
     """
     from local_llm_server import update as upd_mod
 
     monkeypatch.setattr(upd_mod, "check", lambda timeout=3.0: types.SimpleNamespace(
-        available=True, can_apply=True, current="1.0", latest="2.0", reason="ok"))
+        available=True, can_apply=True, current="1.0", latest="2.0", reason="ok",
+        restart_required=False))
+    monkeypatch.setattr(
+        upd_mod,
+        "apply_update",
+        lambda: (_ for _ in ()).throw(AssertionError("watcher must not apply")),
+    )
+    monkeypatch.setattr(upd_mod, "running_source_version", lambda: "1.0")
     monkeypatch.setattr(gw, "_UPDATE_WARMUP_INTERVAL", 0.01)
     monkeypatch.setattr(gw, "_UPDATE_CHECK_INTERVAL", 0.01)
     notes: list[str] = []
     stop = threading.Event()
     state: dict = {}
-    mgr = ModelManager([])
-    class _Srv:
-        def quiesce_for_restart(self, timeout=5.0):
-            return True
-
     t = threading.Thread(
         target=gw._update_watcher,
-        args=(mgr, _Srv(), stop, threading.Event()),
-        kwargs={"auto_apply": False, "state": state, "notify": notes.append},
+        args=(stop,),
+        kwargs={"state": state, "notify": notes.append},
         daemon=True,
     )
     t.start()
@@ -288,4 +290,30 @@ def test_watcher_notifies_when_not_applying(monkeypatch):
     t.join(timeout=3.0)
     assert notes == ["update-available 2.0"]  # 1 回だけ（重複なし）
     assert state["available"] is True and state["latest"] == "2.0"
-    mgr.shutdown()
+
+
+def test_watcher_notifies_when_restart_will_activate_pulled_source(monkeypatch):
+    """別経路で pull 済みなら、再起動可能なこともアイコンへ通知する。"""
+    from local_llm_server import update as upd_mod
+
+    monkeypatch.setattr(upd_mod, "check", lambda timeout=3.0: types.SimpleNamespace(
+        available=False, can_apply=True, current="2.0", latest="2.0", reason="ok",
+        restart_required=True))
+    monkeypatch.setattr(upd_mod, "running_source_version", lambda: "1.0")
+    monkeypatch.setattr(gw, "_UPDATE_WARMUP_INTERVAL", 0.01)
+    monkeypatch.setattr(gw, "_UPDATE_CHECK_INTERVAL", 0.01)
+    notes: list[str] = []
+    stop = threading.Event()
+    t = threading.Thread(
+        target=gw._update_watcher,
+        args=(stop,),
+        kwargs={"state": {}, "notify": notes.append},
+        daemon=True,
+    )
+    t.start()
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline and not notes:
+        time.sleep(0.02)
+    stop.set()
+    t.join(timeout=3.0)
+    assert notes == ["update-ready 2.0"]

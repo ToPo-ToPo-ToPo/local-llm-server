@@ -1391,6 +1391,11 @@ def test_load_gateway_config_parses_image_max_edge(tmp_path):
         gw.load_gateway_config(_write(tmp_path, "image_max_edge = 32\n"))
 
 
+def test_load_gateway_config_accepts_but_ignores_legacy_auto_update(tmp_path):
+    cfg = gw.load_gateway_config(_write(tmp_path, "auto_update = true\n"))
+    assert not hasattr(cfg, "auto_update")
+
+
 @pytest.mark.parametrize("text", [
     "port = 0\n",
     "internal_base_port = 65536\n",
@@ -2045,7 +2050,7 @@ def test_gateway_video_extract_failure_returns_400(monkeypatch):
 
 
 # --- drain（再起動準備: アイドル確認＋新規受付停止を原子的に）------------------------
-# 自動更新の再起動で「確認と kill の間に生成が滑り込んで落ちる」事故を防ぐ仕組み。
+# 手動更新の再起動で「確認と kill の間に生成が滑り込んで落ちる」事故を防ぐ仕組み。
 
 def test_begin_drain_refuses_when_inflight():
     mgr = gw.ModelManager([], dynamic=True)

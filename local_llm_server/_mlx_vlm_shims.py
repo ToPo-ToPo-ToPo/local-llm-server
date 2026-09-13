@@ -4,7 +4,7 @@
 その起動を `python -m mlx_vlm.server` から `python -m local_llm_server._mlx_vlm_shims` へ
 差し替え、パッチを当ててから同じ引数で mlx_vlm.server を __main__ として実行する。
 
-site-packages を直接書き換えない理由: 自動更新（auto_update）が `uv sync` を走らせるため、
+site-packages を直接書き換えない理由: 手動更新が `uv sync` を走らせるため、
 venv への直接パッチは黙って失われる。ここに置けばソース側と一緒に追従する。
 
 現在のパッチ:

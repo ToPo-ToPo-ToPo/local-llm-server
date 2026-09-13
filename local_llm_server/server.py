@@ -343,7 +343,7 @@ def _build_mlx_vlm(config: ServerConfig) -> list[str]:
     ensure_cached(config.model)
     # 直接 mlx_vlm.server を起動せず、シム経由で起動する（_mlx_vlm_shims が上流の
     # 未修正部分を当ててから同じ引数で mlx_vlm.server を __main__ 実行する）。
-    # site-packages を書き換えると auto_update の `uv sync` で消えるため。
+    # site-packages を書き換えると手動更新の `uv sync` で消えるため。
     command = [
         sys.executable,
         "-m",

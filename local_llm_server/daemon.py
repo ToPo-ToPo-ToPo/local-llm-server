@@ -532,16 +532,15 @@ def watch_config_file(
             print("Config reloaded: no effective change.", file=sys.stderr)
 
 
-# 自動更新を適用したので新コードで再起動したい、を表す内部終了コード（run_gateway が execv）。
+# 手動更新を適用したので新コードで再起動したい、を表す内部終了コード（run_gateway が execv）。
 # 通常終了(0)・既に起動済み(3)と衝突しない値。
 _RESTART_CODE = 7
 
-# 自動更新ウォッチャーの周期（秒）。モジュール定数にして差し替え可能にする。
+# 更新確認ウォッチャーの周期（秒）。モジュール定数にして差し替え可能にする。
 _UPDATE_WARMUP_INTERVAL = (
     60.0  # 起動直後は 1 分だけ待ってから初回チェック（起動処理と競合させない）
 )
 _UPDATE_CHECK_INTERVAL = 3600.0  # 以降、新版が未検知のあいだの確認周期
-_UPDATE_DRAIN_POLL_INTERVAL = 30.0  # 取得済み・再起動待ちのあいだ、空くのを待つ周期
 # オンデマンド確認（トレイのメニューを開くたび = /admin/status GET）のスロットル。
 # タグ照会しすぎないための最短間隔。定期チェック（1時間）より短く、確認をほぼ即時にする。
 _UPDATE_ONDEMAND_THROTTLE = 30.0
@@ -563,27 +562,18 @@ def maybe_refresh_update_state(srv, *, wait: bool = False) -> None:
 
 
 def _update_watcher(
-    manager: "ModelManager",
-    server: "GatewayServer",
     stop: threading.Event,
-    restart_requested: threading.Event,
     *,
-    auto_apply: bool = True,
     state: dict | None = None,
     notify=None,
 ) -> None:
     """互換用ファサード。テスト時に変更可能な周期を明示的に注入する。"""
     _gateway_updates.update_watcher(
-        manager,
-        server,
         stop,
-        restart_requested,
-        auto_apply=auto_apply,
         state=state,
         notify=notify,
         warmup_interval=_UPDATE_WARMUP_INTERVAL,
         check_interval=_UPDATE_CHECK_INTERVAL,
-        drain_poll_interval=_UPDATE_DRAIN_POLL_INTERVAL,
     )
 
 
@@ -626,7 +616,7 @@ def run_gateway(cfg: GatewayConfig, config_path: str | None = None) -> int:
         rc = _run_gateway_locked(cfg, config_path)
     finally:
         lock.release()
-    # 自動更新を idle 時に適用したら、ロックとポートを解放し切った **後** で自分自身を
+    # 手動更新を適用したら、ロックとポートを解放し切った **後** で自分自身を
     # 新コードに置き換える（execv は fd を引き継ぐので、ロック保持中に再取得すると自分と
     # 衝突する。必ず lock.release() を通してから exec する）。exec は戻らない。
     if rc == _RESTART_CODE:
@@ -636,10 +626,10 @@ def run_gateway(cfg: GatewayConfig, config_path: str | None = None) -> int:
         # tool venv（make install 導入）は uv sync では更新されず、これを怠るとコードだけ
         # 新しく依存が古い「静かな機能欠け」になる（例: pyobjc 不在でトレイが出ない）。
         ok, msg = update.refresh_tool_env(update.repo_root())
-        print(f"Auto-update: dependencies — {msg}", file=sys.stderr)
+        print(f"Manual update: dependencies — {msg}", file=sys.stderr)
         if not ok:
             print(
-                "Auto-update: 依存の入れ直しに失敗しました。挙動がおかしい場合は "
+                "Manual update: 依存の入れ直しに失敗しました。挙動がおかしい場合は "
                 "`make install` を実行してください。",
                 file=sys.stderr,
             )
@@ -745,7 +735,7 @@ def _maybe_spawn_tray(cfg: GatewayConfig) -> tuple[subprocess.Popen | None, int 
     デーモンと同じプロセスグループに置く（`gw stop` の killpg で一緒に止まる）うえ、
     トレイ**専用の**パイプを渡す——EOF（デーモンの死。kill -9 でも OS が閉じる）で
     アイコンが自分から消えるのはワーカーの繋留と同じで、加えてこのパイプは
-    **更新通知の下り線**を兼ねる（update watcher が `update-ready <ver>` 等を書くと
+    **更新通知の下り線**を兼ねる（update watcher が `update-available <ver>` を書くと
     トレイが更新マークを出す）。ワーカーの繋留パイプと分けるのは、パイプは放送ではなく
     早い者勝ちの読み取りなので、通知がワーカー側ラッパーに食われないため。
     起動失敗（rumps 不在等）は無視する——アイコンは飾りで、ゲートウェイの本体機能ではない。
@@ -1120,13 +1110,8 @@ def _run_gateway_session(
             args=(server, manager, cfg, config_path, stop_reaper),
         )
 
-    # 自動更新監視: 新しいリリースタグを検知し、作業ツリーがクリーンかつ処理中/在席が 0（idle）の
-    # 瞬間にリリースタグへ fast-forward する。適用できたら restart_requested を立てて下のメインループを
-    # 抜け、finally でクリーン停止 → run_gateway が execv で新コードに置き換える。
-    # TUI 廃止に伴い、旧 TUI が担っていた「リリースタグへ git で追従」をデーモン本体へ移した。
-    # gateway.toml の auto_update=false で**適用**は無効化できるが、**チェックは常に行う**
-    # ——Ollama と同じく、更新があることをトレイの更新マークで見せるため（適用はユーザーの
-    # 「今すぐ更新」= /admin/update か `gw update` に任せる）。
+    # 更新監視は確認と通知だけを行う。ソース取得・依存同期・再起動は、ユーザーが明示的に
+    # 「今すぐ更新」または `gw update` を実行したときだけ行う。
     restart_requested = threading.Event()
     # 検知状態と再起動要求を HTTP ハンドラ（/admin/status・/admin/update）から使えるようにする。
     server.update_state = {
@@ -1145,9 +1130,8 @@ def _run_gateway_session(
     resources.start_thread(
         target=_update_watcher,
         name="gateway-update-watcher",
-        args=(manager, server, stop_reaper, restart_requested),
+        args=(stop_reaper,),
         kwargs={
-            "auto_apply": cfg.auto_update,
             "state": server.update_state,
             "notify": _tray_notify,
         },
@@ -1160,7 +1144,7 @@ def _run_gateway_session(
     )
     restart = False
     try:
-        # 割り込み（Ctrl+C / SIGTERM）または自動更新の再起動要求までブロックする。
+        # 割り込み（Ctrl+C / SIGTERM）または手動更新の再起動要求までブロックする。
         restart = restart_requested.wait()
     except KeyboardInterrupt:
         pass
