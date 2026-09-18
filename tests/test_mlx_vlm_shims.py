@@ -121,6 +121,7 @@ def _install_fake(monkeypatch, **kw):
 
 def test_stream_tool_calls_patches_07_class(monkeypatch):
     mod = _install_fake(monkeypatch, with_class=True, with_func=False)
+    monkeypatch.setenv(_mlx_vlm_shims.STREAM_TOOL_CALLS_ENV, "1")      # モデルの既定 on
     result = _mlx_vlm_shims._patch_stream_tool_calls()
     assert result.startswith("applied (mlx-vlm 0.7")
     st = mod.ToolCallStreamState("<tool_call>", "</tool_call>")
@@ -131,6 +132,7 @@ def test_stream_tool_calls_patches_07_class(monkeypatch):
 
 def test_stream_tool_calls_patches_06_function(monkeypatch):
     mod = _install_fake(monkeypatch, with_class=False, with_func=True)
+    monkeypatch.setenv(_mlx_vlm_shims.STREAM_TOOL_CALLS_ENV, "1")      # モデルの既定 on
     result = _mlx_vlm_shims._patch_stream_tool_calls()
     assert result.startswith("applied (mlx-vlm 0.6")
     assert mod.suppress_tool_call_content("x", False, "<tool_call>", "abc") == (False, "abc")
@@ -141,16 +143,89 @@ def test_stream_tool_calls_reports_when_hook_missing(monkeypatch):
     assert _mlx_vlm_shims._patch_stream_tool_calls().startswith("not applied")
 
 
-def test_apply_does_not_patch_without_env(monkeypatch):
+def test_apply_patches_but_keeps_the_upstream_behavior_by_default(monkeypatch, capsys):
+    """パッチは常に当てる。指定が無ければ(ヘッダーもモデルの既定も無し)上流どおり捨てる。"""
     mod = _install_fake(monkeypatch, with_class=True, with_func=False)
     monkeypatch.delenv(_mlx_vlm_shims.STREAM_TOOL_CALLS_ENV, raising=False)
     _mlx_vlm_shims.apply()
-    assert not getattr(mod.ToolCallStreamState, "_llmserver_passthrough", False)
+    assert getattr(mod.ToolCallStreamState, "_llmserver_passthrough", False)
+    assert mod.ToolCallStreamState("<tool_call>", "</tool_call>").feed("<tool_call>{") is None
+    err = capsys.readouterr().err
+    assert "stream_tool_calls: applied" in err and "default off" in err
 
 
-def test_apply_patches_with_env(monkeypatch, capsys):
+def test_model_default_on_streams_without_a_header(monkeypatch):
     mod = _install_fake(monkeypatch, with_class=True, with_func=False)
     monkeypatch.setenv(_mlx_vlm_shims.STREAM_TOOL_CALLS_ENV, "1")
     _mlx_vlm_shims.apply()
-    assert getattr(mod.ToolCallStreamState, "_llmserver_passthrough", False)
-    assert "stream_tool_calls: applied" in capsys.readouterr().err
+    assert mod.ToolCallStreamState("<tool_call>", "</tool_call>").feed("<tool_call>{") == "<tool_call>{"
+
+
+def test_per_request_flag_overrides_the_model_default(monkeypatch):
+    """リクエストごとの指定(X-Stream-Tool-Calls)がモデルの既定より勝つ。流すのは頼んだリクエストだけ。"""
+    mod = _install_fake(monkeypatch, with_class=True, with_func=False)
+    monkeypatch.delenv(_mlx_vlm_shims.STREAM_TOOL_CALLS_ENV, raising=False)
+    _mlx_vlm_shims._patch_stream_tool_calls()
+    var = _mlx_vlm_shims._REQUEST_STREAM_TOOL_CALLS
+    tok = var.set(True)
+    try:
+        on = mod.ToolCallStreamState("<tool_call>", "</tool_call>")
+    finally:
+        var.reset(tok)
+    off = mod.ToolCallStreamState("<tool_call>", "</tool_call>")
+    assert on.feed("<tool_call>{") == "<tool_call>{"     # 頼んだリクエスト
+    assert off.feed("<tool_call>{") is None               # 頼んでいないリクエスト(上流どおり)
+
+    monkeypatch.setenv(_mlx_vlm_shims.STREAM_TOOL_CALLS_ENV, "1")
+    tok = var.set(False)                                   # 既定 on でも、断ったリクエストは流さない
+    try:
+        assert mod.ToolCallStreamState("<tool_call>", "</tool_call>").feed("<tool_call>{") is None
+    finally:
+        var.reset(tok)
+
+
+def test_per_request_flag_for_the_06_function(monkeypatch):
+    mod = _install_fake(monkeypatch, with_class=False, with_func=True)
+    monkeypatch.delenv(_mlx_vlm_shims.STREAM_TOOL_CALLS_ENV, raising=False)
+    _mlx_vlm_shims._patch_stream_tool_calls()
+    assert mod.suppress_tool_call_content("x", False, "<tool_call>", "abc") == (True, None)
+    tok = _mlx_vlm_shims._REQUEST_STREAM_TOOL_CALLS.set(True)
+    try:
+        assert mod.suppress_tool_call_content("x", False, "<tool_call>", "abc") == (False, "abc")
+    finally:
+        _mlx_vlm_shims._REQUEST_STREAM_TOOL_CALLS.reset(tok)
+
+
+def test_middleware_reads_the_header_for_the_request_only():
+    """ASGI ミドルウェアがヘッダーを読み、そのリクエストの処理中だけ文脈に置く。"""
+    import asyncio
+
+    seen = []
+
+    async def app(scope, receive, send):
+        seen.append(_mlx_vlm_shims._REQUEST_STREAM_TOOL_CALLS.get())
+
+    mw = _mlx_vlm_shims._StreamToolCallsFlag(app)
+
+    async def run(headers):
+        await mw({"type": "http", "headers": headers}, None, None)
+
+    asyncio.run(run([(b"x-stream-tool-calls", b"1")]))
+    asyncio.run(run([(b"x-stream-tool-calls", b"0")]))
+    asyncio.run(run([]))
+    assert seen == [True, False, None]
+    assert _mlx_vlm_shims._REQUEST_STREAM_TOOL_CALLS.get() is None
+
+
+def test_install_request_flag_adds_the_middleware_once(monkeypatch):
+    _install_fake(monkeypatch, with_class=True, with_func=False)
+    added = []
+
+    class _App:
+        def add_middleware(self, cls):
+            added.append(cls)
+
+    _sys.modules["mlx_vlm.server"].app = _App()
+    assert _mlx_vlm_shims._install_request_flag().startswith("per-request enabled")
+    assert _mlx_vlm_shims._install_request_flag() == "per-request already installed"
+    assert added == [_mlx_vlm_shims._StreamToolCallsFlag]
