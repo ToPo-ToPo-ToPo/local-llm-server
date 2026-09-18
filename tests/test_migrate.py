@@ -13,7 +13,14 @@ from local_llm_server import migrate
 @pytest.fixture
 def obsolete(monkeypatch):
     """テスト用の廃止キー表に差し替える（本物の表の中身が変わってもテストが揺れない）。"""
-    monkeypatch.setattr(migrate, "OBSOLETE_KEYS", {"gone_key": ("9.9.9", "もう使わない")})
+    monkeypatch.setattr(
+        migrate,
+        "OBSOLETE_KEYS",
+        {
+            "gone_key": ("9.9.9", "もう使わない", False),
+            "gone_but_noted": ("9.9.9", "挙動が変わった", True),
+        },
+    )
     monkeypatch.setattr(migrate, "RENAMED_KEYS", {"old_key": ("new_key", "9.9.9")})
 
 
@@ -29,6 +36,26 @@ def test_removes_obsolete_key_and_its_hanging_comments(obsolete):
     new, notes = migrate.migrate_text(text)
     assert new == 'port = 8799\nmax_resident = 2\n'
     assert len(notes) == 1 and "gone_key" in notes[0] and "9.9.9" in notes[0]
+
+
+def test_tombstone_key_becomes_a_comment_in_place(obsolete):
+    # 挙動が変わった廃止キーは、消す代わりに理由入りのコメントを同じ位置へ残す。
+    # ぶら下がりの説明は（内容が古いので）消し、字下げは元の行に合わせる。
+    text = (
+        'port = 8799\n'
+        '  gone_but_noted = true  # 行末コメント\n'
+        '    # ぶら下がった説明\n'
+        'max_resident = 2\n'
+    )
+    new, notes = migrate.migrate_text(text)
+    assert new == (
+        'port = 8799\n'
+        '  # gone_but_noted は 9.9.9 で廃止 — 挙動が変わった\n'
+        'max_resident = 2\n'
+    )
+    assert len(notes) == 1 and notes[0].startswith("コメント化: gone_but_noted")
+    # 冪等: 2 回目はもうキー行が無いので何も起きない。
+    assert migrate.migrate_text(new) == (new, [])
 
 
 def test_keeps_unindented_comment_after_removed_key(obsolete):
@@ -139,8 +166,17 @@ def test_real_table_drops_vision_model(tmp_path):
     assert any("vision_model" in n for n in notes)
 
 
-def test_migration_preserves_auto_update_so_loader_can_reject_it(tmp_path):
+def test_removed_auto_update_becomes_a_tombstone_comment(tmp_path):
+    # 挙動が変わった廃止キーは、消すのではなく理由入りのコメントに置き換える
+    # （起動を止めずに「もう自動では更新されない」と気づかせる）。
     path = _write(tmp_path, "auto_update = true\ntray = true\n")
     notes = migrate.migrate_file(path)
-    assert open(path, encoding="utf-8").read() == "auto_update = true\ntray = true\n"
-    assert notes == []
+    text = open(path, encoding="utf-8").read()
+    assert "auto_update = true" not in text
+    assert text.startswith("# auto_update は 0.38.15 で廃止 — ")
+    assert "gw update" in text
+    assert text.endswith("tray = true\n")
+    assert any("auto_update" in n for n in notes)
+    # 冪等: もう一度走らせてもコメントは増えない。
+    assert migrate.migrate_file(path) == []
+    assert open(path, encoding="utf-8").read() == text

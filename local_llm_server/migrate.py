@@ -20,13 +20,24 @@ import os
 import re
 import shutil
 
-# 廃止されたトップレベルキー: キー名 -> (廃止したバージョン, 理由)。
+# 廃止されたトップレベルキー: キー名 -> (廃止したバージョン, 理由, 墓標を残すか)。
 # ここに足すだけで、次回起動時に既存の設定から消える。
-OBSOLETE_KEYS: dict[str, tuple[str, str]] = {
+#
+# 「墓標」= 行を消す代わりに、同じ位置へ理由入りのコメントを残す。単に効かなくなった
+# キーは黙って消してよいが、**挙動そのものが変わった**キー（auto_update: 自動適用を
+# やめた）は、消すだけだと「まだ自動で更新される」と誤解したままになる。設定ファイルに
+# 理由を書き残せば、起動を止めずに気づかせられる。
+OBSOLETE_KEYS: dict[str, tuple[str, str, bool]] = {
     "vision_model": (
         "0.36.3",
         "画像入りリクエストの自動振り分けを廃止（mlx-vlm 0.6.7 で Qwen3.6 の画像入力が直り、"
         "gemma-4 系へ逃がす回避策が不要になった）",
+        False,
+    ),
+    "auto_update": (
+        "0.38.15",
+        "更新の適用は常に手動（`gw update`）。デーモンは新版の確認と通知だけ行う",
+        True,
     ),
 }
 
@@ -89,7 +100,7 @@ def migrate_text(text: str) -> tuple[str, list[str]]:
 
         if key in OBSOLETE_KEYS:
             assert m is not None
-            version, why = OBSOLETE_KEYS[key]
+            version, why, tombstone = OBSOLETE_KEYS[key]
             if not _value_is_self_contained(m.group(4)):
                 notes.append(
                     f"要手動削除: {key} は {version} で廃止（{why}）。値が複数行にまたがるため"
@@ -101,7 +112,12 @@ def migrate_text(text: str) -> tuple[str, list[str]]:
             i += 1
             while i < len(lines) and _is_hanging_comment(lines[i]):
                 i += 1               # ぶら下がっている説明コメントも一緒に消す
-            notes.append(f"削除: {key}（{version} で廃止 — {why}）")
+            if tombstone:
+                # 次回以降はただのコメント行なので、何度走らせても増えない（冪等）。
+                out.append(f"{m.group(1)}# {key} は {version} で廃止 — {why}\n")
+            notes.append(
+                f"{'コメント化' if tombstone else '削除'}: {key}（{version} で廃止 — {why}）"
+            )
             continue
 
         if key in RENAMED_KEYS:
