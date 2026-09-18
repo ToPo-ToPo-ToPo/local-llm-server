@@ -248,3 +248,55 @@ def test_forward_aborts_when_client_disconnects_during_upstream_silence():
     assert elapsed < 3.0, (
         f"forward() held the slot for {elapsed:.1f}s after client disconnect"
     )
+
+
+class _HeaderEchoUpstream(BaseHTTPRequestHandler):
+    """受けたヘッダーを本文で返す上流サーバー。"""
+
+    protocol_version = "HTTP/1.1"
+
+    def do_POST(self) -> None:
+        length = int(self.headers.get("Content-Length") or 0)
+        if length:
+            self.rfile.read(length)
+        body = repr(sorted((k.lower(), v) for k, v in self.headers.items())).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *_args) -> None:
+        pass
+
+
+def test_forward_passes_the_stream_tool_calls_header_only():
+    """ツール呼び出しの生成中トークンを流すかのリクエストごとの指定（X-Stream-Tool-Calls）は
+    上流へ渡す。それ以外の任意ヘッダーは従来どおり渡さない。"""
+    upstream = ThreadingHTTPServer(("127.0.0.1", 0), _HeaderEchoUpstream)
+    _ForwardingHandler.upstream_addr = ("127.0.0.1", upstream.server_address[1])
+    _ForwardingHandler.timeout_s = 10.0
+    _ForwardingHandler.finished = None
+    gw = ThreadingHTTPServer(("127.0.0.1", 0), _ForwardingHandler)
+    threading.Thread(target=upstream.serve_forever, daemon=True).start()
+    threading.Thread(target=gw.serve_forever, daemon=True).start()
+    try:
+        def call(extra):
+            conn = http.client.HTTPConnection("127.0.0.1", gw.server_address[1], timeout=10)
+            conn.request("POST", "/v1/chat/completions", body=b"{}",
+                         headers={"Content-Type": "application/json", **extra})
+            out = conn.getresponse().read().decode()
+            conn.close()
+            return out
+
+        with_flag = call({"X-Stream-Tool-Calls": "1", "X-Other": "no"})
+        without = call({})
+    finally:
+        upstream.shutdown()
+        upstream.server_close()
+        gw.shutdown()
+        gw.server_close()
+
+    assert "('x-stream-tool-calls', '1')" in with_flag
+    assert "x-other" not in with_flag
+    assert "x-stream-tool-calls" not in without

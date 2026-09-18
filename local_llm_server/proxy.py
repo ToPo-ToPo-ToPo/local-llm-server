@@ -110,6 +110,10 @@ def forward(handler: Any, addr: tuple[str, int], body: bytes, timeout_s: float |
     auth = handler.headers.get("Authorization")
     if auth:
         headers["Authorization"] = auth
+    # ツール呼び出しの生成中トークンを流すかのリクエストごとの指定（mlx-vlm のシムが読む）
+    stream_tc = handler.headers.get("X-Stream-Tool-Calls")
+    if stream_tc:
+        headers["X-Stream-Tool-Calls"] = stream_tc
     if handler.command == "POST":
         headers["Content-Length"] = str(len(body))
 

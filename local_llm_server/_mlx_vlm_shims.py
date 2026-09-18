@@ -30,6 +30,8 @@ from __future__ import annotations
 import os
 import runpy
 import sys
+from contextvars import ContextVar
+from typing import Optional
 
 # Inkling が本文の周りに出す構造トークン。content から取り除く対象。
 # <|end_message|> は思考の終端でもあるが、思考の切り出しはこの除去より前に
@@ -94,26 +96,98 @@ def _patch_apc_extra_hash() -> None:
 
 
 STREAM_TOOL_CALLS_ENV = "LOCAL_LLM_STREAM_TOOL_CALLS"
+#: リクエストごとの指定（クライアントがこのヘッダーで on/off を選ぶ。ゲートウェイが中継する）。
+STREAM_TOOL_CALLS_HEADER = "x-stream-tool-calls"
+
+# いま処理中のリクエストの指定（True / False / None = 指定なし＝モデルの既定）。
+_REQUEST_STREAM_TOOL_CALLS: ContextVar[Optional[bool]] = ContextVar(
+    "llmserver_stream_tool_calls", default=None)
+
+
+def _default_stream_tool_calls() -> bool:
+    """モデルの既定（gateway.toml の stream_tool_calls → 環境変数 LOCAL_LLM_STREAM_TOOL_CALLS=1）。"""
+    return os.environ.get(STREAM_TOOL_CALLS_ENV) == "1"
+
+
+def _stream_tool_calls_now() -> bool:
+    """このリクエストでツール呼び出しの生成中トークンを流すか。指定が無ければモデルの既定。"""
+    flag = _REQUEST_STREAM_TOOL_CALLS.get()
+    return _default_stream_tool_calls() if flag is None else flag
+
+
+def _parse_flag(raw: bytes | str | None) -> Optional[bool]:
+    if raw is None:
+        return None
+    v = (raw.decode("latin-1") if isinstance(raw, bytes) else str(raw)).strip().lower()
+    if v in ("1", "true", "yes", "on"):
+        return True
+    if v in ("0", "false", "no", "off"):
+        return False
+    return None
+
+
+class _StreamToolCallsFlag:
+    """ASGI ミドルウェア: リクエストの ``X-Stream-Tool-Calls`` を読み、処理中の間だけ文脈に置く。
+
+    ストリーム応答の生成は同じ文脈（から作られたタスク）で走るので、ツール呼び出しの抑止を
+    決める箇所（_patch_stream_tool_calls）がリクエストごとの指定を読める。
+    """
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+        raw = None
+        for k, v in scope.get("headers") or []:
+            if k.lower() == STREAM_TOOL_CALLS_HEADER.encode():
+                raw = v
+                break
+        token = _REQUEST_STREAM_TOOL_CALLS.set(_parse_flag(raw))
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            _REQUEST_STREAM_TOOL_CALLS.reset(token)
+
+
+def _install_request_flag() -> str:
+    """mlx-vlm の app にリクエストごとの指定を読むミドルウェアを足す（起動前に 1 回）。"""
+    try:
+        import mlx_vlm.server as _srv
+    except Exception as exc:  # noqa: BLE001 - mlx-vlm 無し等。起動は止めない
+        return f"per-request not available (mlx_vlm.server unavailable: {exc})"
+    app = getattr(_srv, "app", None)
+    if app is None or not hasattr(app, "add_middleware"):
+        return "per-request not available (no app)"
+    if getattr(app, "_llmserver_stream_flag", False):
+        return "per-request already installed"
+    app.add_middleware(_StreamToolCallsFlag)
+    app._llmserver_stream_flag = True
+    return "per-request enabled (header X-Stream-Tool-Calls)"
 
 
 def _patch_stream_tool_calls(log=None) -> str:
-    """ツール呼び出しの生成中トークンを捨てずに流す(環境変数 LOCAL_LLM_STREAM_TOOL_CALLS=1 のとき)。
+    """ツール呼び出しの生成中トークンを、流すと決まったリクエストでは捨てずに流す。
 
     上流の挙動(mlx-vlm 0.6/0.7): ストリーミング中に生成テキストへ <tool_call> が現れると、
     以後の delta を content から**捨て**、生成終了後に全文を解析した tool_calls を最後の
     1 チャンクにまとめて出す。そのため「ファイル本文を書いている最中の文字」はどのクライアント
     にも届かない(会社リポジトリのエディタのライブ表示が成立しない)。
 
-    このパッチは「捨てる」部分だけを素通しに変える。最後の解析済み tool_calls チャンクは
-    full_output(生成全文)から作られるので従来どおり出る=ツール呼び出しの正しさは不変。
-    副作用として <tool_call>…</tool_call> の生テキストが delta.content に流れるため、
-    受け側(local-llm-client 0.8+)が本文から剥がして途中経過として扱う。知らない
-    クライアントには生 JSON が本文に見えるので、既定 off(設定 stream_tool_calls)。
+    このパッチは「捨てる」部分を、流すと決まったリクエストでだけ素通しに変える。流すかどうかは
+    リクエストの ``X-Stream-Tool-Calls`` ヘッダー(_install_request_flag)、無ければモデルの既定
+    (gateway.toml の stream_tool_calls)。最後の解析済み tool_calls チャンクは full_output(生成全文)
+    から作られるので従来どおり出る=ツール呼び出しの正しさは不変。副作用として
+    <tool_call>…</tool_call> の生テキストが delta.content に流れるため、受け側
+    (local-llm-client 0.8+)が本文から剥がして途中経過として扱う。知らないクライアントには生 JSON が
+    本文に見えるので、既定は off で、使うクライアントだけがヘッダーで頼む。
 
     上流の構造が変わるとパッチが当たらない。その場合は従来の一括挙動に戻るだけで
     壊れはしないが、黙って劣化しないよう結果を文字列で返し、起動ログに出す。
-      - mlx-vlm 0.6.x: openai.suppress_tool_call_content(関数)を素通し版に差し替える
-      - mlx-vlm 0.7.x: openai.ToolCallStreamState(クラス)を feed が素通しの派生に差し替える
+      - mlx-vlm 0.6.x: openai.suppress_tool_call_content(関数)を条件つき素通し版に差し替える
+      - mlx-vlm 0.7.x: openai.ToolCallStreamState(クラス)を条件つき素通しの派生に差し替える
     """
     try:
         from mlx_vlm.server import openai as _oa
@@ -128,7 +202,14 @@ def _patch_stream_tool_calls(log=None) -> str:
         class _PassthroughToolCallStreamState(cls):  # type: ignore[misc,valid-type]
             _llmserver_passthrough = True
 
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                # 流すかどうかは作られた時点(=リクエストの開始)で決める
+                self._llmserver_stream = _stream_tool_calls_now()
+
             def feed(self, text, last: bool = False):
+                if not self._llmserver_stream:
+                    return super().feed(text, last)
                 # 状態(in_tool_call)は追跡しない: 呼び出し側は戻り値の本文しか使わない。
                 # None はそのまま(空 delta の抑止は呼び出し側が行う)
                 return text
@@ -140,8 +221,11 @@ def _patch_stream_tool_calls(log=None) -> str:
     if fn is not None:
         if getattr(fn, "_llmserver_passthrough", False):
             return "already applied (0.6 function)"
+        orig = fn
 
         def suppress_tool_call_content(full_output, in_tool_call, tc_start, delta_content):
+            if not _stream_tool_calls_now():
+                return orig(full_output, in_tool_call, tc_start, delta_content)
             return in_tool_call, delta_content
 
         suppress_tool_call_content._llmserver_passthrough = True  # type: ignore[attr-defined]
@@ -155,9 +239,13 @@ def apply() -> None:
     """既知のパッチを全て適用する。失敗しても起動は止めない。"""
     _patch_content_markers()
     _patch_apc_extra_hash()
-    if os.environ.get(STREAM_TOOL_CALLS_ENV) == "1":
-        result = _patch_stream_tool_calls()
-        print(f"[local-llm-server shim] stream_tool_calls: {result}", file=sys.stderr, flush=True)
+    # ツール呼び出しの生成中トークン: パッチは常に当て、流すかはリクエストごとに決める
+    # (ヘッダー X-Stream-Tool-Calls。無ければモデルの既定 = gateway.toml の stream_tool_calls)
+    result = _patch_stream_tool_calls()
+    flag = _install_request_flag()
+    default = "on" if _default_stream_tool_calls() else "off"
+    print(f"[local-llm-server shim] stream_tool_calls: {result}; default {default}; {flag}",
+          file=sys.stderr, flush=True)
 
 
 def main() -> None:
