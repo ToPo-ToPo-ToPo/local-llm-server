@@ -339,16 +339,14 @@ def test_migrate_dispatch_reports_up_to_date(tmp_path, monkeypatch, capsys):
     assert "変更なし" in capsys.readouterr().out
 
 
-def test_migrate_reports_removed_auto_update_without_deleting_it(
-    tmp_path, monkeypatch, capsys
-):
+def test_migrate_comments_out_removed_auto_update(tmp_path, monkeypatch, capsys):
     p = _use_cfg(tmp_path, monkeypatch, "auto_update = true\nport = 8799\n")
-    before = p.read_text(encoding="utf-8")
-    assert cli.main(["migrate"]) == 2
-    captured = capsys.readouterr()
-    assert "auto_update was removed" in captured.err
-    assert "delete" in captured.err
-    assert p.read_text(encoding="utf-8") == before
+    assert cli.main(["migrate"]) == 0
+    assert "変更しました" in capsys.readouterr().out
+    text = p.read_text(encoding="utf-8")
+    assert "auto_update = true" not in text
+    assert "# auto_update は 0.38.15 で廃止" in text
+    assert "port = 8799" in text
 
 
 def test_start_migrates_config_before_launch(tmp_path, monkeypatch):

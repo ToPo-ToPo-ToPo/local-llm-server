@@ -1392,9 +1392,12 @@ def test_load_gateway_config_parses_image_max_edge(tmp_path):
 
 
 @pytest.mark.parametrize("value", ["true", "false", '"false"'])
-def test_load_gateway_config_rejects_removed_auto_update(tmp_path, value):
-    with pytest.raises(ValueError, match=r"auto_update was removed.*delete"):
-        gw.load_gateway_config(_write(tmp_path, f"auto_update = {value}\n"))
+def test_load_gateway_config_ignores_removed_auto_update(tmp_path, value, capsys):
+    # 移行が書き換え損ねても**起動は止めない**（止めると更新経路そのものが壊れる）。
+    # 値が何であれ無視し、警告だけ出す。
+    cfg = gw.load_gateway_config(_write(tmp_path, f"auto_update = {value}\n"))
+    assert cfg.port == 8799
+    assert "auto_update は廃止されました" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("text", [

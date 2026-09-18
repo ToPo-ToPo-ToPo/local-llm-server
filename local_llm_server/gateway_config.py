@@ -164,6 +164,7 @@ _TOP_LEVEL_CONFIG_KEYS = {
     "repetition_context_size",
     "repetition_penalty_skip_structured",
     "session_ttl",  # 旧設定互換: 個別に警告して無視する
+    "auto_update",  # 旧設定互換: 個別に警告して無視する（移行がコメント化する）
 }
 _MODEL_CONFIG_KEYS = {
     "model",
@@ -441,11 +442,6 @@ def load_gateway_config(path: str, *, default_backend: str) -> GatewayConfig:
     """
     with open(path, "rb") as fh:
         data = tomllib.load(fh)
-    if "auto_update" in data:
-        raise ValueError(
-            "auto_update was removed in 0.38.15; delete this setting "
-            "(release checks are automatic, but applying updates is always manual)"
-        )
     _reject_unknown_keys(data, _TOP_LEVEL_CONFIG_KEYS, "top-level")
 
     host = data.get("host", "127.0.0.1")
@@ -523,6 +519,16 @@ def load_gateway_config(path: str, *, default_backend: str) -> GatewayConfig:
         print(
             "gateway.toml: session_ttl は廃止されました（ハートビートによる生存推定を"
             "やめたため無視します）。モデルの保持時間は idle_timeout で調整してください。",
+            file=sys.stderr,
+        )
+    # auto_update は 0.38.15 で廃止（更新の適用は常に手動）。移行（migrate.py）が設定
+    # ファイル側をコメントへ書き換えるので通常は残らないが、権限等で移行できなかった
+    # 場合に**起動を止めない**——止めると「更新したらデーモンが上がらない」になり、
+    # 更新経路そのものが壊れる。session_ttl と同じく警告だけ出して無視する。
+    if "auto_update" in data:
+        print(
+            "gateway.toml: auto_update は廃止されました（0.38.15 以降、更新の適用は "
+            "`gw update` を実行したときだけです）。この行は削除してかまいません。",
             file=sys.stderr,
         )
     tray = _strict_bool(data.get("tray", True), "tray")

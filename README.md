@@ -36,10 +36,16 @@ gw status     # 稼働/停止・PID・URL・起動経過を表示（自動起動
 gw list       # 使えるモデル一覧（カタログ＋HF キャッシュ）
 gw stop       # 停止（再開は gw start か次回ログイン）
 gw start      # 手動起動（初回は設定を自動生成。自動起動を無効にした場合の入口）
+gw update     # 更新を取り込む（新版の確認は自動、適用はこのコマンドだけ）
 ```
 
 設定は **`~/.config/local-llm-server/gateway.toml` の 1 箇所**（初回の `gw start` が自動生成。
-→ [docs/gateway.md](docs/gateway.md)）。
+→ [docs/gateway.md](docs/gateway.md)）。更新で設定キーが廃止・改名されても**手で直す必要はない**
+——次の起動時に自動で追従する（変更点はログに出し、元の内容は `gateway.toml.bak` に残す）。
+
+**更新は手動**。稼働中のデーモンは新しいリリースを見つけるとメニューバーの `gw` に「⬆」を出すが、
+適用するのは `gw update` を実行したときだけで、放置しても勝手に入れ替わらない
+（→ [docs/operation.md](docs/operation.md)）。
 
 接続は公開ポート（既定 `http://127.0.0.1:8799/v1`）に繋いで `model` を選ぶだけ。
 接続クライアントは別パッケージ [local-llm-client](https://github.com/ToPo-ToPo-ToPo/local-llm-client):
