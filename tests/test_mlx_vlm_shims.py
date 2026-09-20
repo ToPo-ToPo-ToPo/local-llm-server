@@ -84,6 +84,74 @@ def test_apc_patch_is_idempotent():
     assert apc.semantic_extra_hash is once   # 二重ラップしない
 
 
+def _bare_manager(apc):
+    """_observe_cache_size だけを動かすための最小の APCManager（Metal を触らない）。"""
+    import threading
+    if "_observe_cache_size" not in vars(apc.APCManager):
+        pytest.skip("上流がこの関数を持たない版（修正済み or 実装変更）。パッチは no-op")
+    m = object.__new__(apc.APCManager)
+    m.lock = threading.RLock()
+    m._bytes_per_token = 0.0
+    m._prefill_tokens = 0
+    m._prefill_reserve_bytes = 0
+    return m
+
+
+_REAL_RATE = 254660      # 実測: 64 層 4bit の 27B は 1 トークン約 249KB
+_SHORT_RATE = 1670000    # 65 トークンの要求では確保の固定費が乗って 1.6MB 相当に見える
+
+
+def _turn(m, tokens, rate):
+    """1 リクエストぶんの流れ（プリフィルの申告 → 実際の大きさの観測）を真似る。"""
+    m._prefill_tokens = tokens
+    m._prefill_reserve_bytes = int(2 * tokens * m._bytes_per_token)
+    m._observe_cache_size(tokens * rate, tokens)
+
+
+def test_apc_rate_is_not_poisoned_by_a_short_prompt():
+    """短いプロンプト 1 回で 1 トークンあたりの見積りが跳ね上がらないこと。
+
+    上流は max(これまでの値, size / token_count) で覚えるので、65 トークンのような
+    短い要求（会話の題を付ける等）が 1 回来ると実勢の数倍で固定される。その値から
+    計算する予約がメモリ上限を超え、以後すべての保存が見送られて、モデルサーバーを
+    再起動するまで前方一致が効かなくなる（実測 9.9 秒 → 162 秒、予約 2.7GB → 81.5GB）。
+    """
+    apc = pytest.importorskip("mlx_vlm.apc")
+    _mlx_vlm_shims.apply()
+    m = _bare_manager(apc)
+
+    _turn(m, 18000, _REAL_RATE)          # 実用のプロンプト
+    healthy_rate = m._bytes_per_token
+    healthy_reserve = m._prefill_reserve_bytes
+    assert healthy_rate > 0
+
+    _turn(m, 65, _SHORT_RATE)            # 会話の題を付ける短い要求
+    assert m._bytes_per_token == healthy_rate      # 見積りを汚さない
+
+    _turn(m, 18000, _REAL_RATE)          # 次の手番
+    assert m._bytes_per_token == healthy_rate
+    assert m._prefill_reserve_bytes == healthy_reserve   # 予約も元のまま
+
+
+def test_apc_rate_still_rises_for_long_prompts():
+    """長いプロンプトの観測は従来どおり見積りを上げる（過小評価へ倒さない）。"""
+    apc = pytest.importorskip("mlx_vlm.apc")
+    _mlx_vlm_shims.apply()
+    m = _bare_manager(apc)
+    _turn(m, 18000, _REAL_RATE)
+    before = m._bytes_per_token
+    _turn(m, 20000, _REAL_RATE * 2)
+    assert m._bytes_per_token > before
+
+
+def test_apc_rate_patch_is_idempotent():
+    apc = pytest.importorskip("mlx_vlm.apc")
+    _mlx_vlm_shims.apply()
+    once = apc.APCManager._observe_cache_size
+    _mlx_vlm_shims.apply()
+    assert apc.APCManager._observe_cache_size is once   # 二重ラップしない
+
+
 # ---- stream_tool_calls: ツール呼び出しの生成中トークンを流す ----------------------
 
 import sys as _sys

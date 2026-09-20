@@ -16,6 +16,12 @@ venv への直接パッチは黙って失われる。ここに置けばソース
    ため、思考の分離（MLX_VLM_THINKING_* で対応済み）をしても content にこれらが残る。
    除去表へ追記して本文だけを返す。他モデルはこれらの文字列を出さないので無害。
 
+2. APC の 1 トークンあたりバイト数が短いプロンプトで汚染される（mlx-vlm 0.7.1 時点）
+   `_observe_cache_size` は下がることのない最大値で覚えるため、65 トークンのような
+   短い要求が 1 回来ると実勢の数倍で固定され、そこから計算する予約がメモリ上限を
+   超えて以後すべての保存が見送られる。再起動するまで直らない
+   （→ `_patch_apc_rate_poisoning`）。
+
 （履歴）0.6.7 / 0.6.8 向けに当てていた次の 2 つは **0.6.9 で上流が修正したため削除した**:
   - models/inkling が sub-config クラス（TextConfig 等）を再エクスポートせず、
     汎用ローダーの getattr が必ず AttributeError になる問題
@@ -93,6 +99,63 @@ def _patch_apc_extra_hash() -> None:
     _apc.semantic_extra_hash = semantic_extra_hash
     # ar.py は `from .. import apc as _apc` のモジュール参照経由で呼ぶため、
     # モジュール属性の差し替えだけで全呼び出し箇所に効く
+
+
+#: この数より短いプロンプトの観測は「1 トークンあたりのバイト数」の見積りに採らない。
+#: KV は一定の粒度（数百トークン単位）でまとめて確保されるので、短いプロンプトでは
+#: その固定費が少ないトークン数で割られ、実勢より何倍も大きい値になる。1024 なら
+#: 確保の粒度が紛れても 2 割強の過大に収まり、実用のプロンプトはまず上回る。
+_APC_RATE_MIN_TOKENS = 1024
+
+
+def _patch_apc_rate_poisoning() -> None:
+    """短いプロンプト 1 回で APC が止まるのを防ぐ（mlx-vlm 0.7.1 時点）。
+
+    上流の問題: ``APCManager._observe_cache_size`` は 1 トークンあたりのバイト数を
+    ``max(これまでの値, size / token_count)`` で覚える。**下がることのない最大値**なので、
+    短いプロンプトが 1 回来ると実勢よりはるかに大きい値で固定される。この値は
+    ``prefill_reserve = 2 × トークン数 × 1トークンのバイト数`` に使われ、そこが
+    メモリ上限を超えると以後**すべての保存が見送られる**（``memory_skips`` が増え続ける）。
+    最大値は下がらないので、モデルサーバーを再起動するまで直らない。
+
+    実測（64 層・4bit の 27B、18k トークンのプロンプト）:
+
+    ========================================  ==========  ==================
+    条件                                      見積り      同じプロンプトの再送
+    ========================================  ==========  ==================
+    起動直後                                  2.7 GB      9.9 秒（前方一致あり）
+    間に 65 トークンの要求を 1 回挟む         81.5 GB     162 秒（前方一致なし）
+    ========================================  ==========  ==================
+
+    65 トークンの要求は珍しくない（会話の題を付ける・要約するといった短い呼び出し）。
+    エージェントは会話の頭でそれを送ることがあり、その 1 回で以降の全手番が
+    毎回フルのプリフィルになる。
+
+    直し方: 短いプロンプトの観測では見積りを上げない。``_prefill_reserve_bytes`` は
+    上流の式のまま引き直したいので、``size=0`` でもう一度呼ぶ（最大値なので見積りは
+    動かず、予約だけが信頼できる値で計算し直される）。
+    """
+    try:
+        from mlx_vlm import apc as _apc
+    except Exception:
+        return
+    manager = getattr(_apc, "APCManager", None)
+    original = getattr(manager, "_observe_cache_size", None)
+    if original is None or getattr(original, "_llmserver_patched", False):
+        return  # 上流が実装を変えた / 適用済み。触らない
+
+    def _observe_cache_size(self, size: int, token_count: int) -> None:
+        before = getattr(self, "_bytes_per_token", None)
+        original(self, size, token_count)
+        if before is None or token_count <= 0 or token_count >= _APC_RATE_MIN_TOKENS:
+            return
+        if getattr(self, "_bytes_per_token", before) <= before:
+            return  # 短くても見積りを上げていないなら触らない
+        self._bytes_per_token = before
+        original(self, 0, token_count)  # 予約だけを元の見積りで引き直す
+
+    _observe_cache_size._llmserver_patched = True  # type: ignore[attr-defined]
+    manager._observe_cache_size = _observe_cache_size
 
 
 STREAM_TOOL_CALLS_ENV = "LOCAL_LLM_STREAM_TOOL_CALLS"
@@ -239,6 +302,7 @@ def apply() -> None:
     """既知のパッチを全て適用する。失敗しても起動は止めない。"""
     _patch_content_markers()
     _patch_apc_extra_hash()
+    _patch_apc_rate_poisoning()
     # ツール呼び出しの生成中トークン: パッチは常に当て、流すかはリクエストごとに決める
     # (ヘッダー X-Stream-Tool-Calls。無ければモデルの既定 = gateway.toml の stream_tool_calls)
     result = _patch_stream_tool_calls()
