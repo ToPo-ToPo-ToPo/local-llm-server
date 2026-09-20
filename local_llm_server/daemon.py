@@ -42,6 +42,7 @@ from . import gateway_config as _gateway_config
 from . import gateway_updates as _gateway_updates
 from . import provisioner, sglang_provisioner, vllm_provisioner
 from . import video as video
+from .backend_core import PromptCacheConfig
 from .gateway_config import GatewayConfig
 from .gateway_errors import CapacityError
 from .gateway_errors import GatewayDraining as GatewayDraining
@@ -355,8 +356,16 @@ def apply_live_config(
         changed.append(f"{label}: {old!r} → {newv!r}")
 
     # --- 稼働中に変えられない構造設定は警告のみ（適用しない） ---
+    def _structural(fld: str, value):
+        # [[models]] の比較からプロンプトキャッシュの設定を外す（全モデルに配る設定で、
+        # 変更は下で「次回ロードから」として別に扱う。含めると [prompt_cache] を変えただけで
+        # 「models の変更＝要再起動」と誤って警告する）
+        if fld == "models":
+            return [replace(c, prompt_cache=PromptCacheConfig()) for c in value]
+        return value
+
     for fld in _RESTART_ONLY_FIELDS:
-        if getattr(cfg, fld) != getattr(new, fld):
+        if _structural(fld, getattr(cfg, fld)) != _structural(fld, getattr(new, fld)):
             restart_needed.append(fld)
 
     # --- max_resident: 退避を伴うので専用セッター経由（超過分は非同期 LRU 退避） ---

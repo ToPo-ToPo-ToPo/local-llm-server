@@ -1905,6 +1905,25 @@ def test_watch_config_file_applies_on_save(tmp_path):
         server.server_close(); mgr.shutdown()
 
 
+def test_apply_live_config_prompt_cache_is_next_load_not_restart(tmp_path):
+    """[prompt_cache] の変更は「次回ロードから」。[[models]] の要再起動には数えない（設定は全モデルに配られるため、
+    そのまま比べると models が変わったと誤警告する）。manager と各モデルのテンプレートに新しい設定が入る。"""
+    from local_llm_server.backend_core import PromptCacheConfig
+
+    base = 'port = 8080\n[[models]]\nmodel = "org/A"\nbackend = "mlx-vlm"\n'
+    cfg = gw.load_gateway_config(_write(tmp_path, base))
+    server, mgr = _live_server(cfg)
+    try:
+        new = gw.load_gateway_config(_write(tmp_path, base + '[prompt_cache]\ndebug = true\ndisk = false\n'))
+        changed, restart = gw.apply_live_config(server, mgr, cfg, new)
+        assert restart == []
+        assert any(c.startswith("prompt_cache") for c in changed)
+        assert mgr._prompt_cache == PromptCacheConfig(debug=True, disk=False)
+        assert mgr._models["org/A"].config.prompt_cache == PromptCacheConfig(debug=True, disk=False)
+    finally:
+        server.server_close(); mgr.shutdown()
+
+
 # --- 起動元情報（provenance: いつ・どこから・どの経路で立ったか） -------------------
 # 裏でヘッドレス起動されたゲートウェイでも、/admin/status 一発で出所を特定できるようにする。
 
