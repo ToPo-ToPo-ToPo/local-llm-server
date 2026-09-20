@@ -378,6 +378,10 @@ def _build_mlx_vlm(config: ServerConfig) -> list[str]:
             drafter = None
     if drafter:
         command += ["--draft-model", drafter, "--draft-kind", "mtp"]
+    # [prompt_cache] debug: APC のヒット／ミスの理由は mlx-vlm が DEBUG レベルでしか出さない
+    # （APC_DEBUG だけ立ててもログ設定が INFO のままなら何も出ない）。ログレベルも一緒に下げる
+    if config.prompt_cache.debug:
+        command += ["--log-level", "debug"]
     return command
 
 

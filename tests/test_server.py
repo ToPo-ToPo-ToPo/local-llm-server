@@ -1345,6 +1345,20 @@ def test_prompt_cache_settings_come_from_the_config(monkeypatch, tmp_path):
     assert env0["APC_DISK_ENABLED"] == "1" and "APC_MEMORY_MAX_GB" not in env0 and "APC_DEBUG" not in env0
 
 
+def test_prompt_cache_debug_lowers_the_mlx_vlm_log_level(monkeypatch):
+    # APC のヒット／ミスの理由は mlx-vlm が DEBUG レベルでしか出さないので、debug はログレベルも下げる。
+    from local_llm_server import server as srv_mod
+    from local_llm_server.backend_core import PromptCacheConfig, ServerConfig
+
+    monkeypatch.setattr(srv_mod, "ensure_cached", lambda *a, **k: None)
+    monkeypatch.setattr(srv_mod, "resolve_drafter", lambda *a, **k: None)
+    plain = srv_mod._build_mlx_vlm(ServerConfig("mlx-vlm", "org/m", "127.0.0.1", 9))
+    assert "--log-level" not in plain
+    dbg = srv_mod._build_mlx_vlm(ServerConfig("mlx-vlm", "org/m", "127.0.0.1", 9,
+                                              prompt_cache=PromptCacheConfig(debug=True)))
+    assert dbg[-2:] == ["--log-level", "debug"]
+
+
 def test_user_can_disable_prompt_cache(monkeypatch, tmp_path):
     # ユーザーが env で明示していれば尊重する（setdefault なので切れる）。
     env = _capture_start_env(monkeypatch, tmp_path, "mlx-vlm",
