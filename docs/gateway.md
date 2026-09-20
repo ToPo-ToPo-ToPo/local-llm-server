@@ -22,6 +22,14 @@ disable_thinking = false    # 動的ロード時の既定（思考抑制）。�
 stream_tool_calls = false   # ツール呼び出しの生成中トークンを流す（mlx-vlm）。既定 off。各 [[models]] で上書き可（下記「ツール呼び出しのストリーミング」）
 tray = true                 # 稼働中メニューバーに「gw」アイコンを表示（macOS のみ。省略時 true。false で非表示）
 
+[prompt_cache]              # プロンプトキャッシュ（mlx-vlm）。省略可。下記「プロンプトキャッシュ（[prompt_cache]）」
+enabled = true
+entries = 8                 # 保持するスナップショットの数
+guard_tokens = 1024         # スナップショットをプロンプト末尾から何トークン手前で切るか
+# memory_max_gb = 24        # メモリ上のキャッシュの上限 GiB（省略で mlx-vlm が空き RAM から見積る）
+disk = true                 # ディスク層（再起動後も前方一致を復元。書き込みはプリフィル中に走る）
+# disk_max_gb = 20          # ディスク層の上限 GiB（省略で 20。0 で無制限）
+
 # [[models]] は任意（dynamic = true なら省略可）。mlx-vlm の MTP と画像入力は動的ロードでも自動で
 # 効くので、それ目的の事前登録は不要。parallel・llama.cpp の MTP・llama-server への個別フラグ等、
 # ID だけでは決まらない上書きが要るモデルだけ事前登録する。
@@ -60,6 +68,7 @@ backend = "mlx-vlm"
 | `image_max_edge` | `1024` | **静止画の長辺上限 px**（64〜4096、`0` で無効）。上流へ渡す前に縮小し、vision トークンの膨張を防ぐ。→ [画像入力の縮小](#画像入力の縮小image_max_edge) |
 | `max_request_workers` | `32` | 同時に処理するHTTP接続数。超過は503としてメモリ・スレッド枯渇を防ぐ |
 | `max_media_workers` | `2` | 同時に取得・展開する画像／動画数 |
+| `[prompt_cache]` | 有効・8 件・guard 1024・ディスク層あり | プロンプトキャッシュ（mlx-vlm の APC）の設定テーブル。全モデルに同じ設定を渡す（次回ロードから）。→ [プロンプトキャッシュ](#プロンプトキャッシュprompt_cache) |
 | `[llama_cpp]` | 全自動 | `llama-server` の自動導入テーブル。`accel`（auto/cuda/vulkan/metal/cpu）・`pin`（ビルド番号）。導入方法の選択肢は無い（常に自動導入）。→ [llama-cpp.md](llama-cpp.md#自動導入llama_cpp) |
 
 `[[models]]` は 1 モデル 1 エントリ。`model`（HuggingFace ID）と `backend`（`mlx` / `mlx-vlm` /
@@ -287,7 +296,7 @@ git push origin v<新バージョン>
 | 種別 | 対象 | 反映 |
 |---|---|---|
 | **即時反映（ポリシー）** | `default_model`, `image_max_edge`, `max_resident`, `request_timeout`, `idle_timeout`, `load_timeout`, `api_key` | 保存した瞬間に有効 |
-| **次回ロードから（動的既定）** | トップレベルの `draft_model`, `parallel`, `disable_thinking`, `stream_tool_calls`, `max_memory_fraction`, `dynamic`, `start_timeout` | 既にロード済みのモデルは次にロードし直すまで旧設定のまま |
+| **次回ロードから（動的既定）** | トップレベルの `draft_model`, `parallel`, `disable_thinking`, `stream_tool_calls`, `max_memory_fraction`, `dynamic`, `start_timeout`, `[prompt_cache]` | 既にロード済みのモデルは次にロードし直すまで旧設定のまま |
 | **要再起動（構造）** | `host`, `port`, `internal_base_port`, `[[models]]`, `max_request_workers`, `max_media_workers`, `tray` | 稼働中は変えられない（ソケット bind 済み等）。変更を検知しても**適用せず「要再起動」をログ警告**し、旧値のまま動き続ける |
 
 - `max_resident` の即時反映は `POST /admin/config` と同じ挙動（**busy は止めず、超過アイドルのみ非同期
@@ -421,6 +430,29 @@ class GatewaySession:
 
 > `agent_id` はエージェントごとに一意な文字列にする（PID やUUID等）。同一 `agent_id` で別 `model` を
 > `register` し直すと、旧モデルから自動的に外れる（乗り換え。旧モデルが無人になれば解放される）。
+
+## プロンプトキャッシュ（`[prompt_cache]`）
+
+mlx-vlm のプロンプトキャッシュ（APC）は既定で有効。会話の連続する手番は前方（system プロンプト＋履歴）が
+同じなので、前の手番のキャッシュが残っていればプリフィルはその差分だけになる（実測: 41k トークンの前方を
+共有する 2 要求で、2 つ目は 40k がキャッシュ命中、357 秒 → 13 秒）。
+
+**設定は `gateway.toml` の `[prompt_cache]` テーブル**（PC ごとの設定。環境変数で渡す必要はなく、値をコードに
+埋めてもいない）。ゲートウェイがモデルサーバーを起動するときに環境変数へ写して渡すので、変更は**次回ロードから**
+効く（ロード済みのモデルは `gw restart` か idle アンロード後の再ロードで新設定になる）。
+
+| キー | 既定 | 説明 |
+|---|---|---|
+| `enabled` | `true` | キャッシュを使う |
+| `entries` | `8` | 保持するスナップショットの数。ハイブリッド注意機構のモデル（gemma4 系・Qwen3.6 系など）は **exact モード**＝プレフィックス丸ごとのスナップショットで、1 手番に複数回 LLM を呼ぶエージェントは上流既定の 2 だと玉突きで追い出される |
+| `guard_tokens` | `1024` | スナップショットをプロンプト末尾から何トークン手前で切るか。エージェントのプロンプトは「共通の前方＋毎回変わる末尾（状態通知・発言）」なので、末尾の長さぶん手前で切らないと前方一致が働かない |
+| `memory_max_gb` | なし | メモリ上のキャッシュの上限（GiB）。省略時は mlx-vlm が空き RAM から見積る。**同じモデルを数セッションが使い、他のモデルも常駐する PC では見積りが小さくなって手番ごとに追い出される**ことがある。そのときはここで明示する |
+| `disk` | `true` | ディスク層。スナップショットをディスクにも書き、再起動後や追い出し後に前方一致を復元する。書き込みはプリフィル中に走るので、長いプロンプト（数万トークン。64 層のモデルで数 GB）では生のプリフィルが遅くなる副作用がある |
+| `disk_max_gb` | `20` | ディスク層の上限（GiB）。`0` で無制限。上限に当たると古いものから消える（`APC disk: evicted …` がログに出る） |
+
+命中の有無はモデルサーバーのログ `Prefill completed: … cached_tokens=N` で分かる（`N=0` が続くなら、①クライアントが
+過去のメッセージを書き換えている（ハイブリッド注意層のモデルは前方が丸ごと一致しないと命中しない）、②追い出し、
+③同じモデルの複数インスタンスに交互に振られている、のいずれか。2026-09-20 の実例は①＝エージェントの履歴の刈り取り）。
 
 ## ツール呼び出しのストリーミング（`stream_tool_calls`）
 

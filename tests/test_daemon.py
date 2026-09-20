@@ -45,6 +45,40 @@ def test_load_gateway_config_assigns_internal_ports(tmp_path):
     assert [c.port for c in cfg.models] == [9001, 9002]
 
 
+def test_load_gateway_config_prompt_cache_table(tmp_path):
+    """[prompt_cache] は PC ごとの設定ファイルで決める（環境変数でもコード埋め込みでもなく）。
+    事前登録・動的ロードのどちらのモデルにも同じ設定が渡る。型・範囲・未知のキーは厳密に弾く。"""
+    from local_llm_server.backend_core import PromptCacheConfig
+
+    p = _write(tmp_path, 'port = 8080\n[[models]]\nmodel = "org/A"\nbackend = "mlx-vlm"\n')
+    cfg = gw.load_gateway_config(p)
+    assert cfg.prompt_cache == PromptCacheConfig()                       # テーブル無し → 既定
+    assert cfg.models[0].prompt_cache == PromptCacheConfig()
+
+    p = _write(tmp_path, 'port = 8080\n[prompt_cache]\nentries = 4\nmemory_max_gb = 24\ndisk = false\n'
+                         '[[models]]\nmodel = "org/A"\nbackend = "mlx-vlm"\n')
+    cfg = gw.load_gateway_config(p)
+    assert cfg.prompt_cache == PromptCacheConfig(entries=4, memory_max_gb=24.0, disk=False)
+    assert cfg.models[0].prompt_cache == cfg.prompt_cache
+    assert cfg.prompt_cache.env() == {"APC_ENABLED": "1", "APC_EXACT_CACHE_ENTRIES": "4",
+                                      "APC_EXACT_PREFIX_GUARD_TOKENS": "1024", "APC_DISK_ENABLED": "0",
+                                      "APC_MEMORY_MAX_GB": "24"}
+    # 動的ロードのモデルにも同じ設定
+    from local_llm_server.gateway_manager import ModelManager
+
+    mgr = ModelManager([], dynamic=True, prompt_cache=cfg.prompt_cache, _server_factory=lambda *a, **k: None)
+    with mgr._state:
+        mm = mgr._register_dynamic_locked("org/B-mlx")
+    assert mm.config.prompt_cache == cfg.prompt_cache
+
+    for bad in ('[prompt_cache]\nentries = -1\n', '[prompt_cache]\nguard_tokens = 0\n',
+                '[prompt_cache]\nmemory_max_gb = 0\n', '[prompt_cache]\ndisk = "yes"\n',
+                '[prompt_cache]\nsize = 3\n', '[prompt_cache]\ndebug = true\n', 'prompt_cache = 3\n'):
+        p = _write(tmp_path, 'port = 8080\ndynamic = true\n' + bad)
+        with pytest.raises(ValueError):
+            gw.load_gateway_config(p)
+
+
 def test_load_gateway_config_llama_draft_passthrough(tmp_path):
     # llama-cpp の draft_model は repo-id をそのまま採用（speculative decoding 用）。
     # グローバル既定 "auto" は llama-cpp では無効化される（自動解決表が無い）。
@@ -1868,6 +1902,25 @@ def test_watch_config_file_applies_on_save(tmp_path):
         assert _wait_until(lambda: server.default_model == "org/c")
     finally:
         stop.set(); t.join(timeout=2)
+        server.server_close(); mgr.shutdown()
+
+
+def test_apply_live_config_prompt_cache_is_next_load_not_restart(tmp_path):
+    """[prompt_cache] の変更は「次回ロードから」。[[models]] の要再起動には数えない（設定は全モデルに配られるため、
+    そのまま比べると models が変わったと誤警告する）。manager と各モデルのテンプレートに新しい設定が入る。"""
+    from local_llm_server.backend_core import PromptCacheConfig
+
+    base = 'port = 8080\n[[models]]\nmodel = "org/A"\nbackend = "mlx-vlm"\n'
+    cfg = gw.load_gateway_config(_write(tmp_path, base))
+    server, mgr = _live_server(cfg)
+    try:
+        new = gw.load_gateway_config(_write(tmp_path, base + '[prompt_cache]\nentries = 3\ndisk = false\n'))
+        changed, restart = gw.apply_live_config(server, mgr, cfg, new)
+        assert restart == []
+        assert any(c.startswith("prompt_cache") for c in changed)
+        assert mgr._prompt_cache == PromptCacheConfig(entries=3, disk=False)
+        assert mgr._models["org/A"].config.prompt_cache == PromptCacheConfig(entries=3, disk=False)
+    finally:
         server.server_close(); mgr.shutdown()
 
 

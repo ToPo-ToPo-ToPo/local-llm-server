@@ -1314,6 +1314,37 @@ def test_mlx_vlm_gets_exact_apc_tuning_defaults(monkeypatch, tmp_path):
     assert env["APC_EXACT_CACHE_ENTRIES"] == "8"
 
 
+def test_prompt_cache_settings_come_from_the_config(monkeypatch, tmp_path):
+    # 利用者が触るのは gateway.toml の [prompt_cache]（→ ServerConfig.prompt_cache）。環境変数は
+    # モデルサーバーへの受け渡しにだけ使う（人向けの設定口ではない・値をコードに埋めない）。
+    import subprocess
+    from local_llm_server import server as srv_mod
+    from local_llm_server import LocalServer, ServerConfig
+    from local_llm_server.backend_core import PromptCacheConfig
+
+    monkeypatch.setattr(srv_mod, "build_command", lambda cfg: ["true"])
+    captured = {}
+
+    class _FakePopen:
+        pid = 4242
+        def __init__(self, *a, **k):
+            captured["env"] = k.get("env")
+        def poll(self):
+            return 0
+
+    monkeypatch.setattr(subprocess, "Popen", _FakePopen)
+    pc = PromptCacheConfig(entries=3, guard_tokens=256, memory_max_gb=12.5, disk=False, disk_max_gb=0)
+    LocalServer(ServerConfig("mlx-vlm", "dummy", "127.0.0.1", 9, prompt_cache=pc),
+                log_path=str(tmp_path / "s.log")).start()
+    env = captured["env"]
+    assert env["APC_ENABLED"] == "1" and env["APC_EXACT_CACHE_ENTRIES"] == "3"
+    assert env["APC_EXACT_PREFIX_GUARD_TOKENS"] == "256" and env["APC_MEMORY_MAX_GB"] == "12.5"
+    assert env["APC_DISK_ENABLED"] == "0" and env["APC_DISK_MAX_GB"] == "0" and "APC_DEBUG" not in env
+    # 既定（テーブル無し）: 上限は書かない（mlx-vlm の見積りに任せる）、ディスク層は有効
+    env0 = _capture_start_env(monkeypatch, tmp_path, "mlx-vlm")
+    assert env0["APC_DISK_ENABLED"] == "1" and "APC_MEMORY_MAX_GB" not in env0
+
+
 def test_user_can_disable_prompt_cache(monkeypatch, tmp_path):
     # ユーザーが env で明示していれば尊重する（setdefault なので切れる）。
     env = _capture_start_env(monkeypatch, tmp_path, "mlx-vlm",

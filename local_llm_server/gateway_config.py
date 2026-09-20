@@ -16,6 +16,7 @@ from .backend_core import (
     BACKEND_SPECS,
     ServerConfig,
     backend_spec,
+    PromptCacheConfig,
 )
 from .constants import BACKENDS
 from .model_catalog import resolve_drafter
@@ -132,6 +133,9 @@ class GatewayConfig:
     # true にすると、必須の繰り返し記号（JSON 構文・フィールド名）を減点しうる structured 生成を
     # 保護できる（実測では 1.1 で実害は無いが、保険として明示的に切れるようにする）。
     repetition_penalty_skip_structured: bool = False
+    # プロンプトキャッシュ（mlx-vlm の APC）。[prompt_cache] テーブル。全モデルに同じ設定を渡す
+    # （次回ロードから有効。→ PromptCacheConfig）
+    prompt_cache: PromptCacheConfig = field(default_factory=PromptCacheConfig)
 
 
 _TOP_LEVEL_CONFIG_KEYS = {
@@ -163,6 +167,7 @@ _TOP_LEVEL_CONFIG_KEYS = {
     "repetition_penalty",
     "repetition_context_size",
     "repetition_penalty_skip_structured",
+    "prompt_cache",
     "session_ttl",  # 旧設定互換: 個別に警告して無視する
     "auto_update",  # 旧設定互換: 個別に警告して無視する（移行がコメント化する）
 }
@@ -176,6 +181,42 @@ _MODEL_CONFIG_KEYS = {
     "extra_args",
 }
 _LLAMA_CPP_CONFIG_KEYS = {"accel", "pin"}
+_PROMPT_CACHE_CONFIG_KEYS = {"enabled", "entries", "guard_tokens", "memory_max_gb", "disk", "disk_max_gb"}
+
+
+def _parse_prompt_cache_table(data: dict) -> PromptCacheConfig:
+    """`[prompt_cache]` テーブル → PromptCacheConfig。無ければ既定。型と範囲は厳密に検査する。"""
+    table = data.get("prompt_cache")
+    if table is None:
+        return PromptCacheConfig()
+    if not isinstance(table, dict):
+        raise ValueError("[prompt_cache] must be a table")
+    _reject_unknown_keys(table, _PROMPT_CACHE_CONFIG_KEYS, "prompt_cache")
+    base = PromptCacheConfig()
+    entries = _strict_int(table.get("entries", base.entries), "prompt_cache.entries")
+    if entries < 0:
+        raise ValueError("prompt_cache.entries must be 0 or greater")
+    guard = _strict_int(table.get("guard_tokens", base.guard_tokens), "prompt_cache.guard_tokens")
+    if guard < 1:
+        raise ValueError("prompt_cache.guard_tokens must be 1 or greater")
+    memory_max_gb = table.get("memory_max_gb")
+    if memory_max_gb is not None:
+        memory_max_gb = _finite_float(memory_max_gb, "prompt_cache.memory_max_gb")
+        if memory_max_gb <= 0:
+            raise ValueError("prompt_cache.memory_max_gb must be greater than 0")
+    disk_max_gb = table.get("disk_max_gb")
+    if disk_max_gb is not None:
+        disk_max_gb = _finite_float(disk_max_gb, "prompt_cache.disk_max_gb")
+        if disk_max_gb < 0:
+            raise ValueError("prompt_cache.disk_max_gb must be 0 or greater (0 = uncapped)")
+    return PromptCacheConfig(
+        enabled=_strict_bool(table.get("enabled", base.enabled), "prompt_cache.enabled"),
+        entries=entries,
+        guard_tokens=guard,
+        memory_max_gb=memory_max_gb,
+        disk=_strict_bool(table.get("disk", base.disk), "prompt_cache.disk"),
+        disk_max_gb=disk_max_gb,
+    )
 
 
 def _reject_unknown_keys(data: dict, allowed: set[str], scope: str) -> None:
@@ -342,6 +383,7 @@ def _parse_model_entries(
     default_draft,
     default_backend: str,
     default_stream_tool_calls: bool = False,
+    prompt_cache: PromptCacheConfig | None = None,
 ):
     """[[models]] 配列を検証して ServerConfig 群に組み立てる。
 
@@ -412,6 +454,7 @@ def _parse_model_entries(
                 ),
                 draft_model=draft,
                 extra_args=list(extra_args),
+                prompt_cache=prompt_cache or PromptCacheConfig(),
             )
         )
     return configs, seen
@@ -566,6 +609,7 @@ def load_gateway_config(path: str, *, default_backend: str) -> GatewayConfig:
     )
 
     llama_accel, llama_build = _parse_llama_cpp_table(data)
+    prompt_cache = _parse_prompt_cache_table(data)
 
     (
         video_frames,
@@ -583,6 +627,7 @@ def load_gateway_config(path: str, *, default_backend: str) -> GatewayConfig:
         default_draft=default_draft,
         default_backend=default_backend,
         default_stream_tool_calls=stream_tool_calls,
+        prompt_cache=prompt_cache,
     )
 
     # dynamic 無効のときだけ default_model が事前登録に在ることを要求する
@@ -620,4 +665,5 @@ def load_gateway_config(path: str, *, default_backend: str) -> GatewayConfig:
         repetition_penalty=repetition_penalty,
         repetition_context_size=repetition_context_size,
         repetition_penalty_skip_structured=repetition_penalty_skip_structured,
+        prompt_cache=prompt_cache,
     )

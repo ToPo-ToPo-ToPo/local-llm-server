@@ -35,13 +35,14 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 from http.server import ThreadingHTTPServer
 
 from . import gateway_config as _gateway_config
 from . import gateway_updates as _gateway_updates
 from . import provisioner, sglang_provisioner, vllm_provisioner
 from . import video as video
+from .backend_core import PromptCacheConfig
 from .gateway_config import GatewayConfig
 from .gateway_errors import CapacityError
 from .gateway_errors import GatewayDraining as GatewayDraining
@@ -355,8 +356,16 @@ def apply_live_config(
         changed.append(f"{label}: {old!r} → {newv!r}")
 
     # --- 稼働中に変えられない構造設定は警告のみ（適用しない） ---
+    def _structural(fld: str, value):
+        # [[models]] の比較からプロンプトキャッシュの設定を外す（全モデルに配る設定で、
+        # 変更は下で「次回ロードから」として別に扱う。含めると [prompt_cache] を変えただけで
+        # 「models の変更＝要再起動」と誤って警告する）
+        if fld == "models":
+            return [replace(c, prompt_cache=PromptCacheConfig()) for c in value]
+        return value
+
     for fld in _RESTART_ONLY_FIELDS:
-        if getattr(cfg, fld) != getattr(new, fld):
+        if _structural(fld, getattr(cfg, fld)) != _structural(fld, getattr(new, fld)):
             restart_needed.append(fld)
 
     # --- max_resident: 退避を伴うので専用セッター経由（超過分は非同期 LRU 退避） ---
@@ -427,6 +436,12 @@ def apply_live_config(
     if cfg.stream_tool_calls != new.stream_tool_calls:
         note("stream_tool_calls", cfg.stream_tool_calls, new.stream_tool_calls)
         manager._default_stream_tool_calls = new.stream_tool_calls
+    if cfg.prompt_cache != new.prompt_cache:
+        # 次回ロードから（モデルサーバーの起動時の環境で渡すため、ロード済みは次に立て直すまで旧設定）
+        note("prompt_cache", cfg.prompt_cache, new.prompt_cache)
+        manager._prompt_cache = new.prompt_cache
+        for mm in manager._models.values():
+            mm.config = replace(mm.config, prompt_cache=new.prompt_cache)
     if cfg.draft_model != new.draft_model:
         note("draft_model", cfg.draft_model, new.draft_model)
         manager._default_draft = new.draft_model
@@ -903,6 +918,7 @@ def _run_gateway_locked(cfg: GatewayConfig, config_path: str | None = None) -> i
             dynamic=cfg.dynamic,
             default_disable_thinking=cfg.disable_thinking,
             default_stream_tool_calls=cfg.stream_tool_calls,
+            prompt_cache=cfg.prompt_cache,
             default_draft=cfg.draft_model,
             default_parallel=cfg.parallel,
             max_memory_fraction=cfg.max_memory_fraction,
