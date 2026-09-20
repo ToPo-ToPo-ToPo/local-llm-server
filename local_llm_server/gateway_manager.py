@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass, field, replace
 from typing import Protocol
 
-from .backend_core import ServerConfig, backend_spec, infer_backend, parallel_supported
+from .backend_core import PromptCacheConfig, ServerConfig, backend_spec, infer_backend, parallel_supported
 from .gateway_errors import CapacityError, GatewayDraining
 from .gateway_runtime import daemon_log_path
 from .model_catalog import MTP_DRAFTERS, resolve_drafter
@@ -130,6 +130,7 @@ class ModelManager:
         dynamic: bool = False,
         default_disable_thinking: bool = False,
         default_stream_tool_calls: bool = False,
+        prompt_cache: PromptCacheConfig | None = None,
         default_draft: str | None = None,
         default_parallel: int | None = None,
         max_memory_fraction: float | None = None,
@@ -157,6 +158,8 @@ class ModelManager:
         self._dynamic = dynamic
         self._default_disable_thinking = default_disable_thinking
         self._default_stream_tool_calls = default_stream_tool_calls
+        # プロンプトキャッシュの設定（gateway.toml の [prompt_cache]）。動的ロードのモデルにも同じものを渡す
+        self._prompt_cache = prompt_cache or PromptCacheConfig()
         # 動的ロード時の MTP ドラフター既定。None なら mlx-vlm は "auto"（対応表 MTP_DRAFTERS
         # から本体名で自動選択）を試みる。"off"/"none"/"" で無効化、明示 id でその指定を使う。
         self._default_draft = default_draft
@@ -233,6 +236,7 @@ class ModelManager:
             disable_thinking=self._default_disable_thinking,
             stream_tool_calls=self._default_stream_tool_calls,
             draft_model=self._dynamic_draft(model_id, backend),
+            prompt_cache=self._prompt_cache,
         )
         mm = _Model(config=cfg, dynamic=True)
         self._models[model_id] = mm

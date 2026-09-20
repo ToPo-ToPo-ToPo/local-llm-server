@@ -39,6 +39,49 @@ def infer_backend(model: str) -> str:
     return default_backend()
 
 
+@dataclass(frozen=True)
+class PromptCacheConfig:
+    """プロンプトキャッシュ（mlx-vlm の APC）の設定。gateway.toml の `[prompt_cache]` テーブル。
+
+    人が触るのはこの設定ファイルだけで、モデルサーバーへは起動時の環境変数（APC_*）として内部で渡す
+    （環境変数はモデルサーバー側の受け口であって、利用者向けの設定口ではない）。既定値はここが正本。
+
+    - enabled: キャッシュを使う
+    - entries: 保持するスナップショットの数（exact モード。ハイブリッド注意機構のモデルはプレフィックス
+      丸ごとのスナップショット。1 手番に複数回呼ぶエージェント向けに上流既定 2 より多い）
+    - guard_tokens: スナップショットをプロンプト末尾から何トークン手前で切るか（毎回変わる末尾の長さぶん）
+    - memory_max_gb: メモリ上のキャッシュの上限（None で mlx-vlm の見積り＝空き RAM から判断）
+    - disk: ディスク層を使う（スナップショットをディスクにも書き、再起動後も前方一致を復元できる。
+      書き込みはプリフィル中に走る）
+    - disk_max_gb: ディスク層の上限（None で mlx-vlm 既定 20）
+    - debug: ヒット／ミスの理由をモデルサーバーのログに出す
+    """
+
+    enabled: bool = True
+    entries: int = 8
+    guard_tokens: int = 1024
+    memory_max_gb: float | None = None
+    disk: bool = True
+    disk_max_gb: float | None = None
+    debug: bool = False
+
+    def env(self) -> dict[str, str]:
+        """モデルサーバー（mlx-vlm）へ渡す環境変数。"""
+        out = {
+            "APC_ENABLED": "1" if self.enabled else "0",
+            "APC_EXACT_CACHE_ENTRIES": str(int(self.entries)),
+            "APC_EXACT_PREFIX_GUARD_TOKENS": str(int(self.guard_tokens)),
+            "APC_DISK_ENABLED": "1" if self.disk else "0",
+        }
+        if self.memory_max_gb is not None:
+            out["APC_MEMORY_MAX_GB"] = f"{float(self.memory_max_gb):g}"
+        if self.disk_max_gb is not None:
+            out["APC_DISK_MAX_GB"] = f"{float(self.disk_max_gb):g}"
+        if self.debug:
+            out["APC_DEBUG"] = "1"
+        return out
+
+
 @dataclass
 class ServerConfig:
     """Configuration for one local model-server process."""
@@ -52,6 +95,7 @@ class ServerConfig:
     draft_model: str | None = None
     stream_tool_calls: bool = False
     extra_args: list[str] = field(default_factory=list)
+    prompt_cache: PromptCacheConfig = field(default_factory=PromptCacheConfig)
 
     @property
     def base_url(self) -> str:

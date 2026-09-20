@@ -35,7 +35,7 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 from http.server import ThreadingHTTPServer
 
 from . import gateway_config as _gateway_config
@@ -427,6 +427,12 @@ def apply_live_config(
     if cfg.stream_tool_calls != new.stream_tool_calls:
         note("stream_tool_calls", cfg.stream_tool_calls, new.stream_tool_calls)
         manager._default_stream_tool_calls = new.stream_tool_calls
+    if cfg.prompt_cache != new.prompt_cache:
+        # 次回ロードから（モデルサーバーの起動時の環境で渡すため、ロード済みは次に立て直すまで旧設定）
+        note("prompt_cache", cfg.prompt_cache, new.prompt_cache)
+        manager._prompt_cache = new.prompt_cache
+        for mm in manager._models.values():
+            mm.config = replace(mm.config, prompt_cache=new.prompt_cache)
     if cfg.draft_model != new.draft_model:
         note("draft_model", cfg.draft_model, new.draft_model)
         manager._default_draft = new.draft_model
@@ -903,6 +909,7 @@ def _run_gateway_locked(cfg: GatewayConfig, config_path: str | None = None) -> i
             dynamic=cfg.dynamic,
             default_disable_thinking=cfg.disable_thinking,
             default_stream_tool_calls=cfg.stream_tool_calls,
+            prompt_cache=cfg.prompt_cache,
             default_draft=cfg.draft_model,
             default_parallel=cfg.parallel,
             max_memory_fraction=cfg.max_memory_fraction,

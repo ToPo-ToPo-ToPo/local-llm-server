@@ -629,7 +629,10 @@ class LocalServer:
                 # メモリ増は観測されず（26B-4bit で RSS 16.1GB のまま）、外して
                 # おく理由が無いため既定を有効側にする。ブロック数などの調整は
                 # APC_* を環境変数で渡す（ここは未設定時のみ＝ユーザー指定が優先）。
-                env.setdefault("APC_ENABLED", "1")
+                # 値は gateway.toml の [prompt_cache]（→ ServerConfig.prompt_cache。既定はそこが正本）。
+                # 環境変数はモデルサーバーへの受け渡しであって、利用者向けの設定口ではない
+                for key, value in self.config.prompt_cache.env().items():
+                    env.setdefault(key, value)
                 # ツール呼び出しの生成中トークンを流す(シム側が読む。→ ServerConfig.stream_tool_calls)
                 if self.config.stream_tool_calls:
                     env["LOCAL_LLM_STREAM_TOOL_CALLS"] = "1"
@@ -647,8 +650,6 @@ class LocalServer:
                 # entries: スナップショットの保持数。上流既定の 2 は 1 ターンに複数回
                 # LLM を呼ぶエージェントで玉突き追い出しを起こす。8 でも RSS 増は
                 # 観測されなかった（26B-4bit で 16.1GB のまま）。
-                env.setdefault("APC_EXACT_PREFIX_GUARD_TOKENS", "1024")
-                env.setdefault("APC_EXACT_CACHE_ENTRIES", "8")
             cmd = build_command(self.config)
             extra: dict = {}
             # 繋留が有効（デーモン内）なら、ワーカーを tether ラッパー越しに起動する。
