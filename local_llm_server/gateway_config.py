@@ -181,7 +181,7 @@ _MODEL_CONFIG_KEYS = {
     "extra_args",
 }
 _LLAMA_CPP_CONFIG_KEYS = {"accel", "pin"}
-_PROMPT_CACHE_CONFIG_KEYS = {"enabled", "entries", "guard_tokens", "memory_max_gb", "disk", "disk_max_gb", "debug"}
+_PROMPT_CACHE_CONFIG_KEYS = {"enabled", "entries", "guard_tokens", "memory_max_gb", "disk", "disk_max_gb"}
 
 
 def _parse_prompt_cache_table(data: dict) -> PromptCacheConfig:
@@ -216,7 +216,6 @@ def _parse_prompt_cache_table(data: dict) -> PromptCacheConfig:
         memory_max_gb=memory_max_gb,
         disk=_strict_bool(table.get("disk", base.disk), "prompt_cache.disk"),
         disk_max_gb=disk_max_gb,
-        debug=_strict_bool(table.get("debug", base.debug), "prompt_cache.debug"),
     )
 
 

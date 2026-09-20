@@ -54,8 +54,9 @@ class PromptCacheConfig:
     - disk: ディスク層を使う（スナップショットをディスクにも書き、再起動後も前方一致を復元できる。
       書き込みはプリフィル中に走る）
     - disk_max_gb: ディスク層の上限（None で mlx-vlm 既定 20）
-    - debug: mlx-vlm の APC 内部の詳細ログを出す（命中の有無は INFO の Prefill completed … cached_tokens= で分かる。
-      これは mlx-vlm 側を疑うときだけ）
+
+    命中の有無と量はモデルサーバーの INFO ログ ``Prefill completed: … cached_tokens=N`` で分かる（専用の
+    デバッグ設定は持たない。mlx-vlm 内部の詳細が要るときだけ、その環境変数 APC_DEBUG を直接使う）。
     """
 
     enabled: bool = True
@@ -64,7 +65,6 @@ class PromptCacheConfig:
     memory_max_gb: float | None = None
     disk: bool = True
     disk_max_gb: float | None = None
-    debug: bool = False
 
     def env(self) -> dict[str, str]:
         """モデルサーバー（mlx-vlm）へ渡す環境変数。"""
@@ -78,8 +78,6 @@ class PromptCacheConfig:
             out["APC_MEMORY_MAX_GB"] = f"{float(self.memory_max_gb):g}"
         if self.disk_max_gb is not None:
             out["APC_DISK_MAX_GB"] = f"{float(self.disk_max_gb):g}"
-        if self.debug:
-            out["APC_DEBUG"] = "1"
         return out
 
 

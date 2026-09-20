@@ -55,14 +55,14 @@ def test_load_gateway_config_prompt_cache_table(tmp_path):
     assert cfg.prompt_cache == PromptCacheConfig()                       # テーブル無し → 既定
     assert cfg.models[0].prompt_cache == PromptCacheConfig()
 
-    p = _write(tmp_path, 'port = 8080\n[prompt_cache]\nentries = 4\nmemory_max_gb = 24\ndisk = false\ndebug = true\n'
+    p = _write(tmp_path, 'port = 8080\n[prompt_cache]\nentries = 4\nmemory_max_gb = 24\ndisk = false\n'
                          '[[models]]\nmodel = "org/A"\nbackend = "mlx-vlm"\n')
     cfg = gw.load_gateway_config(p)
-    assert cfg.prompt_cache == PromptCacheConfig(entries=4, memory_max_gb=24.0, disk=False, debug=True)
+    assert cfg.prompt_cache == PromptCacheConfig(entries=4, memory_max_gb=24.0, disk=False)
     assert cfg.models[0].prompt_cache == cfg.prompt_cache
     assert cfg.prompt_cache.env() == {"APC_ENABLED": "1", "APC_EXACT_CACHE_ENTRIES": "4",
                                       "APC_EXACT_PREFIX_GUARD_TOKENS": "1024", "APC_DISK_ENABLED": "0",
-                                      "APC_MEMORY_MAX_GB": "24", "APC_DEBUG": "1"}
+                                      "APC_MEMORY_MAX_GB": "24"}
     # 動的ロードのモデルにも同じ設定
     from local_llm_server.gateway_manager import ModelManager
 
@@ -73,7 +73,7 @@ def test_load_gateway_config_prompt_cache_table(tmp_path):
 
     for bad in ('[prompt_cache]\nentries = -1\n', '[prompt_cache]\nguard_tokens = 0\n',
                 '[prompt_cache]\nmemory_max_gb = 0\n', '[prompt_cache]\ndisk = "yes"\n',
-                '[prompt_cache]\nsize = 3\n', 'prompt_cache = 3\n'):
+                '[prompt_cache]\nsize = 3\n', '[prompt_cache]\ndebug = true\n', 'prompt_cache = 3\n'):
         p = _write(tmp_path, 'port = 8080\ndynamic = true\n' + bad)
         with pytest.raises(ValueError):
             gw.load_gateway_config(p)
@@ -1914,12 +1914,12 @@ def test_apply_live_config_prompt_cache_is_next_load_not_restart(tmp_path):
     cfg = gw.load_gateway_config(_write(tmp_path, base))
     server, mgr = _live_server(cfg)
     try:
-        new = gw.load_gateway_config(_write(tmp_path, base + '[prompt_cache]\ndebug = true\ndisk = false\n'))
+        new = gw.load_gateway_config(_write(tmp_path, base + '[prompt_cache]\nentries = 3\ndisk = false\n'))
         changed, restart = gw.apply_live_config(server, mgr, cfg, new)
         assert restart == []
         assert any(c.startswith("prompt_cache") for c in changed)
-        assert mgr._prompt_cache == PromptCacheConfig(debug=True, disk=False)
-        assert mgr._models["org/A"].config.prompt_cache == PromptCacheConfig(debug=True, disk=False)
+        assert mgr._prompt_cache == PromptCacheConfig(entries=3, disk=False)
+        assert mgr._models["org/A"].config.prompt_cache == PromptCacheConfig(entries=3, disk=False)
     finally:
         server.server_close(); mgr.shutdown()
 
