@@ -54,7 +54,8 @@ class PromptCacheConfig:
     - disk: ディスク層を使う（スナップショットをディスクにも書き、再起動後も前方一致を復元できる。
       書き込みはプリフィル中に走る）
     - disk_max_gb: ディスク層の上限（None で mlx-vlm 既定 20）
-    - debug: ヒット／ミスの理由をモデルサーバーのログに出す
+    - debug: mlx-vlm の APC 内部の詳細ログを出す（命中の有無は INFO の Prefill completed … cached_tokens= で分かる。
+      これは mlx-vlm 側を疑うときだけ）
     """
 
     enabled: bool = True
