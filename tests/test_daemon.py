@@ -2258,6 +2258,45 @@ def test_provision_vllm_continues_on_failure(tmp_path, monkeypatch):
     assert set_calls == []
 
 
+# --- mlx-audio（音声合成）バックエンドの配線 ------------------------------------------
+
+def test_provision_mlx_audio_sets_python_when_registered(tmp_path, monkeypatch):
+    cfg = gw.load_gateway_config(_write(
+        tmp_path,
+        'dynamic = false\n[[models]]\nmodel = "org/m-tts"\nbackend = "mlx-audio"\n'))
+    monkeypatch.setattr(gw.mlx_audio_provisioner, "ensure_mlx_audio",
+                        lambda **k: "/managed/mlx-audio-venv/bin/python")
+    set_calls = []
+    monkeypatch.setattr(gw, "set_mlx_audio_python", lambda p, **k: set_calls.append(p))
+    gw.provision_mlx_audio_if_needed(cfg)
+    assert set_calls == ["/managed/mlx-audio-venv/bin/python"]
+
+
+def test_provision_mlx_audio_skipped_when_not_registered(tmp_path, monkeypatch):
+    """動的ロードの構成では起動時に導入しない（読み上げを使わない人に数百 MB を入れない）。"""
+    cfg = gw.load_gateway_config(_write(tmp_path, "dynamic = true\n"))
+    called = []
+    monkeypatch.setattr(gw.mlx_audio_provisioner, "ensure_mlx_audio",
+                        lambda **k: called.append(1) or "x")
+    gw.provision_mlx_audio_if_needed(cfg)
+    assert called == []
+
+
+def test_provision_mlx_audio_continues_on_failure(tmp_path, monkeypatch):
+    cfg = gw.load_gateway_config(_write(
+        tmp_path,
+        'dynamic = false\n[[models]]\nmodel = "org/m-tts"\nbackend = "mlx-audio"\n'))
+
+    def boom(**k):
+        raise gw.mlx_audio_provisioner.MlxAudioUnavailable("not apple silicon")
+
+    monkeypatch.setattr(gw.mlx_audio_provisioner, "ensure_mlx_audio", boom)
+    set_calls = []
+    monkeypatch.setattr(gw, "set_mlx_audio_python", lambda p, **k: set_calls.append(p))
+    gw.provision_mlx_audio_if_needed(cfg)  # 例外を投げない
+    assert set_calls == []
+
+
 # --- SGLang バックエンドの配線 ------------------------------------------------------
 
 def test_sglang_in_use_only_when_registered(tmp_path):

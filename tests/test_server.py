@@ -484,6 +484,41 @@ def test_build_command_whisper(stub_cache):
     assert "9300" in cmd
 
 
+def test_infer_backend_tts_before_mlx():
+    # TTS の mlx repo は id に "mlx" を含むが、音声合成（mlx-audio）に振り分ける。
+    assert srv.infer_backend("mlx-community/Qwen3-TTS-12Hz-0.6B-Base-8bit") == "mlx-audio"
+    assert srv.infer_backend("mlx-community/Kokoro-82M-bf16") == "mlx-audio"
+    # STT とチャットは従来どおり。
+    assert srv.infer_backend("mlx-community/whisper-large-v3-turbo") == "whisper"
+    assert srv.infer_backend("ToPo-ToPo/gemma-4-26B-A4B-it-mlx-8bit") == "mlx-vlm"
+
+
+def test_build_command_mlx_audio_uses_isolated_python(stub_cache, monkeypatch):
+    """本体の python では起動しない（依存がぶつかる）。導入済みの隔離 venv の python を使う。"""
+    monkeypatch.setattr(srv, "mlx_audio_python", lambda: "/managed/mlx-audio-venv/bin/python")
+    cmd = build_command(ServerConfig("mlx-audio", "mlx-community/Kokoro-82M-bf16", port=9310))
+    assert cmd[:3] == ["/managed/mlx-audio-venv/bin/python", "-m", "mlx_audio.server"]
+    assert cmd[cmd.index("--port") + 1] == "9310"
+    # サーバーは起動した場所に logs/ を作るので、ゲートウェイのログ置き場を渡す
+    assert cmd[cmd.index("--log-dir") + 1].startswith(srv.log_dir())
+
+
+def test_build_command_mlx_audio_provisions_on_first_use(stub_cache, monkeypatch):
+    """登録が無い（動的ロード）とき、最初の読み上げで隔離 venv を用意し、以後はそれを使う。"""
+    from local_llm_server import mlx_audio_provisioner
+
+    state = {"py": None}
+    calls = []
+    monkeypatch.setattr(srv, "mlx_audio_python", lambda: state["py"])
+    monkeypatch.setattr(srv, "set_mlx_audio_python", lambda p: state.__setitem__("py", p))
+    monkeypatch.setattr(mlx_audio_provisioner, "ensure_mlx_audio",
+                        lambda **k: calls.append(1) or "/managed/mlx-audio-venv/bin/python")
+    for _ in range(2):
+        cmd = build_command(ServerConfig("mlx-audio", "mlx-community/Kokoro-82M-bf16"))
+        assert cmd[0] == "/managed/mlx-audio-venv/bin/python"
+    assert calls == [1]
+
+
 def test_build_command_mlx_requires_predownload(hf_cache):
     # 配線確認: 未取得モデルでは build_command がそのまま起動せずエラーにする。
     with pytest.raises(ValueError, match="hf download"):

@@ -40,7 +40,7 @@ from http.server import ThreadingHTTPServer
 
 from . import gateway_config as _gateway_config
 from . import gateway_updates as _gateway_updates
-from . import provisioner, sglang_provisioner, vllm_provisioner
+from . import mlx_audio_provisioner, provisioner, sglang_provisioner, vllm_provisioner
 from . import video as video
 from .backend_core import PromptCacheConfig
 from .gateway_config import GatewayConfig
@@ -75,6 +75,7 @@ from .server import (
     reap_orphan_workers,
     reclaim_stale_workers,
     set_llama_server_binary,
+    set_mlx_audio_python,
     set_sglang_python,
     set_vllm_python,
     write_gateway_runtime,
@@ -739,6 +740,31 @@ def provision_sglang_if_needed(cfg: GatewayConfig) -> None:
     print(f"SGLang ready: {py}", file=sys.stderr)
 
 
+def _mlx_audio_in_use(cfg: GatewayConfig) -> bool:
+    """事前登録に backend="mlx-audio"（音声合成）のモデルがあるか。"""
+    return any(backend_spec(c.backend).provisioner == "mlx-audio" for c in cfg.models)
+
+
+def provision_mlx_audio_if_needed(cfg: GatewayConfig) -> None:
+    """mlx-audio のモデルが登録された構成のときだけ、起動時に mlx-audio を隔離 venv へ導入する。
+
+    登録が無くても、動的ロードで読み上げが要求されたときに導入される（server._build_mlx_audio）。
+    起動時に済ませておけば、最初の読み上げが導入を待たない。失敗してもゲートウェイは起動を続ける。
+    """
+    if not _mlx_audio_in_use(cfg):
+        return
+    try:
+        py = mlx_audio_provisioner.ensure_mlx_audio()
+    except Exception as exc:  # noqa: BLE001 - 導入失敗で起動を止めない（Apple Silicon 以外・pip 失敗等）
+        print(
+            f"mlx-audio provisioning failed (continuing without it): {exc}",
+            file=sys.stderr,
+        )
+        return
+    set_mlx_audio_python(py)
+    print(f"mlx-audio ready: {py}", file=sys.stderr)
+
+
 def _maybe_spawn_tray(cfg: GatewayConfig) -> tuple[subprocess.Popen | None, int | None]:
     """メニューバーアイコン（tray.py）を随伴プロセスとして起動する（macOS・tray=true のみ）。
 
@@ -910,6 +936,7 @@ def _run_gateway_locked(cfg: GatewayConfig, config_path: str | None = None) -> i
         provision_llama_if_needed(cfg)
         provision_vllm_if_needed(cfg)
         provision_sglang_if_needed(cfg)
+        provision_mlx_audio_if_needed(cfg)
         resources.manager = ModelManager(
             cfg.models,
             max_resident=cfg.max_resident,

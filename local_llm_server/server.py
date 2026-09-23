@@ -28,7 +28,10 @@ from .backend_runtime import (  # noqa: F401 - public compatibility exports
     llama_provision_info,
     llama_server_binary,
     provisioned,
+    mlx_audio_provision_info,
+    mlx_audio_python,
     set_llama_server_binary,
+    set_mlx_audio_python,
     set_provisioned,
     set_sglang_python,
     set_vllm_python,
@@ -460,6 +463,34 @@ def _build_whisper(config: ServerConfig) -> list[str]:
     ]
 
 
+def _build_mlx_audio(config: ServerConfig) -> list[str]:
+    """mlx-audio を OpenAI 互換の TTS サーバ（POST /v1/audio/speech）として、隔離 venv の python から起動する。
+
+    依存が本体とぶつかるので本体の環境には入れない（→ mlx_audio_provisioner）。起動時に導入されて
+    いなければ（動的ロード）ここで導入する。初回だけ数分かかり、その間このロードは待つ。
+    本体重みは他の mlx 同様に事前 DL 必須。サーバーは起動した場所に logs/ を作るので、
+    ゲートウェイのログ置き場を渡す。モデルは最初の要求で読み込まれる（以後は常駐）。
+    """
+    ensure_cached(config.model)
+    py = mlx_audio_python()
+    if py is None:
+        from . import mlx_audio_provisioner
+
+        py = mlx_audio_provisioner.ensure_mlx_audio()
+        set_mlx_audio_python(py)
+    return [
+        py,
+        "-m",
+        "mlx_audio.server",
+        "--host",
+        config.host,
+        "--port",
+        str(config.port),
+        "--log-dir",
+        os.path.join(log_dir(), "mlx-audio"),
+    ]
+
+
 def _build_vllm(config: ServerConfig) -> list[str]:
     """vLLM の OpenAI 互換 API サーバを、隔離 venv の python から起動する（→ vllm_provisioner）。
 
@@ -510,6 +541,7 @@ _COMMAND_BUILDERS = {
     "mlx-vlm": _build_mlx_vlm,
     "llama-cpp": _build_llama_cpp,
     "whisper": _build_whisper,
+    "mlx-audio": _build_mlx_audio,
     "vllm": _build_vllm,
     "sglang": _build_sglang,
 }
