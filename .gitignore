@@ -11,3 +11,7 @@ dist/
 
 # Claude Code のローカル個人設定（マシン固有・共有しない）
 .claude/settings.local.json
+
+# 網羅率の計測データ（make check の coverage run が作る）。コミットしない
+.coverage
+.coverage.*
