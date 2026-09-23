@@ -141,7 +141,8 @@ def _patch_apc_rate_poisoning() -> None:
         return
     manager = getattr(_apc, "APCManager", None)
     original = getattr(manager, "_observe_cache_size", None)
-    if original is None or getattr(original, "_llmserver_patched", False):
+    if (manager is None or original is None
+            or getattr(original, "_llmserver_patched", False)):
         return  # 上流が実装を変えた / 適用済み。触らない
 
     def _observe_cache_size(self, size: int, token_count: int) -> None:
