@@ -1,7 +1,7 @@
 # 特徴と全体像
 
 ローカルLLM（**mlx** / **mlx-vlm** / **llama.cpp** / **vLLM** / **SGLang**）と音声認識
-（**whisper** / STT）を束ねる**マルチモデルゲートウェイ**。1 プロセス起動するだけで、
+（**whisper** / STT）・音声合成（**mlx-audio** / TTS）を束ねる**マルチモデルゲートウェイ**。1 プロセス起動するだけで、
 1 つの公開ポートに複数モデルを配信する。
 
 - **モデルの事前登録は不要**。クライアントが指定した `model` をその場でロードする。画像入力
@@ -18,6 +18,9 @@
 - **音声認識（STT）も同じポートで**。`/v1/audio/transcriptions` に音声を投げれば mlx-whisper が
   遅延起動して文字起こしする。エージェント側に mlx 依存は要らない
   （→ [音声認識（STT / whisper）](gateway.md#音声認識stt--whisper)）。
+- **音声合成（TTS）も同じポートで**。`/v1/audio/speech` に文を投げれば mlx-audio が遅延起動して
+  音声を返す。mlx-audio は本体と依存がぶつかるので**隔離 venv へ初回に自動導入**する
+  （→ [音声合成（TTS / mlx-audio）](gateway.md#音声合成tts--mlx-audio)）。
 - **デーモンは裏で常駐、運用は `gw` の CLI サブコマンド**（Ollama 流）。`gw start` で常駐起動、
   `gw status`/`gw ps` で稼働確認、`gw stop` で停止。端末を占有しない。`status`/`stop` 等は
   **`gateway.toml` の無い場所からでも**唯一のデーモンを見つけて叩ける（→ [起動・運用](operation.md)）。

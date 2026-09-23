@@ -25,6 +25,8 @@ DEFAULT_BACKEND = default_backend()
 
 
 _STT_HINTS = ("whisper", "parakeet")
+# 音声合成（TTS）。mlx-community の TTS repo も ID に "mlx" を含むので、下の mlx 判定より先に見る。
+_TTS_HINTS = ("-tts", "tts-", "kokoro")
 
 
 def infer_backend(model: str) -> str:
@@ -32,6 +34,8 @@ def infer_backend(model: str) -> str:
     low = model.lower()
     if any(hint in low for hint in _STT_HINTS):
         return "whisper"
+    if any(hint in low for hint in _TTS_HINTS):
+        return "mlx-audio"
     if "gguf" in low:
         return "llama-cpp"
     if "mlx" in low:
@@ -128,6 +132,7 @@ BACKEND_SPECS: dict[str, BackendSpec] = {
             provisioner="llama",
         ),
         BackendSpec("whisper"),
+        BackendSpec("mlx-audio", provisioner="mlx-audio"),
         BackendSpec("vllm", provisioner="vllm"),
         BackendSpec("sglang", provisioner="sglang"),
     )

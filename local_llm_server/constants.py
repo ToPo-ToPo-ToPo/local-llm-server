@@ -16,10 +16,10 @@ DEFAULT_VISION_MODEL = DEFAULT_MODEL
 
 # 起動可能なローカルLLMサーバーのバックエンド一覧。
 # server/ が実装し、agent/ は agent.toml の backend 検証に使う（共有値）。
-# whisper は音声→テキスト（STT）。他はテキスト/画像の生成系。
+# whisper は音声→テキスト（STT）、mlx-audio はテキスト→音声（TTS）。他はテキスト/画像の生成系。
 # vllm / sglang は Linux/NVIDIA（Windows は WSL2 経由）向けの高スループット生成（明示 opt-in）。
 # sglang は RadixAttention でプレフィックス共有の多い用途（エージェント）に強い。
-BACKENDS = ("mlx", "mlx-vlm", "llama-cpp", "whisper", "vllm", "sglang")
+BACKENDS = ("mlx", "mlx-vlm", "llama-cpp", "whisper", "mlx-audio", "vllm", "sglang")
 
 
 def log_dir() -> str:

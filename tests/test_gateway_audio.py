@@ -154,3 +154,57 @@ def test_no_model_and_no_default_is_400():
     finally:
         server.shutdown(); server.server_close()
         upstream.shutdown(); upstream.server_close()
+
+
+# --- 音声合成（TTS）: JSON の要求を model で振り分け、WAV（バイナリ）をそのまま返す -----------
+
+_WAV = b"RIFF\x24\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00" + bytes(range(256)) * 4
+
+
+class _SpeechUpstream(BaseHTTPRequestHandler):
+    """受け取った JSON を控え、WAV のバイト列を返すダミー TTS サーバ。"""
+
+    protocol_version = "HTTP/1.1"
+    seen: list = []
+
+    def do_POST(self) -> None:
+        length = int(self.headers.get("Content-Length") or 0)
+        _SpeechUpstream.seen.append((self.path, json.loads(self.rfile.read(length))))
+        self.send_response(200)
+        self.send_header("Content-Type", "audio/wav")
+        self.send_header("Content-Length", str(len(_WAV)))
+        self.end_headers()
+        self.wfile.write(_WAV)
+
+    def log_message(self, *_a):
+        pass
+
+
+def test_speech_routes_by_json_model_and_returns_wav_bytes():
+    _SpeechUpstream.seen = []
+    upstream = ThreadingHTTPServer(("127.0.0.1", 0), _SpeechUpstream)
+    threading.Thread(target=upstream.serve_forever, daemon=True).start()
+    mgr = _FakeManager(("127.0.0.1", upstream.server_address[1]))
+    server = gw.GatewayServer(("127.0.0.1", 0), mgr, catalog=[], default_model=None)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        req = {"model": "mlx-community/Kokoro-82M-bf16", "input": "こんにちは。",
+               "response_format": "wav", "ref_audio": "/abs/ref.wav", "max_tokens": 120}
+        conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=10)
+        conn.request("POST", "/v1/audio/speech", body=json.dumps(req).encode(),
+                     headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        data = resp.read()
+        conn.close()
+        assert resp.status == 200
+        assert resp.getheader("Content-Type") == "audio/wav"
+        assert data == _WAV                                   # バイナリが化けずに届く
+        assert mgr.acquired == ["mlx-community/Kokoro-82M-bf16"]
+        path, got = _SpeechUpstream.seen[0]
+        assert path == "/v1/audio/speech"
+        # 読み上げ固有の項目（参照音声・生成上限）は手を加えずに渡る
+        assert got["ref_audio"] == "/abs/ref.wav" and got["max_tokens"] == 120
+        assert "repetition_penalty" not in got                # チャット向けの注入はしない
+    finally:
+        server.shutdown(); server.server_close()
+        upstream.shutdown(); upstream.server_close()

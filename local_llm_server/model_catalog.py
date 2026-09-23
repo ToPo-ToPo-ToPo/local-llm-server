@@ -443,14 +443,15 @@ def discover_cached_models(
             elif (
                 "config.json" in files
                 and any(f.endswith((".safetensors", ".npz")) for f in files)
-                # 生成系（チャット）または STT（whisper）を対象にする。埋め込み・分類器などの
-                # 非チャット・非STT モデルは除外する（_is_generative_repo）。
-                and (_is_generative_repo(snap_root) or infer_backend(repo) == "whisper")
+                # 生成系（チャット）・STT（whisper）・TTS（mlx-audio）を対象にする。埋め込み・
+                # 分類器などは除外する（_is_generative_repo）。
+                and (_is_generative_repo(snap_root)
+                     or infer_backend(repo) in ("whisper", "mlx-audio"))
             ):
                 cands = [repo]
                 backend = infer_backend(
                     repo
-                )  # whisper → STT、mlx → mlx-vlm、他は OS 既定
+                )  # whisper → STT、tts → mlx-audio、mlx → mlx-vlm、他は OS 既定
             else:
                 continue
             # MTP（高速化）の利用可否を本体ごとに付与する（ドラフターが揃っていれば "ready"）。

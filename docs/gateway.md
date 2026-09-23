@@ -171,6 +171,35 @@ curl http://127.0.0.1:8799/v1/audio/transcriptions \
 OpenAI SDK からもそのまま使える（`client.audio.transcriptions.create(model=..., file=...)`）。
 `base_url` を公開ポートに向けるだけで、振り分け・遅延起動・アンロードはゲートウェイが行う。
 
+## 音声合成（TTS / mlx-audio）
+
+`backend = "mlx-audio"` で mlx-audio を **OpenAI 互換の TTS サーバ**として束ねる。STT と同じく、初回
+リクエストで遅延起動し、LRU 退避・idle アンロード・`max_resident` のメモリ会計がそのまま効く。
+エージェントは mlx-audio を持たず、公開ポートに読ませたい文を POST するだけでよい。
+
+- **公開エンドポイント**: `POST /v1/audio/speech`（JSON。`model` に TTS の repo ID、`input` に文）。
+  応答は音声のバイト列（`response_format` で `wav` などを選ぶ）。`voice` / `instruct` /
+  `ref_audio` / `ref_text` / `lang_code` / `max_tokens` など mlx-audio の項目は、手を加えずに渡す。
+  `ref_audio`（参照音声からの声の複製）はファイルのパスで、ゲートウェイと同じマシンの絶対パスを渡す。
+- **モデル ID**: ID に `-tts` / `tts-` / `kokoro` を含めば、動的ロードで自動的にこのバックエンドへ
+  振り分けられる（`mlx` を含んでもチャット用の mlx-vlm には回らない）。本体重みは他の mlx 同様に事前 DL
+  必須（`hf download <repo>`）。
+- **隔離 venv**: mlx-audio は本体と依存がぶつかる（setuptools・mlx・transformers の版）ので、本体の環境には
+  入れず、管理ディレクトリの専用 venv（`~/.cache/local-llm-server/mlx-audio-venv`）へ導入して、その
+  python からサーバを起動する（vLLM / SGLang と同じ仕組み）。gateway.toml に `backend = "mlx-audio"` の
+  登録があれば起動時に、無ければ最初の読み上げ要求のときに導入する。**初回だけ数分かかり**、その要求は
+  導入を待つ（以後は venv を再利用）。Apple Silicon の macOS 専用。
+- **アンロード**: 他のモデルと同じく `idle_timeout` で降ろされる。降ろされたあとの最初の 1 文は、モデルの
+  読み込みぶん（小さなモデルで数秒）遅れる。
+
+```bash
+# 例: 読み上げ（クライアントは公開ポートに文を投げるだけ。mlx-audio は不要）
+curl http://127.0.0.1:8799/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{"model": "<TTS の repo ID>", "input": "こんにちは。", "response_format": "wav"}' \
+  -o out.wav
+```
+
 ## 画像入力の縮小（`image_max_edge`）
 
 長辺がこの px を超える画像は、**上流へ渡す前にゲートウェイが縮小する**（既定 1024px、`0` で無効。

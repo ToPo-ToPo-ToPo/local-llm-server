@@ -58,3 +58,16 @@ def sglang_python() -> str:
 
 def sglang_provision_info() -> dict | None:
     return provisioned("sglang")
+
+
+def set_mlx_audio_python(path: str | None) -> None:
+    set_provisioned("mlx-audio", None if path is None else {"python": path})
+
+
+def mlx_audio_python() -> str | None:
+    """導入済みの mlx-audio の python（未導入なら None。本体の python には落とさない）。"""
+    return (provisioned("mlx-audio") or {}).get("python")
+
+
+def mlx_audio_provision_info() -> dict | None:
+    return provisioned("mlx-audio")
