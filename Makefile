@@ -1,11 +1,12 @@
 # local-llm-server の導入を簡単にするためのラッパー。
 # 導入は `make install` の一度だけ。以降の運用はすべて `gw` サブコマンド（gw help で一覧）。
-.PHONY: help install dev uninstall
+.PHONY: help install dev check uninstall
 
 help:
 	@echo "make install    gw コマンドを PATH に導入／更新し、自動起動を登録（以後どこでも gw）"
 	@echo "make uninstall  自動起動を解除し、gw と設定・ログ・自動DLした llama.cpp を削除（モデル重みは対象外）"
 	@echo "make dev        開発用 venv を用意（uv sync。uv run pytest でテスト）"
+	@echo "make check      PR 前の検査を手元で回す（lint・型・セキュリティ・依存監査・テストと網羅率）"
 	@echo "運用は gw で行う: gw status / gw ps / gw stop（一覧は gw help。常駐は OS が世話する）"
 
 # editable 固定（クローンのソースを直接指す＝自動更新が効く）＋ --reinstall で
@@ -70,3 +71,16 @@ uninstall:
 
 dev:
 	uv sync
+
+# PR 前の検査。GitHub の CI は使わない（課金制限でジョブが起動せず、失敗の信号として
+# 機能していなかった）ので、以前 CI の quality ジョブで回していたものをここで回す。
+# テストは網羅率の計測を兼ねて 1 回だけ走らせる（下限は pyproject の fail_under）。
+check:
+	uv sync --dev --frozen
+	uv run ruff check --select E9,F63,F7,F82 local_llm_server tests
+	uv run mypy --ignore-missing-imports --follow-imports=skip --check-untyped-defs local_llm_server
+	uv run bandit -r local_llm_server -q -lll
+	uv export --frozen --no-dev --no-hashes -o "$${TMPDIR:-/tmp}/local-llm-server-requirements.txt"
+	uv run pip-audit -r "$${TMPDIR:-/tmp}/local-llm-server-requirements.txt" --no-deps --disable-pip
+	uv run coverage run -m pytest -q
+	uv run coverage report
