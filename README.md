@@ -66,6 +66,7 @@ print(llm.respond("ローカルLLMの利点を3つ。"))
 - [docs/llama-cpp.md](docs/llama-cpp.md) — llama.cpp（`llama-server`）の自動導入・最新モデル追従
 - [docs/vllm.md](docs/vllm.md) — vLLM / SGLang（高スループット生成）
 - [docs/mtp.md](docs/mtp.md) — MTP による高速化
+- [experimental/strata_lite](experimental/strata_lite/README.md) — 実験: MoE のエキスパートを使用頻度で GPU/RAM に振り分ける試作エンジン（本体とは独立）
 
 ## ライセンス
 
