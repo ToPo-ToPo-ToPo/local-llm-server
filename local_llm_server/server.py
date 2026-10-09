@@ -463,6 +463,26 @@ def _build_whisper(config: ServerConfig) -> list[str]:
     ]
 
 
+def _build_embed(config: ServerConfig) -> list[str]:
+    """テキスト埋め込みモデルを OpenAI 互換の Embeddings サーバ（POST /v1/embeddings。1 モデル 1 プロセス）として起動する。
+
+    専用サーバは同梱の local_llm_server.embed_server（transformers + torch。本体の環境で動く）。
+    本体重みは他の HF モデル同様に事前 DL 必須（未取得なら案内付き ValueError）。
+    """
+    ensure_cached(config.model)
+    return [
+        sys.executable,
+        "-m",
+        "local_llm_server.embed_server",
+        "--model",
+        config.model,
+        "--host",
+        config.host,
+        "--port",
+        str(config.port),
+    ]
+
+
 def _build_mlx_audio(config: ServerConfig) -> list[str]:
     """mlx-audio を OpenAI 互換の TTS サーバ（POST /v1/audio/speech）として、隔離 venv の python から起動する。
 
@@ -542,6 +562,7 @@ _COMMAND_BUILDERS = {
     "llama-cpp": _build_llama_cpp,
     "whisper": _build_whisper,
     "mlx-audio": _build_mlx_audio,
+    "embed": _build_embed,
     "vllm": _build_vllm,
     "sglang": _build_sglang,
 }
