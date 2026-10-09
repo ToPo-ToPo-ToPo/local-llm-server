@@ -1437,3 +1437,24 @@ def test_log_dir_is_cwd_independent(tmp_path, monkeypatch):
     assert ".local-llm-server" not in path
     assert srv.daemon_log_path(9001).startswith(path)
     assert srv.gateway_log_path(8799).startswith(path)
+
+
+def test_infer_backend_embed_before_mlx():
+    # テキスト埋め込みの repo は id に "mlx" を含むことがあるが、埋め込み（embed）に振り分ける。
+    assert srv.infer_backend("google/embeddinggemma-2") == "embed"
+    assert srv.infer_backend("mlx-community/embeddinggemma-2-bf16") == "embed"
+    assert srv.infer_backend("BAAI/bge-m3") == "embed"
+    assert srv.infer_backend("intfloat/multilingual-e5-large") == "embed"
+    assert srv.infer_backend("Qwen/Qwen3-Embedding-0.6B") == "embed"
+    # STT / TTS / チャットは従来どおり。
+    assert srv.infer_backend("mlx-community/whisper-large-v3-turbo") == "whisper"
+    assert srv.infer_backend("mlx-community/Kokoro-82M-bf16") == "mlx-audio"
+    assert srv.infer_backend("ToPo-ToPo/Qwen3.6-27B-mlx-4bit") == "mlx-vlm"
+    assert srv.infer_backend("ToPo-ToPo/gemma-4-26B-A4B-it-mlx-8bit") == "mlx-vlm"
+
+
+def test_build_command_embed(stub_cache):
+    cmd = build_command(ServerConfig("embed", "google/embeddinggemma-2", port=9320))
+    assert cmd[1:3] == ["-m", "local_llm_server.embed_server"]
+    assert "--model" in cmd and "google/embeddinggemma-2" in cmd
+    assert "9320" in cmd

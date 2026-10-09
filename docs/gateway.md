@@ -72,7 +72,7 @@ backend = "mlx-vlm"
 | `[llama_cpp]` | 全自動 | `llama-server` の自動導入テーブル。`accel`（auto/cuda/vulkan/metal/cpu）・`pin`（ビルド番号）。導入方法の選択肢は無い（常に自動導入）。→ [llama-cpp.md](llama-cpp.md#自動導入llama_cpp) |
 
 `[[models]]` は 1 モデル 1 エントリ。`model`（HuggingFace ID）と `backend`（`mlx` / `mlx-vlm` /
-`llama-cpp` / `whisper`）が必須。各エントリで `draft_model` を上書きできる。`dynamic = true` なら
+`llama-cpp` / `whisper` / `mlx-audio` / `embed`）が必須。各エントリで `draft_model` を上書きできる。`dynamic = true` なら
 `[[models]]` は省略可（全て動的ロード）。`whisper` は音声→テキスト（STT）バックエンド
 （→ [音声認識（STT / whisper）](#音声認識stt--whisper)）。
 
@@ -199,6 +199,45 @@ curl http://127.0.0.1:8799/v1/audio/speech \
   -d '{"model": "<TTS の repo ID>", "input": "こんにちは。", "response_format": "wav"}' \
   -o out.wav
 ```
+
+## テキスト埋め込み（Embeddings / embed）
+
+`backend = "embed"` でテキスト埋め込みモデルを **OpenAI 互換の Embeddings サーバ**として束ねる。
+チャットや STT とまったく同じく、初回リクエストで遅延起動し、LRU 退避・idle アンロード・在席即時解放・
+`max_resident` のメモリ会計がそのまま効く。**狙いは RAG（意味検索）を持つアプリからモデルの常駐を
+剥がすこと** —— アプリ（agent-corporation の search-tool 等）はジョブごとにモデルを import して読み直す
+（10 秒前後）代わりに、公開ポートへ文を POST するだけでよい。
+
+- **公開エンドポイント**: `POST /v1/embeddings`（JSON。`model`・`input`（文字列か文字列の配列、最大 2048 本）・
+  任意で `dimensions`（Matryoshka の切り詰め。先頭 N 次元を取って L2 正規化し直す）・
+  `encoding_format`（`float` 既定 / `base64`））。返り値は OpenAI 仕様
+  （`data[].embedding` / `data[].index` / `usage.prompt_tokens`）。token id の配列は受けない。
+- **モデル ID**: HF の埋め込みモデル（例 `google/embeddinggemma-2`、`BAAI/bge-m3`、
+  `intfloat/multilingual-e5-large`、`Qwen/Qwen3-Embedding-0.6B`）。ID に `embedding` / `embed` / `bge-` / `e5-` /
+  `gte-` / `minilm` を含めば動的ロードで自動的に embed バックエンドへ振り分けられる。
+- **実装**: 同梱の `local_llm_server.embed_server`（transformers + torch。Apple Silicon では bfloat16 / mps、
+  他は float32 / cpu）。`AutoModel` の `last_hidden_state` を平均プーリング（モデルが sentence-transformers 形式の
+  `1_Pooling/config.json` を同梱していれば、その CLS / 平均の指定に従う）して L2 正規化する。EmbeddingGemma 2 は
+  画像・音声の符号化器を外してテキスト部分（270M）だけを読む。出力は sentence-transformers と一致する
+  （cos ≈ 1.0。bf16 の丸めの範囲）。mlx 版は mlx-vlm のリリース版に EmbeddingGemma 2 の読み込みが入った時点で
+  `embed_server` の中だけ差し替える。
+- **接頭辞はクライアントが付ける**。OpenAI API に「問い合わせ用 / 文書用」の区別は無いので、モデルの作法
+  （EmbeddingGemma 2 なら `task: search result | query: …` と `title: … | text: …`、e5 なら `query: ` / `passage: `）
+  はアプリ側が `input` に含める。
+- **要件**: 本体重みは他の HF モデル同様に事前 DL 必須（`hf download google/embeddinggemma-2`。ゲートウェイは
+  `HF_HUB_OFFLINE=1` で起動するため、未取得だとロード時にエラー）。
+
+```bash
+# 例: 文書 2 本を 256 次元で（クライアントは公開ポートに投げるだけ。torch 依存は不要）
+curl http://127.0.0.1:8799/v1/embeddings -H "Content-Type: application/json" -d '{
+  "model": "google/embeddinggemma-2",
+  "input": ["title: none | text: ABS 樹脂の引張強度は 40 MPa 前後。", "title: none | text: 格子構造の最適化。"],
+  "dimensions": 256
+}'
+# → {"object": "list", "data": [{"object": "embedding", "index": 0, "embedding": [...]}, ...], "usage": {...}}
+```
+
+OpenAI SDK からもそのまま使える（`client.embeddings.create(model=..., input=[...], dimensions=256)`）。
 
 ## 画像入力の縮小（`image_max_edge`）
 

@@ -30,7 +30,7 @@ OpenAI 互換 API（`/v1/*`）で足りているため、**Phase 1（`/api/*` �
 | `ollama pull` / `rm`（進捗付き DL・削除） | `gw pull` / `gw rm` / `gw show` | ✅（Phase 2 実装済み） |
 | 短いモデル名 + タグ（`qwen3:8b`） | HF リポジトリ ID 直指定 | Phase 3 |
 | Modelfile（`ollama create`） | なし | **保留**（system prompt 等はエージェント側が管理しており需要が薄い） |
-| `/v1/embeddings`（OpenAI 互換） | なし | Phase 5（RAG 用途が出てきたら） |
+| `/v1/embeddings`（OpenAI 互換） | あり（`backend = "embed"`。2026-10-10） | Phase 5（実装済み） |
 
 **クローンしないもの**: registry.ollama.ai 相当の独自レジストリと blob ストアは作らない。
 モデル配布は Hugging Face、格納は HF キャッシュ（`~/.cache/huggingface`）を正とする。
@@ -168,12 +168,15 @@ system prompt・生成パラメータはエージェント側（agent-corporatio
 - 保存したモデル名でリクエストが来たら、system prompt / パラメータを注入して土台モデルへ転送
 - `/api/create` / `/api/copy` をここで実装完了にする
 
-## Phase 5: Embeddings（RAG 用途が出てきたら）
+## Phase 5: Embeddings（実装済み 2026-10-10）
 
-- バックエンド対応: llama-server は `--embeddings` フラグ、mlx 系は埋め込み対応モデルの
-  ロードパスを追加
-- `POST /v1/embeddings`（OpenAI 互換のみ。`/api/embed` は Phase 1 見送りに伴い作らない）
-- agent-corporation 側で RAG（ベクトル検索）が必要になったときに着手する
+- agent-corporation の search-tool（手元の文書の RAG）が必要になったので着手した。
+- `backend = "embed"`: 同梱の `local_llm_server.embed_server`（transformers + torch）が `POST /v1/embeddings`
+  （OpenAI 互換のみ。`/api/embed` は Phase 1 見送りに伴い作らない）を 1 モデル 1 プロセスで出す。ID に
+  `embedding` / `embed` / `bge-` / `e5-` / `gte-` / `minilm` を含めば動的ロードで振り分ける（→ gateway.md）。
+- mlx 系の埋め込みロード（mlx-vlm の embedding_loader）は、リリース版に EmbeddingGemma 2 が入っていない
+  （0.7.6 時点。GitHub main にはある）ので見送り、入った時点で embed_server の中を差し替える。
+  llama-server の `--embeddings` も需要が出たら。
 
 ---
 
