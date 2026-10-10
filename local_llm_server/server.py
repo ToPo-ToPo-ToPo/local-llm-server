@@ -483,6 +483,25 @@ def _build_embed(config: ServerConfig) -> list[str]:
     ]
 
 
+def _build_rerank(config: ServerConfig) -> list[str]:
+    """リランカーを Cohere / Jina 互換の Rerank サーバ（POST /v1/rerank。1 モデル 1 プロセス）として起動する。
+
+    専用サーバは同梱の local_llm_server.rerank_server（transformers + torch。本体の環境で動く）。
+    """
+    ensure_cached(config.model)
+    return [
+        sys.executable,
+        "-m",
+        "local_llm_server.rerank_server",
+        "--model",
+        config.model,
+        "--host",
+        config.host,
+        "--port",
+        str(config.port),
+    ]
+
+
 def _build_mlx_audio(config: ServerConfig) -> list[str]:
     """mlx-audio を OpenAI 互換の TTS サーバ（POST /v1/audio/speech）として、隔離 venv の python から起動する。
 
@@ -563,6 +582,7 @@ _COMMAND_BUILDERS = {
     "whisper": _build_whisper,
     "mlx-audio": _build_mlx_audio,
     "embed": _build_embed,
+    "rerank": _build_rerank,
     "vllm": _build_vllm,
     "sglang": _build_sglang,
 }

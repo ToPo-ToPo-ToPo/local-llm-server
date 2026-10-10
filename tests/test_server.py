@@ -1458,3 +1458,18 @@ def test_build_command_embed(stub_cache):
     assert cmd[1:3] == ["-m", "local_llm_server.embed_server"]
     assert "--model" in cmd and "google/embeddinggemma-2" in cmd
     assert "9320" in cmd
+
+
+def test_infer_backend_rerank_before_embed():
+    # リランカーは id に "bge-" や "mlx" を含むことがあるが、rerank に振り分ける。
+    assert srv.infer_backend("Qwen/Qwen3-Reranker-0.6B") == "rerank"
+    assert srv.infer_backend("BAAI/bge-reranker-v2-m3") == "rerank"
+    assert srv.infer_backend("cl-nagoya/ruri-v3-reranker-310m") == "rerank"
+    assert srv.infer_backend("hotchpotch/japanese-reranker-xsmall-v2") == "rerank"
+    assert srv.infer_backend("BAAI/bge-m3") == "embed"
+
+
+def test_build_command_rerank(stub_cache):
+    cmd = build_command(ServerConfig("rerank", "cl-nagoya/ruri-v3-reranker-310m", port=9330))
+    assert cmd[1:3] == ["-m", "local_llm_server.rerank_server"]
+    assert "--model" in cmd and "cl-nagoya/ruri-v3-reranker-310m" in cmd and "9330" in cmd

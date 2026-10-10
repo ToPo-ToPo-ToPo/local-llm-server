@@ -11,7 +11,7 @@
 # その場でロード・管理する（バックエンドは ID から推論）。通常利用に加えて、画像入力（mmproj は
 # 隣のファイルを自動検出）も、mlx-vlm の MTP（対応モデルは本体名から自動選択）も、
 # 事前登録なしで効く。テキスト埋め込み（ID に embedding / bge- / e5- 等を含むモデル → POST /v1/embeddings）も
-# 同じく動的ロードで embed バックエンドへ振り分ける。下の [[models]] は任意で、parallel・llama.cpp の MTP・llama-server への
+# 同じく動的ロードで embed バックエンドへ振り分ける。リランカー（ID に rerank → POST /v1/rerank）も同様。下の [[models]] は任意で、parallel・llama.cpp の MTP・llama-server への
 # 個別フラグ（extra_args）など、ID だけでは決まらない上書きが要るモデルだけ書く。
 #
 # 各クライアントは（クライアントはサーバーを起動せず接続するだけ）:

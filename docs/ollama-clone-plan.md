@@ -177,6 +177,8 @@ system prompt・生成パラメータはエージェント側（agent-corporatio
 - mlx 系の埋め込みロード（mlx-vlm の embedding_loader）は、リリース版に EmbeddingGemma 2 が入っていない
   （0.7.6 時点。GitHub main にはある）ので見送り、入った時点で embed_server の中を差し替える。
   llama-server の `--embeddings` も需要が出たら。
+- 同日、RAG の 2 段目として `backend = "rerank"`（`POST /v1/rerank`、Cohere / Jina 互換）も足した
+  （同梱 `rerank_server.py`。系列分類のクロスエンコーダと Qwen3-Reranker の yes/no 型の両方）。
 
 ---
 
