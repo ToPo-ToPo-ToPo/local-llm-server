@@ -30,6 +30,8 @@ _TTS_HINTS = ("-tts", "tts-", "kokoro")
 # テキスト埋め込み（RAG の意味検索）。embeddinggemma / bge-m3 / multilingual-e5 / gte 系。
 # mlx-community の埋め込み repo も ID に "mlx" を含むので、下の mlx 判定より先に見る。
 _EMBED_HINTS = ("embedding", "embed-", "-embed", "bge-", "/e5-", "-e5-", "/gte-", "minilm")
+# リランカー（RAG の 2 段目）。bge-reranker は "bge-" も含むので、埋め込みの判定より先に見る。
+_RERANK_HINTS = ("rerank",)
 
 
 def infer_backend(model: str) -> str:
@@ -39,6 +41,8 @@ def infer_backend(model: str) -> str:
         return "whisper"
     if any(hint in low for hint in _TTS_HINTS):
         return "mlx-audio"
+    if any(hint in low for hint in _RERANK_HINTS):
+        return "rerank"
     if any(hint in low for hint in _EMBED_HINTS):
         return "embed"
     if "gguf" in low:
@@ -139,6 +143,7 @@ BACKEND_SPECS: dict[str, BackendSpec] = {
         BackendSpec("whisper"),
         BackendSpec("mlx-audio", provisioner="mlx-audio"),
         BackendSpec("embed"),
+        BackendSpec("rerank"),
         BackendSpec("vllm", provisioner="vllm"),
         BackendSpec("sglang", provisioner="sglang"),
     )

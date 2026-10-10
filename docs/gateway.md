@@ -72,7 +72,7 @@ backend = "mlx-vlm"
 | `[llama_cpp]` | 全自動 | `llama-server` の自動導入テーブル。`accel`（auto/cuda/vulkan/metal/cpu）・`pin`（ビルド番号）。導入方法の選択肢は無い（常に自動導入）。→ [llama-cpp.md](llama-cpp.md#自動導入llama_cpp) |
 
 `[[models]]` は 1 モデル 1 エントリ。`model`（HuggingFace ID）と `backend`（`mlx` / `mlx-vlm` /
-`llama-cpp` / `whisper` / `mlx-audio` / `embed`）が必須。各エントリで `draft_model` を上書きできる。`dynamic = true` なら
+`llama-cpp` / `whisper` / `mlx-audio` / `embed` / `rerank`）が必須。各エントリで `draft_model` を上書きできる。`dynamic = true` なら
 `[[models]]` は省略可（全て動的ロード）。`whisper` は音声→テキスト（STT）バックエンド
 （→ [音声認識（STT / whisper）](#音声認識stt--whisper)）。
 
@@ -238,6 +238,31 @@ curl http://127.0.0.1:8799/v1/embeddings -H "Content-Type: application/json" -d 
 ```
 
 OpenAI SDK からもそのまま使える（`client.embeddings.create(model=..., input=[...], dimensions=256)`）。
+
+## リランク（RAG の 2 段目 / rerank）
+
+`backend = "rerank"` でリランカー（クロスエンコーダ）を **Cohere / Jina 互換の Rerank サーバ**として束ねる。
+埋め込みで広く拾った候補（数十件）を、問いと文の組ごとに精査して並べ直し、**較正された関連度（0〜1）**を付ける
+RAG の 2 段目。生成はしない（分類モデル）。遅延起動・LRU・idle アンロードは他と同じ。
+
+- **公開エンドポイント**: `POST /v1/rerank`（JSON。`model`・`query`・`documents`（文字列か `{"text"}` の配列、最大 512）・
+  任意で `top_n`・`return_documents`・`instruction`）。返り値は `results[]`（関連度の高い順。`index` は入力の位置、
+  `relevance_score` は 0〜1）と `usage.total_tokens`。OpenAI に rerank は無いので Cohere / Jina の形。
+- **モデル ID**: ID に `rerank` を含めば動的ロードで振り分ける。系列分類のクロスエンコーダ
+  （`cl-nagoya/ruri-v3-reranker-310m`、`BAAI/bge-reranker-v2-m3`、`hotchpotch/japanese-reranker-*`）と、生成モデル型
+  （`Qwen/Qwen3-Reranker-0.6B`。公式の prompt で yes / no の次トークンから関連度を出す）の両方を読める。
+- **実装**: 同梱の `local_llm_server.rerank_server`（transformers + torch。bfloat16 / mps、他は float32 / cpu）。
+  本体重みは事前 DL 必須（`hf download <repo>`）。
+
+```bash
+curl http://127.0.0.1:8799/v1/rerank -H "Content-Type: application/json" -d '{
+  "model": "cl-nagoya/ruri-v3-reranker-310m",
+  "query": "格子構造の剛性を上げた検討",
+  "documents": ["ラティス材のスティフネス向上に関する検討 …", "渦巻ポンプ羽根車の振動対策 …"],
+  "top_n": 1
+}'
+# → {"model": "...", "results": [{"index": 0, "relevance_score": 0.98}], "usage": {"total_tokens": 61}}
+```
 
 ## 画像入力の縮小（`image_max_edge`）
 

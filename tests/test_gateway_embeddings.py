@@ -75,3 +75,48 @@ def test_embeddings_route_by_json_model_and_pass_the_body_through():
         server.server_close()
         upstream.shutdown()
         upstream.server_close()
+
+
+class _RerankUpstream(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    seen: list = []
+
+    def do_POST(self) -> None:
+        length = int(self.headers.get("Content-Length") or 0)
+        payload = json.loads(self.rfile.read(length))
+        _RerankUpstream.seen.append((self.path, payload))
+        body = json.dumps({"model": payload.get("model"), "results": [{"index": 1, "relevance_score": 0.9}],
+                           "usage": {"total_tokens": 5}}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *_a):
+        pass
+
+
+def test_rerank_routes_by_json_model_and_passes_the_body_through():
+    _RerankUpstream.seen = []
+    upstream = ThreadingHTTPServer(("127.0.0.1", 0), _RerankUpstream)
+    threading.Thread(target=upstream.serve_forever, daemon=True).start()
+    mgr = _FakeManager(("127.0.0.1", upstream.server_address[1]))
+    server = gw.GatewayServer(("127.0.0.1", 0), mgr, catalog=[], default_model=None)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        req = {"model": "cl-nagoya/ruri-v3-reranker-310m", "query": "格子の剛性", "documents": ["a", "b"], "top_n": 1}
+        conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=10)
+        conn.request("POST", "/v1/rerank", body=json.dumps(req).encode(), headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        data = json.loads(resp.read().decode())
+        conn.close()
+        assert resp.status == 200 and mgr.acquired == ["cl-nagoya/ruri-v3-reranker-310m"]
+        assert data["results"][0]["index"] == 1
+        path, payload = _RerankUpstream.seen[0]
+        assert path.endswith("/v1/rerank") and payload == req
+    finally:
+        server.shutdown()
+        server.server_close()
+        upstream.shutdown()
+        upstream.server_close()
