@@ -15,6 +15,7 @@ dependencies = [
     "safetensors>=0.4",
     "huggingface_hub>=0.30",
     "psutil>=5",
+    "gguf>=0.17",
 ]
 
 [project.optional-dependencies]

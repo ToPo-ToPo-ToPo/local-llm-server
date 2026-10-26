@@ -32,7 +32,8 @@ transformers の実装をそのまま使い、エキスパート部分だけを�
 - NVIDIA GPU（8GB で動く想定）。**RTX 30 系以降（Ampere 以降）を推奨**します。int4 の高速な行列積
   （tinygemm）は Ampere 以降でしか使えず、それより古い GPU では展開してから掛ける遅い方式になります。
 - RAM 32GB 以上
-- ディスク: 元の重み（bf16、約 52GB。変換後は消してよい）と、変換後のファイル（約 16〜18GB）
+- ディスク: 変換後のファイル（約 16〜18GB）。HF の bf16 から変換する場合はさらに元の重み（約 52GB。
+  変換後は消してよい）、GGUF から取り込む場合はその GGUF（約 14GB）
 - Python 3.11 以上、[uv](https://docs.astral.sh/uv/)
 - Hugging Face のアカウント（Gemma の利用規約への同意と `hf auth login`）
 
@@ -64,6 +65,31 @@ python -m strata_lite convert google/gemma-4-26B-A4B-it D:\models\gemma4-26b-str
 - **変換は実際に動かす PC で行ってください。** CPU 用 int4 の並び順は CPU によって変わる可能性があり、
   違う場合はロード時に止まって再変換を促します。
 - 終わったら HF のキャッシュ（`%USERPROFILE%\.cache\huggingface`）にある元の重みは消して構いません。
+
+### 1'. GGUF から取り込む（QAT 版をそのまま使う。推奨）
+
+`convert` に `.gguf` を渡すと、HF の bf16 重みを取らずに **GGUF から直接**取り込めます。
+Gemma 4 の QAT 版 GGUF（`google/gemma-4-26B-A4B-it-qat-q4_0-gguf` や、ゲートウェイで使う
+`unsloth/gemma-4-26B-A4B-it-qat-GGUF` の Q4_0 系）は Q4_0 の格子で学習されており、strata-lite の
+`q4_0` 方式と格子が同じなので、エキスパートは**再量子化せずに**詰め替えるだけです（bf16 から丸め直す
+上の経路より品質が良く、52GB の取得も要りません）。
+
+```powershell
+# ローカルの .gguf から（ゲートウェイが HF キャッシュに置いた GGUF をそのまま使える）
+python -m strata_lite convert C:\path\to\gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf D:\models\gemma4-26b-strata
+
+# HF の GGUF リポジトリから（--gguf-file でファイルを名指し）
+python -m strata_lite convert google/gemma-4-26B-A4B-it-qat-q4_0-gguf D:\models\gemma4-26b-strata --gguf-file gemma-4-26B_q4_0-it.gguf
+```
+
+- `config.json` と tokenizer は GGUF に無いので、元の HF リポジトリ（`--base`。既定は
+  `google/gemma-4-26B-A4B-it`）から小さなファイルだけ取ります。GGUF のメタデータ（層数・エキスパート数・
+  次元）と突き合わせ、違うモデルの設定なら止まります。
+- エキスパート以外（attention・共有 MLP・埋め込み）は展開して bf16 で持ち、ロード時に改めて int4 化します
+  （HF 経路と同じ）。スケールは GGUF が fp16、カーネルが bf16 なので、そこだけ丸めが入ります。
+- Q4_0 以外の量子化（Q4_K 等）のエキスパートは展開してから q4_0 に量子化し直します（`strata.json` の
+  `experts_requantized` に数が出ます）。
+- 取り込み後の使い方（plan / bench / chat / serve）は同じです。`strata.json` の `source_format` が `gguf` になります。
 
 ### 2. 見積もり
 

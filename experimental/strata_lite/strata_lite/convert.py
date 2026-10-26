@@ -69,7 +69,18 @@ def text_config_dict(src: str) -> dict:
     return cfg.get("text_config", cfg)
 
 
-def convert(src: str, out: str, *, group: int = 32, scheme: str = "q4_0", log=print) -> str:
+DEFAULT_BASE = "google/gemma-4-26B-A4B-it"
+
+
+def convert(src: str, out: str, *, group: int = 32, scheme: str = "q4_0", base: str | None = None,
+            gguf_file: str | None = None, log=print) -> str:
+    """src が `.gguf`（ローカルファイル、または HF repo-id ＋ gguf_file）なら GGUF から取り込む。
+    それ以外は HF の safetensors（ローカルディレクトリまたは HF repo-id）から変換する。"""
+    if gguf_file or src.lower().endswith(".gguf"):
+        from .gguf_import import convert_gguf, resolve_gguf
+
+        path = resolve_gguf(src, gguf_file, log)
+        return convert_gguf(path, out, base=base or DEFAULT_BASE, group=group, scheme=scheme, log=log)
     src = resolve_source(src, log)
     tc = text_config_dict(src)
     if not tc.get("enable_moe_block"):
