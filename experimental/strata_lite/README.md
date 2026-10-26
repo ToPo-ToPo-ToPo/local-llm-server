@@ -44,8 +44,8 @@ PyPI にある Windows 版の torch は CPU 専用なので、**CUDA 版の torc
 cd experimental\strata_lite
 uv venv
 .venv\Scripts\activate
-uv pip install torch --index-url https://download.pytorch.org/whl/cu128
-uv pip install -e .
+uv pip install -c constraints.txt torch --index-url https://download.pytorch.org/whl/cu128
+uv pip install -c constraints.txt -e .
 python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
 ```
 
@@ -144,6 +144,6 @@ GPU が無くても、小さなランダム初期化の Gemma 4 で一連の流�
 
 ```bash
 cd experimental/strata_lite
-uv venv && uv pip install torch -e ".[test]"
+uv venv && uv pip install -c constraints.txt torch -e ".[test]"
 .venv/bin/python -m pytest
 ```

@@ -27,3 +27,9 @@ include = ["strata_lite*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+# 本体（../../pyproject.toml の [tool.uv]）と同じく、使わないのにサプライチェーン攻撃の多い
+# パッケージを導入禁止にする（満たせない制約）。uv sync / uv lock はここを読む。
+# README の `uv pip install` は constraints.txt を -c で渡して同じ制約を掛ける。
+[tool.uv]
+constraint-dependencies = ["litellm<0"]
