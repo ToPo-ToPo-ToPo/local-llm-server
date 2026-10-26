@@ -87,6 +87,12 @@ sglang = ["sglang==0.5.2 ; sys_platform == 'linux'"]
 # の隔離 venv で）。
 [tool.uv]
 conflicts = [[{ extra = "vllm" }, { extra = "sglang" }]]
+# 使わないのに脆弱性・サプライチェーン攻撃の多いパッケージを導入禁止にする（満たせない制約）。
+# litellm: 2026 年に PyPI 版の改ざん（1.82.7/1.82.8・1.107.0）とプロキシの重大 CVE が続いた。
+# 間接依存で要求されても入らない（uv は依存元を litellm 不要の版へ後退させるので、uv.lock の
+# 差分で不自然に古い版が出たらこれが原因）。隔離 venv の pip には _venv_backend.BLOCKED_PACKAGES
+# で同じ制約を渡す（両者の一致は tests/test_blocked_packages.py が検証）。
+constraint-dependencies = ["litellm<0"]
 # vllm / sglang は sdist からビルドしない（wheel のみ使う）。両者は CUDA 前提で、ソースビルドは
 # CUDA の無い Mac では必ず失敗する。これが無いと `uv lock --upgrade` の全面再解決で、
 # vllm の固定（torch==/torchvision== ピン）と新しい torchvision が衝突したとき uv が

@@ -81,6 +81,25 @@ def test_auto_install_and_reuse(tmp_path, monkeypatch):
     assert again == py
 
 
+def test_pip_install_passes_blocked_constraints(tmp_path, monkeypatch):
+    # 隔離 venv の pip にも導入禁止の制約ファイル（litellm<0 等）を -c で渡す。
+    monkeypatch.setattr(vb.provisioner, "detect_os", lambda: "linux")
+    vdir = str(tmp_path / "v")
+    seen = []
+
+    def run(cmd, capture_output=False, timeout=None):
+        seen.append(cmd)
+        return _ok(0)
+
+    with pytest.raises(_Exc):  # import 検証は常に失敗させ、pip 呼び出しだけを見る
+        vb.ensure_backend(**_base(venv_dir=vdir, create_venv=lambda d: None, run=run,
+                                  importable=lambda p, r: False))
+    (cmd,) = [c for c in seen if "install" in c]
+    path = cmd[cmd.index("-c") + 1]
+    assert cmd[-1] == "pkg"
+    assert open(path, encoding="utf-8").read().splitlines() == ["litellm<0"]
+
+
 def test_pip_failure_raises_given_exc(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
     monkeypatch.setattr(vb.provisioner, "detect_os", lambda: "linux")

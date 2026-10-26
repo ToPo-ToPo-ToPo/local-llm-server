@@ -24,6 +24,9 @@ conflicts = [[
     { package = "local-llm-server", extra = "vllm" },
 ]]
 
+[manifest]
+constraints = [{ name = "litellm", specifier = "<0" }]
+
 [[package]]
 name = "agent-detector"
 version = "2.0.0"
