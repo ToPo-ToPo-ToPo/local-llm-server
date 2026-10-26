@@ -732,8 +732,8 @@ def start_gateway_background(
 
     ターミナルを占有しない常駐起動（Ollama 流）。cwd の ./gateway.toml を読む
     ヘッドレスワーカー（`python -m local_llm_server` = __main__）を、新セッション（POSIX）/
-    DETACHED_PROCESS（Windows）で起動して端末・親から切り離し、出力は gateway_log_path に
-    逃がす。応答可能になったら PID を返す。既に起動済みなら何もせず既存 PID（不明なら 0）を返す。
+    CREATE_NO_WINDOW（Windows。非表示コンソール＋新プロセスグループ）で起動して端末・親から
+    切り離し、出力は gateway_log_path に逃がす。応答可能になったら PID を返す。既に起動済みなら何もせず既存 PID（不明なら 0）を返す。
     起動失敗は RuntimeError、時間内に応答しなければ TimeoutError。
     """
     base_url = f"http://{host}:{port}/v1"
@@ -792,8 +792,18 @@ def start_gateway_background(
     }
     if os.name == "nt":
         # 端末から切り離し、新プロセスグループにする（stop の taskkill /T と対）。
+        #
+        # DETACHED_PROCESS ではなく CREATE_NO_WINDOW を使う。sys.executable は uv の
+        # トランポリン（Scripts\python.exe）で、実体の python.exe はその子として起動される。
+        # 親を DETACHED（コンソール無し）にすると、子の実体 python が**新しいコンソールを
+        # 自動確保**し、Windows 11 ではそれが Windows Terminal の空ウィンドウとして画面に
+        # 現れる（タイトルは Scripts\python.exe のパス）。利用者がその「何もない端末」を
+        # 閉じると CTRL_CLOSE でデーモンとモデルサーバーが黙って道連れになる（実機 2026-10-26:
+        # gw start したゲートウェイが数十秒〜十数分で消える原因だった）。
+        # CREATE_NO_WINDOW なら親に**非表示のコンソール**が付き、実体 python と
+        # llama-server はそれを継承する——ウィンドウは出ず、閉じられることもない。
         popen_kwargs["creationflags"] = (
-            subprocess.DETACHED_PROCESS  # type: ignore[attr-defined]
+            subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
             | subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
         )
     else:

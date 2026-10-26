@@ -1,8 +1,8 @@
 """`python -m local_llm_server` — ゲートウェイ本体（常駐デーモン）。**`gw start` 専用の内部入口**。
 
 `gw start`（cli）が裏で常駐させる実体。`server.start_gateway_background` がこのモジュールを
-新セッション（POSIX）/ DETACHED_PROCESS（Windows）の別プロセスとして spawn し、出力は
-ログへ逃がす。端末を持たず、CWD の `./gateway.toml` のゲートウェイをフォアグラウンドで実行する。
+新セッション（POSIX）/ CREATE_NO_WINDOW（Windows。非表示コンソール）の別プロセスとして spawn し、
+出力はログへ逃がす（Windows でウィンドウを出さない理由は gateway_runtime.start_gateway_background）。端末を持たず、CWD の `./gateway.toml` のゲートウェイをフォアグラウンドで実行する。
 メニューバーの手動更新が適用されると、このプロセスを新コードで execv し直す
 （execv は環境変数を引き継ぐので、下の spawn ガードも通る）。
 
