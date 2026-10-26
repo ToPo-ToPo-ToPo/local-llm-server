@@ -1,0 +1,3 @@
+# 導入禁止のパッケージ（満たせない制約）。`uv pip install -c constraints.txt ...` で渡す。
+# 本体の pyproject.toml [tool.uv] constraint-dependencies と同じ内容に保つ。
+litellm<0
