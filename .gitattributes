@@ -1,0 +1,3 @@
+# リポジトリ内の改行は LF に統一する（Windows のチェックアウトでも CRLF に変換しない）
+* text=auto eol=lf
+*.png binary
