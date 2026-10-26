@@ -11,6 +11,7 @@ HybridExperts に差し替える。
 from __future__ import annotations
 
 import copy
+import gc
 import json
 import os
 import time
@@ -268,9 +269,17 @@ class Engine:
         profile = None
         if old is not None:
             profile = old.counts.clone()
+            # 各層の HybridExperts が旧キャッシュを握ったままだと GPU スロットが解放されず、
+            # 下の _slot_count() が「空き VRAM ほぼ 0」を見て新キャッシュのスロット数を 0 にしてしまう
+            # （実機 2026-10-27: bench --compare の 2 回目以降の方式が GPU 0% で走った）。
+            # 先に参照を外し、確実に回収してから空き VRAM を測る。
+            for lid in self.meta["moe_layers"]:
+                self.model.model.layers[lid].experts = nn.Identity()
             self.cache = None
             del old
+            gc.collect()
             if self.device.type == "cuda":
+                torch.cuda.synchronize()
                 torch.cuda.empty_cache()
         elif self.use_profile:
             profile = ExpertCache.load_profile(os.path.join(self.model_dir, PROFILE_NAME),
