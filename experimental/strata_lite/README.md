@@ -5,9 +5,34 @@ Strata のやり方（よく使う MoE エキスパートを GPU に、残りを
 を自分の機材で確かめること**です。ゲートウェイ本体（`local_llm_server`）とは独立しており、本体の
 依存にも検査（`make check`）にも入っていません。
 
-> **状態**: CPU 上の小型モデルでは、計算結果の正しさを自動テスト（32 件）で確認済みです。
-> **実際の GPU と実際の Gemma 4 の重みでは、まだ一度も動かしていません**（開発環境に GPU が無く、
-> HF にも接続できなかったため）。最初の実行で問題が出る可能性があります。
+> **結論（2026-10-27、実機で確認済み）**: **エンジンとしては使わない。llama.cpp の `--moe-cache-mib` で十分。**
+> このディレクトリは「配置方針の実験記録」として残す（本体には影響しない）。
+>
+> 実機（Windows 11 / RTX 3080 10GB / RAM 32GB / Core i9-11900K、Gemma 4 26B-A4B の QAT 版 Q4_0 GGUF、
+> 生成 64 トークン、GPU にエキスパートの 42%）での結果:
+>
+> | エンジン | 配置 | 生成 | プリフィル | GPU ヒット率 |
+> |---|---|---|---|---|
+> | strata-lite | `layer`（llama.cpp の `--n-cpu-moe` 相当） | 1.28 tok/s | 6.6 tok/s | 40% |
+> | strata-lite | `hot`（使用頻度順） | 3.51 tok/s | 8.2 tok/s | 90% |
+> | strata-lite | `hot` ＋ `--miss transfer` | 6.45 tok/s | 26.7 tok/s | 90% |
+> | llama.cpp b11896 | `--n-cpu-moe 20` | 31.3 tok/s | — | — |
+> | llama.cpp b11896 | `--n-cpu-moe 30 --moe-cache-mib 4096` | **49.0 tok/s** | 598 tok/s（長文） | — |
+>
+> 分かったこと:
+> - **配置方針の価値は本物**。同じ 42% しか GPU に置けなくても、使用頻度順にするとヒット率が 40% → 90%、
+>   生成が 2.7 倍（layer → hot）になる。
+> - **しかしエンジンの差がそれを覆い隠す**。生成ループが transformers（Python）で、層ごとの GPU 同期と
+>   CPU-GPU 往復が重く、最良でも llama.cpp の 1/8。
+> - **llama.cpp には同じ仕組みがすでに入っている**（2026-10-07 `--moe-cache-mib`、10-19 に SLRU 化。
+>   Strata とは独立に実装されたもの）。全エキスパートを CPU に置いて GPU に 4GiB のキャッシュを持たせるだけで
+>   31 → 49 tok/s。ゲートウェイの `[[models]]` の `extra_args` で設定できる（→ [docs/llama-cpp.md](../../docs/llama-cpp.md)）。
+> - 公式の Strata（Niko1221/Strata）も Gemma 非対応・3 モデル専用なので、Gemma 4 用途では選ばない。
+>
+> 残る改良余地は「使用履歴の保存（起動直後から効かせる）」程度で、llama.cpp 側に足すならそこ。
+> このエンジンを速くする方向（C++ 化など）は、llama.cpp の再実装になるので行わない。
+>
+> 状態: GPU 経路（tinygemm・固定メモリ・転送）と GGUF 取り込みは実機で動作確認済み。自動テスト 41 件。
 
 ## 何をするか
 
@@ -32,7 +57,8 @@ transformers の実装をそのまま使い、エキスパート部分だけを�
 - NVIDIA GPU（8GB で動く想定）。**RTX 30 系以降（Ampere 以降）を推奨**します。int4 の高速な行列積
   （tinygemm）は Ampere 以降でしか使えず、それより古い GPU では展開してから掛ける遅い方式になります。
 - RAM 32GB 以上
-- ディスク: 元の重み（bf16、約 52GB。変換後は消してよい）と、変換後のファイル（約 16〜18GB）
+- ディスク: 変換後のファイル（約 16〜18GB）。HF の bf16 から変換する場合はさらに元の重み（約 52GB。
+  変換後は消してよい）、GGUF から取り込む場合はその GGUF（約 14GB）
 - Python 3.11 以上、[uv](https://docs.astral.sh/uv/)
 - Hugging Face のアカウント（Gemma の利用規約への同意と `hf auth login`）
 
@@ -64,6 +90,31 @@ python -m strata_lite convert google/gemma-4-26B-A4B-it D:\models\gemma4-26b-str
 - **変換は実際に動かす PC で行ってください。** CPU 用 int4 の並び順は CPU によって変わる可能性があり、
   違う場合はロード時に止まって再変換を促します。
 - 終わったら HF のキャッシュ（`%USERPROFILE%\.cache\huggingface`）にある元の重みは消して構いません。
+
+### 1'. GGUF から取り込む（QAT 版をそのまま使う。推奨）
+
+`convert` に `.gguf` を渡すと、HF の bf16 重みを取らずに **GGUF から直接**取り込めます。
+Gemma 4 の QAT 版 GGUF（`google/gemma-4-26B-A4B-it-qat-q4_0-gguf` や、ゲートウェイで使う
+`unsloth/gemma-4-26B-A4B-it-qat-GGUF` の Q4_0 系）は Q4_0 の格子で学習されており、strata-lite の
+`q4_0` 方式と格子が同じなので、エキスパートは**再量子化せずに**詰め替えるだけです（bf16 から丸め直す
+上の経路より品質が良く、52GB の取得も要りません）。
+
+```powershell
+# ローカルの .gguf から（ゲートウェイが HF キャッシュに置いた GGUF をそのまま使える）
+python -m strata_lite convert C:\path\to\gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf D:\models\gemma4-26b-strata
+
+# HF の GGUF リポジトリから（--gguf-file でファイルを名指し）
+python -m strata_lite convert google/gemma-4-26B-A4B-it-qat-q4_0-gguf D:\models\gemma4-26b-strata --gguf-file gemma-4-26B_q4_0-it.gguf
+```
+
+- `config.json` と tokenizer は GGUF に無いので、元の HF リポジトリ（`--base`。既定は
+  `google/gemma-4-26B-A4B-it`）から小さなファイルだけ取ります。GGUF のメタデータ（層数・エキスパート数・
+  次元）と突き合わせ、違うモデルの設定なら止まります。
+- エキスパート以外（attention・共有 MLP・埋め込み）は展開して bf16 で持ち、ロード時に改めて int4 化します
+  （HF 経路と同じ）。スケールは GGUF が fp16、カーネルが bf16 なので、そこだけ丸めが入ります。
+- Q4_0 以外の量子化（Q4_K 等）のエキスパートは展開してから q4_0 に量子化し直します（`strata.json` の
+  `experts_requantized` に数が出ます）。
+- 取り込み後の使い方（plan / bench / chat / serve）は同じです。`strata.json` の `source_format` が `gguf` になります。
 
 ### 2. 見積もり
 

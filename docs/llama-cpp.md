@@ -31,6 +31,43 @@ pin = "b9946"            # ビルド番号を固定（省略で最新を取得�
 - **macOS の注意**: Apple Silicon は既定が mlx-vlm なので、llama-cpp を使うときだけ導入される
   （`[[models]]` に `backend = "llama-cpp"` を登録するか GGUF を要求する構成）。
 
+## VRAM に収まらない MoE モデル（`--n-cpu-moe` / `--moe-cache-mib`）
+
+MoE モデル（Gemma 4 26B-A4B、Qwen3.6-35B-A3B など）は重みの大半がエキスパートで、1 トークンで使うのは
+その一部だけ。VRAM に全部載らなくても、**エキスパートを RAM に置き、使われるものを GPU にキャッシュする**
+ことで実用速度が出る。llama.cpp（b11896 以降で確認）の 2 つのオプションを `[[models]]` の `extra_args` で渡す:
+
+- `--n-cpu-moe N` … 先頭 N 層のエキスパートを RAM（CPU）に置く。attention・共有 MLP は GPU のまま。
+- `--moe-cache-mib M` … RAM に置いたエキスパートのうち、最近よく使われたものを GPU 上の M MiB の
+  キャッシュに保持する（SLRU。Strata 流の「よく使うエキスパートを GPU に」が llama.cpp 本体に入っている）。
+
+**実測（Windows 11 / RTX 3080 10GB / RAM 32GB、Gemma 4 26B-A4B QAT Q4_0 GGUF 13.3GB、16K ctx、KV q8_0、
+生成 64 トークン）**:
+
+| `extra_args` | 生成 | VRAM |
+|---|---|---|
+| 未指定（llama.cpp の `--fit` に任せる） | 6 tok/s（ctx が 4096 に縮められる） | 9.9 GB |
+| `--n-cpu-moe 20` | 31 tok/s | 7.7 GB |
+| `--n-cpu-moe 25 --moe-cache-mib 2048` | 40 tok/s | 7.7 GB |
+| **`--n-cpu-moe 30 --moe-cache-mib 4096`**（全層 CPU ＋ 4GiB キャッシュ） | **49 tok/s**（ゲートウェイ経由 45〜63） | 9.0 GB |
+| `--n-cpu-moe 20 --moe-cache-mib 512` | 16 tok/s（VRAM 圧迫で逆効果） | 8.2 GB |
+
+目安: **全層を CPU に置き、空いた VRAM をキャッシュに回す**のが最も速かった。キャッシュを大きくするほど
+ヒット率が上がる一方、KV キャッシュや計算バッファの分（1〜1.5GB）は残す。`-c` を明示しないと
+`--fit` がコンテキストを 4096 まで縮めるので、エージェント用途では `-c` も併せて指定する。
+
+```toml
+[[models]]
+model = "unsloth/gemma-4-26B-A4B-it-qat-GGUF:UD-Q4_K_XL"
+backend = "llama-cpp"
+parallel = 1
+extra_args = ["-c", "16384", "--n-cpu-moe", "30", "--moe-cache-mib", "4096",
+              "--cache-type-k", "q8_0", "--cache-type-v", "q8_0"]
+```
+
+VRAM の大きさやモデルが違えば最適値は変わるので、`llama-server` を直接起動して `--n-cpu-moe` と
+`--moe-cache-mib` を数通り試し、`timings.predicted_per_second` を比べるのが確実（上の表はそれで測った）。
+
 ## model の書き方（HF repo-id）
 
 `model` は **HF repo-id（`org/repo`）で指定する**（実ファイルパスは非対応）。**DL 済みキャッシュ**から

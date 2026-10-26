@@ -63,10 +63,10 @@ print(llm.respond("ローカルLLMの利点を3つ。"))
 - [docs/features.md](docs/features.md) — 特徴と全体像
 - [docs/operation.md](docs/operation.md) — `gw` サブコマンドでの起動・停止・状態確認・アンインストール
 - [docs/gateway.md](docs/gateway.md) — `gateway.toml` の全フィールドと振る舞い
-- [docs/llama-cpp.md](docs/llama-cpp.md) — llama.cpp（`llama-server`）の自動導入・最新モデル追従
+- [docs/llama-cpp.md](docs/llama-cpp.md) — llama.cpp（`llama-server`）の自動導入・最新モデル追従・VRAM に収まらない MoE の配置（`--moe-cache-mib`）
 - [docs/vllm.md](docs/vllm.md) — vLLM / SGLang（高スループット生成）
 - [docs/mtp.md](docs/mtp.md) — MTP による高速化
-- [experimental/strata_lite](experimental/strata_lite/README.md) — 実験: MoE のエキスパートを使用頻度で GPU/RAM に振り分ける試作エンジン（本体とは独立）
+- [experimental/strata_lite](experimental/strata_lite/README.md) — 実験記録: MoE のエキスパートを使用頻度で GPU/RAM に振り分ける試作エンジン（本体とは独立。結論: llama.cpp の `--moe-cache-mib` で十分 → docs/llama-cpp.md）
 
 ## ライセンス
 

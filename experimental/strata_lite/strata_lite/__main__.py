@@ -59,7 +59,7 @@ def _engine(a):
 def cmd_convert(a):
     from .convert import convert
 
-    convert(a.src, a.out, group=a.group, scheme=a.scheme)
+    convert(a.src, a.out, group=a.group, scheme=a.scheme, base=a.base, gguf_file=a.gguf_file)
 
 
 def plan(model_dir: str, vram_gb: float, reserve_gb: float, context_gb: float = 0.5) -> dict:
@@ -198,11 +198,16 @@ def main(argv=None):
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    c = sub.add_parser("convert", help="HF の safetensors を変換する")
-    c.add_argument("src")
+    c = sub.add_parser("convert", help="HF の safetensors、または GGUF（.gguf）を変換する")
+    c.add_argument("src", help="HF repo-id / ローカルディレクトリ（safetensors）、または .gguf のパス")
     c.add_argument("out")
     c.add_argument("--group", type=int, default=32, choices=[32, 64, 128])
     c.add_argument("--scheme", default="q4_0", choices=["q4_0", "asym"])
+    c.add_argument("--base", default=None,
+                   help="GGUF のとき config.json / tokenizer を取る元（HF repo-id かディレクトリ。"
+                        "既定: google/gemma-4-26B-A4B-it）")
+    c.add_argument("--gguf-file", default=None,
+                   help="src が HF repo-id のとき、取り込む .gguf のファイル名（例 gemma-4-26B_q4_0-it.gguf）")
     c.set_defaults(fn=cmd_convert)
 
     pl = sub.add_parser("plan", help="GPU と RAM の使い方を見積もる")
