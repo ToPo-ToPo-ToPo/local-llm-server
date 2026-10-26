@@ -38,18 +38,18 @@ transformers の実装をそのまま使い、エキスパート部分だけを�
 
 ## 導入（Windows / PowerShell）
 
-PyPI にある Windows 版の torch は CPU 専用なので、**CUDA 版の torch を先に入れます**。
+PyPI にある Windows 版の torch は CPU 専用ですが、`pyproject.toml` の `[tool.uv.sources]` で torch だけを
+PyTorch 公式の CUDA 12.8 用インデックス（cu128）から取るようにしてあるので、**`uv sync` だけで CUDA 版が入ります**
+（Windows / Linux。macOS は PyPI の通常版）。NVIDIA ドライバは 570 以降が必要です。
 
 ```powershell
 cd experimental\strata_lite
-uv venv
-.venv\Scripts\activate
-uv pip install -c constraints.txt torch --index-url https://download.pytorch.org/whl/cu128
-uv pip install -c constraints.txt -e .
-python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+uv sync
+uv run python -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.get_device_name(0))"
 ```
 
-最後の行で `True` と GPU 名が出れば準備完了です。
+最後の行で `+cu128` 付きのバージョンと `True`、GPU 名が出れば準備完了です。以降のコマンドは
+`uv run python -m strata_lite ...` か、`.venv\Scripts\activate` してから `python -m strata_lite ...` で実行します。
 
 ## 使い方
 
@@ -144,6 +144,6 @@ GPU が無くても、小さなランダム初期化の Gemma 4 で一連の流�
 
 ```bash
 cd experimental/strata_lite
-uv venv && uv pip install -c constraints.txt torch -e ".[test]"
-.venv/bin/python -m pytest
+uv sync --extra test
+uv run pytest
 ```
