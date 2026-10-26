@@ -7,7 +7,8 @@ name = "strata-lite"
 version = "0.1.0"
 description = "実験: よく使う MoE エキスパートを GPU に、残りを RAM/CPU に置く Gemma 4 用の推論エンジン（Strata 流の試作）"
 requires-python = ">=3.11"
-# torch は CUDA 版を先に入れる（PyPI の Windows 版 torch は CPU 専用）。README の手順を参照。
+# torch は CUDA 版を使う。PyPI の Windows 版 torch は CPU 専用なので、下の [tool.uv.sources] で
+# Windows / Linux のときだけ PyTorch 公式の cu128 インデックスから取る（uv sync だけで CUDA 版が入る）。
 dependencies = [
     "torch>=2.8",
     "transformers>=5.14",
@@ -33,3 +34,18 @@ testpaths = ["tests"]
 # README の `uv pip install` は constraints.txt を -c で渡して同じ制約を掛ける。
 [tool.uv]
 constraint-dependencies = ["litellm<0"]
+
+# CUDA 版 torch の取得元。PyPI の Windows 向け torch は CPU 専用ビルドしか無いので、PyTorch 公式の
+# CUDA 12.8 用インデックスを登録し、torch だけをそこから解決する（explicit = true: 他のパッケージには
+# 使わない）。Windows / Linux に限定するのは、macOS には CUDA 版が無く PyPI の通常版を使うため。
+# これで `uv sync` だけで GPU 対応の torch が入り、README の「先に torch を入れる」手順が不要になる。
+# 2026-10 時点の対応: RTX 30 系以降・NVIDIA ドライバ 570 以降（cu128 の要件）。
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu128", marker = "sys_platform == 'win32' or sys_platform == 'linux'" },
+]
