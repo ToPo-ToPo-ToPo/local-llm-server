@@ -18,6 +18,20 @@ import venv
 
 from . import provisioner  # detect_os / _has_nvidia_gpu を再利用
 
+# 隔離 venv に入れさせないパッケージ（pip の制約ファイルに「<0」＝満たせない制約として渡す）。
+# pyproject.toml の [tool.uv] constraint-dependencies と同じ集合を保つ（理由もそちらに記載）。
+BLOCKED_PACKAGES = ("litellm",)
+CONSTRAINTS_FILE = "blocked-constraints.txt"
+
+
+def write_constraints(venv_dir: str) -> str:
+    """venv_dir に導入禁止の制約ファイルを書き、そのパスを返す（pip install -c 用）。"""
+    os.makedirs(venv_dir, exist_ok=True)
+    path = os.path.join(venv_dir, CONSTRAINTS_FILE)
+    with open(path, "w", encoding="utf-8") as f:
+        f.writelines(f"{name}<0\n" for name in BLOCKED_PACKAGES)
+    return path
+
 
 def gpu_available() -> bool:
     """実用になる NVIDIA GPU があるか（vLLM/SGLang は GPU 前提）。"""
@@ -106,7 +120,8 @@ def ensure_backend(
             venv.create(vdir, with_pip=True, symlinks=(os.name != "nt"))
         # venv 付属の pip をそのまま使う。毎回「現時点の最新 pip」へ無条件に
         # 更新すると再現性を失い、その更新失敗も従来は見逃していた。
-        proc = run([py, "-m", "pip", "install", package],
+        # -c で BLOCKED_PACKAGES を間接依存でも入らないようにする（要求されたら解決失敗）。
+        proc = run([py, "-m", "pip", "install", "-c", write_constraints(vdir), package],
                    capture_output=True, timeout=3600)
         if getattr(proc, "returncode", 1) != 0:
             err = (getattr(proc, "stderr", b"") or b"").decode("utf-8", "replace")
