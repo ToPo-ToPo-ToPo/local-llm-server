@@ -163,6 +163,7 @@ def _find_pids_lsof(port: int) -> list[int]:
             ["lsof", "-t", f"-iTCP:{port}", "-sTCP:LISTEN"],
             capture_output=True,
             text=True,
+            errors="replace",  # 日本語 Windows の出力は cp932。UTF-8 モード(PYTHONUTF8=1)でも落とさない
             timeout=5,
         )
     except (FileNotFoundError, subprocess.SubprocessError):
@@ -182,6 +183,7 @@ def _find_pids_netstat(port: int) -> list[int]:
             ["netstat", "-ano", "-p", "tcp"],
             capture_output=True,
             text=True,
+            errors="replace",  # 日本語 Windows の出力は cp932。UTF-8 モード(PYTHONUTF8=1)でも落とさない
             timeout=5,
         )
     except (FileNotFoundError, subprocess.SubprocessError):
@@ -354,6 +356,7 @@ def _stop_pid_windows(pid: int) -> bool:
             ["taskkill", "/PID", str(pid), "/T", "/F"],
             capture_output=True,
             text=True,
+            errors="replace",  # 日本語 Windows の出力は cp932。UTF-8 モード(PYTHONUTF8=1)でも落とさない
             timeout=10,
         )
     except (FileNotFoundError, subprocess.SubprocessError):
