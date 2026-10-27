@@ -95,3 +95,27 @@ def test_macos_backend_matches_available_python_wheels(monkeypatch):
     assert backend_core.default_backend() == "mlx-vlm"
     monkeypatch.setattr(backend_core.sys, "version_info", (3, 15, 2))
     assert backend_core.default_backend() == "llama-cpp"
+
+
+@pytest.mark.parametrize("cloned", [True, False])
+def test_release_tag_lookup_uses_verified_git_transport(tmp_path, monkeypatch, cloned):
+    monkeypatch.setenv("GIT_SSL_NO_VERIFY", "true")
+    monkeypatch.setattr(update, "repo_root", lambda: tmp_path if cloned else None)
+    captured = {}
+    def run(command, **kwargs):
+        captured.update(command=command, **kwargs)
+        return types.SimpleNamespace(returncode=0, stdout="abc\trefs/tags/v0.38.25\n")
+    monkeypatch.setattr(update.subprocess, "run", run)
+    assert update.latest_release_version() == "0.38.25"
+    assert "http.sslVerify=true" in captured["command"]
+    assert "GIT_SSL_NO_VERIFY" not in captured["env"]
+    assert Path(captured["env"]["GIT_SSL_CAINFO"]).is_file()
+    assert Path(captured["env"]["GIT_SSL_CAPATH"]).is_dir()
+    assert captured["command"][-1] == ("origin" if cloned else update._CANONICAL_REPO)
+
+
+def test_release_tag_lookup_fails_closed_without_secure_ca(monkeypatch):
+    def unavailable():
+        raise RuntimeError("unpatched certifi")
+    monkeypatch.setattr(tls_policy, "git_environment", unavailable)
+    assert update.latest_release_version() is None

@@ -66,15 +66,17 @@ def latest_release_version(timeout: float = 10.0) -> str | None:
     clone があればその origin、無ければ公式リポジトリへ `git ls-remote --tags` で照会する
     （認証不要・API レート制限なし。GitHub の Releases 機能ではなく git タグそのものを見る）。
     """
+    from .tls_policy import git_environment
+
     root = repo_root()
     remote = "origin" if root is not None else _CANONICAL_REPO
     try:
         r = subprocess.run(
-            ["git", "ls-remote", "--tags", remote],
+            ["git", "-c", "http.sslVerify=true", "ls-remote", "--tags", remote],
             cwd=str(root) if root is not None else None,
-            capture_output=True, text=True, timeout=timeout,
+            capture_output=True, text=True, timeout=timeout, env=git_environment(),
         )
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, RuntimeError, subprocess.SubprocessError):
         return None
     if r.returncode != 0:
         return None
