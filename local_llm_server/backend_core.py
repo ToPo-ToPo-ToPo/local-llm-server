@@ -16,7 +16,8 @@ from .constants import BACKENDS
 
 def default_backend() -> str:
     """Return the platform-appropriate default inference backend."""
-    if sys.platform == "darwin" and platform.machine() == "arm64":
+    if (sys.platform == "darwin" and platform.machine() == "arm64"
+            and sys.version_info[:2] < (3, 15)):
         return "mlx-vlm"
     return "llama-cpp"
 

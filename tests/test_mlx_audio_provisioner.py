@@ -44,7 +44,7 @@ def test_macos_is_allowed_without_nvidia_gpu(apple_silicon, monkeypatch):
     assert py == _venv_backend.sys.executable
 
 
-def test_auto_creates_venv_and_installs_server_extra(tmp_path, monkeypatch, apple_silicon):
+def test_auto_creates_venv_with_server_dependencies_and_fixed_vad(tmp_path, monkeypatch, apple_silicon):
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
     created, installed = {}, []
     state = {"installed": False}
@@ -62,9 +62,11 @@ def test_auto_creates_venv_and_installs_server_extra(tmp_path, monkeypatch, appl
     py = mp.ensure_mlx_audio(create_venv=fake_create, run=marking_run,
                              importable=lambda p, run: state["installed"] and p != mp._venv_backend.sys.executable)
     assert created["dir"].endswith("mlx-audio-venv")
-    # サーバーを立てるのに server extra が要る（tts だけだと uvicorn が無くて起動しない）
-    assert any(mp.MLX_AUDIO_PACKAGE in c for c in installed)
-    assert "server" in mp.MLX_AUDIO_PACKAGE and "tts" in mp.MLX_AUDIO_PACKAGE
+    # Install the server requirements without its legacy setuptools cap.
+    command = next(c for c in installed if mp.MLX_AUDIO_PACKAGE in c)
+    assert all(requirement in command for requirement in mp.MLX_AUDIO_SERVER_REQUIREMENTS)
+    assert "webrtcvad-wheels==2.0.14.post1" in command
+    assert not any("[tts,server]" in argument for argument in command)
     assert py == mp.venv_python(created["dir"])
 
 

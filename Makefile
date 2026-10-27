@@ -9,32 +9,10 @@ help:
 	@echo "make check      PR 前の検査を手元で回す（lint・型・セキュリティ・依存監査・テストと網羅率）"
 	@echo "運用は gw で行う: gw status / gw ps / gw stop（一覧は gw help。常駐は OS が世話する）"
 
-# editable 固定（クローンのソースを直接指す＝自動更新が効く）＋ --reinstall で
-# 「初回導入」も「依存が変わったときの入れ直し」も同じ 1 コマンドで済ませる。
-# 導入後に PATH 設定（uv tool update-shell。既に通っていれば何もしない）と
-# 自動起動（launchd / systemd user unit）の登録まで一気に行う——Ollama と同じく
-# 「サーバーを意識しない」がデフォルト。戻したい場合は `gw disable`（手動 gw start 運用）。
-# gw はこのシェルの PATH にまだ無いことがある（PATH 反映は次のシェルから）ので、
-# uv tool の既定 bin（~/.local/bin）を直接叩く。未対応 OS（Windows）では案内だけ出して続行。
+# Use a project-scoped toolchain and preserve previous runtime environments.
+UV := ./scripts/uv
 install:
-	uv tool install --editable . --reinstall
-	-@uv tool update-shell 2>/dev/null || true
-	@# Ollama 流: 最初から PATH に入っている /usr/local/bin へ gw を設置する（要管理者権限）。
-	@# これで exec や新ターミナルなしに、今のシェルから即 `gw` が使える。書けない・
-	@# パスワードを入れない場合はスキップし、上の update-shell（新しいシェルから有効）に任せる。
-	@GW_SRC="$$HOME/.local/bin/gw"; DEST=/usr/local/bin/gw; \
-	if [ "$$(readlink "$$DEST" 2>/dev/null)" = "$$GW_SRC" ]; then \
-	  echo "gw: $$DEST 設置済み"; \
-	elif ln -sf "$$GW_SRC" "$$DEST" 2>/dev/null; then \
-	  echo "gw: $$DEST に設置しました（今のシェルからそのまま使えます）"; \
-	elif sudo -p "[sudo] gw を /usr/local/bin へ設置するため管理者パスワード（Ctrl-C でスキップ可）: " \
-	  sh -c "mkdir -p /usr/local/bin && ln -sf '$$GW_SRC' '$$DEST'" 2>/dev/null; then \
-	  echo "gw: $$DEST に設置しました（今のシェルからそのまま使えます）"; \
-	else \
-	  echo "gw: /usr/local/bin への設置はスキップ（新しいターミナルからは PATH 経由で使えます）"; \
-	fi
-	@GW="$$HOME/.local/bin/gw"; command -v gw >/dev/null 2>&1 && GW="$$(command -v gw)"; \
-	"$$GW" enable || echo "自動起動は未登録です（後から gw enable で登録できます）"
+	$(UV) run --no-project --python 3.13.18 scripts/install_runtime.py --activate
 
 # 設定・キャッシュの置き場所（cli.py / provisioner.py と同じ XDG 規則で解決する）。
 CONFIG_DIR := $(if $(XDG_CONFIG_HOME),$(XDG_CONFIG_HOME),$(HOME)/.config)/local-llm-server
@@ -63,24 +41,26 @@ uninstall:
 	  rm -f "$$DEST" 2>/dev/null || \
 	  sudo -p "[sudo] /usr/local/bin/gw を削除するため管理者パスワード: " rm -f "$$DEST"; \
 	fi
-	-uv tool uninstall local-llm-server
+	$(UV) run --no-project --python 3.13.18 scripts/install_runtime.py --uninstall
 	rm -rf "$(CONFIG_DIR)" "$(CACHE_DIR)" .local-llm-server
 	@echo "削除: $(CONFIG_DIR)（設定）"
 	@echo "削除: $(CACHE_DIR)（ログと自動DLした llama.cpp）"
 	@echo "モデル重み ~/.cache/huggingface は未削除（共用のため手動で）"
 
 dev:
-	uv sync
+	$(UV) sync
+	$(UV) --no-config pip install --no-deps --require-hashes -r requirements/test-client.lock
 
 # PR 前の検査。GitHub の CI は使わない（課金制限でジョブが起動せず、失敗の信号として
 # 機能していなかった）ので、以前 CI の quality ジョブで回していたものをここで回す。
 # テストは網羅率の計測を兼ねて 1 回だけ走らせる（下限は pyproject の fail_under）。
 check:
-	uv sync --dev --frozen
-	uv run ruff check --select E9,F63,F7,F82 local_llm_server tests
-	uv run mypy --ignore-missing-imports --follow-imports=skip --check-untyped-defs local_llm_server
-	uv run bandit -r local_llm_server -q -lll
-	uv export --frozen --no-dev --no-hashes -o "$${TMPDIR:-/tmp}/local-llm-server-requirements.txt"
-	uv run pip-audit -r "$${TMPDIR:-/tmp}/local-llm-server-requirements.txt" --no-deps --disable-pip
-	uv run coverage run -m pytest -q
-	uv run coverage report
+	$(UV) sync --dev --frozen
+	$(UV) --no-config pip install --no-deps --require-hashes -r requirements/test-client.lock
+	$(UV) run ruff check --select E9,F63,F7,F82 local_llm_server tests
+	$(UV) run mypy --ignore-missing-imports --follow-imports=skip --check-untyped-defs local_llm_server
+	$(UV) run bandit -r local_llm_server -q -lll
+	$(UV) export --frozen --no-dev --no-hashes -o "$${TMPDIR:-/tmp}/local-llm-server-requirements.txt"
+	$(UV) run pip-audit -r "$${TMPDIR:-/tmp}/local-llm-server-requirements.txt" --no-deps --disable-pip
+	$(UV) run coverage run -m pytest -q
+	$(UV) run coverage report

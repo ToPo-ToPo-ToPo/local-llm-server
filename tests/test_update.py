@@ -300,7 +300,7 @@ def test_tool_env_root_none_for_project_venv(monkeypatch):
     assert update.tool_env_root() is None
 
 
-def test_refresh_tool_env_runs_reinstall(monkeypatch, tmp_path):
+def test_refresh_tool_env_preserves_installed_versions(monkeypatch, tmp_path):
     """tool venv 稼働時は uv tool install --editable <root> --reinstall を実行する。"""
     calls = []
 
@@ -316,8 +316,12 @@ def test_refresh_tool_env_runs_reinstall(monkeypatch, tmp_path):
                         lambda cmd, **kw: calls.append(tuple(cmd)) or _R())
     ok, _msg = update.refresh_tool_env(tmp_path)
     assert ok is True
-    assert calls and calls[0][:3] == ("/opt/homebrew/bin/uv", "tool", "install")
-    assert "--reinstall" in calls[0] and "--editable" in calls[0]
+    assert calls and calls[0][:3] == ("/opt/homebrew/bin/uv", "pip", "install")
+    assert "--constraint" in calls[0] and "--python" in calls[0]
+    assert "--reinstall" not in calls[0] and "--editable" in calls[0]
+    pins = update.Path(calls[0][calls[0].index("--constraint") + 1])
+    assert "local-llm-server==" not in pins.read_text()
+    assert "==" in pins.read_text()
 
 
 def _repo_with_deps(tmp_path, lock=b"lock-v1", pyproject=b"[project]"):

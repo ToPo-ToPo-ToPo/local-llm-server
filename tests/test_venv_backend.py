@@ -97,7 +97,8 @@ def test_pip_install_passes_blocked_constraints(tmp_path, monkeypatch):
     (cmd,) = [c for c in seen if "install" in c]
     path = cmd[cmd.index("-c") + 1]
     assert cmd[-1] == "pkg"
-    assert open(path, encoding="utf-8").read().splitlines() == ["litellm<0"]
+    requirements = open(path, encoding="utf-8").read().splitlines()
+    assert requirements == ["litellm<0", *vb.tls_policy.dependency_constraints()]
 
 
 def test_pip_failure_raises_given_exc(tmp_path, monkeypatch):

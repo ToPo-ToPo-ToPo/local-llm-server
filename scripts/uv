@@ -1,0 +1,18 @@
+#!/bin/sh
+# Project-local toolchain; no shell startup or shared PATH changes.
+set -eu
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+LOCAL_UV="$ROOT/.tools/uv/0.13.6/uv"
+if [ -x "$LOCAL_UV" ]; then
+    UV_BIN="$LOCAL_UV"
+else
+    UV_BIN=$(command -v uv || true)
+    if [ -z "$UV_BIN" ]; then
+        echo 'uv>=0.13.6 is required; see docs/operation.md.' >&2
+        exit 1
+    fi
+fi
+export UV_PYTHON_INSTALL_DIR="$ROOT/.runtime/python"
+export UV_PYTHON_BIN_DIR="$ROOT/.runtime/python-bin"
+export UV_CACHE_DIR="$ROOT/.runtime/uv-cache"
+exec "$UV_BIN" "$@"

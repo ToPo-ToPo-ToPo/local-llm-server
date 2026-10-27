@@ -16,6 +16,7 @@
 # 前提: `hf auth whoami` が書き込み権のあるアカウント（ToPo-ToPo）でログイン済み。
 # 使い方: bash scripts/refresh_gemma4_chat_templates.sh [--dry-run]
 set -euo pipefail
+ROOT="$(cd -- "$(dirname -- "$0")/.." && pwd)"
 
 DRY="${1:-}"
 WORK="$(mktemp -d)"
@@ -27,8 +28,10 @@ EFFICIENT_SRC="google/gemma-4-E2B-it-qat-q4_0-unquantized"  # fbe3b59b...（E2B/
 LARGE_OID="4741bf6e4132ba23a5537f9d6e74e9a6d613d7cd"
 EFFICIENT_OID="fbe3b59b625cd1b8850ea592d4203df6ec04684b"
 
-curl -fsSL "https://huggingface.co/${LARGE_SRC}/resolve/main/chat_template.jinja"     -o "$WORK/large.jinja"
-curl -fsSL "https://huggingface.co/${EFFICIENT_SRC}/resolve/main/chat_template.jinja" -o "$WORK/efficient.jinja"
+CA_FILE=$("$ROOT/scripts/uv" run --frozen python -c "from local_llm_server.tls_policy import ca_file; print(ca_file())")
+
+curl -q --cacert "$CA_FILE" -fsSL "https://huggingface.co/${LARGE_SRC}/resolve/main/chat_template.jinja"     -o "$WORK/large.jinja"
+curl -q --cacert "$CA_FILE" -fsSL "https://huggingface.co/${EFFICIENT_SRC}/resolve/main/chat_template.jinja" -o "$WORK/efficient.jinja"
 
 got_large=$(git hash-object "$WORK/large.jinja")
 got_eff=$(git hash-object "$WORK/efficient.jinja")

@@ -1,9 +1,9 @@
 [project]
 name = "local-llm-server"
-version = "0.38.24"
+version = "0.38.25"
 description = "ローカルLLM（mlx / mlx-vlm / llama.cpp / vLLM / SGLang）と音声（STT/TTS）・テキスト埋め込み（Embeddings）を OpenAI 互換 API で束ねるマルチモデルゲートウェイ（サーバー）。gateway.toml のカタログを 1 ポートで配信し、model で振り分け・遅延起動・LRU 退避・MTP 高速化（Ollama 流の共有デーモン）。接続用クライアントは別パッケージ local-llm-client。"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.11.18,!=3.12.0,!=3.12.1,!=3.12.2,!=3.12.3,!=3.12.4,!=3.12.5,!=3.12.6,!=3.12.7,!=3.12.8,!=3.12.9,!=3.12.10,!=3.12.11,!=3.12.12,!=3.12.13,!=3.12.14,!=3.12.15,!=3.13.0,!=3.13.1,!=3.13.2,!=3.13.3,!=3.13.4,!=3.13.5,!=3.13.6,!=3.13.7,!=3.13.8,!=3.13.9,!=3.13.10,!=3.13.11,!=3.13.12,!=3.13.13,!=3.13.14,!=3.13.15,!=3.13.16,!=3.13.17,!=3.14.0,!=3.14.1,!=3.14.2,!=3.14.3,!=3.14.4,!=3.14.5,!=3.14.6,!=3.14.7,!=3.14.8,!=3.14.9,!=3.15.0,!=3.15.1"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 authors = [{ name = "ToPo-ToPo-ToPo" }]
@@ -23,10 +23,15 @@ classifiers = [
 # （他 OS / Intel Mac では入らず、llama.cpp を各自で用意）。なので `uv sync` だけでよく、extra 指定は不要。
 # 接続用クライアントは別パッケージ local-llm-client。
 dependencies = [
+    # CA bundles and the interpreter are independent TLS layers.
+    "certifi>=2026.10.19",
+    "filelock>=4.2.1",
+    "urllib3>=2.8.0",
     # メモリガード（max_memory_fraction）で総RAM/空き容量を取得する。クロスプラットフォーム。
     "psutil>=5.9",
     # mlx 系バックエンド（テキスト/vision/STT）。Apple Silicon でのみ解決・インストールされる。
-    "mlx-lm>=0.31.3 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    # Native MLX/torchvision wheels are not yet available for CPython 3.15.
+    "mlx-lm>=0.31.3 ; sys_platform == 'darwin' and platform_machine == 'arm64' and python_version < '3.15'",
     # 0.6.9 以上を要求する。理由は 3 つ:
     # ① 0.6.4 の Qwen3.6 garble（変換・推論とも壊れる）が 0.6.5 で直った
     #    （norm の +1.0 シフトを raw-HF レイアウト限定に絞る修正）。
@@ -40,7 +45,7 @@ dependencies = [
     #    MoE の global_scale / gate.bias を実装しておらず、当時の変換物はこの重みを
     #    **黙って落としていた**（＝本来の推論と異なる）。0.6.9 は公式 config を
     #    そのまま読み、これらの重みも扱う。0.6.9 未満に落とすと Inkling が壊れる。
-    "mlx-vlm>=0.6.9 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "mlx-vlm>=0.6.9 ; sys_platform == 'darwin' and platform_machine == 'arm64' and python_version < '3.15'",
     # mlx-vlm 0.6.5+ が transformers>=5.14 を要求する（0.6.4 は <5.13 に固定していた）。
     # 5.18 以上: 埋め込みバックエンド（embed_server）が EmbeddingGemma 2（google/embeddinggemma-2）を
     # AutoModel で読むのに要る（EmbeddingGemma2Model は 5.18 から）。mlx-vlm 0.7.1 のチャット推論は
@@ -51,10 +56,10 @@ dependencies = [
     # 未導入だと AutoProcessor が ValueError を投げてモデルサーバーが起動すらできない。
     # wheel 自体は ~2MB で、torch は transformers 経由で既に入っている。mlx-vlm と同じく
     # Apple Silicon でのみ解決させる（他 OS は llama.cpp 経路で Inkling を使う）。
-    "torchvision ; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "torchvision ; sys_platform == 'darwin' and platform_machine == 'arm64' and python_version < '3.15'",
     # STT（音声→テキスト）バックエンド。backend="whisper" が同梱の stt_server 経由で使う。
     # Apple Silicon でのみ解決・インストールされる。
-    "mlx-whisper>=0.4.3 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "mlx-whisper>=0.4.3 ; sys_platform == 'darwin' and platform_machine == 'arm64' and python_version < '3.15'",
     # ffmpeg を pip 同梱バイナリで供給する（brew/apt を使わず uv だけで完結）。用途は 2 つ:
     # ① STT の音声デコード（Apple Silicon）② 動画入力のフレーム抽出（全 OS。video.py）。
     # 動画入力は llama-cpp / mlx-vlm どちらでも効くので、全 OS に入れる。
@@ -62,11 +67,11 @@ dependencies = [
     # 画像入力の長辺リサイズ（image_max_edge。image.py）。上流へ渡す前に縮めて vision トークンの
     # 爆発を防ぐ。mlx-vlm は Apple Silicon でこれを間接的に入れるが、llama.cpp 運用（他 OS）でも
     # 効かせたいので全 OS の直接依存にする。未導入環境では縮小せず素通しする実装にしてある。
-    "pillow>=10",
+    "pillow>=13.0.0",
     # torch が間接依存で入れる古い setuptools には macOS の sdist 作成時の
     # パストラバーサル脆弱性がある。Apple Silicon 実行環境は修正版以上へ引き上げる。
     # Linux のvLLMは setuptools<81 を要求するため、OSマーカーで分離する。
-    "setuptools>=83 ; sys_platform == 'darwin'",
+    "setuptools>=84.1.0 ; sys_platform == 'darwin'",
     # メニューバー常駐アイコン（tray.py。Ollama 流の「動いていることが見える」）。macOS のみ。
     # rumps は使わない——非推奨 API 依存で最新 macOS では表示されない。AppKit を直接使う。
     "pyobjc-framework-Cocoa>=10 ; sys_platform == 'darwin'",
@@ -79,13 +84,18 @@ dependencies = [
 # 両方使いたいときは各 backend の provision='auto'（隔離 venv・別環境）を使う。
 # 環境マーカーで Linux 以外では解決対象から外す（Mac/Win にネイティブ wheel が無い）。
 [project.optional-dependencies]
-vllm = ["vllm==0.28.0 ; sys_platform == 'linux'"]
+# The pinned CUDA wheels do not support CPython 3.15 yet.
+vllm = ["vllm==0.28.0 ; sys_platform == 'linux' and python_version < '3.15'"]
 sglang = ["sglang==0.5.2 ; sys_platform == 'linux'"]
 
 # vLLM と SGLang は同一環境に共存できない（torch/flashinfer のピンが食い違う）。排他 extras
 # として宣言し、uv が両者を1つの解決に混ぜない／同時 install を拒む（両立は各 provision='auto'
 # の隔離 venv で）。
 [tool.uv]
+# Split platform-specific setuptools requirements before resolving Linux-only extras.
+# These disjoint environments cover every platform; they do not restrict support.
+environments = ["sys_platform == 'darwin'", "sys_platform == 'linux'", "sys_platform != 'darwin' and sys_platform != 'linux'"]
+required-version = ">=0.13.6"
 conflicts = [[{ extra = "vllm" }, { extra = "sglang" }]]
 # 使わないのに脆弱性・サプライチェーン攻撃の多いパッケージを導入禁止にする（満たせない制約）。
 # litellm: 2026 年に PyPI 版の改ざん（1.82.7/1.82.8・1.107.0）とプロキシの重大 CVE が続いた。
@@ -104,6 +114,7 @@ no-build-package = ["vllm", "sglang"]
 
 [dependency-groups]
 dev = [
+    "pip>=26.2.2",
     "pytest>=8.0",
     "coverage[toml]>=7.6",
     "ruff>=0.12",
@@ -123,7 +134,7 @@ Repository = "https://github.com/ToPo-ToPo-ToPo/local-llm-server"
 gw = "local_llm_server.cli:main"
 
 [build-system]
-requires = ["setuptools>=83"]
+requires = ["setuptools>=84.1.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]

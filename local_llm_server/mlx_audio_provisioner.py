@@ -1,7 +1,8 @@
 """mlx-audio（音声合成 TTS）バックエンドの自動導入（隔離 venv プロビジョナ）。
 
-mlx-audio のサーバーは本体と依存がぶつかる（例: 本体は macOS で setuptools>=83 を要求し、
-mlx-audio の server extra は setuptools<81 を要求する。mlx / transformers の版も引きずられる）。
+mlx-audio のサーバーは本体と依存がぶつかる（mlx / transformers の版を引きずられる）。
+上流のserver extraは旧webrtcvadのためsetuptools<81を要求するので使わず、
+サーバー依存を明示し、同じwebrtcvad APIを提供するwebrtcvad-wheelsを使う。
 本体の環境に混ぜると mlx-vlm（チャット推論）まで壊しうるので、vLLM / SGLang と同じく
 **管理ディレクトリに隔離した専用 venv** へ導入し、その python から `python -m mlx_audio.server`
 を起動する（共通ロジックは _venv_backend）。Apple Silicon の macOS 専用。
@@ -20,7 +21,16 @@ from . import _venv_backend, provisioner  # noqa: F401 - provisioner はテス�
 # 起動モジュール（OpenAI 互換の POST /v1/audio/speech）。build_command が使う。
 MLX_AUDIO_SERVER_MODULE = "mlx_audio.server"
 # 導入する版。上げるときは実機で読み上げを確かめてから（再現性のため固定する）。
-MLX_AUDIO_PACKAGE = "mlx-audio[tts,server]==0.5.5"
+MLX_AUDIO_PACKAGE = "mlx-audio[tts]==0.5.5"
+# The upstream server extra caps setuptools only to retain pkg_resources for
+# webrtcvad 2.0.10. Use its maintained API-compatible wheels instead, and keep
+# all other server requirements explicit. Never co-install both distributions.
+MLX_AUDIO_SERVER_REQUIREMENTS = (
+    "fastapi>=0.95.0",
+    "uvicorn[standard]>=0.22.0",
+    "python-multipart>=0.0.22",
+    "webrtcvad-wheels==2.0.14.post1",
+)
 
 venv_python = _venv_backend.venv_python
 
@@ -48,6 +58,7 @@ def ensure_mlx_audio(
     """mlx-audio のサーバーを起動できる python の絶対パスを返す（必要なら隔離 venv へ導入する）。"""
     return _venv_backend.ensure_backend(
         package=MLX_AUDIO_PACKAGE, import_name=MLX_AUDIO_SERVER_MODULE,
+        extra_packages=MLX_AUDIO_SERVER_REQUIREMENTS,
         venv_dir=mlx_audio_venv_dir(), human_name="mlx-audio (TTS)",
         unavailable=MlxAudioUnavailable, gpu_check=lambda: True,
         require_gpu=False, apple_silicon_only=True,
