@@ -1,15 +1,20 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=84.1.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "strata-lite"
 version = "0.1.0"
 description = "実験: よく使う MoE エキスパートを GPU に、残りを RAM/CPU に置く Gemma 4 用の推論エンジン（Strata 流の試作）"
-requires-python = ">=3.11"
+requires-python = ">=3.11.18,!=3.12.0,!=3.12.1,!=3.12.2,!=3.12.3,!=3.12.4,!=3.12.5,!=3.12.6,!=3.12.7,!=3.12.8,!=3.12.9,!=3.12.10,!=3.12.11,!=3.12.12,!=3.12.13,!=3.12.14,!=3.12.15,!=3.13.0,!=3.13.1,!=3.13.2,!=3.13.3,!=3.13.4,!=3.13.5,!=3.13.6,!=3.13.7,!=3.13.8,!=3.13.9,!=3.13.10,!=3.13.11,!=3.13.12,!=3.13.13,!=3.13.14,!=3.13.15,!=3.13.16,!=3.13.17,!=3.14.0,!=3.14.1,!=3.14.2,!=3.14.3,!=3.14.4,!=3.14.5,!=3.14.6,!=3.14.7,!=3.14.8,!=3.14.9,!=3.15.0,!=3.15.1"
 # torch は CUDA 版を使う。PyPI の Windows 版 torch は CPU 専用なので、下の [tool.uv.sources] で
 # Windows / Linux のときだけ PyTorch 公式の cu128 インデックスから取る（uv sync だけで CUDA 版が入る）。
 dependencies = [
+    # CA bundles and the interpreter are independent TLS layers.
+    "certifi>=2026.10.19",
+    "filelock>=4.2.1",
+    "urllib3>=2.8.0",
+    "setuptools>=84.1.0 ; sys_platform == 'darwin'",
     "torch>=2.8",
     "transformers>=5.14",
     "safetensors>=0.4",
@@ -34,6 +39,7 @@ testpaths = ["tests"]
 # パッケージを導入禁止にする（満たせない制約）。uv sync / uv lock はここを読む。
 # README の `uv pip install` は constraints.txt を -c で渡して同じ制約を掛ける。
 [tool.uv]
+required-version = ">=0.13.6"
 constraint-dependencies = ["litellm<0"]
 
 # CUDA 版 torch の取得元。PyPI の Windows 向け torch は CPU 専用ビルドしか無いので、PyTorch 公式の

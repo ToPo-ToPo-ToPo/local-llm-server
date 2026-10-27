@@ -19,7 +19,8 @@ from local_llm_server import (
 
 def test_build_command_mlx(stub_cache):
     cmd = build_command(ServerConfig("mlx", "model", port=8080))
-    assert cmd[0] == "mlx_lm.server" and "--model" in cmd and "8080" in cmd
+    assert cmd[:3] == [srv.sys.executable, "-m", "mlx_lm.server"]
+    assert "--model" in cmd and "8080" in cmd
 
 
 def _make_hf_cache(tmp_path, repo, files):

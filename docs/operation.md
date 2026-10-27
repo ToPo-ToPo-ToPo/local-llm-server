@@ -194,3 +194,91 @@ make uninstall   # gw disable → gw stop → uv tool uninstall → 設定・ロ
 > **モデル本体（重み）には触れない**。mlx / mlx-vlm は HuggingFace の共有キャッシュ
 > `~/.cache/huggingface` にモデルをダウンロードするが、他ツールと共用のため**アンインストールでは一切
 > 削除しない**（場所を案内するだけ）。不要になったら自分で中のモデルフォルダを消す。
+
+
+## TLSと実行環境
+
+開発環境は`.python-version`のCPython 3.13.18に固定する。`make dev`、`make check`、
+`./scripts/uv run --frozen …`を使用する。uvは0.13.6以上を必要とする。
+リポジトリ専用uvを使う場合の配置先は`.tools/uv/0.13.6/uv`（Windowsはuv.exe）。
+公式配布物を取得し、公式リリースのハッシュ・署名情報を確認して配置する。
+既存の信頼ストアが未修正のツールでブートストラップしないこと。
+共有uv、シェル設定、PC既定PythonやOS証明書ストアの変更は不要。
+
+公開パッケージの最小Pythonは系列ごとに3.11.18、3.12.16、3.13.18、3.14.10、
+3.15.2。既知の未修正パッチをRequires-Pythonでも除外する。certifi>=2026.10.19、
+pipを使う環境ではpip>=26.2.2を必要とする。vLLM 0.28.0の追加機能は、固定された
+GPU依存wheelが対応するLinux / Python<3.15に限定する。vLLM自体の固定版は維持する。
+参照: [Python公式](https://blog.python.org/2026/10/python-3152-31410-31318-31216-31118/)、
+[pip](https://pip.pypa.io/en/stable/news/)、[uv](https://github.com/astral-sh/uv/releases/tag/0.13.6)。
+
+`make install`は`scripts/install_runtime.py --activate`を実行し、`.runtime/installs/`
+以下に新しいtool環境を構築する。旧環境は削除しない。既存環境がある場合はその導入版を
+constraintsに保存し、MLX等を開発ロックに合わせて後退させない。新規導入では本体ロックを使う。
+`install.json`、`constraints.txt`、環境内の`.gw-runtime-constraints.txt`が実際の固定版を示す。
+更新時も稼働環境の固定版をconstraintsとして同期する。新要件と衝突した場合は失敗として
+報告し、無関係な依存を一括最新版化しない。アプリの再起動後には実行プロセスのPythonも確認する。
+Windowsは修正済みuvで`uv tool install --python 3.13.18 --editable . --with pip==26.2.2`
+を使用する（上記サービス切替スクリプトはmacOS/Linux用）。既存環境の退避を先に行う。
+
+`gw pull`と`./scripts/hf`は、hf-xetの独立したRust TLS経路を迂回する。
+このアプリ内でHF_HUB_DISABLE_XET=1を設定するが、TLS証明書検証は有効のまま。
+別途直接起動した`hf`や他アプリには適用されない。実験Strata Liteも同じ迂回を行う。
+Gitの更新通信とテンプレート取得curlには、このアプリの修正済みCAバンドルを指定する。
+企業独自CAを利用する環境ではCAの運用要件も個別に確認する。
+
+TLS検査用のチェーン資料を[説明サイト](https://emudhra.we-have-a-problem.com/)から取得した後、
+以下で正常対照と14ホストを検査できる。取得したスクリプトを実行する必要はない。
+
+```bash
+./scripts/uv run --frozen python scripts/check_emudhra.py --reference-chains /path/to/chains.zip
+```
+
+各実装でjulialang.orgの成功を先に確認する。認証情報なし、リダイレクトなし、TLS検証有効で実施し、
+エラーの具体的理由と証明書指紋を記録する。DNS/タイムアウト、期限切れ、ホスト名不一致、CT要件だけの
+拒否を、侵害CA拒否とは混同しない。CI/Docker定義は本リポジトリに存在しないため、
+将来導入する際はPython・uv・CA・独自TLSをそれぞれ更新し、コンテナ内でも同じ検査を行う。
+
+VS Codeはリポジトリ内`.vscode`のPythonパスを使用する。以前に別Pythonを選択済みの場合は
+「Python: Select Interpreter」でも`.venv/bin/python`を選択する。PC共通設定は変更しない。
+Python本体を変更しても、IDE/Electronやllama.cpp独自TLSの更新確認の代わりにはならない。
+
+復元時は新プロセスを停止し、各install.jsonに記録した旧ランチャーと保存済みサービス定義を戻す。
+開発用.venvを退避した場合は、そのディレクトリを元の.venvの位置に戻してから使う
+（console scriptには作成時の絶対パスが入る）。旧環境には未修正TLSが残るため、復元は
+短時間の障害切り分け用途とし、その環境での外部通信を安全確認済みとは扱わない。
+
+
+結線テスト用の公開local-llm-clientはhttpxを未宣言でimportする版があるため、
+`make dev` / `make check`は`requirements/test-client.lock`のハッシュ付き補完依存も導入する。
+この固定ファイルは開発環境専用で、稼働用MLX等を更新しない。
+
+
+Python 3.15はゲートウェイ本体・llama.cppの対象とする。Mac用MLX/torchvisionの
+対応wheelが揃っていないため、MLX系の自動依存と既定選択はPython<3.15に限定する。
+このリポジトリで固定するPython 3.13.18では、従来どおりMLXを使用できる。
+
+
+### 追加の依存セキュリティ更新（2026-10-28）
+
+公開要件はfilelock>=4.2.1、Pillow>=13.0.0、urllib3>=2.8.0、
+macOSのsetuptools>=84.1.0。今回のMac用固定版は順に4.2.4、13.0.0、
+2.8.0、84.2.1とする。ビルド用setuptoolsも>=84.1.0を要求する。
+隔離バックエンドにも下限を適用し、導入済みでも古い版があれば別環境を使う。
+setuptoolsの実行時下限はmacOSだけに適用する。LinuxのvLLM固定依存は
+setuptools<81を要求するため、Linux/WindowsやCUDA実行を含めた全環境の
+監査合格を意味しない。
+
+Pillow 13では古い画像APIとIモードのPNG保存が変わり、filelock 4では
+SoftReadWriteLockの保存形式が変わる。関連プロセスを止めて切り替え、
+画像処理・ダウンロードの排他制御を検証する。今回のHF Hub経路は
+FileLock/SoftFileLockを使う。無関係なMLX・transformers・torchの版は維持する。
+旧環境を削除せず、検証済みの新環境へ参照を切り替える。
+Kokoroとmisakiは導入しない。
+
+音声隔離環境のmlx-audio 0.5.5は版を維持するが、server extraは使わない。
+このextraが要求するwebrtcvad 2.0.10はpkg_resourcesに依存し、修正済み
+setuptoolsと両立しない。サーバーの他の依存は明示し、webrtcvadを
+同じAPIを提供するwebrtcvad-wheels 2.0.14.post1へ置換する。
+両方を同時導入すると同名モジュールが競合するため、同時導入しない。
+Kokoro・misakiを追加する変更ではない。

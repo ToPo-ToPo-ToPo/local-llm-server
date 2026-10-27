@@ -16,6 +16,7 @@ import subprocess
 import sys
 import venv
 
+from . import tls_policy
 from . import provisioner  # detect_os / _has_nvidia_gpu を再利用
 
 # 隔離 venv に入れさせないパッケージ（pip の制約ファイルに「<0」＝満たせない制約として渡す）。
@@ -30,6 +31,7 @@ def write_constraints(venv_dir: str) -> str:
     path = os.path.join(venv_dir, CONSTRAINTS_FILE)
     with open(path, "w", encoding="utf-8") as f:
         f.writelines(f"{name}<0\n" for name in BLOCKED_PACKAGES)
+        f.writelines(f"{requirement}\n" for requirement in tls_policy.dependency_constraints())
     return path
 
 
@@ -67,6 +69,7 @@ def ensure_backend(
     *,
     package: str,
     import_name: str,
+    extra_packages: tuple[str, ...] = (),
     venv_dir: str,
     human_name: str,
     unavailable: type[RuntimeError],
@@ -87,6 +90,7 @@ def ensure_backend(
     `unavailable` は各バックエンドの例外型（VllmUnavailable / SglangUnavailable / MlxAudioUnavailable）。
     apple_silicon_only=True は mlx 系（mlx-audio）用: Apple Silicon の macOS 以外を拒み、GPU 判定はしない。
     """
+    tls_policy.require_secure_python()
     importable = importable or make_importable(import_name)
     if apple_silicon_only:
         # mlx 系（mlx-audio）: Apple Silicon の macOS 専用。GPU（NVIDIA）判定と macOS 拒否は使わない。
@@ -102,13 +106,22 @@ def ensure_backend(
             f"{human_name} は macOS では非対応です（Apple Silicon は backend='mlx-vlm' を使用）。"
         )
 
-    if importable(sys.executable, run):
+    if importable(sys.executable, run) and tls_policy.runtime_compatible(sys.executable, run):
         return sys.executable
 
     vdir = os.path.normpath(venv_dir)
     py = venv_python(vdir)
-    if os.path.exists(py) and importable(py, run):
-        return py
+    if os.path.exists(vdir):
+        if (os.path.exists(py) and importable(py, run)
+                and tls_policy.runtime_compatible(py, run, require_pip=True)):
+            return py
+        # Preserve an old environment; use a separate directory for the patched runtime.
+        vdir += "-tls-" + ".".join(map(str, sys.version_info[:3]))
+        py = venv_python(vdir)
+        if os.path.exists(py):
+            if importable(py, run) and tls_policy.runtime_compatible(py, run, require_pip=True):
+                return py
+            raise unavailable(f"セキュリティ要件を満たさない既存環境を保護しました: {vdir}")
 
     try:
         if create_venv is not None:
@@ -121,7 +134,8 @@ def ensure_backend(
         # venv 付属の pip をそのまま使う。毎回「現時点の最新 pip」へ無条件に
         # 更新すると再現性を失い、その更新失敗も従来は見逃していた。
         # -c で BLOCKED_PACKAGES を間接依存でも入らないようにする（要求されたら解決失敗）。
-        proc = run([py, "-m", "pip", "install", "-c", write_constraints(vdir), package],
+        proc = run([py, "-m", "pip", "install", "pip==26.2.2", "certifi==2026.10.23",
+                    "-c", write_constraints(vdir), *extra_packages, package],
                    capture_output=True, timeout=3600)
         if getattr(proc, "returncode", 1) != 0:
             err = (getattr(proc, "stderr", b"") or b"").decode("utf-8", "replace")
@@ -131,7 +145,7 @@ def ensure_backend(
     except (OSError, subprocess.SubprocessError) as exc:
         raise unavailable(f"{human_name} 用 venv の作成/導入に失敗: {exc}") from exc
 
-    if not importable(py, run):
+    if not importable(py, run) or not tls_policy.runtime_compatible(py, run, require_pip=True):
         raise unavailable(
             f"{human_name} を導入したが import できない（{py}）。CUDA/torch の不整合の可能性。"
         )

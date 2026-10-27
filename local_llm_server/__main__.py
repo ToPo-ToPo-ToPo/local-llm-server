@@ -18,7 +18,7 @@ import os
 import sys
 import tomllib
 
-from . import migrate
+from . import migrate, tls_policy
 from .cli import resolve_config
 from .daemon import load_gateway_config, run_gateway
 from .server import install_shutdown_handlers
@@ -29,6 +29,7 @@ _SPAWN_MARK = "LOCAL_LLM_GW_LAUNCHER"
 
 
 def main() -> int:
+    tls_policy.require_secure_python()
     if os.environ.get(_SPAWN_MARK) != "cli":
         print(
             "このモジュールは gw が内部で使う起動口です。ゲートウェイの起動は `gw start` で行ってください"

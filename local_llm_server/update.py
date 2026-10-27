@@ -135,6 +135,11 @@ def _find_uv() -> str | None:
     import os
     import shutil
 
+    root = repo_root()
+    if root is not None:
+        wrapper = root / "scripts" / "uv"
+        if os.access(wrapper, os.X_OK):
+            return str(wrapper)
     found = shutil.which("uv")
     if found:
         return found
@@ -158,7 +163,7 @@ def tool_env_root() -> Path | None:
 
     判定は sys.prefix（稼働中 venv のルート）で行う。sys.executable を resolve() すると
     venv の python は uv 管理の素の CPython への**シンボリックリンクなので venv の外へ
-    解決されてしまい**、tool venv 稼働中でも None を返す（＝依存の入れ直しが本番で
+    解決されてしまい**、tool venv 稼働中でも None を返す（＝依存の同期が本番で
     一度も走らない）という不具合があった。パスの実在に依存しないよう、resolve はしない。
     """
     for path in (Path(sys.prefix), Path(sys.executable).absolute()):
@@ -193,21 +198,12 @@ def _deps_fingerprint(root: Path) -> str | None:
 
 
 def refresh_tool_env(root: Path | None, timeout: float = 600.0) -> tuple[bool, str]:
-    """gw が動いている uv tool venv の依存を、更新後の pyproject に合わせて入れ直す。
+    """Sync the active tool environment while preserving its installed versions.
 
-    editable 導入はコード変更こそ即反映されるが、**依存の追加は再インストールしないと
-    入らない**（例: メニューバーアイコンの pyobjc 追加が旧環境では欠けて、トレイが
-    静かに機能を落とした）。tool venv で動いていないとき（`uv run gw`）は何もしない
-    ——そちらは `uv sync` / 次回 `uv run` が同期する。
-
-    呼ぶタイミングは**再起動の直前**（モデルサーバー停止後）。venv を入れ直した後に
-    古いプロセスが新規 import をする時間を最小にするため。
-
-    **依存が変わっていなければスキップする**: `uv tool install --reinstall` は無条件だと
-    ~5 秒かかり、zero-drop restart で accept キューに並んだ接続の待ち時間の支配項になる。
-    手動更新の大半はコードだけの変更なので、uv.lock + pyproject.toml のハッシュを venv 内の
-    マーカーと比べ、同一なら入れ直さない（マーカーは成功時にのみ書く。無い・読めない・
-    ハッシュ不能のときは安全側＝従来どおり再インストール）。
+    A source lock fingerprints the requested change; constraints additionally
+    record the running environment's actual versions. A conflict is reported
+    instead of silently upgrading or downgrading ML engines. No tool venv is
+    deleted by this operation.
     """
     env_root = tool_env_root()
     if env_root is None:
@@ -226,12 +222,20 @@ def refresh_tool_env(root: Path | None, timeout: float = 600.0) -> tuple[bool, s
     if uv is None:
         return False, "uv が見つからない（PATH と ~/.local/bin を確認）"
     try:
+        from . import tls_policy
+        tls_policy.require_secure_python()
+        pins_dir = root / ".runtime" / "constraints"
+        pins_dir.mkdir(parents=True, exist_ok=True)
+        import hashlib
+        pins = pins_dir / (hashlib.sha256(str(env_root).encode()).hexdigest()[:12] + ".txt")
+        pins.write_text(tls_policy.installed_constraints(), encoding="utf-8")
         res = subprocess.run(
-            [uv, "tool", "install", "--editable", str(root), "--reinstall", "--quiet"],
-            capture_output=True, text=True, timeout=timeout,
+            [uv, "pip", "install", "--python", sys.executable, "--constraint", str(pins),
+             "--editable", str(root), "--quiet"],
+            cwd=str(root), capture_output=True, text=True, timeout=timeout,
         )
-    except (OSError, subprocess.SubprocessError) as exc:
-        return False, f"uv tool install を実行できませんでした: {exc}"
+    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+        return False, f"tool環境を固定版で同期できませんでした: {exc}"
     if res.returncode != 0:
         return False, (res.stderr or res.stdout).strip()[:200] or "uv tool install 失敗"
     if fingerprint is not None:
@@ -239,13 +243,15 @@ def refresh_tool_env(root: Path | None, timeout: float = 600.0) -> tuple[bool, s
             marker.write_text(fingerprint + "\n")
         except OSError:
             pass  # 書けなくても致命ではない（次回はフル再インストールになるだけ）
-    return True, "tool venv の依存を入れ直しました"
+    return True, "tool venv の固定版依存を同期しました"
 
 
 def _git(root: Path, *args: str, timeout: float = 30.0) -> subprocess.CompletedProcess:
+    from .tls_policy import git_environment
+
     return subprocess.run(
-        ["git", "-C", str(root), *args],
-        capture_output=True, text=True, timeout=timeout,
+        ["git", "-c", "http.sslVerify=true", "-C", str(root), *args],
+        capture_output=True, text=True, timeout=timeout, env=git_environment(),
     )
 
 

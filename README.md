@@ -13,21 +13,19 @@
 ```bash
 git clone https://github.com/ToPo-ToPo-ToPo/local-llm-server
 cd local-llm-server
-make install    # これだけ。導入・PATH 設定・自動起動の登録まで全部やる
+make install    # 専用環境を作成し、アプリの起動参照と自動起動を登録する
 ```
 
-途中で管理者パスワードを 1 回聞かれる（Ollama と同じく、最初から PATH に入っている
-`/usr/local/bin` へ `gw` を置くため。**そのままこのシェルで `gw` が使える**）。
-入れずにスキップしても壊れない——その場合は新しいターミナルから使える。
+Pythonは3.13.18、uvは0.13.6以上を使用する。`scripts/uv`はリポジトリ専用の
+ツール・Python・キャッシュを優先し、シェル設定やPC全体のPATHを書き換えない。
+`make install`は新しいtool環境を別ディレクトリに作成し、既存環境を保存して
+`~/.local/bin/gw`とアプリ専用サービスを切り替える。PATH未設定ならこの絶対パスで実行する。
+既存インストールの依存バージョンを維持し、未修正CA/pipだけを更新する。
+導入の詳細とTLS要件は[運用手順](docs/operation.md#tlsと実行環境)を参照。
 
-導入後は Ollama と同じく**サーバーを意識しなくてよい**——ログイン時に自動起動し、異常終了時は
-自動復活する（`gw disable` で従来の手動 `gw start` 運用に戻せる → [docs/operation.md](docs/operation.md)）。
-
-`make install` が「`~/.local/bin` is not on your PATH」と警告するのは、`uv tool install` が
-シェル設定を変更しないため。`uv tool update-shell` がその追記を行う（zsh なら `~/.zshrc` では
-なく **`~/.zshenv`**）。書き込み先はシェルによって違うので、反映は特定ファイルの `source` では
-なく `exec $SHELL -l` か新しいターミナルで行う。アンインストールは `make uninstall`
-（→ [docs/operation.md](docs/operation.md)）。
+モデルの取得には`gw pull`または`./scripts/hf download`を使う。
+修正済みhf-xetの動作を確認するまではPython HTTP経路を使用するため、
+大容量ファイルの転送速度・帯域・キャッシュ効率に影響する場合がある。
 
 ## 使い方
 

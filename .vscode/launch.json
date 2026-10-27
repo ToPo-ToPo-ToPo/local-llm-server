@@ -1,0 +1,19 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "gw (project Python)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "local_llm_server.cli",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "args": [
+                "status"
+            ],
+            "cwd": "${workspaceFolder}",
+            "windows": {
+                "python": "${workspaceFolder}\\.venv\\Scripts\\python.exe"
+            }
+        }
+    ]
+}

@@ -321,6 +321,8 @@ def _build_mlx(config: ServerConfig) -> list[str]:
     # （未取得ならここで案内付き ValueError）。
     ensure_cached(config.model)
     command = [
+        sys.executable,
+        "-m",
         "mlx_lm.server",
         "--model",
         config.model,

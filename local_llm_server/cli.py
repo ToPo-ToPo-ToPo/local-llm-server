@@ -35,7 +35,7 @@ import sys
 import time
 import tomllib
 
-from . import migrate
+from . import migrate, tls_policy
 from .daemon import load_gateway_config
 from .server import (
     MTP_DRAFTERS,
@@ -755,6 +755,7 @@ def cmd_pull(gcfg, args) -> int:
         return 2
     backend = infer_backend(args.model)
     try:
+        tls_policy.disable_xet()
         from huggingface_hub import snapshot_download
         if backend_spec(backend).gguf:
             from huggingface_hub import HfApi
@@ -1126,6 +1127,11 @@ def main(argv: list[str] | None = None) -> int:
     「1 ライブラリ 1 使い方」。query/control 系はどのディレクトリからでも、稼働中デーモンの
     ランタイム記録を辿って同じ 1 つのデーモンに届く。
     """
+    try:
+        tls_policy.require_secure_python()
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
     parser = build_parser()
     args = parser.parse_args(argv)
 
