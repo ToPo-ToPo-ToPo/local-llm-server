@@ -1736,8 +1736,8 @@ name = "httpcore"
 version = "1.0.9"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "certifi", marker = "python_full_version < '3.15' and sys_platform == 'linux'" },
-    { name = "h11", marker = "python_full_version < '3.15' and sys_platform == 'linux'" },
+    { name = "certifi" },
+    { name = "h11" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/06/94/82699a10bca87a5556c9c59b5963f2d039dbd239f25bc2a63907a05a14cb/httpcore-1.0.9.tar.gz", hash = "sha256:6e34463af53fd2ab5d807f399a9b45ea31c3dfa2276f15a2c3f00afff6e176e8", size = 85484, upload-time = "2025-04-24T22:06:22.219Z" }
 wheels = [
@@ -1805,10 +1805,10 @@ name = "httpx"
 version = "0.28.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "anyio", marker = "python_full_version < '3.15' and sys_platform == 'linux'" },
-    { name = "certifi", marker = "python_full_version < '3.15' and sys_platform == 'linux'" },
-    { name = "httpcore", marker = "python_full_version < '3.15' and sys_platform == 'linux'" },
-    { name = "idna", marker = "python_full_version < '3.15' and sys_platform == 'linux'" },
+    { name = "anyio" },
+    { name = "certifi" },
+    { name = "httpcore" },
+    { name = "idna" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/b1/df/48c586a5fe32a0f01324ee087459e112ebb7224f646c0b5023f5e79e9956/httpx-0.28.1.tar.gz", hash = "sha256:75e98c5f16b0f35b567856f597f06ff2270a374470a5c2392242528e3e3e42fc", size = 141406, upload-time = "2024-12-06T15:37:23.222Z" }
 wheels = [
@@ -2390,14 +2390,22 @@ wheels = [
 
 [[package]]
 name = "local-llm-client"
-version = "0.10.1"
+version = "0.10.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
+    { name = "anyio" },
+    { name = "certifi" },
+    { name = "httpcore" },
+    { name = "httpx" },
+    { name = "httpx2" },
     { name = "openai" },
+    { name = "pydantic" },
+    { name = "tqdm" },
+    { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/6c/d1/006f6499dc0861ca78fada00e4272371a7d6771365511af630a67410cffd/local_llm_client-0.10.1.tar.gz", hash = "sha256:9d84b999ab5b35c99094d0bdc3e4ec8d656871c373a30822ca55407a26896912", size = 48316, upload-time = "2026-09-24T13:41:39.348Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/18/c4/aa05cbc172179996e9d6651449331a0807363789cad411ef4f5cb92de32b/local_llm_client-0.10.3.tar.gz", hash = "sha256:2f00b1fdb54fdf3b0b80f4d1039d5d053ffaf2d5149233be5949b30b9b1ff71f", size = 51893, upload-time = "2026-10-27T15:35:36.207Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/b8/4f/01729b740014748e74665a2744e7194299768306303d10c24faebcf32244/local_llm_client-0.10.1-py3-none-any.whl", hash = "sha256:5ae1118adabeac340e0b3f422ec0c4784006d9b3c19b61be5b8b1cd72e79e653", size = 34101, upload-time = "2026-09-24T13:41:38.162Z" },
+    { url = "https://files.pythonhosted.org/packages/da/c1/51ba84f5ebf0a0b116c51d1d46905029e426bd410849d4f81e08147fdf28/local_llm_client-0.10.3-py3-none-any.whl", hash = "sha256:d36bbbee4736aaf1ad076410a05f294ae35f1fc35395eadb2509f7ddc2310557", size = 35872, upload-time = "2026-10-27T15:35:34.909Z" },
 ]
 
 [[package]]
@@ -2465,7 +2473,7 @@ provides-extras = ["vllm", "sglang"]
 dev = [
     { name = "bandit", specifier = ">=1.8" },
     { name = "coverage", extras = ["toml"], specifier = ">=7.6" },
-    { name = "local-llm-client", specifier = ">=0.7.0" },
+    { name = "local-llm-client", specifier = ">=0.10.3" },
     { name = "msgpack", specifier = ">=1.2.3" },
     { name = "mypy", specifier = ">=1.17" },
     { name = "pip", specifier = ">=26.2.2" },
