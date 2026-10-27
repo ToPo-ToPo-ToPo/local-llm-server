@@ -22,6 +22,11 @@ venv への直接パッチは黙って失われる。ここに置けばソース
    超えて以後すべての保存が見送られる。再起動するまで直らない
    （→ `_patch_apc_rate_poisoning`）。
 
+3. APC のディスク置き場が長いモデルパスで別モデルと共有される（mlx-vlm 0.7.9 時点）
+   ディレクトリ名を 128 文字で切り捨てるため、モデルを見分ける指紋（名前の末尾）が
+   落ち、頭 128 文字が同じ別モデルが同じ置き場を読み書きする
+   （→ `_patch_apc_disk_namespace`）。
+
 （履歴）0.6.7 / 0.6.8 向けに当てていた次の 2 つは **0.6.9 で上流が修正したため削除した**:
   - models/inkling が sub-config クラス（TextConfig 等）を再エクスポートせず、
     汎用ローダーの getattr が必ず AttributeError になる問題
@@ -33,6 +38,7 @@ venv への直接パッチは黙って失われる。ここに置けばソース
 
 from __future__ import annotations
 
+import hashlib
 import os
 import runpy
 import sys
@@ -157,6 +163,54 @@ def _patch_apc_rate_poisoning() -> None:
 
     _observe_cache_size._llmserver_patched = True  # type: ignore[attr-defined]
     manager._observe_cache_size = _observe_cache_size
+
+
+#: 上流 ``_safe_namespace`` がディレクトリ名を切り捨てる長さ。これより短い名前は切られて
+#: いないので、そのまま使う（既存のキャッシュを無効にしない）。
+_APC_NAMESPACE_MAX = 128
+#: 切り捨てる名前に残す頭の長さ。末尾に "-" と 16 桁の指紋を足して 117 文字に収める。
+_APC_NAMESPACE_HEAD = 100
+
+
+def _patch_apc_disk_namespace() -> None:
+    """長いモデルパスの APC ディスク置き場を、別モデルと共有しない名前にする（mlx-vlm 0.7.9 時点）。
+
+    上流の問題: ディスク層の置き場は ``_safe_namespace(apc_disk_namespace(model_path, …))``。
+    ``apc_disk_namespace`` は ``"{model_path}#s{版}-{指紋 8 桁}"`` を返すが、
+    ``_safe_namespace`` は記号を ``_`` に置き換えたあと **頭 128 文字で切り捨てる**。
+    モデルパスが長いと、モデル・アダプタ・KV 量子化を見分ける指紋（末尾）ごと落ちて、
+    頭 128 文字が同じ別モデルが同じ置き場を読み書きする。
+
+    実測（2026-10-27）: 同じ親ディレクトリにある Ornith の 122B と 35B が
+    ``…_mlx-maker_output_Ornith-`` を共有し、同じシステムプロンプトで前方一致した 122B が
+    35B の GatedDeltaNet の畳み込み状態を復元して、長い要求がすべて
+    ``[concatenate] … (1,3,8192), (1,1016,12288)`` で落ちた（8192 は 35B、12288 は 122B の次元）。
+    短い要求は前方一致しないので通り、共有した頭に当たるまで表に出ない。形が同じモデル
+    同士なら落ちずに、互いの KV を黙って読んで誤った出力を返す。
+
+    直し方: 上流の結果が切り捨ての長さに届いたら、頭 100 文字に**切る前の名前全体**の
+    SHA-256（16 桁）を足す。指紋は名前全体から取るので、切られた末尾の違いも記号の
+    置き換えで潰れた違いも残る。128 文字に届かない名前は上流の結果のまま
+    （既存の置き場をそのまま使い続ける）。
+    """
+    try:
+        from mlx_vlm import apc as _apc
+    except Exception:
+        return
+    original = getattr(_apc, "_safe_namespace", None)
+    if original is None or getattr(original, "_llmserver_patched", False):
+        return  # 上流が実装を変えた / 適用済み。触らない
+
+    def _safe_namespace(name: str) -> str:
+        safe = original(name)
+        if len(safe) < _APC_NAMESPACE_MAX:
+            return safe  # 切り捨てられていない
+        digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:16]
+        return f"{safe[:_APC_NAMESPACE_HEAD].rstrip('_')}-{digest}"
+
+    _safe_namespace._llmserver_patched = True  # type: ignore[attr-defined]
+    _apc._safe_namespace = _safe_namespace
+    # DiskBlockStore.__init__ はモジュールの大域名として呼ぶので、属性の差し替えで効く
 
 
 STREAM_TOOL_CALLS_ENV = "LOCAL_LLM_STREAM_TOOL_CALLS"
@@ -304,6 +358,7 @@ def apply() -> None:
     _patch_content_markers()
     _patch_apc_extra_hash()
     _patch_apc_rate_poisoning()
+    _patch_apc_disk_namespace()
     # ツール呼び出しの生成中トークン: パッチは常に当て、流すかはリクエストごとに決める
     # (ヘッダー X-Stream-Tool-Calls。無ければモデルの既定 = gateway.toml の stream_tool_calls)
     result = _patch_stream_tool_calls()

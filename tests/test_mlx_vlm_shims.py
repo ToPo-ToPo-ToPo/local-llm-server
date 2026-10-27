@@ -152,10 +152,90 @@ def test_apc_rate_patch_is_idempotent():
     assert apc.APCManager._observe_cache_size is once   # 二重ラップしない
 
 
-# ---- stream_tool_calls: ツール呼び出しの生成中トークンを流す ----------------------
+# ---- APC のディスク置き場: 長いモデルパスで別モデルと共有しない ----------------------
 
+import re as _re
 import sys as _sys
 import types as _types
+
+# 実際に置き場を共有して落ちた 2 つ（頭 128 文字が同じで、指紋は切り捨ての先にある）
+_ORNITH_DIR = ("/Users/octopus/my_programs/01_github/agent-corporation/.claude/worktrees/"
+               "serene-spence-b0be87/.worktrees/mlx-maker/output/")
+_ORNITH_122B = _ORNITH_DIR + "Ornith-1.5-122B-mlx-8bit"
+_ORNITH_35B = _ORNITH_DIR + "Ornith-1.5-35B-A3B-tone-eval-bf16"
+_SHORT_NS = "ToPo-ToPo/gemma-4-26B-A4B-it-mlx-8bit#s4-aa791046"
+_SHORT_DIR = "ToPo-ToPo_gemma-4-26B-A4B-it-mlx-8bit_s4-aa791046"   # 既存の置き場の名前
+
+
+def _upstream_safe_namespace(name):
+    """mlx-vlm 0.7.1〜0.7.9 の _safe_namespace と同じ（記号を _ にして 128 文字で切る）。"""
+    safe = _re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("_") or "default"
+    return safe[:128]
+
+
+def _install_fake_apc(monkeypatch):
+    apc = _types.ModuleType("mlx_vlm.apc")
+    apc._safe_namespace = _upstream_safe_namespace
+    pkg = _types.ModuleType("mlx_vlm")
+    pkg.apc = apc
+    monkeypatch.setitem(_sys.modules, "mlx_vlm", pkg)
+    monkeypatch.setitem(_sys.modules, "mlx_vlm.apc", apc)
+    return apc
+
+
+def test_apc_disk_namespace_separates_long_paths_sharing_the_head(monkeypatch):
+    """頭 128 文字が同じ別モデルの置き場が分かれること（上流は同じ置き場を共有していた）。"""
+    apc = _install_fake_apc(monkeypatch)
+    a, b = _ORNITH_122B + "#s4-11111111", _ORNITH_35B + "#s4-22222222"
+    assert _upstream_safe_namespace(a) == _upstream_safe_namespace(b)   # 上流の衝突を再現
+
+    _mlx_vlm_shims._patch_apc_disk_namespace()
+    da, db = apc._safe_namespace(a), apc._safe_namespace(b)
+    assert da != db
+    assert len(da) <= 128 and len(db) <= 128
+    assert da.startswith("Users_octopus_my_programs")   # 人が見て分かる頭は残す
+    assert apc._safe_namespace(a) == da                  # 同じモデルは毎回同じ置き場
+
+    # 指紋（名前の末尾）だけが違う場合も分かれる（アダプタ・KV 量子化の違い）
+    assert apc._safe_namespace(_ORNITH_122B + "#s4-33333333") != da
+
+
+def test_apc_disk_namespace_keeps_short_names(monkeypatch):
+    """切り捨てに届かない名前は上流と同じ（既存のキャッシュを無効にしない）。"""
+    apc = _install_fake_apc(monkeypatch)
+    _mlx_vlm_shims._patch_apc_disk_namespace()
+    assert apc._safe_namespace(_SHORT_NS) == _SHORT_DIR
+    assert apc._safe_namespace("x" * 127) == "x" * 127
+    assert apc._safe_namespace("") == "default"
+
+
+def test_apc_disk_namespace_patch_is_idempotent(monkeypatch):
+    apc = _install_fake_apc(monkeypatch)
+    _mlx_vlm_shims._patch_apc_disk_namespace()
+    once = apc._safe_namespace
+    _mlx_vlm_shims._patch_apc_disk_namespace()
+    assert apc._safe_namespace is once   # 二重ラップしない
+
+
+def test_apc_disk_store_dirs_differ_for_real_namespaces(tmp_path):
+    """本物の mlx-vlm で、ディスク層が 2 つのモデルに別の置き場を作ること。"""
+    apc = pytest.importorskip("mlx_vlm.apc")
+    if not hasattr(apc, "DiskBlockStore") or not hasattr(apc, "apc_disk_namespace"):
+        pytest.skip("上流のディスク層の構造が変わった")
+    _mlx_vlm_shims.apply()
+    dirs = []
+    for model in (_ORNITH_122B, _ORNITH_35B):
+        store = apc.DiskBlockStore(tmp_path, namespace=apc.apc_disk_namespace(model))
+        try:
+            dirs.append(store.dir)
+        finally:
+            store.close()
+    assert dirs[0] != dirs[1]
+    assert all(d.parent == tmp_path and len(d.name) <= 128 for d in dirs)
+    assert apc._safe_namespace(_SHORT_NS) == _SHORT_DIR
+
+
+# ---- stream_tool_calls: ツール呼び出しの生成中トークンを流す ----------------------
 
 
 def _fake_openai_module(*, with_class: bool, with_func: bool):
