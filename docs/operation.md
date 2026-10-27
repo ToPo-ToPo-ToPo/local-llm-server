@@ -12,29 +12,40 @@ cd local-llm-server
 make install                     # これだけ。導入・PATH 設定・自動起動の登録まで全部やる
 ```
 
-`make install` は `uv tool install --editable . --reinstall` に続けて次を全部行う
-（editable は確定なので畳んである。再実行で入れ直しにもなる）:
+`make install`は修正済みuvとPython 3.13.18で導入補助を実行する。
+既存環境のパッケージ情報を読み、新しいtool環境を別ディレクトリに作成する。
+セキュリティ更新対象だけを検証済み版へ上げ、他の導入版と任意バックエンドを維持する。
+依存整合性と実際の導入版を検証してから、`~/.local/bin/gw`とアプリの自動起動を切り替える。
+旧環境は削除しない。シェル設定、PC全体のPATHやPython設定は変更しない。
 
-1. **`/usr/local/bin/gw` の設置（要・管理者パスワード 1 回）** — Ollama と同じく、最初から
-   PATH に入っている場所へ symlink を置く。これで **今のシェルからそのまま `gw` が使える**
-   （exec や新ターミナル不要）。パスワードを入れずスキップしても壊れない（下記 2 が受け皿）
-2. **PATH 設定（`uv tool update-shell`）** — `~/.local/bin` をシェル設定に追記
-   （既に通っていれば何もしない）。1 をスキップした場合は新しいターミナルから有効
-3. **`gw enable`（自動起動の登録）**
+`gw`がPATHにない場合は`~/.local/bin/gw`を使用する。
 
-**editable** なのでソースはこのクローンを指し、`gw update` の取り込みがそのまま効く。
+### 旧環境からのセキュリティ移行
 
-### 導入直後に `gw: command not found` になるとき
+古いPythonでは新しい`gw`自体が起動を拒む場合があるため、移行には旧`gw`を使わず、
+修正済みuv（0.13.6以上。リポジトリ専用版も利用可能）を用意して次を実行する。
 
-`/usr/local/bin` への設置をスキップした場合に、**今のシェルに PATH がまだ反映されていない**だけ
-（環境変数は起動済みのシェルへ外から注入できない——これはどのツールでも同じ）。
-新しいターミナルを開くか **`exec $SHELL -l`** で反映する（追記先は zsh では `~/.zshenv` なので
-`source ~/.zshrc` では反映されない）。いつでも `make install` を再実行すれば
-`/usr/local/bin` への設置からやり直せる。
+```bash
+# 旧環境を読み取り、変更予定だけを確認する
+./scripts/uv run --no-project --python 3.13.18 scripts/install_runtime.py --dry-run
+# 新環境を作成・検証して切り替える
+make install
+```
 
-> `~/.zshrc` に `. "$HOME/.local/bin/env"` がある環境では、そちら経由でも PATH が通る。これは
-> uv を**スタンドアロンインストーラ**で入れたときに作られる行で、Homebrew 版の uv では作られない
-> （環境によって有無が違うので、上の手順に頼るのが確実）。
+対象はcertifi、pip、filelock、Pillow、urllib3、macOSのsetuptools、導入済みのmsgpack。
+安全性の下限を満たす版は引き下げず、未導入の任意パッケージは追加しない。
+pipとcertifiは新環境の安全な管理・通信に必要な場合に補完する。
+LinuxのsetuptoolsはCUDA側の上限を維持し、全面的な安全性確認済みとは扱わない。
+別のeditable/VCS/直接URL依存は版だけで再現できないため自動移行を止め、明示的な移行を求める。
+安全な通信環境を作るためにローカル配置されたpip・certifiの標準wheelは移行対象として扱う。
+
+`--previous-python /path/to/old/bin/python`で移行元を指定できる。
+`--activate`を省くと新環境の作成・検証まで行い、起動参照は切り替えない。
+記録は`.runtime/installs/<作成時刻>/install.json`と`constraints.txt`に保存する。
+検証に失敗した新環境は非稼働のまま残り、既存の起動参照は維持する。
+
+`gw update`が安全性更新を検出した場合は`make install`へ案内し、旧環境をその場で
+書き換えたり、稼働中サーバーを停止・再起動したりしない。
 
 開発（テストを回す）は `make dev`（＝`uv sync`）で開発用 venv を作り `uv run pytest`。
 PR の前には `make check`（lint・型・セキュリティ・依存監査・テストと網羅率）を手元で回す。
@@ -214,7 +225,8 @@ GPU依存wheelが対応するLinux / Python<3.15に限定する。vLLM自体の�
 
 `make install`は`scripts/install_runtime.py --activate`を実行し、`.runtime/installs/`
 以下に新しいtool環境を構築する。旧環境は削除しない。既存環境がある場合はその導入版を
-constraintsに保存し、MLX等を開発ロックに合わせて後退させない。新規導入では本体ロックを使う。
+constraintsに保存し、安全性の下限未満だけを検証済み版へ更新する。MLX等は開発ロックに合わせて
+後退させず、任意で入れたパッケージも新環境へ引き継ぐ。新規導入では本体ロックを使う。
 `install.json`、`constraints.txt`、環境内の`.gw-runtime-constraints.txt`が実際の固定版を示す。
 更新時も稼働環境の固定版をconstraintsとして同期する。新要件と衝突した場合は失敗として
 報告し、無関係な依存を一括最新版化しない。アプリの再起動後には実行プロセスのPythonも確認する。
