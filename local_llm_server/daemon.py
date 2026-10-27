@@ -644,6 +644,7 @@ def run_gateway(cfg: GatewayConfig, config_path: str | None = None) -> int:
                 "`make install` を実行してください。",
                 file=sys.stderr,
             )
+            return 1  # Do not re-exec with dependencies known to be incompatible.
         update.reexec_daemon()
     return rc
 

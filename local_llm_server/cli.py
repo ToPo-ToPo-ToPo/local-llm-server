@@ -954,6 +954,10 @@ def cmd_update(gcfg, args) -> int:
             running = ustate.get("running")
             print(f"no new release, but the running gateway still has {running} loaded "
                   f"(source is {st.current}) — restarting to pick it up")
+            ok, message = update.refresh_tool_env(update.repo_root())
+            if not ok:
+                print(f"依存の移行が必要です（{message}）。make install を実行してください。", file=sys.stderr)
+                return 1
             _stop_pids(_collect_gateway_pids(host, port, all_ports))
             return cmd_start(gcfg, args)
         print("already up to date" if st.reason == "ok" else f"no update: {st.reason}")
@@ -972,6 +976,7 @@ def cmd_update(gcfg, args) -> int:
     if not ok:
         print(f"依存の入れ直しに失敗しました（{msg}）。`make install` を実行してください。",
               file=sys.stderr)
+        return 1
     # 新版で廃止・改名されたキーを設定へ反映する（この後の再起動で新スキーマのまま立ち上がる）。
     migrate.migrate_quietly(user_config_path(), log=print)
     # 稼働中なら新コードで再起動（stop → start）。

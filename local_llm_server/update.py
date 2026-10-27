@@ -212,6 +212,15 @@ def refresh_tool_env(root: Path | None, timeout: float = 600.0) -> tuple[bool, s
         return True, "tool venv ではない（uv sync が受け持つ）"
     if root is None:
         return False, "git クローン運用ではない"
+    from . import migration_policy, tls_policy
+    try:
+        tls_policy.require_secure_python()
+        versions, changes = migration_policy.plan_migration(migration_policy.installed_versions())
+    except (OSError, ValueError, RuntimeError) as exc:
+        return False, f"旧環境を保護しました。make install で新環境を作成してください: {exc}"
+    if changes:
+        names = ", ".join(sorted(changes))
+        return False, f"安全性の更新が必要です（{names}）。旧環境を残す make install で移行してください"
     fingerprint = _deps_fingerprint(root)
     marker = env_root / _DEPS_FINGERPRINT_NAME
     if fingerprint is not None:
@@ -230,7 +239,7 @@ def refresh_tool_env(root: Path | None, timeout: float = 600.0) -> tuple[bool, s
         pins_dir.mkdir(parents=True, exist_ok=True)
         import hashlib
         pins = pins_dir / (hashlib.sha256(str(env_root).encode()).hexdigest()[:12] + ".txt")
-        pins.write_text(tls_policy.installed_constraints(), encoding="utf-8")
+        pins.write_text(migration_policy.format_constraints(versions), encoding="utf-8")
         res = subprocess.run(
             [uv, "pip", "install", "--python", sys.executable, "--constraint", str(pins),
              "--editable", str(root), "--quiet"],
