@@ -90,6 +90,9 @@ def installer(tmp_path, monkeypatch):
     project = tmp_path/"project"
     (project/"local_llm_server").mkdir(parents=True)
     shutil.copy2(ROOT/"local_llm_server/migration_policy.py", project/"local_llm_server/migration_policy.py")
+    shutil.copy2(ROOT/"local_llm_server/runtime_retention.py", project/"local_llm_server/runtime_retention.py")
+    monkeypatch.setattr(module, "verify_activation", lambda python: {"pid": 123})
+    monkeypatch.setattr(module, "prune_old_installations", lambda *args: {"removed": []})
     home = tmp_path/"home"
     monkeypatch.setattr(module, "ROOT", project)
     monkeypatch.setattr(module.Path, "home", lambda: home)

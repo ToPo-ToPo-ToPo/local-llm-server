@@ -1,7 +1,7 @@
 """Build and verify a new runtime while preserving its predecessor.
 
 Run with scripts/uv run --no-project --python 3.13.18 scripts/install_runtime.py.
-Use --dry-run to inspect the security migration; --activate switches the app.
+Use --dry-run to inspect migration; --activate keeps the active and previous runtimes.
 """
 from __future__ import annotations
 
@@ -52,6 +52,42 @@ def read_versions(python: Path) -> dict[str, str]:
     return json.loads(result.stdout)
 
 
+def verify_activation(python: Path) -> dict:
+    """Check HTTP health, process ownership, environment, and loaded version."""
+    code = """
+import json,sys,time
+from pathlib import Path
+from importlib.metadata import version
+from local_llm_server.gateway_runtime import read_gateway_runtime,gateway_admin_status
+end=time.monotonic()+25
+while time.monotonic()<end:
+    record=read_gateway_runtime()
+    if record and record.get('cmdline') and Path(record['cmdline'][0]).absolute()==Path(sys.executable).absolute():
+        status=gateway_admin_status(record['host'],record['port'],timeout=1)
+        if status and status.get('pid')==record['pid'] and status.get('update',{}).get('running')==version('local-llm-server'):
+            print(json.dumps({'pid':record['pid'],'python':sys.executable,'version':version('local-llm-server')}))
+            break
+    time.sleep(.25)
+else:
+    raise RuntimeError('New runtime did not become healthy; older environments retained')
+"""
+    result = run([str(python), "-I", "-B", "-c", code], capture_output=True, timeout=35)
+    return json.loads(result.stdout)
+
+
+def prune_old_installations(python: Path, prefix: Path, previous: str | None,
+                            launcher: Path) -> dict:
+    code = (
+        "import json,sys;from pathlib import Path;"
+        "from local_llm_server.runtime_retention import prune_installations;"
+        "print(json.dumps(prune_installations(Path(sys.argv[1]),Path(sys.argv[2]),"
+        "sys.argv[3] or None,Path(sys.argv[4]))))"
+    )
+    result = run([str(python), "-I", "-B", "-c", code, str(ROOT), str(prefix),
+                  previous or "", str(launcher)], capture_output=True, timeout=60)
+    return json.loads(result.stdout)
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group()
@@ -65,6 +101,15 @@ def main(argv: list[str] | None = None) -> None:
     if os.name == "nt":
         parser.error("This service installer is for macOS/Linux; see docs/operation.md for Windows.")
     launcher = Path.home()/".local/bin/gw"
+    if args.dry_run:
+        _install(args, launcher)
+        return
+    retention = runpy.run_path(str(ROOT/"local_llm_server/runtime_retention.py"))
+    with retention["installation_lock"](ROOT):
+        _install(args, launcher)
+
+
+def _install(args, launcher: Path) -> None:
     if args.uninstall:
         if not launcher.is_symlink():
             print("No managed gw symlink; no environment was deleted.")
@@ -166,6 +211,16 @@ def main(argv: list[str] | None = None) -> None:
                         rollback.replace(launcher)
                     record["activated"] = False
                 raise
+            record["health"] = verify_activation(python)
+            save()
+            try:
+                record["cleanup"] = prune_old_installations(
+                    python, prefix, record["previous_launcher"], launcher)
+            except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
+                # An uncertain cleanup must not undo a healthy activation.
+                record["cleanup"] = {"removed": [], "error": str(error)[-1500:]}
+                print("Old-runtime cleanup skipped: " + str(error)[-1500:], file=sys.stderr)
+            save()
     except Exception as error:
         record["status"] = "failed"
         record["error"] = str(error)[:1000]
