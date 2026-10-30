@@ -102,7 +102,8 @@ conflicts = [[{ extra = "vllm" }, { extra = "sglang" }]]
 # 間接依存で要求されても入らない（uv は依存元を litellm 不要の版へ後退させるので、uv.lock の
 # 差分で不自然に古い版が出たらこれが原因）。隔離 venv の pip には _venv_backend.BLOCKED_PACKAGES
 # で同じ制約を渡す（両者の一致は tests/test_blocked_packages.py が検証）。
-constraint-dependencies = ["litellm<0"]
+# multidict 6.7.0-6.9.0 has CVE-2026-104874; constrain it only when required.
+constraint-dependencies = ["litellm<0", "multidict>=6.9.1"]
 # vllm / sglang は sdist からビルドしない（wheel のみ使う）。両者は CUDA 前提で、ソースビルドは
 # CUDA の無い Mac では必ず失敗する。これが無いと `uv lock --upgrade` の全面再解決で、
 # vllm の固定（torch==/torchvision== ピン）と新しい torchvision が衝突したとき uv が
