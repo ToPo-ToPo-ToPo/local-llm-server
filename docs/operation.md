@@ -1,7 +1,7 @@
 # 起動・運用・アンインストール
 
-標準のuvプロジェクト環境で運用する。この文書の`gw`コマンドは、リポジトリで
-`uv run --frozen gw ...`として実行する（または`.venv`をactivateして実行する）。
+標準のuvプロジェクト環境で運用する。この文書の`gw`コマンドは、`gw enable`の後は
+どのディレクトリからでも`gw ...`で実行できる。リポジトリで`uv run --frozen gw ...`としても同じ。
 
 ## インストール
 
@@ -14,7 +14,11 @@ uv run --frozen gw status
 ```
 
 `.venv`はuvが作る実体のあるディレクトリー。Python実行ファイルなどの内部はuv標準に任せる。
-常駐サービスも、この`.venv/bin/gw`を直接登録する。グローバルな起動リンクは作らない。
+常駐サービスも、この`.venv/bin/gw`を直接登録する。
+ゲートウェイはPCに1つの常駐サービスなので、`gw enable`は同じ`.venv/bin/gw`を`~/.local/bin/gw`にリンクする。
+リンクは`.venv`の実行ファイルを指すだけで、独自の環境は作らない。既存の`~/.local/bin/gw`がリンクなら張り替え、
+リンクでないファイルなら置き換えずに知らせる。`~/.local/bin`がPATHに無いときも知らせる。
+`make uninstall`は、このチェックアウトの`.venv/bin/gw`を指すリンクだけを外す。
 `make install`は`uv sync --frozen`と`uv run --frozen gw enable`を実行する補助。
 依存は`uv.lock`に従って同じ`.venv`へ同期し、通常の更新では世代別ディレクトリーを作らない。
 
@@ -50,6 +54,8 @@ uv run --frozen gw enable
 Pythonは`.python-version`の3.13.18を使う。共有PythonやPC全体のPATH・シェル設定は変更しない。
 モデル・設定は従来の場所を使い、移行後の起動と機能を確認してから旧環境を整理する。
 旧tool環境用の`scripts/install_runtime.py`と2世代保持処理は互換用に残すが、通常の導入では使わない。
+旧`uv tool install`で入れていた場合は、先に`uv tool uninstall local-llm-server`で外してから
+`gw enable`する（uv toolが置いた`~/.local/bin/gw`を、後から外す操作で消さないため）。
 
 依存を変更する開発作業では、通常のuvでロックも同期する。
 
