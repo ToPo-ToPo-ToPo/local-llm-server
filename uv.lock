@@ -2619,7 +2619,7 @@ wheels = [
 
 [[package]]
 name = "local-llm-server"
-version = "0.38.26"
+version = "0.38.27"
 source = { editable = "." }
 dependencies = [
     { name = "certifi" },
