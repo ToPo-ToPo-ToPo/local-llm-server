@@ -192,6 +192,38 @@ def enable() -> None:
         _enable_systemd(gw)
 
 
+def is_registered() -> bool:
+    """自動起動が登録済みか（定義ファイルの有無で見る。gw enable が書き、gw disable が消す）。"""
+    kind = service_kind()
+    if kind == "launchd":
+        return os.path.isfile(launchd_plist_path())
+    if kind == "systemd":
+        return os.path.isfile(systemd_unit_path())
+    return False
+
+
+def start() -> None:
+    """登録済みのサービスとして起動する（失敗は RuntimeError）。
+
+    gw start / restart / update の再起動もここを通し、サービス管理の外に手動デーモンを
+    作らない（作ると異常終了時の自動復活が次回ログインまで効かない）。呼ぶのは
+    ゲートウェイが応答していないときだけで、走っている登録ジョブは入れ替える
+    （launchd は -k。stop 直後に launchd がまだ終了を拾っていなくても確実に起動させる）。
+    """
+    kind = service_kind()
+    if kind == "launchd":
+        cmd = ["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{LAUNCHD_LABEL}"]
+    elif kind == "systemd":
+        cmd = ["systemctl", "--user", "restart", SYSTEMD_UNIT]
+    else:
+        raise RuntimeError("この OS では自動起動サービスに未対応です")
+    res = _run(cmd)
+    if res.returncode != 0:
+        raise RuntimeError(
+            f"{' '.join(cmd)} に失敗しました: {res.stderr.strip() or res.stdout.strip()}"
+        )
+
+
 def disable() -> bool:
     """自動起動を解除する（稼働中のサービスも止める）。登録が無ければ False。"""
     kind = service_kind()
