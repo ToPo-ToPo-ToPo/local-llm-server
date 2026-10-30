@@ -143,3 +143,113 @@ def test_enable_places_launcher_and_keeps_going_on_failure(monkeypatch, tmp_path
     assert cli_mod.cmd_enable(None, args) == 0
     assert link.read_text() == "user script"
     assert "置き換えません" in capsys.readouterr().err
+
+
+def _register(monkeypatch, kind="launchd"):
+    """定義ファイルを置いて「gw enable 済み」にする（パスは conftest でテスト専用）。"""
+    import os
+
+    monkeypatch.setattr(service, "service_kind", lambda: kind)
+    path = service.launchd_plist_path() if kind == "launchd" else service.systemd_unit_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("registered")
+
+
+def test_is_registered_follows_the_definition_file(monkeypatch):
+    monkeypatch.setattr(service, "service_kind", lambda: "launchd")
+    assert service.is_registered() is False
+    _register(monkeypatch)
+    assert service.is_registered() is True
+    monkeypatch.setattr(service, "service_kind", lambda: None)
+    assert service.is_registered() is False
+
+
+@pytest.mark.parametrize("kind, expected", [
+    ("launchd", ["launchctl", "kickstart", "-k"]),
+    ("systemd", ["systemctl", "--user", "restart", service.SYSTEMD_UNIT]),
+])
+def test_start_asks_the_service_manager(monkeypatch, kind, expected):
+    import subprocess
+
+    calls = []
+    monkeypatch.setattr(service, "service_kind", lambda: kind)
+    monkeypatch.setattr(service, "_run", lambda cmd: calls.append(cmd)
+                        or subprocess.CompletedProcess(cmd, 0, "", ""))
+    service.start()
+    assert calls[0][:len(expected)] == expected
+    if kind == "launchd":
+        assert calls[0][-1].endswith("/" + service.LAUNCHD_LABEL)
+
+    monkeypatch.setattr(service, "_run", lambda cmd: subprocess.CompletedProcess(cmd, 1, "", "no job"))
+    with pytest.raises(RuntimeError, match="no job"):
+        service.start()
+
+
+def _start_env(monkeypatch, tmp_path, *, admin=None):
+    """cmd_start を外部に触れずに回すための差し替え一式。起きた事を events に記録する。"""
+    import types
+
+    from local_llm_server import cli as cli_mod
+
+    events = []
+    state = {"up": admin is not None}
+    monkeypatch.setattr(cli_mod, "_endpoint", lambda gcfg: ("127.0.0.1", 8799, [8799]))
+    monkeypatch.setattr(cli_mod, "gateway_admin_status",
+                        lambda host, port: {"pid": 7} if state["up"] else None)
+    monkeypatch.setattr(cli_mod, "is_ready", lambda url, **k: state["up"])
+    monkeypatch.setattr(cli_mod, "render_status", lambda *a: "gateway: running")
+    monkeypatch.setattr(cli_mod, "start_gateway_background",
+                        lambda *a, **k: events.append("background") or state.update(up=True) or 8)
+
+    def fake_start():
+        events.append("service")
+        state["up"] = True
+    monkeypatch.setattr(service, "start", fake_start)
+    gcfg = types.SimpleNamespace(_config_dir=str(tmp_path))
+    return cli_mod, gcfg, events, state
+
+
+def test_gw_start_uses_the_service_when_registered(monkeypatch, tmp_path):
+    """gw enable 済みなら、gw start（stop 後の再開・restart・update の再起動）もサービス経由。"""
+    _register(monkeypatch)
+    cli_mod, gcfg, events, _ = _start_env(monkeypatch, tmp_path)
+    assert cli_mod.cmd_start(gcfg, None) == 0
+    assert events == ["service"]
+
+
+def test_gw_start_reuses_a_running_gateway_without_restarting(monkeypatch, tmp_path):
+    _register(monkeypatch)
+    cli_mod, gcfg, events, _ = _start_env(monkeypatch, tmp_path, admin={"pid": 7})
+    assert cli_mod.cmd_start(gcfg, None) == 0
+    assert events == []
+
+
+def test_gw_start_without_registration_starts_in_background(monkeypatch, tmp_path):
+    monkeypatch.setattr(service, "service_kind", lambda: "launchd")
+    cli_mod, gcfg, events, _ = _start_env(monkeypatch, tmp_path)
+    assert cli_mod.cmd_start(gcfg, None) == 0
+    assert events == ["background"]
+
+
+def test_gw_start_falls_back_when_the_service_cannot_start(monkeypatch, tmp_path, capsys):
+    _register(monkeypatch)
+    cli_mod, gcfg, events, _ = _start_env(monkeypatch, tmp_path)
+
+    def broken():
+        raise RuntimeError("launchctl kickstart に失敗しました")
+    monkeypatch.setattr(service, "start", broken)
+    assert cli_mod.cmd_start(gcfg, None) == 0
+    assert events == ["background"]
+    assert "gw enable" in capsys.readouterr().err
+
+
+def test_gw_restart_stops_then_starts_through_the_service(monkeypatch, tmp_path):
+    """restart（update の再起動も同じ順）: 全プロセスを止めてから、サービスとして起動し直す。"""
+    _register(monkeypatch)
+    cli_mod, gcfg, events, state = _start_env(monkeypatch, tmp_path, admin={"pid": 7})
+    monkeypatch.setattr(cli_mod, "_collect_gateway_pids", lambda *a: [7])
+    monkeypatch.setattr(cli_mod, "_stop_pids",
+                        lambda pids: events.append(("stop", pids)) or state.update(up=False))
+    assert cli_mod.cmd_restart(gcfg, None) == 0
+    assert events == [("stop", [7]), "service"]
