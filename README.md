@@ -8,34 +8,36 @@
 
 ## インストール
 
-[uv](https://docs.astral.sh/uv/) を使う。一度入れれば**どこからでも `gw`**。
+[uv](https://docs.astral.sh/uv/) の標準プロジェクト環境を使う。
 
 ```bash
 git clone https://github.com/ToPo-ToPo-ToPo/local-llm-server
 cd local-llm-server
-make install    # 専用環境を作成し、アプリの起動参照と自動起動を登録する
+uv sync
+uv run gw enable    # 自動起動を使う場合
+uv run gw status
 ```
 
-Pythonは3.13.18、uvは0.13.6以上を使用する。`scripts/uv`はリポジトリ専用の
-ツール・Python・キャッシュを優先し、シェル設定やPC全体のPATHを書き換えない。
-`make install`は新しいtool環境を別ディレクトリに作成し、既存環境を保存して
-`~/.local/bin/gw`とアプリ専用サービスを切り替える。PATH未設定ならこの絶対パスで実行する。
-既存インストールの依存版を引き継ぎ、セキュリティ更新が必要なパッケージだけを検証済み版へ上げる。
-更新済み・より新しい版は維持し、任意のバックエンドも消さない。切り替え前に新環境を検証する。
+Pythonは3.13.18、uvは0.13.6以上を使用する。`.python-version`と`uv.lock`に従い、
+uvがリポジトリ直下に実体の`.venv`を作成する。Python実行ファイルなどの内部構造はuv標準のまま。
+通常の実行は`uv run gw ...`。自動起動もこの`.venv`の実行ファイルを直接使う。
+`make install`は`uv sync --frozen`と`uv run --frozen gw enable`の補助にすぎず、
+独自の世代環境やグローバルコマンドのシンボリックリンクは作成しない。
+更新時は同じ`.venv`をロックされた依存に同期する。シェル設定やPC全体のPATHは変更しない。
 導入の詳細とTLS要件は[運用手順](docs/operation.md#tlsと実行環境)を参照。
 
-モデルの取得には`gw pull`または`./scripts/hf download`を使う。
+モデルの取得には`uv run gw pull`または`./scripts/hf download`を使う。
 修正済みhf-xetの動作を確認するまではPython HTTP経路を使用するため、
 大容量ファイルの転送速度・帯域・キャッシュ効率に影響する場合がある。
 
 ## 使い方
 
 ```bash
-gw status     # 稼働/停止・PID・URL・起動経過を表示（自動起動済みなら常に稼働）
-gw list       # 使えるモデル一覧（カタログ＋HF キャッシュ）
-gw stop       # 停止（再開は gw start か次回ログイン）
-gw start      # 手動起動（初回は設定を自動生成。自動起動を無効にした場合の入口）
-gw update     # 更新を取り込む（新版の確認は自動、適用はこのコマンドだけ）
+uv run gw status     # 稼働/停止・PID・URL・起動経過を表示（自動起動済みなら常に稼働）
+uv run gw list       # 使えるモデル一覧（カタログ＋HF キャッシュ）
+uv run gw stop       # 停止（再開は gw start か次回ログイン）
+uv run gw start      # 手動起動（初回は設定を自動生成。自動起動を無効にした場合の入口）
+uv run gw update     # 更新を取り込む（新版の確認は自動、適用はこのコマンドだけ）
 ```
 
 設定は **`~/.config/local-llm-server/gateway.toml` の 1 箇所**（初回の `gw start` が自動生成。

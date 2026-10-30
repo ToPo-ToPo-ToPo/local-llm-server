@@ -63,3 +63,14 @@ def test_managed_serve_exits_zero_when_already_running(monkeypatch, tmp_path):
     manual = types.SimpleNamespace(managed=False)
     assert cli_mod.cmd_serve(gcfg, managed) == 0
     assert cli_mod.cmd_serve(gcfg, manual) == 3
+
+
+
+def test_uv_project_entry_is_registered_directly(monkeypatch, tmp_path):
+    entry = tmp_path / ".venv/bin/gw"
+    entry.parent.mkdir(parents=True);entry.write_text("project gw");entry.chmod(0o755)
+    monkeypatch.setattr(service.sys, "argv", [str(entry), "enable"])
+    monkeypatch.setattr(service.shutil, "which", lambda name: "/legacy/bin/gw")
+    assert service.gw_executable() == str(entry)
+    arguments = plistlib.loads(service.render_launchd_plist(service.gw_executable()).encode())["ProgramArguments"]
+    assert arguments[0] == str(entry)

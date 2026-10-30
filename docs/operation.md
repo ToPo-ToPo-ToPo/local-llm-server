@@ -1,66 +1,49 @@
 # 起動・運用・アンインストール
 
-運用は `gw` の **CLI サブコマンド**で行う。デーモン本体は端末を持たず裏で常駐し、`gw` は
-「そのデーモンを起動・停止・監視する薄い CLI」。マシンに 1 ゲートウェイだけ（`GatewayLock`）なので、
-`gw` を何度打ってもデーモンは 0 個か 1 個。
+標準のuvプロジェクト環境で運用する。この文書の`gw`コマンドは、リポジトリで
+`uv run gw ...`として実行する（または`.venv`をactivateして実行する）。
 
-## インストール（一度だけ）
+## インストール
 
 ```bash
 git clone https://github.com/ToPo-ToPo-ToPo/local-llm-server
 cd local-llm-server
-make install                     # これだけ。導入・PATH 設定・自動起動の登録まで全部やる
+uv sync
+uv run gw enable     # 自動起動を使う場合
+uv run gw status
 ```
 
-`make install`は修正済みuvとPython 3.13.18で導入補助を実行する。
-既存環境のパッケージ情報を読み、新しいtool環境を別ディレクトリに作成する。
-セキュリティ更新対象だけを検証済み版へ上げ、他の導入版と任意バックエンドを維持する。
-依存整合性と実際の導入版を検証してから、`~/.local/bin/gw`とアプリの自動起動を切り替える。
-起動確認に成功した後、現行と直前に使っていた環境の2世代を残し、それ以前の未使用環境を削除する。
-シェル設定、PC全体のPATHやPython設定は変更しない。
+`.venv`はuvが作る実体のあるディレクトリー。Python実行ファイルなどの内部はuv標準に任せる。
+常駐サービスも、この`.venv/bin/gw`を直接登録する。グローバルな起動リンクは作らない。
+`make install`は`uv sync --frozen`と`uv run --frozen gw enable`を実行する補助。
+依存は`uv.lock`に従って同じ`.venv`へ同期し、通常の更新では世代別ディレクトリーを作らない。
 
-`gw`がPATHにない場合は`~/.local/bin/gw`を使用する。
+### 以前のシンボリックリンク構成からの移行
 
-### 旧環境からのセキュリティ移行
-
-古いPythonでは新しい`gw`自体が起動を拒む場合があるため、移行には旧`gw`を使わず、
-修正済みuv（0.13.6以上。リポジトリ専用版も利用可能）を用意して次を実行する。
+`.venv`がシンボリックリンクの場合は、リンクだけを外してから通常のuvで作り直す。
+リンク先の旧環境はこの操作では削除されない。仮想環境は絶対パスを含むため移動しない。
 
 ```bash
-# 旧環境を読み取り、変更予定だけを確認する
-./scripts/uv run --no-project --python 3.13.18 scripts/install_runtime.py --dry-run
-# 新環境を作成・検証して切り替える
-make install
+if [ -L .venv ]; then unlink .venv; fi
+uv sync --frozen
+uv run --frozen gw enable
 ```
 
-対象はcertifi、pip、filelock、Pillow、urllib3、macOSのsetuptools、導入済みのmsgpack。
-安全性の下限を満たす版は引き下げず、未導入の任意パッケージは追加しない。
-pipとcertifiは新環境の安全な管理・通信に必要な場合に補完する。
-LinuxのsetuptoolsはCUDA側の上限を維持し、全面的な安全性確認済みとは扱わない。
-別のeditable/VCS/直接URL依存は版だけで再現できないため自動移行を止め、明示的な移行を求める。
-安全な通信環境を作るためにローカル配置されたpip・certifiの標準wheelは移行対象として扱う。
+古いPythonでは新しい`gw`が起動を拒むため、最初の`uv sync`には修正済みuv 0.13.6以上を使う。
+Pythonは`.python-version`の3.13.18を使う。共有PythonやPC全体のPATH・シェル設定は変更しない。
+モデル・設定は従来の場所を使い、移行後の起動と機能を確認してから旧環境を整理する。
+旧tool環境用の`scripts/install_runtime.py`と2世代保持処理は互換用に残すが、通常の導入では使わない。
 
-`--previous-python /path/to/old/bin/python`で移行元を指定できる。
-`--activate`を省くと新環境の作成・検証まで行い、起動参照は切り替えない。
-記録は`.runtime/installs/<作成時刻>/install.json`と`constraints.txt`に保存する。
-構築・依存検証に失敗した場合は起動先を変更しない。サービス切り替え後は新環境のPythonで
-起動したプロセスと管理APIの応答・読み込んだバージョンを確認してから旧世代を整理する。
-起動確認に失敗した場合は旧世代を削除しない。
+開発と検査も通常のuvで行う。
 
-自動整理は、このリポジトリの`.runtime/installs/`にある導入成功済み環境だけが対象。
-現行と実際に直前の起動先だった環境を残し、それ以前をフォルダーごと削除する（ゴミ箱には移さない）。
-開発・音声・実験環境、モデル、設定、共有Python/uv・依存キャッシュは対象外。
-未有効化・失敗した導入、管理記録が不明なもの、他のプロセスや起動リンクが使用中のものは残す。
-使用状況の確認に必要な`lsof`が使えない場合や確認が不完全な場合も削除せず、`install.json`に理由を残す。
-整理だけが失敗しても、新しい環境の稼働は継続する。並列のインストールはロックで防止する。
+```bash
+uv sync --frozen
+uv run pytest
+make check
+```
 
-`gw update`が安全性更新を検出した場合は`make install`へ案内し、旧環境をその場で
-書き換えたり、稼働中サーバーを停止・再起動したりしない。
-
-開発（テストを回す）は `make dev`（＝`uv sync`）で開発用 venv を作り `uv run pytest`。
-PR の前には `make check`（lint・型・セキュリティ・依存監査・テストと網羅率）を手元で回す。
-GitHub の CI は使わない（ワークフローは置いていない）。
-`make install` と併用してよい（ソースは共有され、`gw` は編集が即反映される）。
+結線テスト用local-llm-client 0.10.3の依存もuv.lockで管理するため、手動の補完インストールは不要。
+GitHub CIは使用していないため、PR前にmake checkでlint・型・セキュリティ・依存監査・テストを回す。
 
 ## 自動起動（既定。Ollama と同じ「サーバーを意識しない」運用）
 
@@ -176,11 +159,11 @@ gw start      # 手動起動（自動起動を無効にしている場合や、g
 
 ## アンインストール
 
-`make install` の逆を 1 コマンドで実行すれば、自動起動の登録も含めて跡形なく消える。
+`make uninstall`で自動起動の登録とアプリ設定・ログを削除する。プロジェクトの.venvとモデル重みは保持する。
 
 ```bash
 cd local-llm-server
-make uninstall   # gw disable → gw stop → uv tool uninstall → 設定・ログ・llama.cpp を削除
+make uninstall   # プロジェクトのgwで停止・登録解除し、設定・ログ・llama.cppを削除
 ```
 
 消えるのはクローン外に残る次のもの（クローン自体は手動で削除する）。
@@ -190,7 +173,6 @@ make uninstall   # gw disable → gw stop → uv tool uninstall → 設定・ロ
 | `~/.config/local-llm-server/` | `gateway.toml` |
 | `~/.cache/local-llm-server/` | ログ（`logs/`）と自動ダウンロードした `llama.cpp` バイナリ |
 | `~/Library/LaunchAgents/com.local-llm-server.gw.plist` ほか | 自動起動の登録（`gw disable` が削除。Linux は `~/.config/systemd/user/local-llm-server.service`） |
-| `/usr/local/bin/gw` | install が置いた symlink（リンク先が自分のときだけ削除。要・管理者パスワード） |
 
 ログもキャッシュも **cwd 非依存の固定パス**に書くので、どのディレクトリから `gw start` しても
 この 2 つの外には何も残らない。
@@ -220,7 +202,7 @@ make uninstall   # gw disable → gw stop → uv tool uninstall → 設定・ロ
 ## TLSと実行環境
 
 開発環境は`.python-version`のCPython 3.13.18に固定する。`make dev`、`make check`、
-`./scripts/uv run --frozen …`を使用する。uvは0.13.6以上を必要とする。
+`uv run --frozen …`を使用する。uvは0.13.6以上を必要とする。
 リポジトリ専用uvを使う場合の配置先は`.tools/uv/0.13.6/uv`（Windowsはuv.exe）。
 公式配布物を取得し、公式リリースのハッシュ・署名情報を確認して配置する。
 既存の信頼ストアが未修正のツールでブートストラップしないこと。
@@ -233,15 +215,11 @@ GPU依存wheelが対応するLinux / Python<3.15に限定する。vLLM自体の�
 参照: [Python公式](https://blog.python.org/2026/10/python-3152-31410-31318-31216-31118/)、
 [pip](https://pip.pypa.io/en/stable/news/)、[uv](https://github.com/astral-sh/uv/releases/tag/0.13.6)。
 
-`make install`は`scripts/install_runtime.py --activate`を実行し、`.runtime/installs/`
-以下に新しいtool環境を構築する。現行と直前の2世代を保持する。既存環境がある場合はその導入版を
-constraintsに保存し、安全性の下限未満だけを検証済み版へ更新する。MLX等は開発ロックに合わせて
-後退させず、任意で入れたパッケージも新環境へ引き継ぐ。新規導入では本体ロックを使う。
-`install.json`、`constraints.txt`、環境内の`.gw-runtime-constraints.txt`が実際の固定版を示す。
-更新時も稼働環境の固定版をconstraintsとして同期する。新要件と衝突した場合は失敗として
-報告し、無関係な依存を一括最新版化しない。アプリの再起動後には実行プロセスのPythonも確認する。
-Windowsは修正済みuvで`uv tool install --python 3.13.18 --editable . --with pip==26.2.2`
-を使用する（上記サービス切替スクリプトはmacOS/Linux用）。既存環境の退避を先に行う。
+`make install`は標準の`uv sync --frozen`でプロジェクトの`.venv`を同期し、
+`uv run --frozen gw enable`で自動起動を登録する。依存の固定版はuv.lock、実行環境は.venvに集約する。
+旧tool導入専用の世代切り替え・自動整理は通常のプロジェクト環境には適用しない。
+追加の任意extrasを使う場合は、通常のuvと同様に`uv sync --extra <名前>`で指定する。
+Windowsでも標準のuvで環境を作り、`uv run gw start`で手動起動する（自動起動サービスは未対応）。
 
 `gw pull`と`./scripts/hf`は、hf-xetの独立したRust TLS経路を迂回する。
 このアプリ内でHF_HUB_DISABLE_XET=1を設定するが、TLS証明書検証は有効のまま。
@@ -253,7 +231,7 @@ TLS検査用のチェーン資料を[説明サイト](https://emudhra.we-have-a-
 以下で正常対照と14ホストを検査できる。取得したスクリプトを実行する必要はない。
 
 ```bash
-./scripts/uv run --frozen python scripts/check_emudhra.py --reference-chains /path/to/chains.zip
+uv run --frozen python scripts/check_emudhra.py --reference-chains /path/to/chains.zip
 ```
 
 各実装でjulialang.orgの成功を先に確認する。認証情報なし、リダイレクトなし、TLS検証有効で実施し、
@@ -265,14 +243,12 @@ VS Codeはリポジトリ内`.vscode`のPythonパスを使用する。以前に�
 「Python: Select Interpreter」でも`.venv/bin/python`を選択する。PC共通設定は変更しない。
 Python本体を変更しても、IDE/Electronやllama.cpp独自TLSの更新確認の代わりにはならない。
 
-復元時は新プロセスを停止し、各install.jsonに記録した旧ランチャーと保存済みサービス定義を戻す。
-開発用.venvを退避した場合は、そのディレクトリを元の.venvの位置に戻してから使う
-（console scriptには作成時の絶対パスが入る）。旧環境には未修正TLSが残るため、復元は
-短時間の障害切り分け用途とし、その環境での外部通信を安全確認済みとは扱わない。
+通常の復元ではソースとuv.lockを対象リリースに合わせ、停止後に`uv sync --frozen`してから
+`uv run gw enable`で登録し直す。仮想環境フォルダーの移動・改名は行わない。
+セキュリティ対策前のPythonや依存へ戻す場合は、その環境での外部通信を安全確認済みとは扱わない。
 
 
-結線テスト用の公開local-llm-clientはhttpxを未宣言でimportする版があるため、
-`make dev` / `make check`は`requirements/test-client.lock`のハッシュ付き補完依存も導入する。
+結線テスト用local-llm-client 0.10.3のhttpx等はuv.lockに含まれ、通常のuv syncで導入される。
 この固定ファイルは開発環境専用で、稼働用MLX等を更新しない。
 
 

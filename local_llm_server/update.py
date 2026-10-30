@@ -137,11 +137,6 @@ def _find_uv() -> str | None:
     import os
     import shutil
 
-    root = repo_root()
-    if root is not None:
-        wrapper = root / "scripts" / "uv"
-        if os.access(wrapper, os.X_OK):
-            return str(wrapper)
     found = shutil.which("uv")
     if found:
         return found
@@ -152,6 +147,12 @@ def _find_uv() -> str | None:
     ):
         if os.access(cand, os.X_OK):
             return cand
+    # Compatibility for older installations without uv on their normal PATH.
+    root = repo_root()
+    if root is not None:
+        wrapper = root / "scripts" / "uv"
+        if os.access(wrapper, os.X_OK):
+            return str(wrapper)
     return None
 
 

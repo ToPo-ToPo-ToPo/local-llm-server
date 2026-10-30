@@ -45,7 +45,7 @@ def require_secure_python() -> None:
         raise RuntimeError(
             "eMudhra対策済みのPythonが必要です: 3.11.18 / 3.12.16 / "
             "3.13.18 / 3.14.10 / 3.15.2以上（同じ系列内）。"
-            "リポジトリでは scripts/uv を使って環境を作成してください。"
+            "リポジトリでは修正済みuvで uv sync を実行してください。"
         )
 
 

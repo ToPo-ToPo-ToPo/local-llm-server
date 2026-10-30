@@ -40,9 +40,8 @@ def service_kind() -> str | None:
 def gw_executable() -> str:
     """サービス定義に書く gw 実行ファイルの絶対パスを解決する。
 
-    実行中の自分自身（sys.argv[0]）を優先する——`uv tool install` の
-    `~/.local/bin/gw` は再インストールでも変わらない安定パスで、venv の実体
-    （realpath）より寿命が長い。見つからなければ PATH から引く。
+    実行中の自分自身（sys.argv[0]）を優先する。標準の `uv run gw enable` は
+    プロジェクト .venv/bin/gw を直接登録する。見つからなければ PATH から引く。
     """
     argv0 = sys.argv[0] or ""
     if os.path.basename(argv0) == "gw":

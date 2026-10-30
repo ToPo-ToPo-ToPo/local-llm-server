@@ -457,3 +457,13 @@ def test_check_reports_restart_required_even_when_offline(monkeypatch, tmp_path)
     monkeypatch.setattr(update, "_RUNNING_SOURCE_VERSION", "0.37.0")
     st = update.check()
     assert st.reason == "offline" and st.restart_required is True
+
+
+
+def test_find_uv_prefers_standard_path_over_legacy_wrapper(monkeypatch, tmp_path):
+    import shutil
+    wrapper = tmp_path / "scripts/uv"
+    wrapper.parent.mkdir();wrapper.write_text("legacy wrapper");wrapper.chmod(0o755)
+    monkeypatch.setattr(update, "repo_root", lambda: tmp_path)
+    monkeypatch.setattr(shutil, "which", lambda name: "/opt/homebrew/bin/uv")
+    assert update._find_uv() == "/opt/homebrew/bin/uv"
