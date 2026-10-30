@@ -1,13 +1,13 @@
 # local-llm-server の導入を簡単にするためのラッパー。
-# 導入は標準の uv sync。運用は uv run gw サブコマンドで行う。
+# 導入は標準の uv sync。運用は gw サブコマンド（gw enable 後はどこからでも）で行う。
 .PHONY: help install dev check uninstall
 
 help:
-	@echo "make install    プロジェクト .venv を導入／更新し、自動起動を登録"
-	@echo "make uninstall  自動起動を解除し、設定・ログ・自動DLした llama.cpp を削除（モデル重みと .venv は保持）"
+	@echo "make install    プロジェクト .venv を導入／更新し、自動起動と ~/.local/bin/gw を登録"
+	@echo "make uninstall  自動起動と ~/.local/bin/gw を解除し、設定・ログ・自動DLした llama.cpp を削除（モデル重みと .venv は保持）"
 	@echo "make dev        開発用 venv を用意（uv sync。uv run pytest でテスト）"
 	@echo "make check      PR 前の検査を手元で回す（lint・型・セキュリティ・依存監査・テストと網羅率）"
-	@echo "運用: uv run gw status / uv run gw ps / uv run gw stop"
+	@echo "運用: gw status / gw ps / gw stop（どこからでも。uv run --frozen gw ... でも同じ）"
 
 # Standard uv project environment (.venv is a real directory).
 UV ?= uv
@@ -24,9 +24,11 @@ CACHE_DIR := $(if $(XDG_CACHE_HOME),$(XDG_CACHE_HOME),$(HOME)/.cache)/local-llm-
 # 他ツールと共用なので触らない——不要なら自分で消す。
 # ./.local-llm-server は旧バージョンが cwd に作っていたログの残骸（現行は作らない）。
 #
-# Use only the project's installed entry point; no global command links are created.
+# ~/.local/bin/gw は gw enable が置いたリンク。このチェックアウトの .venv/bin/gw を指すときだけ外す。
+LAUNCHER := $(HOME)/.local/bin/gw
 uninstall:
 	-if [ -x .venv/bin/gw ]; then .venv/bin/gw disable; .venv/bin/gw stop; fi
+	-if [ -L "$(LAUNCHER)" ] && [ "$$(readlink "$(LAUNCHER)")" = "$(CURDIR)/.venv/bin/gw" ]; then rm "$(LAUNCHER)"; fi
 	rm -rf "$(CONFIG_DIR)" "$(CACHE_DIR)" .local-llm-server
 	@echo "モデル重み ~/.cache/huggingface とプロジェクト .venv は未削除"
 

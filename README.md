@@ -20,10 +20,12 @@ uv run --frozen gw status
 
 Pythonは3.13.18、uvは0.13.6以上を使用する。`.python-version`と`uv.lock`に従い、
 uvがリポジトリ直下に実体の`.venv`を作成する。Python実行ファイルなどの内部構造はuv標準のまま。
-通常の実行は`uv run --frozen gw ...`。自動起動もこの`.venv`の実行ファイルを直接使う。
-`make install`は`uv sync --frozen`と`uv run --frozen gw enable`の補助にすぎず、
-独自の世代環境やグローバルコマンドのシンボリックリンクは作成しない。
-更新時は同じ`.venv`をロックされた依存に同期する。シェル設定やPC全体のPATHは変更しない。
+自動起動はこの`.venv`の実行ファイルを直接使う。
+ゲートウェイはPCに1つの常駐サービスなので、`gw enable`は同じ`.venv/bin/gw`を
+`~/.local/bin/gw`にもリンクし、どのディレクトリからでも`gw ...`で操作できるようにする
+（`uv run --frozen gw ...`でも同じ）。`make install`は`uv sync --frozen`と`uv run --frozen gw enable`の補助にすぎず、
+独自の世代環境は作成しない。更新時は同じ`.venv`をロックされた依存に同期する。
+シェル設定やPC全体のPATHは変更しない（`~/.local/bin`がPATHに無ければ`gw enable`が知らせる）。
 
 **利用する場合は`uv sync --frozen`を推奨**する。公開版に同梱された`uv.lock`を更新せず、
 その固定内容で環境を同期する指定であり、uv標準のオプション。各実行に対する指定で、永続的な設定ではない。

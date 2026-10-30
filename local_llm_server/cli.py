@@ -548,6 +548,7 @@ def cmd_enable(gcfg, args) -> int:
     kind = "launchd" if service.service_kind() == "launchd" else "systemd --user"
     print(f"自動起動を登録しました（{kind}）。ログイン時に自動起動し、異常終了時は自動復活します。")
     print("解除は gw disable（以後は手動 gw start）。停止だけなら従来どおり gw stop。")
+    _install_launcher(service)
     # サービスが立ち上がるのを軽く待って現況を見せる（初回はモデル導入等で遅いことも
     # あるので best-effort。間に合わなくても裏で起動は進む）。
     deadline = time.monotonic() + 30
@@ -559,6 +560,22 @@ def cmd_enable(gcfg, args) -> int:
     ready = admin is not None or is_ready(f"http://{host}:{port}/v1")
     print(render_status(gcfg, admin, ready))
     return 0
+
+
+def _install_launcher(service) -> None:
+    """登録したのと同じ gw を `~/.local/bin/gw` にリンクする。失敗しても登録は成功のまま。"""
+    link = service.launcher_path()
+    try:
+        gw = service.gw_executable()
+        status = service.install_launcher(gw)
+    except (OSError, RuntimeError) as exc:
+        print(f"{link} は置けませんでした: {exc}", file=sys.stderr)
+        return
+    if status != "unchanged":
+        print(f"どのディレクトリからでも gw で使えます（{link} → {gw}）。")
+    if not service.launcher_on_path():
+        print(f"{os.path.dirname(link)} が PATH にありません。gw だけで呼ぶには PATH に加えてください。",
+              file=sys.stderr)
 
 
 def cmd_disable(gcfg, args) -> int:
