@@ -1,22 +1,39 @@
 # 起動・運用・アンインストール
 
 標準のuvプロジェクト環境で運用する。この文書の`gw`コマンドは、リポジトリで
-`uv run gw ...`として実行する（または`.venv`をactivateして実行する）。
+`uv run --frozen gw ...`として実行する（または`.venv`をactivateして実行する）。
 
 ## インストール
 
 ```bash
 git clone https://github.com/ToPo-ToPo-ToPo/local-llm-server
 cd local-llm-server
-uv sync
-uv run gw enable     # 自動起動を使う場合
-uv run gw status
+uv sync --frozen
+uv run --frozen gw enable     # 自動起動を使う場合
+uv run --frozen gw status
 ```
 
 `.venv`はuvが作る実体のあるディレクトリー。Python実行ファイルなどの内部はuv標準に任せる。
 常駐サービスも、この`.venv/bin/gw`を直接登録する。グローバルな起動リンクは作らない。
 `make install`は`uv sync --frozen`と`uv run --frozen gw enable`を実行する補助。
 依存は`uv.lock`に従って同じ`.venv`へ同期し、通常の更新では世代別ディレクトリーを作らない。
+
+### uv syncの使い分け
+
+| 用途 | コマンド | ロックの扱い |
+|---|---|---|
+| 公開版の導入・利用環境の同期 | `uv sync --frozen` | 同梱の`uv.lock`を更新せず使う |
+| 依存を追加・変更する開発作業 | `uv sync` | 必要に応じて`uv.lock`も更新する |
+
+利用時はソースと`uv.lock`を同じ公開版に揃え、`--frozen`でその固定内容を使う。
+`--frozen`はこの実行でロックを更新しない指定であり、環境を永久に固定する設定ではない。
+また、`pyproject.toml`とロックの整合性確認は省略するため、依存定義を編集した後は
+`uv sync`でロックを同期して差分を確認する。通常の`uv sync`も、既存ロックが最新ならその固定内容を使い、
+毎回すべてのパッケージを最新版へ更新するわけではない。
+
+`uv run`にも`--frozen`を指定できる。利用時の起動例も`uv run --frozen gw ...`に揃える。
+どちらもuv標準の使い方で、実体の`.venv`を使う構成や証明書対策は変わらない。
+詳細は[uv公式のロックと同期の説明](https://docs.astral.sh/uv/concepts/projects/sync/)を参照。
 
 ### 以前のシンボリックリンク構成からの移行
 
@@ -34,10 +51,10 @@ Pythonは`.python-version`の3.13.18を使う。共有PythonやPC全体のPATH�
 モデル・設定は従来の場所を使い、移行後の起動と機能を確認してから旧環境を整理する。
 旧tool環境用の`scripts/install_runtime.py`と2世代保持処理は互換用に残すが、通常の導入では使わない。
 
-開発と検査も通常のuvで行う。
+依存を変更する開発作業では、通常のuvでロックも同期する。
 
 ```bash
-uv sync --frozen
+uv sync
 uv run pytest
 make check
 ```
@@ -80,12 +97,12 @@ GitHub CIは使用していないため、PR前にmake checkでlint・型・セ�
   メニューを開いた際の更新確認は裏で行い、結果は開いている更新項目へその場で反映する
   （メニューを閉じてもう一度押す必要はない）。
 
-## 起動と状態確認（どのディレクトリからでも）
+## 起動と状態確認（リポジトリ内）
 
 ```bash
-gw status     # 稼働/停止・PID・URL・起動経過・累計リクエストを 1 行表示
-gw ps         # ロード中モデルの状態（処理中数・在席・アイドル残り）
-gw start      # 手動起動（自動起動を無効にしている場合や、gw stop からの再開に）
+uv run --frozen gw status     # 稼働/停止・PID・URL・起動経過・累計リクエストを 1 行表示
+uv run --frozen gw ps         # ロード中モデルの状態（処理中数・在席・アイドル残り）
+uv run --frozen gw start      # 手動起動（自動起動を無効にしている場合や、gw stop からの再開に）
 ```
 
 設定ファイルは **`~/.config/local-llm-server/gateway.toml` の 1 箇所だけ**。無ければ初回の
@@ -218,8 +235,9 @@ GPU依存wheelが対応するLinux / Python<3.15に限定する。vLLM自体の�
 `make install`は標準の`uv sync --frozen`でプロジェクトの`.venv`を同期し、
 `uv run --frozen gw enable`で自動起動を登録する。依存の固定版はuv.lock、実行環境は.venvに集約する。
 旧tool導入専用の世代切り替え・自動整理は通常のプロジェクト環境には適用しない。
-追加の任意extrasを使う場合は、通常のuvと同様に`uv sync --extra <名前>`で指定する。
-Windowsでも標準のuvで環境を作り、`uv run gw start`で手動起動する（自動起動サービスは未対応）。
+追加の任意extrasを使う場合は、通常のuvと同様に`uv sync --frozen --extra <名前>`で指定する。
+その機能を使って起動する例は`uv run --frozen --extra <名前> gw start`。
+Windowsでも標準のuvで環境を作り、`uv run --frozen gw start`で手動起動する（自動起動サービスは未対応）。
 
 `gw pull`と`./scripts/hf`は、hf-xetの独立したRust TLS経路を迂回する。
 このアプリ内でHF_HUB_DISABLE_XET=1を設定するが、TLS証明書検証は有効のまま。
@@ -244,7 +262,7 @@ VS Codeはリポジトリ内`.vscode`のPythonパスを使用する。以前に�
 Python本体を変更しても、IDE/Electronやllama.cpp独自TLSの更新確認の代わりにはならない。
 
 通常の復元ではソースとuv.lockを対象リリースに合わせ、停止後に`uv sync --frozen`してから
-`uv run gw enable`で登録し直す。仮想環境フォルダーの移動・改名は行わない。
+`uv run --frozen gw enable`で登録し直す。仮想環境フォルダーの移動・改名は行わない。
 セキュリティ対策前のPythonや依存へ戻す場合は、その環境での外部通信を安全確認済みとは扱わない。
 
 
