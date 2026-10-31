@@ -139,7 +139,7 @@ ToPo-ToPo/gemma-4-31b-it-mlx-4bit
   **mlx-vlm 0.7.0 以降**が要る（本リポジトリのロックで担保）。
 - **Ornith-1.5-35B-A3B（qwen3_5_moe）**: 公式 bf16 内蔵の `mtp.*`（最終シャード
   `model-00016-of-00016.safetensors` に全部ある）を切り出した `ToPo-ToPo/Ornith-1.5-35B-A3B-MTP-bf16`。
-  **公式 bf16 本体 `ornith-ai/Ornith-1.5-35B-A3B` にだけ登録している**。実測（M3 Ultra・mlx-vlm 0.7.10）:
+  **公式 bf16 本体 `ornith-ai/Ornith-1.5-35B-A3B` にだけ登録している**。実測（MacBook Pro M4 Max 128GB・mlx-vlm 0.7.10）:
 
   | 本体 | 内容 | MTP なし | MTP あり（block 3） | 採択率 |
   |---|---|---|---|---|
