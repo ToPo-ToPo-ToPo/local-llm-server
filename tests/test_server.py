@@ -232,6 +232,16 @@ def test_topo_qwen36_mtp_pair_and_drafter_hidden():
     assert drafter in srv._DRAFTER_REPOS
 
 
+def test_ornith_35b_mtp_only_for_bf16_target():
+    """Ornith-1.5-35B-A3B は bf16 本体だけ MTP を引く（4bit は MTP の方が遅いので載せない）。"""
+    drafter = "ToPo-ToPo/Ornith-1.5-35B-A3B-MTP-bf16"
+    assert resolve_drafter("ornith-ai/Ornith-1.5-35B-A3B", "auto") == drafter
+    assert drafter in srv._DRAFTER_REPOS
+    for target in ("ToPo-ToPo/Ornith-1.5-35B-A3B-mlx-4bit",
+                   "ornith-ai/Ornith-1.5-35B-A3B-MLX-4bit"):
+        assert target not in MTP_DRAFTERS
+
+
 def test_build_command_mlx_no_draft_support(stub_cache):
     # テキスト専用 mlx には MTP を渡さない（mlx-vlm のみ対応）。
     cmd = build_command(ServerConfig("mlx", "m", draft_model="d"))

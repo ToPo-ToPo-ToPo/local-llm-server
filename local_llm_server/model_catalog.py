@@ -75,6 +75,13 @@ MTP_DRAFTERS = {
     "ToPo-ToPo/Qwen3.8-Flash-Next-mlx-4bit": "ToPo-ToPo/Qwen3.8-Flash-Next-MTP-bf16",
     "ToPo-ToPo/Qwen3.8-Flash-Next-mlx-8bit": "ToPo-ToPo/Qwen3.8-Flash-Next-MTP-bf16",
     "ToPo-ToPo/Qwen3.8-Flash-Next-mlx-bf16": "ToPo-ToPo/Qwen3.8-Flash-Next-MTP-bf16",
+    # Ornith-1.5-35B-A3B（qwen3_5_moe）。ドラフターは公式 bf16 内蔵の mtp.*（最終シャードに全部ある）を
+    # mlx-vlm 0.7.10 の qwen3_5_mtp.split で切り出した自作 MTP ヘッド（block_size 3）。公式 bf16 本体で
+    # 59.4 → 79.7 tok/s の 1.34 倍（コード・採択率 75.9%）、日本語自由文 1.13 倍。
+    # 4bit 本体（ToPo-ToPo/Ornith-1.5-35B-A3B-mlx-4bit・ornith-ai/…-MLX-4bit）は**載せない**:
+    # 採択率は高い（block 2 でコード 87.7%）が、A3B の 4bit は素で 114 tok/s と速く、ドラフト＋一括検証の
+    # コストが上回って 0.81〜0.91 倍に遅くなる。auto で引かせると遅くなるだけなので対象外にしている。
+    "ornith-ai/Ornith-1.5-35B-A3B": "ToPo-ToPo/Ornith-1.5-35B-A3B-MTP-bf16",
     # 自作 ToPo-ToPo 版 gemma 4。各 model card が推奨する Google 公式 MTP ドラフター
     # google/gemma-4-<size>-it-assistant を使う（mlx-vlm で変換不要・サイズ固有で量子化に依らず共通。
     # mlx-vlm >= 0.6.3 が必要）。
