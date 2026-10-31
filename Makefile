@@ -1,12 +1,13 @@
 # local-llm-server の導入を簡単にするためのラッパー。
 # 導入は `make install` の一度だけ。以降の運用はすべて `gw` サブコマンド（gw help で一覧）。
-.PHONY: help install dev check uninstall
+.PHONY: help install dev check mtp-check uninstall
 
 help:
 	@echo "make install    gw コマンドを PATH に導入／更新し、自動起動を登録（以後どこでも gw）"
 	@echo "make uninstall  自動起動を解除し、gw と設定・ログ・自動DLした llama.cpp を削除（モデル重みは対象外）"
 	@echo "make dev        開発用 venv を用意（uv sync。uv run pytest でテスト）"
 	@echo "make check      PR 前の検査を手元で回す（lint・型・セキュリティ・依存監査・テストと網羅率）"
+	@echo "make mtp-check  mlx-vlm 更新後に MTP の採択率・速度が劣化していないか実測する（Apple Silicon）"
 	@echo "運用は gw で行う: gw status / gw ps / gw stop（一覧は gw help。常駐は OS が世話する）"
 
 # Use a project-scoped toolchain and preserve previous runtime environments.
@@ -64,3 +65,8 @@ check:
 	$(UV) run pip-audit -r "$${TMPDIR:-/tmp}/local-llm-server-requirements.txt" --no-deps --disable-pip
 	$(UV) run coverage run -m pytest -q
 	$(UV) run coverage report
+
+# mlx-vlm 更新後の MTP 実測（docs/mtp.md）。取得済みの対応モデルを本体単独／MTP ありで生成して比べる。
+# 引数は ARGS で渡す（例: make mtp-check ARGS="ToPo-ToPo/Qwen3.6-27B-mlx-4bit --save-baseline"）。
+mtp-check:
+	$(UV) run --frozen python scripts/check_mtp.py $(ARGS)
