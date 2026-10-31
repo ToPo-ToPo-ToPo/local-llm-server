@@ -13,6 +13,10 @@ Ollama が「サーバーを意識せず使える」のは常駐を OS が管理
 （launchd は KeepAlive.SuccessfulExit=false、systemd は Restart=on-failure）。
 クラッシュループはスロットリングで頭打ちにする。「エージェントや corp がライフサイクルに
 触らない」ルールは不変——委任先はあくまで OS であり、真実は常に `gw status` の 1 箇所。
+
+常駐するゲートウェイはマシンに 1 つなので、`gw enable` は同じ gw を `~/.local/bin/gw`
+にもリンクする（どのディレクトリからでも `gw` で操作できるように）。リンク先は登録した
+サービスと同じプロジェクト .venv/bin/gw で、独自の環境は作らない。
 """
 from __future__ import annotations
 
@@ -40,13 +44,15 @@ def service_kind() -> str | None:
 def gw_executable() -> str:
     """サービス定義に書く gw 実行ファイルの絶対パスを解決する。
 
-    実行中の自分自身（sys.argv[0]）を優先する——`uv tool install` の
-    `~/.local/bin/gw` は再インストールでも変わらない安定パスで、venv の実体
-    （realpath）より寿命が長い。見つからなければ PATH から引く。
+    実行中の自分自身（sys.argv[0]）を優先する。標準の `uv run gw enable` は
+    プロジェクト .venv/bin/gw を直接登録する。`~/.local/bin/gw` などのリンクから
+    実行されたときはリンク先（.venv/bin/gw）を登録する。見つからなければ PATH から引く。
     """
     argv0 = sys.argv[0] or ""
     if os.path.basename(argv0) == "gw":
         path = os.path.abspath(argv0)
+        if os.path.islink(path):
+            path = os.path.realpath(path)
         if os.access(path, os.X_OK):
             return path
     resolved = shutil.which("gw")
@@ -54,6 +60,47 @@ def gw_executable() -> str:
         return os.path.abspath(resolved)
     raise RuntimeError(
         "gw 実行ファイルが見つかりません。`make install` で導入してから gw enable してください"
+    )
+
+
+def launcher_path() -> str:
+    """どこからでも `gw` を使うためのリンクの置き場所（uv の実行ファイル置き場と同じ）。"""
+    return os.path.join(os.path.expanduser("~"), ".local", "bin", "gw")
+
+
+def install_launcher(gw: str) -> str:
+    """`~/.local/bin/gw` を gw へのリンクにする（冪等）。結果を "created"/"updated"/"unchanged" で返す。
+
+    既存がリンクなら張り替える（旧 uv tool の残骸や別の場所の .venv を指していても）。
+    リンクでないファイルは利用者の物かもしれないので置き換えず RuntimeError。
+    """
+    link = launcher_path()
+    if os.path.islink(link):
+        if os.readlink(link) == gw:
+            return "unchanged"
+        status = "updated"
+    elif os.path.lexists(link):
+        raise RuntimeError(f"{link} がリンクではないため置き換えません（不要なら消してから gw enable）")
+    else:
+        status = "created"
+    os.makedirs(os.path.dirname(link), exist_ok=True)
+    # 一時リンクを作ってから置き換える（途中で gw が消えている瞬間を作らない）。
+    tmp = f"{link}.tmp-{os.getpid()}"
+    try:
+        os.symlink(gw, tmp)
+        os.replace(tmp, link)
+    finally:
+        if os.path.lexists(tmp):
+            os.remove(tmp)
+    return status
+
+
+def launcher_on_path() -> bool:
+    """`~/.local/bin` が PATH に入っているか（入っていなければリンクを置いても `gw` で呼べない）。"""
+    want = os.path.dirname(launcher_path())
+    return any(
+        os.path.abspath(os.path.expanduser(p)) == want
+        for p in os.environ.get("PATH", "").split(os.pathsep) if p
     )
 
 
@@ -143,6 +190,38 @@ def enable() -> None:
         _enable_launchd(gw)
     else:
         _enable_systemd(gw)
+
+
+def is_registered() -> bool:
+    """自動起動が登録済みか（定義ファイルの有無で見る。gw enable が書き、gw disable が消す）。"""
+    kind = service_kind()
+    if kind == "launchd":
+        return os.path.isfile(launchd_plist_path())
+    if kind == "systemd":
+        return os.path.isfile(systemd_unit_path())
+    return False
+
+
+def start() -> None:
+    """登録済みのサービスとして起動する（失敗は RuntimeError）。
+
+    gw start / restart / update の再起動もここを通し、サービス管理の外に手動デーモンを
+    作らない（作ると異常終了時の自動復活が次回ログインまで効かない）。呼ぶのは
+    ゲートウェイが応答していないときだけで、走っている登録ジョブは入れ替える
+    （launchd は -k。stop 直後に launchd がまだ終了を拾っていなくても確実に起動させる）。
+    """
+    kind = service_kind()
+    if kind == "launchd":
+        cmd = ["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{LAUNCHD_LABEL}"]
+    elif kind == "systemd":
+        cmd = ["systemctl", "--user", "restart", SYSTEMD_UNIT]
+    else:
+        raise RuntimeError("この OS では自動起動サービスに未対応です")
+    res = _run(cmd)
+    if res.returncode != 0:
+        raise RuntimeError(
+            f"{' '.join(cmd)} に失敗しました: {res.stderr.strip() or res.stdout.strip()}"
+        )
 
 
 def disable() -> bool:

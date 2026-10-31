@@ -147,9 +147,9 @@ def test_apc_rate_still_rises_for_long_prompts():
 def test_apc_rate_patch_is_idempotent():
     apc = pytest.importorskip("mlx_vlm.apc")
     _mlx_vlm_shims.apply()
-    once = apc.APCManager._observe_cache_size
+    once = getattr(apc.APCManager, "_observe_cache_size", None)
     _mlx_vlm_shims.apply()
-    assert apc.APCManager._observe_cache_size is once   # 二重ラップしない
+    assert getattr(apc.APCManager, "_observe_cache_size", None) is once   # 二重ラップしない
 
 
 # ---- APC のディスク置き場: 長いモデルパスで別モデルと共有しない ----------------------

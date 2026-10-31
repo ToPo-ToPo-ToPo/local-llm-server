@@ -1,6 +1,6 @@
 """mlx-vlm を更新したあとに MTP（speculative decoding）が劣化していないかを実測で確かめる。
 
-Run with ./scripts/uv run --frozen python scripts/check_mtp.py [model ...]
+Run with uv run --frozen python scripts/check_mtp.py [model ...]
 
 ドラフターの重みは変換時の mlx-vlm の形式（重み名・ノルムの +1.0 補正・config 項目）で
 焼き込まれており、実行時の mlx-vlm がその解釈を変えると**黙って**採択率が落ちる（本体が

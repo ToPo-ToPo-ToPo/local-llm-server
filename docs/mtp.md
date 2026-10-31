@@ -126,8 +126,8 @@ ToPo-ToPo/gemma-4-31b-it-mlx-4bit
 
 ```bash
 make mtp-check                                   # 取得済みの対応モデルを全部測る
-./scripts/uv run --frozen python scripts/check_mtp.py ToPo-ToPo/Qwen3.6-27B-mlx-4bit
-./scripts/uv run --frozen python scripts/check_mtp.py --save-baseline   # 今回を基準として保存
+uv run --frozen python scripts/check_mtp.py ToPo-ToPo/Qwen3.6-27B-mlx-4bit
+uv run --frozen python scripts/check_mtp.py --save-baseline   # 今回を基準として保存
 ```
 
 本体単独と MTP ありを同じ条件（greedy・コード生成と日本語自由文）で生成し、導入済み `gw` の

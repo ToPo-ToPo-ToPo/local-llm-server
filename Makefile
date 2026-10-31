@@ -1,63 +1,46 @@
 # local-llm-server の導入を簡単にするためのラッパー。
-# 導入は `make install` の一度だけ。以降の運用はすべて `gw` サブコマンド（gw help で一覧）。
+# 導入は標準の uv sync。運用は gw サブコマンド（gw enable 後はどこからでも）で行う。
 .PHONY: help install dev check mtp-check uninstall
 
 help:
-	@echo "make install    gw コマンドを PATH に導入／更新し、自動起動を登録（以後どこでも gw）"
-	@echo "make uninstall  自動起動を解除し、gw と設定・ログ・自動DLした llama.cpp を削除（モデル重みは対象外）"
+	@echo "make install    プロジェクト .venv を導入／更新し、自動起動と ~/.local/bin/gw を登録"
+	@echo "make uninstall  自動起動と ~/.local/bin/gw を解除し、設定・ログ・自動DLした llama.cpp を削除（モデル重みと .venv は保持）"
 	@echo "make dev        開発用 venv を用意（uv sync。uv run pytest でテスト）"
 	@echo "make check      PR 前の検査を手元で回す（lint・型・セキュリティ・依存監査・テストと網羅率）"
 	@echo "make mtp-check  mlx-vlm 更新後に MTP の採択率・速度が劣化していないか実測する（Apple Silicon）"
-	@echo "運用は gw で行う: gw status / gw ps / gw stop（一覧は gw help。常駐は OS が世話する）"
+	@echo "運用: gw status / gw ps / gw stop（どこからでも。uv run --frozen gw ... でも同じ）"
 
-# Use a project-scoped toolchain and preserve previous runtime environments.
-UV := ./scripts/uv
+# Standard uv project environment (.venv is a real directory).
+UV ?= uv
 install:
-	$(UV) run --no-project --python 3.13.18 scripts/install_runtime.py --activate
+	$(UV) sync --frozen
+	$(UV) run --frozen gw enable
 
 # 設定・キャッシュの置き場所（cli.py / provisioner.py と同じ XDG 規則で解決する）。
 CONFIG_DIR := $(if $(XDG_CONFIG_HOME),$(XDG_CONFIG_HOME),$(HOME)/.config)/local-llm-server
 CACHE_DIR := $(if $(XDG_CACHE_HOME),$(XDG_CACHE_HOME),$(HOME)/.cache)/local-llm-server
 
-# `make install` の逆。常駐を止め、gw を除去し、クローン外に残るものまで消す。
+# 常駐と自動起動を解除し、アプリ設定・ログを削除する。
 # gw が未導入でも失敗させない（`-` で続行）。モデル本体（~/.cache/huggingface）は
 # 他ツールと共用なので触らない——不要なら自分で消す。
 # ./.local-llm-server は旧バージョンが cwd に作っていたログの残骸（現行は作らない）。
 #
-# make は /bin/sh（非ログインシェル）で走るため ~/.local/bin が PATH に無いことがある。
-# install と同じく uv tool の既定 bin を直接叩き、gw 自体がもう無い場合でも
-# launchd 登録の解除とプロセス停止は素の launchctl / pkill で必ずやり切る
-# （gw が消えた後にアイコンとデーモンだけ残る事故を防ぐ）。
+# ~/.local/bin/gw は gw enable が置いたリンク。このチェックアウトの .venv/bin/gw を指すときだけ外す。
+LAUNCHER := $(HOME)/.local/bin/gw
 uninstall:
-	-GW="$$HOME/.local/bin/gw"; command -v gw >/dev/null 2>&1 && GW="$$(command -v gw)"; \
-	if [ -x "$$GW" ]; then "$$GW" disable && "$$GW" stop; else \
-	  launchctl bootout "gui/$$(id -u)/com.local-llm-server.gw" 2>/dev/null; \
-	  rm -f "$$HOME/Library/LaunchAgents/com.local-llm-server.gw.plist"; \
-	  pkill -f "python[3]* -m local_llm_server" 2>/dev/null; \
-	fi; true
-	@# /usr/local/bin の gw（install が置いた symlink）を除去する。自分が置いたもの
-	@# （リンク先が ~/.local/bin/gw）だけを対象にし、無関係な同名バイナリには触れない。
-	-@DEST=/usr/local/bin/gw; \
-	if [ "$$(readlink "$$DEST" 2>/dev/null)" = "$$HOME/.local/bin/gw" ]; then \
-	  rm -f "$$DEST" 2>/dev/null || \
-	  sudo -p "[sudo] /usr/local/bin/gw を削除するため管理者パスワード: " rm -f "$$DEST"; \
-	fi
-	$(UV) run --no-project --python 3.13.18 scripts/install_runtime.py --uninstall
+	-if [ -x .venv/bin/gw ]; then .venv/bin/gw disable; .venv/bin/gw stop; fi
+	-if [ -L "$(LAUNCHER)" ] && [ "$$(readlink "$(LAUNCHER)")" = "$(CURDIR)/.venv/bin/gw" ]; then rm "$(LAUNCHER)"; fi
 	rm -rf "$(CONFIG_DIR)" "$(CACHE_DIR)" .local-llm-server
-	@echo "削除: $(CONFIG_DIR)（設定）"
-	@echo "削除: $(CACHE_DIR)（ログと自動DLした llama.cpp）"
-	@echo "モデル重み ~/.cache/huggingface は未削除（共用のため手動で）"
+	@echo "モデル重み ~/.cache/huggingface とプロジェクト .venv は未削除"
 
 dev:
 	$(UV) sync
-	$(UV) --no-config pip install --no-deps --require-hashes -r requirements/test-client.lock
 
 # PR 前の検査。GitHub の CI は使わない（課金制限でジョブが起動せず、失敗の信号として
 # 機能していなかった）ので、以前 CI の quality ジョブで回していたものをここで回す。
 # テストは網羅率の計測を兼ねて 1 回だけ走らせる（下限は pyproject の fail_under）。
 check:
 	$(UV) sync --dev --frozen
-	$(UV) --no-config pip install --no-deps --require-hashes -r requirements/test-client.lock
 	$(UV) run ruff check --select E9,F63,F7,F82 local_llm_server tests
 	$(UV) run mypy --ignore-missing-imports --follow-imports=skip --check-untyped-defs local_llm_server
 	$(UV) run bandit -r local_llm_server -q -lll

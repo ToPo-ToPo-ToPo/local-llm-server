@@ -461,6 +461,41 @@ def _start_cwd(gcfg) -> str:
 
 
 def cmd_start(gcfg, args) -> int:
+    from . import service
+
+    if service.is_registered():
+        return _start_via_service(gcfg, service)
+    return _start_background(gcfg)
+
+
+def _start_via_service(gcfg, service) -> int:
+    """自動起動の登録があれば、起動もサービス管理（launchd / systemd）に任せる。
+
+    `gw stop` 後の `gw start`、`gw restart`、`gw update` の再起動がここを通る。手動の
+    デーモンを別に立てると管理者が OS から外れ、異常終了時の自動復活が効かなくなる。
+    """
+    host, port, _ = _endpoint(gcfg)
+    admin = gateway_admin_status(host, port)
+    if admin is None:
+        try:
+            service.start()
+        except RuntimeError as exc:
+            print(f"{exc}。サービス管理を使わずに起動します（戻すには gw enable）。",
+                  file=sys.stderr)
+            return _start_background(gcfg)
+        deadline = time.monotonic() + 120
+        while not is_ready(f"http://{host}:{port}/v1"):
+            if time.monotonic() >= deadline:
+                print(f"start failed: gateway did not become ready; see {service.service_log_path()}",
+                      file=sys.stderr)
+                return 1
+            time.sleep(0.5)
+        admin = gateway_admin_status(host, port)
+    print(render_status(gcfg, admin, True))
+    return 0
+
+
+def _start_background(gcfg) -> int:
     host, port, _ = _endpoint(gcfg)
     cwd = _start_cwd(gcfg)
     try:
@@ -548,6 +583,7 @@ def cmd_enable(gcfg, args) -> int:
     kind = "launchd" if service.service_kind() == "launchd" else "systemd --user"
     print(f"自動起動を登録しました（{kind}）。ログイン時に自動起動し、異常終了時は自動復活します。")
     print("解除は gw disable（以後は手動 gw start）。停止だけなら従来どおり gw stop。")
+    _install_launcher(service)
     # サービスが立ち上がるのを軽く待って現況を見せる（初回はモデル導入等で遅いことも
     # あるので best-effort。間に合わなくても裏で起動は進む）。
     deadline = time.monotonic() + 30
@@ -559,6 +595,22 @@ def cmd_enable(gcfg, args) -> int:
     ready = admin is not None or is_ready(f"http://{host}:{port}/v1")
     print(render_status(gcfg, admin, ready))
     return 0
+
+
+def _install_launcher(service) -> None:
+    """登録したのと同じ gw を `~/.local/bin/gw` にリンクする。失敗しても登録は成功のまま。"""
+    link = service.launcher_path()
+    try:
+        gw = service.gw_executable()
+        status = service.install_launcher(gw)
+    except (OSError, RuntimeError) as exc:
+        print(f"{link} は置けませんでした: {exc}", file=sys.stderr)
+        return
+    if status != "unchanged":
+        print(f"どのディレクトリからでも gw で使えます（{link} → {gw}）。")
+    if not service.launcher_on_path():
+        print(f"{os.path.dirname(link)} が PATH にありません。gw だけで呼ぶには PATH に加えてください。",
+              file=sys.stderr)
 
 
 def cmd_disable(gcfg, args) -> int:
@@ -979,7 +1031,7 @@ def cmd_update(gcfg, args) -> int:
         return 1
     # 新版で廃止・改名されたキーを設定へ反映する（この後の再起動で新スキーマのまま立ち上がる）。
     migrate.migrate_quietly(user_config_path(), log=print)
-    # 稼働中なら新コードで再起動（stop → start）。
+    # 稼働中なら新コードで再起動（stop → start。自動起動の登録があれば start はサービス経由）。
     host, port, all_ports = _endpoint(gcfg)
     if is_ready(f"http://{host}:{port}/v1"):
         _stop_pids(_collect_gateway_pids(host, port, all_ports))

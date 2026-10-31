@@ -8,34 +8,44 @@
 
 ## インストール
 
-[uv](https://docs.astral.sh/uv/) を使う。一度入れれば**どこからでも `gw`**。
+[uv](https://docs.astral.sh/uv/) の標準プロジェクト環境を使う。
 
 ```bash
 git clone https://github.com/ToPo-ToPo-ToPo/local-llm-server
 cd local-llm-server
-make install    # 専用環境を作成し、アプリの起動参照と自動起動を登録する
+uv sync --frozen
+uv run --frozen gw enable    # 自動起動を使う場合
+uv run --frozen gw status
 ```
 
-Pythonは3.13.18、uvは0.13.6以上を使用する。`scripts/uv`はリポジトリ専用の
-ツール・Python・キャッシュを優先し、シェル設定やPC全体のPATHを書き換えない。
-`make install`は新しいtool環境を別ディレクトリに作成し、既存環境を保存して
-`~/.local/bin/gw`とアプリ専用サービスを切り替える。PATH未設定ならこの絶対パスで実行する。
-既存インストールの依存版を引き継ぎ、セキュリティ更新が必要なパッケージだけを検証済み版へ上げる。
-更新済み・より新しい版は維持し、任意のバックエンドも消さない。切り替え前に新環境を検証する。
+Pythonは3.13.18、uvは0.13.6以上を使用する。`.python-version`と`uv.lock`に従い、
+uvがリポジトリ直下に実体の`.venv`を作成する。Python実行ファイルなどの内部構造はuv標準のまま。
+自動起動はこの`.venv`の実行ファイルを直接使う。
+ゲートウェイはPCに1つの常駐サービスなので、`gw enable`は同じ`.venv/bin/gw`を
+`~/.local/bin/gw`にもリンクし、どのディレクトリからでも`gw ...`で操作できるようにする
+（`uv run --frozen gw ...`でも同じ）。`make install`は`uv sync --frozen`と`uv run --frozen gw enable`の補助にすぎず、
+独自の世代環境は作成しない。更新時は同じ`.venv`をロックされた依存に同期する。
+シェル設定やPC全体のPATHは変更しない（`~/.local/bin`がPATHに無ければ`gw enable`が知らせる）。
+
+**利用する場合は`uv sync --frozen`を推奨**する。公開版に同梱された`uv.lock`を更新せず、
+その固定内容で環境を同期する指定であり、uv標準のオプション。各実行に対する指定で、永続的な設定ではない。
+依存を追加・変更する開発作業では`uv sync`を使い、必要なロック変更も反映する。
+設定と`uv.lock`が一致していれば、どちらでも同じ固定内容が使われる。
+詳しい使い分けは[運用手順](docs/operation.md#uv-syncの使い分け)を参照。
 導入の詳細とTLS要件は[運用手順](docs/operation.md#tlsと実行環境)を参照。
 
-モデルの取得には`gw pull`または`./scripts/hf download`を使う。
+モデルの取得には`uv run --frozen gw pull`または`./scripts/hf download`を使う。
 修正済みhf-xetの動作を確認するまではPython HTTP経路を使用するため、
 大容量ファイルの転送速度・帯域・キャッシュ効率に影響する場合がある。
 
 ## 使い方
 
 ```bash
-gw status     # 稼働/停止・PID・URL・起動経過を表示（自動起動済みなら常に稼働）
-gw list       # 使えるモデル一覧（カタログ＋HF キャッシュ）
-gw stop       # 停止（再開は gw start か次回ログイン）
-gw start      # 手動起動（初回は設定を自動生成。自動起動を無効にした場合の入口）
-gw update     # 更新を取り込む（新版の確認は自動、適用はこのコマンドだけ）
+uv run --frozen gw status     # 稼働/停止・PID・URL・起動経過を表示（自動起動済みなら常に稼働）
+uv run --frozen gw list       # 使えるモデル一覧（カタログ＋HF キャッシュ）
+uv run --frozen gw stop       # 停止（再開は gw start か次回ログイン）
+uv run --frozen gw start      # 手動起動（初回は設定を自動生成。自動起動を無効にした場合の入口）
+uv run --frozen gw update     # 更新を取り込む（新版の確認は自動、適用はこのコマンドだけ）
 ```
 
 設定は **`~/.config/local-llm-server/gateway.toml` の 1 箇所**（初回の `gw start` が自動生成。
