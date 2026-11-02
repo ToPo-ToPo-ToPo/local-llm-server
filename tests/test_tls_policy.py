@@ -17,15 +17,20 @@ from local_llm_server import tls_policy, update
     ((3,11,17),(3,11,18)), ((3,12,15),(3,12,16)),
     ((3,13,17),(3,13,18)), ((3,14,9),(3,14,10)), ((3,15,1),(3,15,2)),
 ])
-def test_security_release_boundaries_match_package_metadata(before, after):
-    root = Path(__file__).resolve().parents[1]
-    for project in (root, root / "experimental/strata_lite"):
-        metadata = tomllib.loads((project/"pyproject.toml").read_text())
-        requirement = SpecifierSet(metadata["project"]["requires-python"])
-        assert ".".join(map(str,before)) not in requirement
-        assert ".".join(map(str,after)) in requirement
+def test_security_release_boundaries(before, after):
     assert not tls_policy.python_is_secure(before)
     assert tls_policy.python_is_secure(after)
+
+
+def test_package_metadata_requires_python_3_15_2():
+    """Python は 3.15.2 以上に一本化(2026-11-02)。未修正の 3.15.0/3.15.1 と、それより古い系列は入れない。
+    experimental/strata_lite は対象外(CUDA 版 torch の cu128 wheel に 3.15 が無く、実験の記録として残すだけ)。"""
+    root = Path(__file__).resolve().parents[1]
+    metadata = tomllib.loads((root/"pyproject.toml").read_text())
+    requirement = SpecifierSet(metadata["project"]["requires-python"])
+    for old in ("3.13.18", "3.14.10", "3.15.1"):
+        assert old not in requirement
+    assert "3.15.2" in requirement and "3.16.0" in requirement
 
 
 def test_xet_disabled_even_if_hub_was_imported(monkeypatch):
@@ -91,9 +96,9 @@ def test_macos_backend_matches_available_python_wheels(monkeypatch):
     from local_llm_server import backend_core
     monkeypatch.setattr(backend_core.sys, "platform", "darwin")
     monkeypatch.setattr(backend_core.platform, "machine", lambda: "arm64")
-    monkeypatch.setattr(backend_core.sys, "version_info", (3, 14, 10))
+    monkeypatch.setattr(backend_core.sys, "version_info", (3, 15, 2))     # 3.15 でも MLX の wheel がある(2026-11-02)
     assert backend_core.default_backend() == "mlx-vlm"
-    monkeypatch.setattr(backend_core.sys, "version_info", (3, 15, 2))
+    monkeypatch.setattr(backend_core.platform, "machine", lambda: "x86_64")
     assert backend_core.default_backend() == "llama-cpp"
 
 

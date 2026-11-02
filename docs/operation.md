@@ -51,7 +51,7 @@ uv run --frozen gw enable
 ```
 
 古いPythonでは新しい`gw`が起動を拒むため、最初の`uv sync`には修正済みuv 0.13.6以上を使う。
-Pythonは`.python-version`の3.13.18を使う。共有PythonやPC全体のPATH・シェル設定は変更しない。
+Pythonは`.python-version`の3.15.2を使う。共有PythonやPC全体のPATH・シェル設定は変更しない。
 モデル・設定は従来の場所を使い、移行後の起動と機能を確認してから旧環境を整理する。
 旧tool環境用の`scripts/install_runtime.py`と2世代保持処理は互換用に残すが、通常の導入では使わない。
 旧`uv tool install`で入れていた場合は、先に`uv tool uninstall local-llm-server`で外してから
@@ -227,17 +227,15 @@ make uninstall   # プロジェクトのgwで停止・登録解除し、設定�
 
 ## TLSと実行環境
 
-開発環境は`.python-version`のCPython 3.13.18に固定する。`make dev`、`make check`、
+開発環境は`.python-version`のCPython 3.15.2に固定する。`make dev`、`make check`、
 `uv run --frozen …`を使用する。uvは0.13.6以上を必要とする。
 リポジトリ専用uvを使う場合の配置先は`.tools/uv/0.13.6/uv`（Windowsはuv.exe）。
 公式配布物を取得し、公式リリースのハッシュ・署名情報を確認して配置する。
 既存の信頼ストアが未修正のツールでブートストラップしないこと。
 共有uv、シェル設定、PC既定PythonやOS証明書ストアの変更は不要。
 
-公開パッケージの最小Pythonは系列ごとに3.11.18、3.12.16、3.13.18、3.14.10、
-3.15.2。既知の未修正パッチをRequires-Pythonでも除外する。certifi>=2026.10.19、
-pipを使う環境ではpip>=26.2.2を必要とする。vLLM 0.28.0の追加機能は、固定された
-GPU依存wheelが対応するLinux / Python<3.15に限定する。vLLM自体の固定版は維持する。
+公開パッケージの最小Pythonは3.15.2に一本化した(2026-11-02。Python 3.15以上を一律で使う方針)。certifi>=2026.10.19、
+pipを使う環境ではpip>=26.2.2を必要とする。vLLM 0.28.0の追加機能(extra)は、固定されたGPU依存wheelがPython 3.15に未対応のため当面入らない。固定版は維持する。
 参照: [Python公式](https://blog.python.org/2026/10/python-3152-31410-31318-31216-31118/)、
 [pip](https://pip.pypa.io/en/stable/news/)、[uv](https://github.com/astral-sh/uv/releases/tag/0.13.6)。
 
@@ -279,9 +277,12 @@ Python本体を変更しても、IDE/Electronやllama.cpp独自TLSの更新確�
 この固定ファイルは開発環境専用で、稼働用MLX等を更新しない。
 
 
-Python 3.15はゲートウェイ本体・llama.cppの対象とする。Mac用MLX/torchvisionの
-対応wheelが揃っていないため、MLX系の自動依存と既定選択はPython<3.15に限定する。
-このリポジトリで固定するPython 3.13.18では、従来どおりMLXを使用できる。
+Python 3.15以上を一律で使う(2026-11-02)。Mac用MLX/torchvisionの3.15対応wheel(mlx 0.32.4、
+torch 2.15、torchvision 0.29)が揃ったので、MLX系の自動依存もPython 3.15で入る。uv tool版
+(`~/.local/bin/gw`)を入れ直すときも`uv tool install --python 3.15.2 -e .`で同じ依存が入る
+(Python 3.15でMLXが無い環境から起動した旧版は、モデルを起動できなかった)。
+`experimental/strata_lite`だけは対象外(CUDA版torchのcu128 wheelに3.15が無い。実験の記録として残すだけで、
+本体の依存にも検査にも入っていない)。
 
 
 ### 追加の依存セキュリティ更新（2026-10-28）
