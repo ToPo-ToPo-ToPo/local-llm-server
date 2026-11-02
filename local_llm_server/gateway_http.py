@@ -347,44 +347,11 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
                 return
             finally:
                 srv._media_slots.release()
-        # 繰り返しループ抑制: mlx 系宛の生成リクエストに repetition_penalty を既定注入する
-        # （chat/text completions のみ。クライアント明示は尊重。設定で無効化可）。
+        # 生成のパラメータ（温度・繰り返しの抑制など）はクライアントの指定をそのまま渡し、
+        # ゲートウェイからは足さない。足すのは disable_thinking を指定したモデルの思考 OFF だけ。
         if path.endswith(("/chat/completions", "/completions")):
-            body = self._maybe_inject_repetition(srv, model, payload, body)
             body = self._maybe_disable_thinking(srv, model, payload, body)
         self._acquire_and_forward(srv, model, body)
-
-    def _maybe_inject_repetition(self, srv, model, payload: dict, body: bytes) -> bytes:
-        """mlx / mlx-vlm 宛のリクエストに repetition_penalty（+任意で context_size）を付与する。
-
-        - サーバー設定が無効（None）なら何もしない（＝設定しない選択）。
-        - クライアントが自分で repetition_penalty を指定していれば尊重して上書きしない。
-        - バックエンドが mlx 系でなければ何もしない（llama-cpp は名前が repeat_penalty で別物）。
-        戻り値は（必要なら差し替えた）リクエストボディ。
-        """
-        rp = getattr(srv, "repetition_penalty", None)
-        if rp is None or not isinstance(model, str):
-            return body
-        if "repetition_penalty" in payload:
-            return body
-        # 構造化リクエスト保護（既定オフ）: tools（native ツールコール）や response_format
-        # （構造化出力）を含むリクエストには注入しない。JSON 構文の必須の繰り返しを減点しうる
-        # のを避ける保険（有効化は gateway.toml の repetition_penalty_skip_structured = true）。
-        if getattr(srv, "repetition_penalty_skip_structured", False) and (
-            "tools" in payload or "response_format" in payload
-        ):
-            return body
-        try:
-            backend = srv.manager.backend_for(model)
-        except Exception:  # noqa: BLE001 - 判定不能なら注入しない（安全側）
-            return body
-        if backend not in ("mlx", "mlx-vlm"):
-            return body
-        payload["repetition_penalty"] = rp
-        rcs = getattr(srv, "repetition_context_size", None)
-        if rcs is not None and "repetition_context_size" not in payload:
-            payload["repetition_context_size"] = rcs
-        return json.dumps(payload).encode("utf-8")
 
     def _maybe_disable_thinking(self, srv, model, payload: dict, body: bytes) -> bytes:
         """mlx-vlm 宛のリクエストに reasoning_effort="none" を注入して思考を止める。

@@ -279,7 +279,7 @@ class ModelManager:
     def backend_for(self, model_id: str) -> str:
         """model_id のバックエンドを返す（登録済みは config 値、未登録は ID から推論）。
 
-        do_POST が「mlx 系のみ repetition_penalty を注入する」判定に使う。acquire 前でも
+        do_POST が「mlx-vlm 宛だけ思考 OFF を注入する」判定に使う。acquire 前でも
         判定できるよう、まだ登録されていない動的モデルは ID から推論する。
         """
         with self._state:

@@ -349,6 +349,19 @@ def test_migrate_comments_out_removed_auto_update(tmp_path, monkeypatch, capsys)
     assert "port = 8799" in text
 
 
+def test_migrate_removes_repetition_keys(tmp_path, monkeypatch, capsys):
+    # 0.38.33 で廃止した繰り返しの抑制の設定を消す。repetition_penalty は理由を残す。
+    p = _use_cfg(tmp_path, monkeypatch,
+                 "port = 8799\nrepetition_penalty = 1.2\nrepetition_context_size = 64   # 窓\n"
+                 "repetition_penalty_skip_structured = true\n")
+    assert cli.main(["migrate"]) == 0
+    text = p.read_text(encoding="utf-8")
+    assert "repetition_penalty = 1.2" not in text and "repetition_context_size = 64" not in text
+    assert "repetition_penalty_skip_structured = true" not in text
+    assert "# repetition_penalty は 0.38.33 で廃止" in text
+    assert "port = 8799" in text
+
+
 def test_start_migrates_config_before_launch(tmp_path, monkeypatch):
     # 起動系は設定を読む前に移行する（更新後に `gw start` するだけで新スキーマに揃う）。
     p = _use_cfg(tmp_path, monkeypatch, 'vision_model = "org/vis"\nport = 8799\n')

@@ -39,6 +39,13 @@ OBSOLETE_KEYS: dict[str, tuple[str, str, bool]] = {
         "更新の適用は常に手動（`gw update`）。デーモンは新版の確認と通知だけ行う",
         True,
     ),
+    "repetition_penalty": (
+        "0.38.33",
+        "ゲートウェイは生成のパラメータを足さない（繰り返しの抑制が要るならクライアントが指定する）",
+        True,
+    ),
+    "repetition_context_size": ("0.38.33", "repetition_penalty の既定注入の廃止に伴う", False),
+    "repetition_penalty_skip_structured": ("0.38.33", "repetition_penalty の既定注入の廃止に伴う", False),
 }
 
 # 改名されたトップレベルキー: 旧キー名 -> (新キー名, 改名したバージョン)。

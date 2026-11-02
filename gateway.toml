@@ -42,20 +42,6 @@ start_timeout = 600         # モデルサーバー1つの起動完了（ready�
 idle_timeout = 1200         # この秒数（=20分）使われないモデルは自動アンロードしてメモリ解放（既定 1200。0 で無効）
 internal_base_port = 9001   # 内部モデルサーバーの割当開始ポート（9001, 9002, ... と連番）
 
-# ── 繰り返しループ抑制（mlx / mlx-vlm 系のみ。既定で有効）──
-# 低温・量子化のローカル LLM は「同じ内容を延々と繰り返して終わらない」degeneration に
-# 陥りやすい。これを緩和するため、mlx 系バックエンド宛の chat リクエストへ
-# repetition_penalty を**既定で注入**する（mlx-lm/mlx-vlm 拡張。llama-cpp は名前が
-# repeat_penalty で別物なので対象外）。クライアントが自分で repetition_penalty を
-# 指定していれば尊重して上書きしない。
-# repetition_penalty = 1.1          # 既定 1.1（穏当）。1.1〜1.3 が実用域。大きいほど強く抑制するが
-                                    # 文法・必要な繰り返しも巻き添えになり不自然になりやすい
-# repetition_penalty = 0            # 0 / false / "off" で**無効化**（注入しない＝「設定しない」選択）
-repetition_context_size = 64        # 参照する直近トークン窓（上流既定 20 は狭く長い反復退化を捉えきれない。研究推奨 64）
-# repetition_penalty_skip_structured = true  # tools（native ツールコール）や response_format（構造化出力）を
-#                                   # 含むリクエストには注入しない（既定 false＝全 chat に注入）。JSON 構文の
-#                                   # 必須の繰り返しを減点しうるのを避ける保険（実測では 1.1 で実害なし）
-
 # ── 在席ベースの早期アンロード（任意。使わなくても idle_timeout で解放される）──
 # エージェントは利用開始/終了をゲートウェイへ通知できる。あるモデルの在席が 0 になったら、
 # 処理中でなければ短い猶予（60 秒・コード定数）ののち idle_timeout を待たずに解放する。

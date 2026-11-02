@@ -153,9 +153,6 @@ class GatewayServer(ThreadingHTTPServer):
         video_frames: int = 8,
         video_max_edge: int = 768,
         image_max_edge: int = 1024,
-        repetition_penalty: float | None = None,
-        repetition_context_size: int | None = None,
-        repetition_penalty_skip_structured: bool = False,
         max_request_workers: int = 32,
         max_media_workers: int = 2,
         listen_fd: int | None = None,
@@ -181,12 +178,6 @@ class GatewayServer(ThreadingHTTPServer):
         self._request_slots = threading.BoundedSemaphore(max_request_workers)
         self._media_slots = threading.BoundedSemaphore(max_media_workers)
         self.manager = manager
-        # 繰り返しループ抑制の既定注入（mlx 系のみ。None で無効）。do_POST が chat リクエストに
-        # 付与する（クライアントが自分で指定していれば尊重して上書きしない）。
-        self.repetition_penalty = repetition_penalty
-        self.repetition_context_size = repetition_context_size
-        # true なら tools / response_format を含む structured リクエストには注入しない（既定 false）。
-        self.repetition_penalty_skip_structured = repetition_penalty_skip_structured
         self.catalog = catalog  # /v1/models で返すモデル一覧
         self.default_model = default_model
         self.timeout_s = timeout_s  # None なら無制限（長時間生成に備える）
@@ -385,25 +376,6 @@ def apply_live_config(
     if cfg.image_max_edge != new.image_max_edge:
         note("image_max_edge", cfg.image_max_edge, new.image_max_edge)
         server.image_max_edge = new.image_max_edge
-    if cfg.repetition_penalty != new.repetition_penalty:
-        note("repetition_penalty", cfg.repetition_penalty, new.repetition_penalty)
-        server.repetition_penalty = new.repetition_penalty
-    if cfg.repetition_context_size != new.repetition_context_size:
-        note(
-            "repetition_context_size",
-            cfg.repetition_context_size,
-            new.repetition_context_size,
-        )
-        server.repetition_context_size = new.repetition_context_size
-    if cfg.repetition_penalty_skip_structured != new.repetition_penalty_skip_structured:
-        note(
-            "repetition_penalty_skip_structured",
-            cfg.repetition_penalty_skip_structured,
-            new.repetition_penalty_skip_structured,
-        )
-        server.repetition_penalty_skip_structured = (
-            new.repetition_penalty_skip_structured
-        )
     if cfg.default_model != new.default_model:
         note("default_model", cfg.default_model, new.default_model)
         server.default_model = new.default_model
@@ -991,9 +963,6 @@ def _run_gateway_session(
             video_frames=cfg.video_frames,
             video_max_edge=cfg.video_max_edge,
             image_max_edge=cfg.image_max_edge,
-            repetition_penalty=cfg.repetition_penalty,
-            repetition_context_size=cfg.repetition_context_size,
-            repetition_penalty_skip_structured=cfg.repetition_penalty_skip_structured,
             max_request_workers=cfg.max_request_workers,
             max_media_workers=cfg.max_media_workers,
             listen_fd=listen_fd,
