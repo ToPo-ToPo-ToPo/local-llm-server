@@ -1,6 +1,6 @@
 """Build and verify a new runtime while preserving its predecessor.
 
-Run with scripts/uv run --no-project --python 3.13.18 scripts/install_runtime.py.
+Run with scripts/uv run --no-project --python 3.15.2 scripts/install_runtime.py.
 Use --dry-run to inspect migration; --activate keeps the active and previous runtimes.
 """
 from __future__ import annotations
@@ -96,8 +96,8 @@ def main(argv: list[str] | None = None) -> None:
     mode.add_argument("--dry-run", action="store_true")
     parser.add_argument("--previous-python", type=Path)
     args = parser.parse_args(argv)
-    if sys.version_info[:3] != (3, 13, 18):
-        parser.error("run with scripts/uv run --no-project --python 3.13.18")
+    if sys.version_info[:3] != (3, 15, 2):
+        parser.error("run with scripts/uv run --no-project --python 3.15.2")
     if os.name == "nt":
         parser.error("This service installer is for macOS/Linux; see docs/operation.md for Windows.")
     launcher = Path.home()/".local/bin/gw"

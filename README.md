@@ -18,7 +18,7 @@ uv run --frozen gw enable    # 自動起動を使う場合
 uv run --frozen gw status
 ```
 
-Pythonは3.13.18、uvは0.13.6以上を使用する。`.python-version`と`uv.lock`に従い、
+Pythonは3.15.2、uvは0.13.6以上を使用する。`.python-version`と`uv.lock`に従い、
 uvがリポジトリ直下に実体の`.venv`を作成する。Python実行ファイルなどの内部構造はuv標準のまま。
 自動起動はこの`.venv`の実行ファイルを直接使う。
 ゲートウェイはPCに1つの常駐サービスなので、`gw enable`は同じ`.venv/bin/gw`を
