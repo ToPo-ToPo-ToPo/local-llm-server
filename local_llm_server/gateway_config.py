@@ -115,24 +115,6 @@ class GatewayConfig:
         32  # accept 後に同時処理するHTTP接続数（Slowloris/メモリ枯渇対策）
     )
     max_media_workers: int = 2  # 同時に動画をDL/ffmpeg展開する数
-    # --- 繰り返しループ抑制: mlx 系バックエンド（mlx / mlx-vlm）宛の chat リクエストに
-    #     repetition_penalty を既定注入する（mlx-lm/mlx-vlm 拡張パラメータ）。低温・量子化の
-    #     ローカル LLM が「同じ内容を繰り返して終わらない」degeneration の緩和。llama-cpp は
-    #     パラメータ名が異なる（repeat_penalty）ので対象外＝mlx 系だけに付ける（ユーザー方針）。
-    #     クライアントが自分で repetition_penalty を指定していれば尊重する（上書きしない）。---
-    repetition_penalty: float | None = (
-        1.1  # 既定 1.1（llama.cpp 既定と同値の穏当な値）。
-    )
-    # 0 / false / "off" で無効化（注入しない）＝設定しない選択
-    repetition_context_size: int | None = (
-        None  # 併せて注入する参照窓（mlx 既定 20。研究推奨 64）。
-    )
-    # None なら注入しない（repetition_penalty だけ付ける）
-    # 構造化リクエスト（`tools`＝native ツールコール / `response_format`＝構造化出力）には
-    # repetition_penalty を注入しないオプション。既定 false（＝従来どおり全 chat に注入）。
-    # true にすると、必須の繰り返し記号（JSON 構文・フィールド名）を減点しうる structured 生成を
-    # 保護できる（実測では 1.1 で実害は無いが、保険として明示的に切れるようにする）。
-    repetition_penalty_skip_structured: bool = False
     # プロンプトキャッシュ（mlx-vlm の APC）。[prompt_cache] テーブル。全モデルに同じ設定を渡す
     # （次回ロードから有効。→ PromptCacheConfig）
     prompt_cache: PromptCacheConfig = field(default_factory=PromptCacheConfig)
@@ -164,13 +146,14 @@ _TOP_LEVEL_CONFIG_KEYS = {
     "image_max_edge",
     "max_request_workers",
     "max_media_workers",
-    "repetition_penalty",
-    "repetition_context_size",
-    "repetition_penalty_skip_structured",
+    "repetition_penalty",  # 旧設定互換: 警告して無視する（移行が消す）
+    "repetition_context_size",  # 同上
+    "repetition_penalty_skip_structured",  # 同上
     "prompt_cache",
     "session_ttl",  # 旧設定互換: 個別に警告して無視する
     "auto_update",  # 旧設定互換: 個別に警告して無視する（移行がコメント化する）
 }
+_REPETITION_KEYS = ("repetition_penalty", "repetition_context_size", "repetition_penalty_skip_structured")
 _MODEL_CONFIG_KEYS = {
     "model",
     "backend",
@@ -274,47 +257,6 @@ def _resolve_model_draft(
             file=sys.stderr,
         )
     return None
-
-
-def _parse_repetition_settings(data: dict):
-    """繰り返しループ抑制の既定注入（mlx 系のみ）の設定を読む。
-
-    既定 1.1。0 / false / "off" / "none" で無効化（＝注入しない＝「設定しない」選択）。
-    < 1.0 は繰り返しを助長するので拒否する（1.0 は中立＝無効相当だが受け付ける）。
-    戻り値: (repetition_penalty, repetition_context_size, skip_structured)。
-    """
-    rp_raw = data.get("repetition_penalty", 1.1)
-    if (
-        rp_raw is None
-        or rp_raw is False
-        or (
-            isinstance(rp_raw, str)
-            and rp_raw.strip().lower() in ("off", "none", "false", "")
-        )
-    ):
-        repetition_penalty = None
-    else:
-        repetition_penalty = _finite_float(rp_raw, "repetition_penalty")
-        if repetition_penalty == 0.0:
-            repetition_penalty = None  # 0 も無効化として扱う
-        elif repetition_penalty < 1.0:
-            raise ValueError(
-                "repetition_penalty must be >= 1.0 (1.0 = neutral; < 1.0 encourages "
-                'repetition). Use 0 / false / "off" to disable injection.'
-            )
-    # 併せて注入する参照窓（省略時は付けない＝上流の既定 20 に任せる）。
-    rcs_raw = data.get("repetition_context_size")
-    repetition_context_size = (
-        None if rcs_raw is None else _strict_int(rcs_raw, "repetition_context_size")
-    )
-    if repetition_context_size is not None and repetition_context_size < 1:
-        raise ValueError("repetition_context_size must be 1 or greater")
-    # 構造化リクエスト（tools / response_format）を注入対象から外すか（既定 false）。
-    skip_structured = _strict_bool(
-        data.get("repetition_penalty_skip_structured", False),
-        "repetition_penalty_skip_structured",
-    )
-    return repetition_penalty, repetition_context_size, skip_structured
 
 
 def _parse_llama_cpp_table(data: dict):
@@ -574,6 +516,15 @@ def load_gateway_config(path: str, *, default_backend: str) -> GatewayConfig:
             "`gw update` を実行したときだけです）。この行は削除してかまいません。",
             file=sys.stderr,
         )
+    # repetition_penalty などの既定注入は 0.38.33 で廃止（生成のパラメータはクライアントの指定を
+    # そのまま渡す）。移行（migrate.py）が設定ファイルから消すが、消せなかった場合も起動は止めない。
+    old_rep = [k for k in _REPETITION_KEYS if k in data]
+    if old_rep:
+        print(
+            f"gateway.toml: {', '.join(old_rep)} は廃止されました（0.38.33 以降、ゲートウェイは"
+            "生成のパラメータを足しません。要るならクライアントが指定します）。この行は削除してかまいません。",
+            file=sys.stderr,
+        )
     tray = _strict_bool(data.get("tray", True), "tray")
     # 未登録モデルを ID 推論で動的ロードするか（既定 true）。false なら事前登録のみ（旧挙動）。
     dynamic = _strict_bool(data.get("dynamic", True), "dynamic")
@@ -603,10 +554,6 @@ def load_gateway_config(path: str, *, default_backend: str) -> GatewayConfig:
         max_memory_fraction = _finite_float(max_memory_fraction, "max_memory_fraction")
         if not (0.0 < max_memory_fraction <= 1.0):
             raise ValueError("max_memory_fraction must be in (0, 1]")
-
-    repetition_penalty, repetition_context_size, repetition_penalty_skip_structured = (
-        _parse_repetition_settings(data)
-    )
 
     llama_accel, llama_build = _parse_llama_cpp_table(data)
     prompt_cache = _parse_prompt_cache_table(data)
@@ -662,8 +609,5 @@ def load_gateway_config(path: str, *, default_backend: str) -> GatewayConfig:
         image_max_edge=image_max_edge,
         max_request_workers=max_request_workers,
         max_media_workers=max_media_workers,
-        repetition_penalty=repetition_penalty,
-        repetition_context_size=repetition_context_size,
-        repetition_penalty_skip_structured=repetition_penalty_skip_structured,
         prompt_cache=prompt_cache,
     )

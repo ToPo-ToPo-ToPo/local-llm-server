@@ -2340,78 +2340,26 @@ def test_provision_sglang_continues_on_failure(tmp_path, monkeypatch):
     assert set_calls == []
 
 
-# --- 繰り返しループ抑制: repetition_penalty の既定注入（mlx 系のみ） ----------
+# --- 生成のパラメータは足さない（repetition_penalty の既定注入は 0.38.33 で廃止） ----------
 
-def test_repetition_penalty_default_is_injected(tmp_path):
-    """gateway.toml に書かなくても既定 1.1 が有効（既定注入）。context_size は既定 None。"""
+def test_gateway_does_not_add_sampling_parameters(tmp_path):
+    """ゲートウェイは繰り返しの抑制などの生成パラメータを持たず、クライアントの指定をそのまま渡す。"""
+    assert not hasattr(gw._GatewayHandler, "_maybe_inject_repetition")
     cfg = gw.load_gateway_config(_write(tmp_path, "port = 8799\n"))
-    assert cfg.repetition_penalty == 1.1
-    assert cfg.repetition_context_size is None
+    assert not any(k.startswith("repetition") for k in vars(cfg))
 
 
-def test_repetition_penalty_explicit_values(tmp_path):
-    cfg = gw.load_gateway_config(_write(
-        tmp_path, "port = 8799\nrepetition_penalty = 1.2\nrepetition_context_size = 64\n"))
-    assert cfg.repetition_penalty == 1.2
-    assert cfg.repetition_context_size == 64
-
-
-@pytest.mark.parametrize("val", ["0", "false", '"off"', '"none"'])
-def test_repetition_penalty_disabled(tmp_path, val):
-    """0 / false / "off" / "none" で無効化（＝設定しない選択。注入しない）。"""
-    cfg = gw.load_gateway_config(_write(tmp_path, f"port = 8799\nrepetition_penalty = {val}\n"))
-    assert cfg.repetition_penalty is None
-
-
-def test_repetition_penalty_below_one_rejected(tmp_path):
-    """< 1.0 は繰り返しを助長するので拒否（無効化は 0/false を使う）。"""
-    with pytest.raises(ValueError):
-        gw.load_gateway_config(_write(tmp_path, "port = 8799\nrepetition_penalty = 0.8\n"))
-
-
-def _mk_srv(rp, backends, rcs=None):
-    from types import SimpleNamespace
-    mgr = SimpleNamespace(backend_for=lambda m: backends[m])
-    return SimpleNamespace(repetition_penalty=rp, repetition_context_size=rcs, manager=mgr)
-
-
-def _inject(srv, model, payload):
-    body = json.dumps(payload).encode("utf-8")
-    out = gw._GatewayHandler._maybe_inject_repetition(None, srv, model, payload, body)
-    return json.loads(out)
-
-
-def test_inject_repetition_for_mlx():
-    srv = _mk_srv(1.1, {"org/gemma": "mlx-vlm"})
-    got = _inject(srv, "org/gemma", {"model": "org/gemma", "messages": []})
-    assert got["repetition_penalty"] == 1.1
-
-
-def test_inject_repetition_with_context_size():
-    srv = _mk_srv(1.15, {"org/gemma": "mlx-vlm"}, rcs=64)
-    got = _inject(srv, "org/gemma", {"model": "org/gemma", "messages": []})
-    assert got["repetition_penalty"] == 1.15 and got["repetition_context_size"] == 64
-
-
-def test_no_inject_for_llama_cpp():
-    """mlx 系以外（llama-cpp は repeat_penalty で別物）には付けない。"""
-    srv = _mk_srv(1.1, {"org/gguf": "llama-cpp"})
-    got = _inject(srv, "org/gguf", {"model": "org/gguf", "messages": []})
-    assert "repetition_penalty" not in got
-
-
-def test_client_specified_is_respected():
-    """クライアントが自分で指定していれば上書きしない。"""
-    srv = _mk_srv(1.1, {"org/gemma": "mlx-vlm"})
-    got = _inject(srv, "org/gemma", {"model": "org/gemma", "messages": [], "repetition_penalty": 1.3})
-    assert got["repetition_penalty"] == 1.3
-
-
-def test_no_inject_when_disabled():
-    """サーバー設定が無効（None）なら何も付けない。"""
-    srv = _mk_srv(None, {"org/gemma": "mlx-vlm"})
-    got = _inject(srv, "org/gemma", {"model": "org/gemma", "messages": []})
-    assert "repetition_penalty" not in got
+@pytest.mark.parametrize("text", [
+    "repetition_penalty = 1.1\n",
+    "repetition_penalty = 0\n",
+    "repetition_context_size = 64\n",
+    "repetition_penalty_skip_structured = true\n",
+])
+def test_load_gateway_config_ignores_removed_repetition_keys(tmp_path, text, capsys):
+    # 移行が消し損ねても起動は止めない。値が何であれ無視し、警告だけ出す。
+    cfg = gw.load_gateway_config(_write(tmp_path, "port = 8799\n" + text))
+    assert cfg.port == 8799
+    assert "は廃止されました" in capsys.readouterr().err
 
 
 # --- 思考 OFF: reasoning_effort="none" の注入（mlx-vlm の disable_thinking） -------
@@ -2457,56 +2405,6 @@ def test_client_reasoning_is_respected(key, val):
     assert got[key] == val
     if key == "reasoning":
         assert "reasoning_effort" not in got
-
-
-# --- 構造化リクエストの注入除外（既定オフの機能） ------------------------------
-
-def test_skip_structured_default_off(tmp_path):
-    """既定は false（＝tools 付きでも従来どおり注入する）。"""
-    cfg = gw.load_gateway_config(_write(tmp_path, "port = 8799\n"))
-    assert cfg.repetition_penalty_skip_structured is False
-
-
-def test_skip_structured_parsed(tmp_path):
-    cfg = gw.load_gateway_config(_write(
-        tmp_path, "port = 8799\nrepetition_penalty_skip_structured = true\n"))
-    assert cfg.repetition_penalty_skip_structured is True
-
-
-def _mk_srv_skip(rp, backends, skip):
-    from types import SimpleNamespace
-    mgr = SimpleNamespace(backend_for=lambda m: backends[m])
-    return SimpleNamespace(repetition_penalty=rp, repetition_context_size=None,
-                           repetition_penalty_skip_structured=skip, manager=mgr)
-
-
-def test_skip_structured_off_still_injects_for_tools():
-    """既定（skip=False）: tools 付きでも注入する（現状維持）。"""
-    srv = _mk_srv_skip(1.1, {"org/gemma": "mlx-vlm"}, skip=False)
-    got = _inject(srv, "org/gemma", {"model": "org/gemma", "messages": [], "tools": [{"x": 1}]})
-    assert got["repetition_penalty"] == 1.1
-
-
-def test_skip_structured_on_skips_tools():
-    """skip=True: tools を含むリクエストには注入しない。"""
-    srv = _mk_srv_skip(1.1, {"org/gemma": "mlx-vlm"}, skip=True)
-    got = _inject(srv, "org/gemma", {"model": "org/gemma", "messages": [], "tools": [{"x": 1}]})
-    assert "repetition_penalty" not in got
-
-
-def test_skip_structured_on_skips_response_format():
-    """skip=True: response_format を含むリクエストにも注入しない。"""
-    srv = _mk_srv_skip(1.1, {"org/gemma": "mlx-vlm"}, skip=True)
-    got = _inject(srv, "org/gemma",
-                  {"model": "org/gemma", "messages": [], "response_format": {"type": "json_object"}})
-    assert "repetition_penalty" not in got
-
-
-def test_skip_structured_on_still_injects_plain_chat():
-    """skip=True でも、構造化でない通常 chat には従来どおり注入する。"""
-    srv = _mk_srv_skip(1.1, {"org/gemma": "mlx-vlm"}, skip=True)
-    got = _inject(srv, "org/gemma", {"model": "org/gemma", "messages": []})
-    assert got["repetition_penalty"] == 1.1
 
 
 # --- zero-drop restart（Listen ソケット引き継ぎ） --------------------------------
