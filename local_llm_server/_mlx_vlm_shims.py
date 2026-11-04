@@ -27,6 +27,12 @@ venv への直接パッチは黙って失われる。ここに置けばソース
    落ち、頭 128 文字が同じ別モデルが同じ置き場を読み書きする
    （→ `_patch_apc_disk_namespace`）。
 
+4. Qwen4-Exp の n-gram 表の外出し(ple_storage)が 4bit 決め打ち（mlx-vlm 0.7.11 時点）
+   量子化の対応表が 4bit affine(g32)と nvfp4(g16)だけで、行の幅・復元の bits と group_size も
+   4bit 前提。8bit の表(Qwen3.8-Flash-Next の e4o8 など)や、項目ごとの量子化に mode が無い config を
+   読めない。量子化を config と safetensors のヘッダから読む版(``_ple_storage``)を、上流の
+   ``mlx_vlm.models.qwen4_exp.ple_storage`` の代わりに入れる（→ `_install_ple_storage`）。
+
 （履歴）0.6.7 / 0.6.8 向けに当てていた次の 2 つは **0.6.9 で上流が修正したため削除した**:
   - models/inkling が sub-config クラス（TextConfig 等）を再エクスポートせず、
     汎用ローダーの getattr が必ず AttributeError になる問題
@@ -353,8 +359,30 @@ def _patch_stream_tool_calls(log=None) -> str:
     return "not applied (no known suppression hook in mlx_vlm.server.openai)"
 
 
+_PLE_MODULE = "mlx_vlm.models.qwen4_exp.ple_storage"
+
+
+def _install_ple_storage() -> str:
+    """n-gram 表の置き場を、量子化を決め打ちしない版に差し替える。
+
+    上流の qwen4_exp は表を作るときに ``from .ple_storage import QuantizedMMapNGramEmbedding`` を
+    その場で読み込むので、モデルを読む前に sys.modules の項目を差し替えておけば、こちらが使われる。
+    """
+    try:
+        from . import _ple_storage
+    except Exception as exc:  # noqa: BLE001 - mlx 無し等。起動は止めない
+        return f"not applied ({exc})"
+    sys.modules[_PLE_MODULE] = _ple_storage
+    parent = sys.modules.get(_PLE_MODULE.rsplit(".", 1)[0])
+    if parent is not None:
+        setattr(parent, "ple_storage", _ple_storage)
+    return "applied"
+
+
 def apply() -> None:
     """既知のパッチを全て適用する。失敗しても起動は止めない。"""
+    ple = _install_ple_storage()
+    print(f"[local-llm-server shim] ple_storage: {ple}", file=sys.stderr, flush=True)
     _patch_content_markers()
     _patch_apc_extra_hash()
     _patch_apc_rate_poisoning()
