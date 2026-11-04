@@ -2548,3 +2548,20 @@ def test_dead_worker_reap_drops_sessions():
     mgr.register_session("ghost", "crashed")
     assert mgr.reap_dead_instances() == 1
     assert mgr.session_known("ghost") is False
+
+
+def test_raise_open_file_limit_lifts_soft_limit_within_hard():
+    """launchd の既定(ソフト 256)のままだと、外出しした埋め込み表の mmap で読み込みが失敗する。
+    ソフト上限をハードの範囲で上げ、配下のモデルサーバーに引き継がせる。"""
+    resource = pytest.importorskip("resource")
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    try:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (256, hard))
+        changed = gw.raise_open_file_limit(4096)
+        new_soft, new_hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        expected = 4096 if hard == resource.RLIM_INFINITY else min(4096, hard)
+        assert new_hard == hard and new_soft == expected
+        assert changed == (256, expected)
+        assert gw.raise_open_file_limit(4096) is None          # 既に足りていれば変えない
+    finally:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))

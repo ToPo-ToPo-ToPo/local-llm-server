@@ -560,6 +560,32 @@ def _update_watcher(
     )
 
 
+_OPEN_FILES_WANTED = 65536
+
+
+def raise_open_file_limit(wanted: int = _OPEN_FILES_WANTED) -> tuple[int, int] | None:
+    """開けるファイル数の上限(ソフト)を、ハードの範囲で wanted まで上げる。配下のモデルサーバーも引き継ぐ。
+
+    launchd が起動するプロセスのソフト上限は 256 で、外出しした埋め込み表(mlx-vlm の qwen4_exp の
+    ple_storage は n-gram の断片ごとに mmap を開く。Qwen3.8-Flash-Next で 128 本)や、層ごとのエキスパートの
+    ファイルを開くと足りずに読み込みが失敗する(Errno 24)。上げられないとき(Windows など)は何もしない。
+    戻り値は (前, 後)。変えなかったら None。
+    """
+    try:
+        import resource
+    except ImportError:  # Windows
+        return None
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    target = wanted if hard == resource.RLIM_INFINITY else min(wanted, hard)
+    if soft != resource.RLIM_INFINITY and soft < target:
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+        except (ValueError, OSError):
+            return None
+        return soft, target
+    return None
+
+
 def run_gateway(cfg: GatewayConfig, config_path: str | None = None) -> int:
     """ゲートウェイを起動し、割り込み（Ctrl+C / SIGTERM）まで動かす。
 
@@ -574,6 +600,7 @@ def run_gateway(cfg: GatewayConfig, config_path: str | None = None) -> int:
     `config_path`（gateway.toml のパス）を渡すと、そのファイルを保存した瞬間にポリシー設定を
     無停止で反映するホットリロード監視を有効にする（→ apply_live_config）。
     """
+    raise_open_file_limit()
     # 単一起動ガード: サーバー本体（ポート bind やモデル起動）に入る前に取る。
     try:
         lock = GatewayLock().acquire()
