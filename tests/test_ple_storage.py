@@ -121,3 +121,56 @@ def test_shim_installs_the_generalized_module(monkeypatch):
     monkeypatch.delitem(sys.modules, _mlx_vlm_shims._PLE_MODULE, raising=False)
     assert _mlx_vlm_shims._install_ple_storage() == "applied"
     assert sys.modules[_mlx_vlm_shims._PLE_MODULE] is ps
+
+
+def _snapshot(tmp_path, q):
+    """HF キャッシュと同じ形(<hub>/models--org--name/snapshots/<rev>)に小さな表を置く。"""
+    snap = tmp_path / "hub" / "models--org--name" / "snapshots" / "rev1"
+    snap.parent.mkdir(parents=True)
+    return snap, _checkpoint(snap, q)
+
+
+def test_external_view_is_made_once_next_to_the_hub(tmp_path):
+    """表を持つモデルは、hub の隣に見え方を自動で作る。2 回目は作り直さない。"""
+    snap, reference = _snapshot(tmp_path, CASES[6])
+    view = ps.external_view(snap)
+    assert view == tmp_path / "ple-views" / "models--org--name" / "rev1"
+    stamp = (view / "EXTERNAL_PLE.json").stat().st_mtime_ns
+    assert ps.external_view(snap) == view
+    assert (view / "EXTERNAL_PLE.json").stat().st_mtime_ns == stamp
+    assert not list(view.parent.glob(".rev1.*"))              # 作り途中の場所は残さない
+    _check_lookup(ps.QuantizedMMapNGramEmbedding(view / "ple-store.json"), reference)
+
+
+def test_models_without_tables_and_views_are_used_as_they_are(tmp_path):
+    snap, _ = _snapshot(tmp_path, CASES[2])
+    view = ps.external_view(snap)
+    assert ps.external_view(view) is None                     # 見え方そのもの
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    (plain / "config.json").write_text("{}")
+    (plain / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {"lm_head.weight": "a.safetensors"}}))
+    assert ps.external_view(plain) is None
+
+
+def test_memory_estimate_leaves_out_the_table(tmp_path, monkeypatch):
+    """ゲートウェイの常駐の見積もりは、表(外に出して読む)の分を数えない。"""
+    from local_llm_server import model_catalog, server
+    snap, _ = _snapshot(tmp_path, CASES[6])
+    files = sum(p.stat().st_size for p in snap.glob("*.safetensors"))
+    table = model_catalog.ple_table_bytes(str(snap))
+    assert 0 < table < files
+    monkeypatch.setattr(server, "_hf_hub_cache", lambda: str(tmp_path / "hub"))
+    config = server.ServerConfig(model="org/name", backend="mlx-vlm")
+    whole = sum(p.stat().st_size for p in snap.iterdir())
+    assert server.estimate_model_bytes(config) == whole - table
+
+
+def test_shim_reads_the_view_under_the_hf_name(tmp_path, monkeypatch):
+    """mlx-vlm がモデルの置き場を決める所で、表を持つモデルは見え方に替わる。"""
+    utils = pytest.importorskip("mlx_vlm.utils")
+    from local_llm_server import _mlx_vlm_shims
+    snap, _ = _snapshot(tmp_path, CASES[6])
+    monkeypatch.setattr(utils, "get_model_path", lambda repo, *a, **k: snap)
+    assert _mlx_vlm_shims._install_external_view() == "applied"
+    assert utils.get_model_path("org/name") == tmp_path / "ple-views" / "models--org--name" / "rev1"

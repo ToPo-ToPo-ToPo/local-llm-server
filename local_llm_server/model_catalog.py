@@ -9,6 +9,7 @@ from __future__ import annotations
 import glob
 import json
 import os
+import struct
 import time
 
 from .backend_core import infer_backend
@@ -495,4 +496,38 @@ def _dir_weight_bytes(directory: str) -> int:
                 total += os.path.getsize(path)
             except OSError:
                 pass
+    return total
+
+
+# Qwen4-Exp の n-gram 表(PLE)の重みの名前に入る印。表は常駐させず SSD から行ごとに読む(→ _ple_storage)
+PLE_MARKER = ".ple.ple_embedding.ngram_embedding.shards."
+
+
+def ple_table_bytes(model_dir: str) -> int:
+    """チェックポイントの n-gram 表の重みのバイト数(safetensors のヘッダだけ読む)。表が無ければ 0。
+
+    表を外に出して読み込む(→ _ple_storage.external_view)ので、常駐の見積もりからこの分を引く。
+    見え方そのもの(config に ple_storage がある)は表を持たないので 0。
+    """
+    index_path = os.path.join(model_dir, "model.safetensors.index.json")
+    try:
+        with open(index_path, encoding="utf-8") as fh:
+            weight_map = json.load(fh).get("weight_map", {})
+    except (OSError, ValueError):
+        return 0
+    files: dict[str, list[str]] = {}
+    for key, file_name in weight_map.items():
+        if PLE_MARKER in key:
+            files.setdefault(file_name, []).append(key)
+    total = 0
+    for file_name, keys in files.items():
+        try:
+            with open(os.path.join(model_dir, file_name), "rb") as fh:
+                size = struct.unpack("<Q", fh.read(8))[0]
+                header = json.loads(fh.read(size))
+        except (OSError, ValueError, struct.error):
+            return 0
+        for key in keys:
+            start, end = header[key]["data_offsets"]
+            total += int(end) - int(start)
     return total

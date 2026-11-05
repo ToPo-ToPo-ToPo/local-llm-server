@@ -33,6 +33,11 @@ venv への直接パッチは黙って失われる。ここに置けばソース
    読めない。量子化を config と safetensors のヘッダから読む版(``_ple_storage``)を、上流の
    ``mlx_vlm.models.qwen4_exp.ple_storage`` の代わりに入れる（→ `_install_ple_storage`）。
 
+5. n-gram 表を持つモデルを HF の名前のまま読むと、表(e4o8 で 54 GiB)まで常駐させる
+   上流は表を外に出すのに「見え方」のフォルダ(config に ple_storage を書いたもの)を要る。モデルの置き場を
+   決める ``mlx_vlm.utils.get_model_path`` を包み、表を持つモデルなら見え方を自動で作ってそちらを読む
+   （→ `_install_external_view`）。受け付けるモデルの名前は HF の名前のまま。
+
 （履歴）0.6.7 / 0.6.8 向けに当てていた次の 2 つは **0.6.9 で上流が修正したため削除した**:
   - models/inkling が sub-config クラス（TextConfig 等）を再エクスポートせず、
     汎用ローダーの getattr が必ず AttributeError になる問題
@@ -379,10 +384,44 @@ def _install_ple_storage() -> str:
     return "applied"
 
 
+def _install_external_view() -> str:
+    """n-gram 表を持つモデルは、表を外に出した見え方を読むようにする(HF の名前のまま使える)。
+
+    mlx-vlm はモデルの置き場を必ず ``mlx_vlm.utils.get_model_path`` で決める(サーバーの各所は関数の中で
+    読み込む)ので、ここを包めば、受け付けるモデルの名前は変えずに中身だけ見え方に替わる。
+    ほかのパッチがサーバーの部品を読み込む前に当てる。
+    """
+    try:
+        import mlx_vlm.utils as utils
+        from . import _ple_storage
+    except Exception as exc:  # noqa: BLE001 - mlx 無し等。起動は止めない
+        return f"not applied ({exc})"
+    original = utils.get_model_path
+    if getattr(original, "_llmserver_external_view", False):
+        return "applied"
+
+    def get_model_path(path_or_hf_repo, *args, **kwargs):
+        path = original(path_or_hf_repo, *args, **kwargs)
+        try:
+            view = _ple_storage.external_view(path)
+        except Exception as exc:  # noqa: BLE001 - 見え方を作れなければ元のまま読む
+            print(f"[local-llm-server shim] external n-gram view: not used ({exc})", file=sys.stderr, flush=True)
+            return path
+        if view is None:
+            return path
+        print(f"[local-llm-server shim] external n-gram view: {view}", file=sys.stderr, flush=True)
+        return view
+
+    get_model_path._llmserver_external_view = True  # type: ignore[attr-defined]
+    utils.get_model_path = get_model_path
+    return "applied"
+
+
 def apply() -> None:
     """既知のパッチを全て適用する。失敗しても起動は止めない。"""
     ple = _install_ple_storage()
-    print(f"[local-llm-server shim] ple_storage: {ple}", file=sys.stderr, flush=True)
+    view = _install_external_view()
+    print(f"[local-llm-server shim] ple_storage: {ple}; external view: {view}", file=sys.stderr, flush=True)
     _patch_content_markers()
     _patch_apc_extra_hash()
     _patch_apc_rate_poisoning()

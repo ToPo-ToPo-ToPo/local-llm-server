@@ -267,7 +267,8 @@ def estimate_model_bytes(config: ServerConfig) -> int | None:
         # ドラフター（MTP）も常駐するので合算する。
         spec = config.model.strip()
         if looks_like_local_path(spec):
-            total = _dir_weight_bytes(os.path.expanduser(spec))
+            local = os.path.expanduser(spec)
+            total = _dir_weight_bytes(local) - _model_catalog.ple_table_bytes(local)
             if config.draft_model and looks_like_local_path(config.draft_model):
                 total += _dir_weight_bytes(
                     os.path.expanduser(config.draft_model.strip())
@@ -282,6 +283,8 @@ def estimate_model_bytes(config: ServerConfig) -> int | None:
         if not os.path.isdir(snap_root):
             return None  # 未DL（mlx はロード時に自動取得）→ 見積もり不能
         by_blob: dict[str, int] = {}
+        # n-gram 表は常駐させない(→ _ple_storage.external_view)ので、その分は数えない
+        ple = sum(_model_catalog.ple_table_bytes(os.path.join(snap_root, snap)) for snap in os.listdir(snap_root))
         for root, _dirs, files in os.walk(snap_root):
             for f in files:
                 p = os.path.join(root, f)
@@ -289,7 +292,7 @@ def estimate_model_bytes(config: ServerConfig) -> int | None:
                     by_blob.setdefault(os.path.realpath(p), os.path.getsize(p))
                 except OSError:
                     pass
-        return sum(by_blob.values()) or None
+        return (sum(by_blob.values()) - ple) or None
     except (ValueError, OSError):
         return None
 
