@@ -803,7 +803,7 @@ wheels = [
 
 [[package]]
 name = "local-llm-server"
-version = "0.38.33"
+version = "0.38.34"
 source = { editable = "." }
 dependencies = [
     { name = "certifi" },
