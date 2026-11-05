@@ -30,7 +30,7 @@ from pathlib import Path
 import mlx.core as mx
 import numpy as np
 
-PLE_MARKER = ".ple.ple_embedding.ngram_embedding.shards."
+from .model_catalog import PLE_MARKER  # noqa: E402 — 印は 1 か所(ゲートウェイの見積もりと同じ)
 MANIFEST_VERSION = 2
 # safetensors の dtype 名 → 読み出しに使う numpy の型(BF16 は numpy に無いので 16bit の整数で持ち、mx へ渡すときに直す)
 _DTYPES = {
@@ -520,6 +520,53 @@ def prepare_external_ple_model(source_path, target_path, *, cache_rows=0):
     }
     (target_path / "EXTERNAL_PLE.json").write_text(json.dumps(provenance, indent=2) + "\n")
     return provenance
+
+
+def view_dir(model_dir) -> Path:
+    """見え方を置く場所。元と同じファイルシステムに置く(ハードリンクのため)。
+
+    HF キャッシュのスナップショット(``<hub>/models--org--name/snapshots/<rev>``)なら ``<hub>`` の隣の
+    ``ple-views/models--org--name/<rev>``、それ以外のフォルダなら隣の ``.ple-views/<名前>``。
+    """
+    model_dir = Path(model_dir).resolve()
+    if model_dir.parent.name == "snapshots" and model_dir.parents[1].name.startswith("models--"):
+        hub = model_dir.parents[2]
+        return hub.parent / "ple-views" / model_dir.parents[1].name / model_dir.name
+    return model_dir.parent / ".ple-views" / model_dir.name
+
+
+def external_view(model_dir) -> Path | None:
+    """n-gram 表を持つモデルなら、表を外に出した見え方の場所を返す(無ければ作る)。表が無ければ None。
+
+    見え方は重みのハードリンクと小さな設定だけなので、作るのは数秒でディスクも増えない。作り途中を
+    読まれないよう、別の場所に作ってから置き換える。
+    """
+    model_dir = Path(model_dir)
+    try:
+        index = json.loads((model_dir / "model.safetensors.index.json").read_text())
+        config = json.loads((model_dir / "config.json").read_text())
+    except (OSError, ValueError):
+        return None
+    if not any(PLE_MARKER in key for key in index.get("weight_map", {})):
+        return None
+    if (config.get("text_config") or {}).get("ple_storage"):
+        return None                      # もう見え方(表は外にある)
+    target = view_dir(model_dir)
+    if (target / "EXTERNAL_PLE.json").is_file():
+        return target
+    target.parent.mkdir(parents=True, exist_ok=True)
+    work = Path(tempfile.mkdtemp(prefix=f".{target.name}.", dir=target.parent))
+    try:
+        prepare_external_ple_model(model_dir, work)
+        try:
+            work.rename(target)
+        except OSError:                   # 同時に作った別の起動が先に置いた
+            if not (target / "EXTERNAL_PLE.json").is_file():
+                raise
+    finally:
+        if work.exists():
+            shutil.rmtree(work, ignore_errors=True)
+    return target
 
 
 def main(argv: list[str] | None = None) -> int:

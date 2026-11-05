@@ -887,6 +887,11 @@ def cmd_rm(gcfg, args) -> int:
             return 1
     import shutil
     shutil.rmtree(cache)
+    # n-gram 表を外に出した見え方(→ _ple_storage.view_dir)は重みのハードリンクなので、
+    # 残すと容量が空かない。一緒に消す
+    views = os.path.join(os.path.dirname(os.path.dirname(cache)), "ple-views", os.path.basename(cache))
+    if os.path.isdir(views):
+        shutil.rmtree(views)
     print(f"deleted: {repo}（{size} 解放）")
     return 0
 
