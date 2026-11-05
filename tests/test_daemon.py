@@ -2379,14 +2379,14 @@ def _inject_thinking(srv, model, payload):
 
 def test_disable_thinking_injects_reasoning_effort_none():
     """mlx-vlm には build_command 側で思考を止める手段が無いのでリクエストで落とす。"""
-    srv = _mk_srv_thinking({"x/inkling": "mlx-vlm"}, {"x/inkling": True})
-    got = _inject_thinking(srv, "x/inkling", {"model": "x/inkling", "messages": []})
+    srv = _mk_srv_thinking({"x/model": "mlx-vlm"}, {"x/model": True})
+    got = _inject_thinking(srv, "x/model", {"model": "x/model", "messages": []})
     assert got["reasoning_effort"] == "none"
 
 
 def test_no_inject_when_disable_thinking_not_set():
-    srv = _mk_srv_thinking({"x/inkling": "mlx-vlm"}, {"x/inkling": False})
-    got = _inject_thinking(srv, "x/inkling", {"model": "x/inkling", "messages": []})
+    srv = _mk_srv_thinking({"x/model": "mlx-vlm"}, {"x/model": False})
+    got = _inject_thinking(srv, "x/model", {"model": "x/model", "messages": []})
     assert "reasoning_effort" not in got
 
 
@@ -2400,8 +2400,8 @@ def test_no_inject_thinking_for_non_mlx_vlm():
 @pytest.mark.parametrize("key,val", [("reasoning_effort", "high"), ("reasoning", {"effort": "high"})])
 def test_client_reasoning_is_respected(key, val):
     """クライアントが明示していれば尊重する（思考させたいリクエストを潰さない）。"""
-    srv = _mk_srv_thinking({"x/inkling": "mlx-vlm"}, {"x/inkling": True})
-    got = _inject_thinking(srv, "x/inkling", {"model": "x/inkling", "messages": [], key: val})
+    srv = _mk_srv_thinking({"x/model": "mlx-vlm"}, {"x/model": True})
+    got = _inject_thinking(srv, "x/model", {"model": "x/model", "messages": [], key: val})
     assert got[key] == val
     if key == "reasoning":
         assert "reasoning_effort" not in got

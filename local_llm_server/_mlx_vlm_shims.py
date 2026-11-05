@@ -9,42 +9,27 @@ venv への直接パッチは黙って失われる。ここに置けばソース
 
 現在のパッチ:
 
-1. Inkling の content マーカーが除去表に無い（mlx-vlm 0.6.9 時点）
-   `server/responses_state.py` の `_CONTENT_MARKERS` は ("<|START_TEXT|>", "<|END_TEXT|>")
-   のハードコードで、env にもリクエストにも逃げ道が無い。Inkling は本文を
-   `<|message_model|><|content_text|>…<|end_message|>` という構造トークンで囲んで出力する
-   ため、思考の分離（MLX_VLM_THINKING_* で対応済み）をしても content にこれらが残る。
-   除去表へ追記して本文だけを返す。他モデルはこれらの文字列を出さないので無害。
-
-2. APC の 1 トークンあたりバイト数が短いプロンプトで汚染される（mlx-vlm 0.7.1 時点）
+1. APC の 1 トークンあたりバイト数が短いプロンプトで汚染される（mlx-vlm 0.7.1 時点）
    `_observe_cache_size` は下がることのない最大値で覚えるため、65 トークンのような
    短い要求が 1 回来ると実勢の数倍で固定され、そこから計算する予約がメモリ上限を
    超えて以後すべての保存が見送られる。再起動するまで直らない
    （→ `_patch_apc_rate_poisoning`）。
 
-3. APC のディスク置き場が長いモデルパスで別モデルと共有される（mlx-vlm 0.7.9 時点）
+2. APC のディスク置き場が長いモデルパスで別モデルと共有される（mlx-vlm 0.7.9 時点）
    ディレクトリ名を 128 文字で切り捨てるため、モデルを見分ける指紋（名前の末尾）が
    落ち、頭 128 文字が同じ別モデルが同じ置き場を読み書きする
    （→ `_patch_apc_disk_namespace`）。
 
-4. Qwen4-Exp の n-gram 表の外出し(ple_storage)が 4bit 決め打ち（mlx-vlm 0.7.11 時点）
+3. Qwen4-Exp の n-gram 表の外出し(ple_storage)が 4bit 決め打ち（mlx-vlm 0.7.11 時点）
    量子化の対応表が 4bit affine(g32)と nvfp4(g16)だけで、行の幅・復元の bits と group_size も
    4bit 前提。8bit の表(Qwen3.8-Flash-Next の e4o8 など)や、項目ごとの量子化に mode が無い config を
    読めない。量子化を config と safetensors のヘッダから読む版(``_ple_storage``)を、上流の
    ``mlx_vlm.models.qwen4_exp.ple_storage`` の代わりに入れる（→ `_install_ple_storage`）。
 
-5. n-gram 表を持つモデルを HF の名前のまま読むと、表(e4o8 で 54 GiB)まで常駐させる
+4. n-gram 表を持つモデルを HF の名前のまま読むと、表(e4o8 で 54 GiB)まで常駐させる
    上流は表を外に出すのに「見え方」のフォルダ(config に ple_storage を書いたもの)を要る。モデルの置き場を
    決める ``mlx_vlm.utils.get_model_path`` を包み、表を持つモデルなら見え方を自動で作ってそちらを読む
    （→ `_install_external_view`）。受け付けるモデルの名前は HF の名前のまま。
-
-（履歴）0.6.7 / 0.6.8 向けに当てていた次の 2 つは **0.6.9 で上流が修正したため削除した**:
-  - models/inkling が sub-config クラス（TextConfig 等）を再エクスポートせず、
-    汎用ローダーの getattr が必ず AttributeError になる問題
-  - prompt_utils.MODEL_CONFIG に inkling が無く、apply_chat_template が text-only 扱いで
-    画像・音声パートを黙って捨てる問題
-0.6.9 は公式 config をそのまま読む（model_type=inkling_mm_model の別名登録あり）ので、
-変換時の config 翻訳も不要になった。→ pyproject の mlx-vlm ピン（>=0.6.9）
 """
 
 from __future__ import annotations
@@ -55,30 +40,6 @@ import runpy
 import sys
 from contextvars import ContextVar
 from typing import Optional
-
-# Inkling が本文の周りに出す構造トークン。content から取り除く対象。
-# <|end_message|> は思考の終端でもあるが、思考の切り出しはこの除去より前に
-# 行われる（_split_thinking → _strip_content_markers の順）ので競合しない。
-_INKLING_CONTENT_MARKERS = (
-    "<|message_model|>",
-    "<|content_text|>",
-    "<|end_message|>",
-)
-
-
-def _patch_content_markers() -> None:
-    """Inkling の構造トークンを content 除去表へ追加する。"""
-    try:
-        from mlx_vlm.server import responses_state
-    except Exception:
-        return
-    markers = getattr(responses_state, "_CONTENT_MARKERS", None)
-    if markers is None:
-        return  # 上流が実装を変えた。触らない
-    missing = tuple(m for m in _INKLING_CONTENT_MARKERS if m not in markers)
-    if missing:
-        responses_state._CONTENT_MARKERS = tuple(markers) + missing
-
 
 def _patch_apc_extra_hash() -> None:
     """APC の照合キーから inputs_embeds / attention_mask を除外する。
@@ -422,7 +383,6 @@ def apply() -> None:
     ple = _install_ple_storage()
     view = _install_external_view()
     print(f"[local-llm-server shim] ple_storage: {ple}; external view: {view}", file=sys.stderr, flush=True)
-    _patch_content_markers()
     _patch_apc_extra_hash()
     _patch_apc_rate_poisoning()
     _patch_apc_disk_namespace()
