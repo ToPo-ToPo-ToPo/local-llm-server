@@ -361,10 +361,8 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
         mlx / llama-cpp 経路だけ）ので、リクエスト側で落とす。
 
         背景: mlx-vlm サーバの既定は思考 OFF だが、それは chat template が
-        `enable_thinking` を見るモデルに限った話。Inkling は **常に**
-        「Thinking effort level: 0.9」をテンプレートで注入する作りで、
-        enable_thinking では止まらず、OpenAI 互換の reasoning_effort でしか制御できない
-        （"none"/"minimal"/"low"/"medium"/"high"/"max" または 0.0〜0.99 の float）。
+        `enable_thinking` を見るモデルに限った話。テンプレートが思考の深さを常に注入し、
+        OpenAI 互換の reasoning_effort でしか止められないモデルにはこちらで落とす。
 
         クライアントが自分で reasoning_effort / reasoning を指定していれば尊重する。
         """

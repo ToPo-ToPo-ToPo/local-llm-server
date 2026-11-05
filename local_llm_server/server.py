@@ -263,7 +263,7 @@ def estimate_model_bytes(config: ServerConfig) -> int | None:
         # mlx / mlx-vlm: ローカルパス指定なら、そのディレクトリの重みサイズ合計。
         # repo-id ではないので下の HF キャッシュ探索には載らず、そのままだと見積もり不能
         # （＝メモリガードがそのモデルを素通しする）。巨大なモデルをローカル変換物として
-        # 登録する運用（→ gateway.toml の Inkling / DeepSeek）では素通しは危険なので数える。
+        # 登録する運用（→ gateway.toml の DeepSeek など）では素通しは危険なので数える。
         # ドラフター（MTP）も常駐するので合算する。
         spec = config.model.strip()
         if looks_like_local_path(spec):

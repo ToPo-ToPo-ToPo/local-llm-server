@@ -193,16 +193,6 @@ def test_thinking_markers_default_is_gemma4_style():
     )
 
 
-def test_thinking_markers_inkling():
-    # Inkling は <|content_thinking|>…<|end_message|><|message_model|>。mlx-vlm の内蔵既定に
-    # 無いので明示しないと思考が丸ごと content に漏れる。ローカルパス登録でも引けること。
-    # 終端が <|end_message|> 単体でないのは、それが本文の終端も兼ねており、思考 OFF のとき
-    # 本文全体が思考と誤判定されて content が空になるため。
-    expected = ("<|content_thinking|>", "<|end_message|><|message_model|>")
-    assert srv.thinking_markers("/Users/x/mlx_models/Inkling-Small-mlx-4bit") == expected
-    assert srv.thinking_markers("mlx-community/inkling-mlx-4bit") == expected
-
-
 def test_build_command_mlx_vlm_mtp_drafter(stub_cache):
     # Gemma 4 MTP: mlx-vlm に --draft-model を渡し、--draft-kind は mtp 固定。
     c = ServerConfig(
@@ -915,7 +905,7 @@ def test_looks_like_local_path_is_cross_platform():
     for spec in ("/abs/model", "./rel", "../up", "~/models/x",
                  r"C:\models\x", "C:/models/x", r"\\server\share\x"):
         assert srv.looks_like_local_path(spec) is True, spec
-    for spec in ("org/repo", "ToPo-ToPo/Inkling-Small-mlx-4bit", "unsloth/x-GGUF:Q4_K_M"):
+    for spec in ("org/repo", "ToPo-ToPo/gemma-4-26B-A4B-it-mlx-4bit", "unsloth/x-GGUF:Q4_K_M"):
         assert srv.looks_like_local_path(spec) is False, spec
 
 
