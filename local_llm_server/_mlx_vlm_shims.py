@@ -30,6 +30,11 @@ venv への直接パッチは黙って失われる。ここに置けばソース
    上流は表を外に出すのに「見え方」のフォルダ(config に ple_storage を書いたもの)を要る。モデルの置き場を
    決める ``mlx_vlm.utils.get_model_path`` を包み、表を持つモデルなら見え方を自動で作ってそちらを読む
    （→ `_install_external_view`）。受け付けるモデルの名前は HF の名前のまま。
+
+5. 前の読み込みの残り(APC)を使う依頼と別の依頼を同じ束で読み込むと、短いほうの返事が壊れる（mlx-vlm 0.7.10 時点）
+   束の行で残りの長さが違うと、短い行の後ろに詰め物を足して長さをそろえる道(右詰め)を通る。
+   この道で読み込んだ短い行は、上限まで意味のない文字(「1234567891011…」)を出し続ける
+   （→ `_patch_apc_mixed_prefill`）。
 """
 
 from __future__ import annotations
@@ -135,6 +140,41 @@ def _patch_apc_rate_poisoning() -> None:
 
     _observe_cache_size._llmserver_patched = True  # type: ignore[attr-defined]
     manager._observe_cache_size = _observe_cache_size
+
+
+def _patch_apc_mixed_prefill() -> None:
+    """複数の依頼を一度に読み込むときは、全部を最初から読み込む（mlx-vlm 0.7.10 時点）。
+
+    上流の問題: ``BatchGenerator._build_mixed_prompt_batch`` は、束の中に前の読み込みの残り
+    (APC)を使える行が 1 つでもあると、行ごとに残りの続きだけを読み込む。行ごとに長さが違うので、
+    短い行の後ろに詰め物を足して長さをそろえる(右詰め)。この道を通った短い行の返事が壊れる。
+
+    実測（2026-11-05、Ornith-1.5-35B-A3B 4bit）: 短い依頼(82 トークン・残りなし)と、
+    長い依頼(3532 トークン・うち 2508 が残り)が同じ束で読み込まれると、短いほうは
+    「1234567891011…」を上限まで出した。先読み(MTP)あり 12/12 回、なし 7/7 回。
+    長い依頼が残りを使えない(全部を最初から読み込む)ときは 10/10 回とも正しかった。
+
+    直し方: 束が 2 行以上なら、この道を使わず ``None`` を返す。呼び出し側は全部の行を
+    最初から読み込む道(左詰め。上の実測で正しかった道)に回す。1 行だけのときは上流のまま
+    残りを使う。重なったときだけ、残りを使えないぶん読み込みが延びる。
+    """
+    try:
+        from mlx_vlm.generate import ar as _ar
+    except Exception:
+        return
+    generator = getattr(_ar, "BatchGenerator", None)
+    original = getattr(generator, "_build_mixed_prompt_batch", None)
+    if (generator is None or original is None
+            or getattr(original, "_llmserver_patched", False)):
+        return  # 上流が実装を変えた / 適用済み。触らない
+
+    def _build_mixed_prompt_batch(self, sequences):
+        if len(sequences) > 1:
+            return None   # 全部の行を最初から読み込む
+        return original(self, sequences)
+
+    _build_mixed_prompt_batch._llmserver_patched = True  # type: ignore[attr-defined]
+    generator._build_mixed_prompt_batch = _build_mixed_prompt_batch
 
 
 #: 上流 ``_safe_namespace`` がディレクトリ名を切り捨てる長さ。これより短い名前は切られて
@@ -386,6 +426,7 @@ def apply() -> None:
     _patch_apc_extra_hash()
     _patch_apc_rate_poisoning()
     _patch_apc_disk_namespace()
+    _patch_apc_mixed_prefill()
     # ツール呼び出しの生成中トークン: パッチは常に当て、流すかはリクエストごとに決める
     # (ヘッダー X-Stream-Tool-Calls。無ければモデルの既定 = gateway.toml の stream_tool_calls)
     result = _patch_stream_tool_calls()

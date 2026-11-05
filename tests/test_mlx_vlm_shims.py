@@ -202,6 +202,50 @@ def test_apc_disk_store_dirs_differ_for_real_namespaces(tmp_path):
     assert apc._safe_namespace(_SHORT_NS) == _SHORT_DIR
 
 
+# ---- APC の混ぜた読み込み: 複数の依頼は全部を最初から読み込む ----------------------
+
+def _install_fake_generator(monkeypatch):
+    calls = []
+
+    class BatchGenerator:
+        def _build_mixed_prompt_batch(self, sequences):
+            calls.append(list(sequences))
+            return "mixed"
+
+    ar = _types.ModuleType("mlx_vlm.generate.ar")
+    ar.BatchGenerator = BatchGenerator
+    generate = _types.ModuleType("mlx_vlm.generate")
+    generate.ar = ar
+    pkg = _types.ModuleType("mlx_vlm")
+    pkg.generate = generate
+    monkeypatch.setitem(_sys.modules, "mlx_vlm", pkg)
+    monkeypatch.setitem(_sys.modules, "mlx_vlm.generate", generate)
+    monkeypatch.setitem(_sys.modules, "mlx_vlm.generate.ar", ar)
+    return BatchGenerator, calls
+
+
+def test_apc_mixed_prefill_reads_several_requests_from_the_start(monkeypatch):
+    """2 行以上の束は残りを使う道に入れず(None で全部を最初から)、1 行は上流のまま残りを使う。"""
+    generator, calls = _install_fake_generator(monkeypatch)
+    _mlx_vlm_shims._patch_apc_mixed_prefill()
+    g = generator()
+    assert g._build_mixed_prompt_batch(["短い依頼", "残りのある長い依頼"]) is None
+    assert calls == []
+    assert g._build_mixed_prompt_batch(["残りのある長い依頼"]) == "mixed"
+    assert calls == [["残りのある長い依頼"]]
+
+    patched = generator._build_mixed_prompt_batch
+    _mlx_vlm_shims._patch_apc_mixed_prefill()
+    assert generator._build_mixed_prompt_batch is patched   # 二重ラップしない
+
+
+def test_apc_mixed_prefill_patches_the_real_generator():
+    """本物の mlx-vlm の BatchGenerator に当たること(上流が名前を変えたら気づく)。"""
+    ar = pytest.importorskip("mlx_vlm.generate.ar")
+    _mlx_vlm_shims.apply()
+    assert getattr(ar.BatchGenerator._build_mixed_prompt_batch, "_llmserver_patched", False)
+
+
 # ---- stream_tool_calls: ツール呼び出しの生成中トークンを流す ----------------------
 
 
