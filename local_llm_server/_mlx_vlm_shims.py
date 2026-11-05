@@ -30,6 +30,13 @@ venv への直接パッチは黙って失われる。ここに置けばソース
    上流は表を外に出すのに「見え方」のフォルダ(config に ple_storage を書いたもの)を要る。モデルの置き場を
    決める ``mlx_vlm.utils.get_model_path`` を包み、表を持つモデルなら見え方を自動で作ってそちらを読む
    （→ `_install_external_view`）。受け付けるモデルの名前は HF の名前のまま。
+
+5. Qwen3.5 系の行ごとのプレフィルで、右パディングの情報が消える（mlx-vlm 0.7.10 時点）
+   APC のキャッシュが当たる行と当たらない行を同じバッチでプレフィルすると、短い行は右パディングされ、
+   バッチのキャッシュに ``prepare()`` でパディングの情報が付く。ところが Qwen3.5 / Qwen4-Exp のモデルは
+   左パディングのある行を 1 行ずつ計算して ``merge`` でキャッシュを作り直し、その情報を落とす。
+   以後のチャンクで短い行のパディングが本物のトークンとして読まれ、返事が壊れる
+   （「1234567891011…」を上限まで出す）（→ `_patch_row_wise_padding`）。
 """
 
 from __future__ import annotations
@@ -135,6 +142,83 @@ def _patch_apc_rate_poisoning() -> None:
 
     _observe_cache_size._llmserver_patched = True  # type: ignore[attr-defined]
     manager._observe_cache_size = _observe_cache_size
+
+
+#: 行ごとのプレフィルを持つモデル(モジュール, クラス)。Qwen3.5 系(Ornith も)と Qwen4-Exp(Qwen3.8 Next)。
+_ROW_WISE_MODELS = (
+    ("mlx_vlm.models.qwen3_5.language", "Qwen3_5Model"),
+    ("mlx_vlm.models.qwen4_exp.language", "Qwen4ExpModel"),
+)
+
+
+def _keep_padding_metadata(original):
+    """モデルの呼び出しの前後で、作り直されたキャッシュに右パディングの情報を戻す。"""
+
+    def __call__(self, inputs, *args, **kwargs):
+        cache = kwargs.get("cache", args[2] if len(args) > 2 else None)
+        if not isinstance(cache, list):
+            return original(self, inputs, *args, **kwargs)
+        before = [(c, getattr(c, "lengths", None), getattr(c, "_right_padding", None),
+                   getattr(c, "_lengths", None)) for c in cache]
+        out = original(self, inputs, *args, **kwargs)
+        embeds = kwargs.get("inputs_embeds", args[0] if args else None)
+        steps = (embeds if embeds is not None else inputs).shape[1]
+        for i, (old, lengths, right, absolute) in enumerate(before):
+            new = cache[i]
+            if new is old or new is None:
+                continue   # その場で更新された(バッチのまま計算した)キャッシュは上流のまま
+            if lengths is not None and getattr(new, "lengths", False) is None:
+                new.lengths = lengths - steps          # バッチの道の advance(steps) と同じ
+            if right is not None and getattr(new, "_right_padding", False) is None:
+                new._right_padding = right             # finalize() でパディングを左へ寄せる
+            if absolute is not None and getattr(new, "_lengths", False) is None:
+                new._lengths = absolute                # BatchRotatingKVCache(絶対位置なのでそのまま)
+        return out
+
+    __call__._llmserver_patched = True  # type: ignore[attr-defined]
+    return __call__
+
+
+def _patch_row_wise_padding() -> list:
+    """行ごとのプレフィルのあとも、右パディングの情報を残す（mlx-vlm 0.7.10 時点）。
+
+    上流の問題: APC のキャッシュが当たる行と当たらない行を同じバッチでプレフィルすると、
+    ``BatchGenerator._build_mixed_prompt_batch`` は短い行を右パディングし、各キャッシュの
+    ``prepare()`` でその情報を付ける(``ArraysCache.lengths``・``BatchKVCache._right_padding``)。
+    プレフィルは短い行が読み終わる位置でチャンクを区切り、続くチャンクでは ``lengths`` のマスクで
+    短い行の Gated DeltaNet の状態を止め、最後に ``finalize()`` で KV のパディングを左へ寄せる。
+
+    ところが ``Qwen3_5Model.__call__``(``Qwen4ExpModel`` も同じ形)は、KV に左パディングのある行が
+    あると 1 行ずつ計算し、行ごとのキャッシュを ``merge`` で作り直す。``merge`` は上の 2 つを引き継がず、
+    直後の ``_restore_batch_padding_metadata`` も ``offset``・``left_padding`` しか戻さない。
+    APC のキャッシュが当たらない行は当たる行に合わせて左パディングを持つので、必ずこの道を通る。
+
+    実測（2026-11-05、Ornith-1.5-35B-A3B 4bit、短い行 82 トークン・長い行 1024 トークン(残り 2508 は
+    キャッシュ)）: 1 つ目のチャンク(82 トークン)のあと ``lengths`` と ``_right_padding`` が None になり、
+    2 つ目のチャンク(941 トークン)で短い行にパディングが流れ込んだ(KV の offset が 82 でなく 1023)。
+    短い行の返事は「1234567891011…」を上限まで出した(MTP あり 12/12、なし 7/7)。パディングの無い
+    混在バッチ(どちらも 82 トークン)は 9/9 正しく、行ごとの位置(RoPE)は原因ではない。
+
+    直し方: モデルの呼び出しを包み、呼ぶ前の情報を覚えておく。作り直されたキャッシュには、
+    ``lengths`` を処理した長さだけ減らして(バッチの道の ``advance`` と同じ)、``_right_padding`` は
+    そのまま戻す。その場で更新されたキャッシュには触らない。
+    """
+    import importlib
+
+    patched = []
+    for module_name, class_name in _ROW_WISE_MODELS:
+        try:
+            module = importlib.import_module(module_name)
+        except Exception:
+            continue
+        cls = getattr(module, class_name, None)
+        original = getattr(cls, "__call__", None)
+        if cls is None or original is None:
+            continue   # 上流が実装を変えた。触らない
+        if not getattr(original, "_llmserver_patched", False):
+            cls.__call__ = _keep_padding_metadata(original)
+        patched.append(class_name)
+    return patched
 
 
 #: 上流 ``_safe_namespace`` がディレクトリ名を切り捨てる長さ。これより短い名前は切られて
@@ -386,6 +470,8 @@ def apply() -> None:
     _patch_apc_extra_hash()
     _patch_apc_rate_poisoning()
     _patch_apc_disk_namespace()
+    rows = _patch_row_wise_padding()
+    print(f"[local-llm-server shim] row-wise padding: {', '.join(rows) or 'not found'}", file=sys.stderr, flush=True)
     # ツール呼び出しの生成中トークン: パッチは常に当て、流すかはリクエストごとに決める
     # (ヘッダー X-Stream-Tool-Calls。無ければモデルの既定 = gateway.toml の stream_tool_calls)
     result = _patch_stream_tool_calls()

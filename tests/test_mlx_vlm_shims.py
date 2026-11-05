@@ -202,6 +202,66 @@ def test_apc_disk_store_dirs_differ_for_real_namespaces(tmp_path):
     assert apc._safe_namespace(_SHORT_NS) == _SHORT_DIR
 
 
+# ---- 行ごとのプレフィル: 作り直したキャッシュに右パディングの情報を戻す ----------------
+
+class _FakeArrays:
+    def __init__(self, lengths=None):
+        self.lengths = lengths
+
+
+class _FakeBatchKV:
+    def __init__(self, right=None):
+        self._right_padding = right
+
+
+class _FakeEmbeds:
+    def __init__(self, length):
+        self.shape = (2, length, 8)
+
+
+def _row_wise_model(rebuild):
+    """上流の行ごとの道の形: rebuild の位置のキャッシュを、情報の無い新しいものに作り直す。"""
+
+    class Model:
+        def __call__(self, inputs, inputs_embeds=None, mask=None, cache=None):
+            for i in rebuild:
+                cache[i] = type(cache[i])()
+            return "out"
+
+    return Model
+
+
+def test_row_wise_prefill_keeps_right_padding():
+    """作り直されたキャッシュに lengths(処理した分を引く)と _right_padding が戻ること。"""
+    Model = _row_wise_model(rebuild=[0, 1])
+    Model.__call__ = _mlx_vlm_shims._keep_padding_metadata(Model.__call__)
+    cache = [_FakeArrays(lengths=82), _FakeBatchKV(right=942)]
+    assert Model()(None, inputs_embeds=_FakeEmbeds(82), cache=cache) == "out"
+    assert cache[0].lengths == 0          # 82 トークン読んだあとの残り(バッチの道の advance と同じ)
+    assert cache[1]._right_padding == 942  # finalize() でパディングを左へ寄せられる
+
+
+def test_row_wise_prefill_leaves_caches_updated_in_place():
+    """その場で更新された(バッチのまま計算した)キャッシュには触らないこと。"""
+    Model = _row_wise_model(rebuild=[])
+    Model.__call__ = _mlx_vlm_shims._keep_padding_metadata(Model.__call__)
+    arrays = _FakeArrays(lengths=82)
+    arrays.lengths = None                 # 上流が finalize() で消した、などの正しい変化
+    cache = [arrays]
+    Model()(None, inputs_embeds=_FakeEmbeds(82), cache=cache)
+    assert cache[0] is arrays and arrays.lengths is None
+
+
+def test_row_wise_padding_patches_the_real_models():
+    """本物の mlx-vlm の Qwen3.5 系のモデルに当たり、二重に包まないこと。"""
+    language = pytest.importorskip("mlx_vlm.models.qwen3_5.language")
+    assert "Qwen3_5Model" in _mlx_vlm_shims._patch_row_wise_padding()
+    once = language.Qwen3_5Model.__call__
+    assert getattr(once, "_llmserver_patched", False)
+    _mlx_vlm_shims._patch_row_wise_padding()
+    assert language.Qwen3_5Model.__call__ is once
+
+
 # ---- stream_tool_calls: ツール呼び出しの生成中トークンを流す ----------------------
 
 
