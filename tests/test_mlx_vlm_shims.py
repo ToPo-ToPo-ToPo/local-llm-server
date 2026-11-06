@@ -404,3 +404,26 @@ def test_install_request_flag_adds_the_middleware_once(monkeypatch):
     assert _mlx_vlm_shims._install_request_flag().startswith("per-request enabled")
     assert _mlx_vlm_shims._install_request_flag() == "per-request already installed"
     assert added == [_mlx_vlm_shims._StreamToolCallsFlag]
+
+
+def test_batch_groups_requests_by_their_own_sampling():
+    """温度・top_p・top_k・seed の違う要求を、同じ束に入れない（mlx-vlm 0.7.12 から）。
+
+    0.7.11 までは束を作った最初の要求の sampler を後から入った要求にも使い、同時に来た要求が
+    自分の温度・seed を無視していた（実測: seed 1 の最中に送った seed 2〜4 が一字一句同じ答え、
+    温度 0 の最中に送った温度 0.6 の要求も同じ答え）。依存の下限を戻すとここで落ちる。
+    """
+    generation = pytest.importorskip("mlx_vlm.server.generation")
+    from types import SimpleNamespace
+
+    base = {"temperature": 0.6, "top_p": 0.95, "top_k": 20, "seed": 1, "top_n_sigma": 0.0,
+            "p_less": False, "typical_p": 1.0, "logprobs": False}
+
+    def key(**change):
+        request = SimpleNamespace(args=SimpleNamespace(**{**base, **change}), session=None)
+        owner = SimpleNamespace(draft_model=None, draft_kind=None)
+        return generation.ResponseGenerator._batch_key(owner, request)
+
+    assert key() == key()
+    for change in ({"temperature": 0.0}, {"top_p": 1.0}, {"top_k": 0}, {"seed": 2}):
+        assert key(**change) != key(), change
