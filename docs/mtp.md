@@ -117,7 +117,7 @@ ToPo-ToPo/gemma-4-31b-it-mlx-4bit
 
 ## 対応モデル（`MTP_DRAFTERS`）
 
-`"auto"` で解決できる本体→ドラフターの対応表。Qwen3.6 / Qwen3.8 / Gemma 4 系を収録
+`"auto"` で解決できる本体→ドラフターの対応表。Qwen3.6 / Qwen3.8 / Gemma 4 / Ornith 系を収録
 （mlx-community 版と自作 ToPo-ToPo 版の両方）。ドラフターの選び方:
 
 - **Qwen3.6-27B（ToPo-ToPo 版）**: 公式 bf16 チェックポイント内蔵の `mtp.*` を切り出した
@@ -137,6 +137,21 @@ ToPo-ToPo/gemma-4-31b-it-mlx-4bit
   config に `block_size = 2` を焼き込んであり、これが最速（採択率 94.1%・25.95 → 35.99 tok/s の
   1.39 倍。block-size 4 は 33.10 tok/s で劣る）。実行には `qwen4_exp_mtp` を持つ
   **mlx-vlm 0.7.0 以降**が要る（本リポジトリのロックで担保）。
+- **Ornith-1.5-35B-A3B（qwen3_5_moe）**: 公式 bf16 内蔵の `mtp.*`（最終シャード
+  `model-00016-of-00016.safetensors` に全部ある）を切り出した `ToPo-ToPo/Ornith-1.5-35B-A3B-MTP-bf16`。
+  **公式 bf16 本体 `ornith-ai/Ornith-1.5-35B-A3B` にだけ登録している**。実測（MacBook Pro M4 Max 128GB・mlx-vlm 0.7.10）:
+
+  | 本体 | 内容 | MTP なし | MTP あり（block 3） | 採択率 |
+  |---|---|---|---|---|
+  | bf16 | コード | 59.4 tok/s | 79.7 tok/s（1.34 倍） | 75.9% |
+  | bf16 | 日本語自由文 | 61.4 tok/s | 69.1 tok/s（1.13 倍） | 39.6% |
+  | 4bit（ToPo-ToPo 版） | コード | 114.2 tok/s | 103.6 tok/s（0.91 倍） | 69.5% |
+  | 4bit | 日本語自由文 | 110.2 tok/s | 95.4 tok/s（0.87 倍） | 36.4% |
+
+  4bit 本体では採択率は十分（block 2 でコード 87.7%）なのに**遅くなる**。A3B（1 トークンあたり
+  3B 分しか動かない MoE）の 4bit は素で 100 tok/s を超え、ドラフト自体（MoE）と、トークンごとに
+  別のエキスパートを読む一括検証のコストが節約分を上回るため。block 2 でも遅い。auto で引かせると
+  遅くなるだけなので、4bit 版は対応表に載せていない（使いたければ `draft_model` に明示する）。
 
 一覧は `gw mtp`（引数なし）か `from local_llm_server import MTP_DRAFTERS` で参照、解決は
 `resolve_drafter(model, "auto")` で行う。未収録モデルは `draft_model` に HF id を明示する。
