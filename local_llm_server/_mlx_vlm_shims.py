@@ -462,8 +462,43 @@ def _install_external_view() -> str:
     return "applied"
 
 
+def _patch_d1_decisions() -> str:
+    """Bridge LFM3 d1's native System One API to mlx-vlm 0.7.11 HTTP decisions.
+
+    The HTTP loader checks decision_types/predict, whereas the new d1 class
+    exposes system_one. Only that class is adapted; native scoring, calibration,
+    media preprocessing and answer fields are returned without alteration.
+    """
+    try:
+        from mlx_vlm.models.d1_lfm3_vl import Model
+    except ImportError:
+        return "not needed (LFM3 d1 unavailable)"
+    if getattr(Model, "decision_types", ()):
+        return "not needed (native HTTP decision support present)"
+    if not callable(getattr(Model, "system_one", None)):
+        return "not applied (no native System One API)"
+
+    def predict(self, processor, state, questions, images=None, **kwargs):
+        if kwargs:
+            raise ValueError("LFM3 d1 HTTP bridge supports image inputs only")
+        engine = getattr(self, "_engine", None)
+        if engine is None or engine.processor is not processor:
+            self.attach_processor(processor)
+        from mlx_vlm.utils import load_image
+
+        media = [load_image(image) for image in images or ()]
+        return self.system_one(state, questions, media=media or None)
+
+    Model.decision_types = ("choice", "score", "noul", "number", "text", "date", "box", "boxes")
+    Model.decision_media = ("images",)
+    Model.predict = predict
+    return "applied (native System One to HTTP decisions)"
+
+
 def apply() -> None:
     """既知のパッチを全て適用する。失敗しても起動は止めない。"""
+    decision = _patch_d1_decisions()
+    print(f"[local-llm-server shim] d1: {decision}", file=sys.stderr, flush=True)
     ple = _install_ple_storage()
     view = _install_external_view()
     print(f"[local-llm-server shim] ple_storage: {ple}; external view: {view}", file=sys.stderr, flush=True)
