@@ -243,6 +243,48 @@ def test_extract_rejects_path_traversal_and_links(tmp_path):
         pv._extract(str(bad_tar), str(tmp_path / "tar-out"))
 
 
+def _tar_with_links(path, links, hardlink=False):
+    """実ファイル 1 つと、それを指すリンクを含む tar.gz を作る。"""
+    data = b"\x7fELF"
+    with tarfile.open(path, "w:gz") as tf:
+        info = tarfile.TarInfo("llama-b1/libllama.0.9.0.dylib")
+        info.size = len(data)
+        tf.addfile(info, io.BytesIO(data))
+        for name, target in links:
+            link = tarfile.TarInfo(name)
+            link.type = tarfile.LNKTYPE if hardlink else tarfile.SYMTYPE
+            link.linkname = target
+            tf.addfile(link)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="シンボリックリンクの作成に権限が要る")
+def test_extract_keeps_shared_library_symlinks(tmp_path):
+    # macOS・Linux のプリビルト（b12211 以降）は共有ライブラリを同じフォルダのリンクでつなぐ。
+    archive = tmp_path / "ok.tar.gz"
+    _tar_with_links(archive, [("llama-b1/libllama.0.dylib", "libllama.0.9.0.dylib"),
+                              ("llama-b1/libllama.dylib", "libllama.0.dylib")])
+    out = tmp_path / "out"
+    pv._extract(str(archive), str(out))
+    link = out / "llama-b1" / "libllama.dylib"
+    assert link.is_symlink()
+    assert link.resolve() == (out / "llama-b1" / "libllama.0.9.0.dylib").resolve()
+
+
+@pytest.mark.parametrize("target", ["/etc/passwd", "../../outside.dylib", "C:/Windows/x.dll", ""])
+def test_extract_rejects_symlinks_leaving_destination(tmp_path, target):
+    archive = tmp_path / "bad.tar.gz"
+    _tar_with_links(archive, [("llama-b1/libllama.dylib", target)])
+    with pytest.raises(pv.ProvisionError):
+        pv._extract(str(archive), str(tmp_path / "out"))
+
+
+def test_extract_still_rejects_hardlinks(tmp_path):
+    archive = tmp_path / "hard.tar.gz"
+    _tar_with_links(archive, [("llama-b1/libllama.dylib", "llama-b1/libllama.0.9.0.dylib")], hardlink=True)
+    with pytest.raises(pv.ProvisionError):
+        pv._extract(str(archive), str(tmp_path / "out"))
+
+
 def test_archive_digest_must_match(tmp_path):
     archive = tmp_path / "asset.zip"
     archive.write_bytes(b"trusted bytes")
@@ -263,14 +305,14 @@ def test_ensure_reuses_installed_build_without_network(tmp_path, monkeypatch):
     monkeypatch.setattr(pv, "detect_arch", lambda: "x64")
 
     # 1 回目: latest=b9946 を導入。
-    monkeypatch.setattr(pv, "latest_build", lambda timeout=5.0: "b9946")
+    monkeypatch.setattr(pv, "latest_build", lambda *a, **k: "b9946")
     kw = dict(accel="cpu",
               download=lambda url, dest, timeout=300.0: _fake_tarball(dest),
               verify=lambda p, **k: True)
     p1, _ = pv.ensure_llama_server(build=None, **kw)
 
     # 2 回目: ネットワーク断＋上流には新ビルドがある想定 → それでも導入済みを使う。
-    def offline(timeout=5.0):
+    def offline(*a, **k):
         raise OSError("network unreachable")
 
     monkeypatch.setattr(pv, "latest_build", offline)
@@ -286,7 +328,7 @@ def test_ensure_offline_without_install_raises_provision_error(tmp_path, monkeyp
     monkeypatch.setattr(pv, "detect_os", lambda: "linux")
     monkeypatch.setattr(pv, "detect_arch", lambda: "x64")
 
-    def offline(timeout=5.0):
+    def offline(*a, **k):
         raise OSError("network unreachable")
 
     monkeypatch.setattr(pv, "latest_build", offline)
@@ -305,3 +347,50 @@ def test_installed_builds_sorted_newest_first(tmp_path, monkeypatch):
                  "src-b9946", "junk"):        # 形式外は無視
         os.makedirs(os.path.join(root, name), exist_ok=True)
     assert pv.installed_builds("linux", "x64", "cpu") == ["b10002", "b9946", "b9900"]
+
+
+def test_latest_build_skips_version_releases_and_incomplete_builds(monkeypatch):
+    # 2026-10 から llama.cpp のビルドごとのリリース（b<番号>）は prerelease 扱いで、
+    # /releases/latest は版のリリース（v0.9.0、プリビルト無し）を指す。
+    # 一覧から、タグが b<番号> でこの環境のアセットが揃った最新のビルドを選ぶ。
+    mac = pv.asset_name("{b}", "macos", "arm64", "metal")
+    releases = [
+        {"tag_name": "b12214", "draft": True, "prerelease": True,
+         "assets": [{"name": mac.format(b="b12214")}]},
+        {"tag_name": "b12213", "prerelease": True,
+         "assets": [{"name": "llama-b12213-bin-ubuntu-x64.tar.gz"}]},  # mac はアップロード中
+        {"tag_name": "v0.9.0", "prerelease": False, "assets": [{"name": "nightly-tag.txt"}]},
+        {"tag_name": "b12212", "prerelease": True, "assets": [{"name": mac.format(b="b12212")}]},
+        {"tag_name": "b12211", "prerelease": True, "assets": [{"name": mac.format(b="b12211")}]},
+    ]
+    seen = {}
+
+    class _Response(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_a):
+            return False
+
+    def fake_urlopen(req, timeout):
+        seen["url"] = req.full_url
+        return _Response(pv.json.dumps(releases).encode())
+
+    monkeypatch.setattr(pv.urllib.request, "urlopen", fake_urlopen)
+    assert pv.latest_build("macos", "arm64", "metal") == "b12212"
+    assert not seen["url"].endswith("/latest")
+
+
+def test_latest_build_without_matching_asset_raises_value_error(monkeypatch):
+    # 合うビルドが無ければ ValueError（ensure_llama_server が案内付き ProvisionError に包む）。
+    class _Response(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_a):
+            return False
+
+    body = pv.json.dumps([{"tag_name": "v0.9.0", "assets": []}]).encode()
+    monkeypatch.setattr(pv.urllib.request, "urlopen", lambda req, timeout: _Response(body))
+    with pytest.raises(ValueError):
+        pv.latest_build("macos", "arm64", "metal")

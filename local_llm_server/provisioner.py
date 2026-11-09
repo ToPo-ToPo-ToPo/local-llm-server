@@ -140,13 +140,33 @@ def asset_url(build: str, name: str) -> str:
     return _DL_URL.format(build=build, name=name)
 
 
-def latest_build(timeout: float = 5.0) -> str:
-    """最新リリースのタグ（例 "b9946"）を GitHub API から取得する。"""
+def latest_build(os_name: str, arch: str, accel: str, timeout: float = 5.0) -> str:
+    """この OS・アーキ・アクセラレータのプリビルトがある最新のビルド番号（例 "b9946"）を返す。
+
+    llama.cpp の Releases には 2 種類ある: ビルドごとのリリース（タグ b<番号>、プリビルト付き）と、
+    2026-10 から出ている版のリリース（タグ v0.9.0 など、プリビルトは付かない）。ビルドごとの
+    リリースは prerelease 扱いなので、prerelease を除く GitHub の /releases/latest は版のリリースを
+    指す。だから一覧を新しい順に見て、タグが b<番号> でこのアセットが揃っている最初のリリースを
+    選ぶ（アセットのアップロード中のビルドは飛ばす）。
+    """
     req = urllib.request.Request(
-        f"{_RELEASES_API}/latest", headers={"Accept": "application/vnd.github+json"}
+        f"{_RELEASES_API}?per_page=30",
+        headers={"Accept": "application/vnd.github+json", "User-Agent": "local-llm-server"},
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.load(resp)["tag_name"]
+        releases = json.load(resp)
+    for release in releases:
+        tag = release.get("tag_name")
+        if release.get("draft"):
+            continue
+        if not isinstance(tag, str) or not re.fullmatch(r"b\d+", tag):
+            continue
+        name = asset_name(tag, os_name, arch, accel)
+        if any(asset.get("name") == name for asset in release.get("assets", [])):
+            return tag
+    raise ValueError(
+        f"直近 {len(releases)} 件のリリースに {asset_name('b<番号>', os_name, arch, accel)} がありません"
+    )
 
 
 # --- 管理ディレクトリと導入 --------------------------------------------------
@@ -260,6 +280,22 @@ def _safe_archive_path(dest: str, name: str) -> str:
     return target
 
 
+def _safe_symlink(dest: str, name: str, linkname: str) -> None:
+    """シンボリックリンクは、展開先の中を相対パスで指すものだけを通す。
+
+    macOS・Linux のプリビルトは共有ライブラリを libllama.dylib → libllama.0.dylib →
+    libllama.0.9.0.dylib のように同じフォルダのリンクでつなぐ（b12211 の macOS 版で 18 本）。
+    絶対パスを指すもの・展開先の外に出るものは断る。
+    """
+    target = linkname.replace("\\", "/")
+    if not target or target.startswith("/") or re.match(r"[A-Za-z]:", target):
+        raise ProvisionError(f"archive contains a symbolic link to an absolute path: {name} -> {linkname}")
+    resolved = os.path.normpath(os.path.join(os.path.dirname(name.replace("\\", "/")), target))
+    if resolved == ".." or resolved.startswith("../"):
+        raise ProvisionError(f"archive symbolic link escapes destination: {name} -> {linkname}")
+    _safe_archive_path(dest, resolved)
+
+
 def _extract(archive: str, dest: str) -> None:
     """.tar.gz / .zip を dest へ展開する。"""
     os.makedirs(dest, exist_ok=True)
@@ -276,9 +312,12 @@ def _extract(archive: str, dest: str) -> None:
             members = tf.getmembers()
             for tar_member in members:
                 _safe_archive_path(dest, tar_member.name)
-                if tar_member.issym() or tar_member.islnk() or tar_member.isdev():
+                if tar_member.issym():
+                    _safe_symlink(dest, tar_member.name, tar_member.linkname)
+                elif tar_member.islnk() or tar_member.isdev():
                     raise ProvisionError(f"archive contains an unsafe special entry: {tar_member.name}")
-            # 検証済みでリンク/デバイスを含まないため、3.11を含む全対応Pythonで安全に展開できる。
+            # 検証済み（ハードリンク・デバイスを含まず、シンボリックリンクは展開先の中を相対で指すだけ）
+            # なので、3.11を含む全対応Pythonで安全に展開できる。
             try:
                 tf.extractall(dest, members=members, filter="data")  # nosec B202 - 検証済み
             except TypeError:  # Python 3.11の古いパッチ版
@@ -331,7 +370,7 @@ def ensure_llama_server(
             if binary and verify(binary):
                 return binary, {"build": installed, "accel": accel}
         try:
-            build = latest_build()
+            build = latest_build(os_name, arch, accel)
         except (OSError, ValueError, KeyError) as exc:  # URLError も OSError の subclass
             raise ProvisionError(
                 f"llama.cpp の最新ビルド番号を取得できない（オフライン?）: {exc}. "
