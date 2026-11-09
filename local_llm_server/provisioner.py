@@ -280,6 +280,22 @@ def _safe_archive_path(dest: str, name: str) -> str:
     return target
 
 
+def _safe_symlink(dest: str, name: str, linkname: str) -> None:
+    """シンボリックリンクは、展開先の中を相対パスで指すものだけを通す。
+
+    macOS・Linux のプリビルトは共有ライブラリを libllama.dylib → libllama.0.dylib →
+    libllama.0.9.0.dylib のように同じフォルダのリンクでつなぐ（b12211 の macOS 版で 18 本）。
+    絶対パスを指すもの・展開先の外に出るものは断る。
+    """
+    target = linkname.replace("\\", "/")
+    if not target or target.startswith("/") or re.match(r"[A-Za-z]:", target):
+        raise ProvisionError(f"archive contains a symbolic link to an absolute path: {name} -> {linkname}")
+    resolved = os.path.normpath(os.path.join(os.path.dirname(name.replace("\\", "/")), target))
+    if resolved == ".." or resolved.startswith("../"):
+        raise ProvisionError(f"archive symbolic link escapes destination: {name} -> {linkname}")
+    _safe_archive_path(dest, resolved)
+
+
 def _extract(archive: str, dest: str) -> None:
     """.tar.gz / .zip を dest へ展開する。"""
     os.makedirs(dest, exist_ok=True)
@@ -296,9 +312,12 @@ def _extract(archive: str, dest: str) -> None:
             members = tf.getmembers()
             for tar_member in members:
                 _safe_archive_path(dest, tar_member.name)
-                if tar_member.issym() or tar_member.islnk() or tar_member.isdev():
+                if tar_member.issym():
+                    _safe_symlink(dest, tar_member.name, tar_member.linkname)
+                elif tar_member.islnk() or tar_member.isdev():
                     raise ProvisionError(f"archive contains an unsafe special entry: {tar_member.name}")
-            # 検証済みでリンク/デバイスを含まないため、3.11を含む全対応Pythonで安全に展開できる。
+            # 検証済み（ハードリンク・デバイスを含まず、シンボリックリンクは展開先の中を相対で指すだけ）
+            # なので、3.11を含む全対応Pythonで安全に展開できる。
             try:
                 tf.extractall(dest, members=members, filter="data")  # nosec B202 - 検証済み
             except TypeError:  # Python 3.11の古いパッチ版

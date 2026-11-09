@@ -243,6 +243,48 @@ def test_extract_rejects_path_traversal_and_links(tmp_path):
         pv._extract(str(bad_tar), str(tmp_path / "tar-out"))
 
 
+def _tar_with_links(path, links, hardlink=False):
+    """実ファイル 1 つと、それを指すリンクを含む tar.gz を作る。"""
+    data = b"\x7fELF"
+    with tarfile.open(path, "w:gz") as tf:
+        info = tarfile.TarInfo("llama-b1/libllama.0.9.0.dylib")
+        info.size = len(data)
+        tf.addfile(info, io.BytesIO(data))
+        for name, target in links:
+            link = tarfile.TarInfo(name)
+            link.type = tarfile.LNKTYPE if hardlink else tarfile.SYMTYPE
+            link.linkname = target
+            tf.addfile(link)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="シンボリックリンクの作成に権限が要る")
+def test_extract_keeps_shared_library_symlinks(tmp_path):
+    # macOS・Linux のプリビルト（b12211 以降）は共有ライブラリを同じフォルダのリンクでつなぐ。
+    archive = tmp_path / "ok.tar.gz"
+    _tar_with_links(archive, [("llama-b1/libllama.0.dylib", "libllama.0.9.0.dylib"),
+                              ("llama-b1/libllama.dylib", "libllama.0.dylib")])
+    out = tmp_path / "out"
+    pv._extract(str(archive), str(out))
+    link = out / "llama-b1" / "libllama.dylib"
+    assert link.is_symlink()
+    assert link.resolve() == (out / "llama-b1" / "libllama.0.9.0.dylib").resolve()
+
+
+@pytest.mark.parametrize("target", ["/etc/passwd", "../../outside.dylib", "C:/Windows/x.dll", ""])
+def test_extract_rejects_symlinks_leaving_destination(tmp_path, target):
+    archive = tmp_path / "bad.tar.gz"
+    _tar_with_links(archive, [("llama-b1/libllama.dylib", target)])
+    with pytest.raises(pv.ProvisionError):
+        pv._extract(str(archive), str(tmp_path / "out"))
+
+
+def test_extract_still_rejects_hardlinks(tmp_path):
+    archive = tmp_path / "hard.tar.gz"
+    _tar_with_links(archive, [("llama-b1/libllama.dylib", "llama-b1/libllama.0.9.0.dylib")], hardlink=True)
+    with pytest.raises(pv.ProvisionError):
+        pv._extract(str(archive), str(tmp_path / "out"))
+
+
 def test_archive_digest_must_match(tmp_path):
     archive = tmp_path / "asset.zip"
     archive.write_bytes(b"trusted bytes")
