@@ -263,14 +263,14 @@ def test_ensure_reuses_installed_build_without_network(tmp_path, monkeypatch):
     monkeypatch.setattr(pv, "detect_arch", lambda: "x64")
 
     # 1 回目: latest=b9946 を導入。
-    monkeypatch.setattr(pv, "latest_build", lambda timeout=5.0: "b9946")
+    monkeypatch.setattr(pv, "latest_build", lambda *a, **k: "b9946")
     kw = dict(accel="cpu",
               download=lambda url, dest, timeout=300.0: _fake_tarball(dest),
               verify=lambda p, **k: True)
     p1, _ = pv.ensure_llama_server(build=None, **kw)
 
     # 2 回目: ネットワーク断＋上流には新ビルドがある想定 → それでも導入済みを使う。
-    def offline(timeout=5.0):
+    def offline(*a, **k):
         raise OSError("network unreachable")
 
     monkeypatch.setattr(pv, "latest_build", offline)
@@ -286,7 +286,7 @@ def test_ensure_offline_without_install_raises_provision_error(tmp_path, monkeyp
     monkeypatch.setattr(pv, "detect_os", lambda: "linux")
     monkeypatch.setattr(pv, "detect_arch", lambda: "x64")
 
-    def offline(timeout=5.0):
+    def offline(*a, **k):
         raise OSError("network unreachable")
 
     monkeypatch.setattr(pv, "latest_build", offline)
@@ -305,3 +305,50 @@ def test_installed_builds_sorted_newest_first(tmp_path, monkeypatch):
                  "src-b9946", "junk"):        # 形式外は無視
         os.makedirs(os.path.join(root, name), exist_ok=True)
     assert pv.installed_builds("linux", "x64", "cpu") == ["b10002", "b9946", "b9900"]
+
+
+def test_latest_build_skips_version_releases_and_incomplete_builds(monkeypatch):
+    # 2026-10 から llama.cpp のビルドごとのリリース（b<番号>）は prerelease 扱いで、
+    # /releases/latest は版のリリース（v0.9.0、プリビルト無し）を指す。
+    # 一覧から、タグが b<番号> でこの環境のアセットが揃った最新のビルドを選ぶ。
+    mac = pv.asset_name("{b}", "macos", "arm64", "metal")
+    releases = [
+        {"tag_name": "b12214", "draft": True, "prerelease": True,
+         "assets": [{"name": mac.format(b="b12214")}]},
+        {"tag_name": "b12213", "prerelease": True,
+         "assets": [{"name": "llama-b12213-bin-ubuntu-x64.tar.gz"}]},  # mac はアップロード中
+        {"tag_name": "v0.9.0", "prerelease": False, "assets": [{"name": "nightly-tag.txt"}]},
+        {"tag_name": "b12212", "prerelease": True, "assets": [{"name": mac.format(b="b12212")}]},
+        {"tag_name": "b12211", "prerelease": True, "assets": [{"name": mac.format(b="b12211")}]},
+    ]
+    seen = {}
+
+    class _Response(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_a):
+            return False
+
+    def fake_urlopen(req, timeout):
+        seen["url"] = req.full_url
+        return _Response(pv.json.dumps(releases).encode())
+
+    monkeypatch.setattr(pv.urllib.request, "urlopen", fake_urlopen)
+    assert pv.latest_build("macos", "arm64", "metal") == "b12212"
+    assert not seen["url"].endswith("/latest")
+
+
+def test_latest_build_without_matching_asset_raises_value_error(monkeypatch):
+    # 合うビルドが無ければ ValueError（ensure_llama_server が案内付き ProvisionError に包む）。
+    class _Response(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_a):
+            return False
+
+    body = pv.json.dumps([{"tag_name": "v0.9.0", "assets": []}]).encode()
+    monkeypatch.setattr(pv.urllib.request, "urlopen", lambda req, timeout: _Response(body))
+    with pytest.raises(ValueError):
+        pv.latest_build("macos", "arm64", "metal")
