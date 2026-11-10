@@ -20,6 +20,7 @@ from .backend_runtime import (
     vllm_provision_info,
 )
 from .gateway_errors import CapacityError, GatewayDraining
+from .gateway_manager import conversation_keys
 from .gateway_runtime import primary_lan_ip
 from .model_catalog import discover_cached_models
 from .proxy import forward, send_error, send_json
@@ -351,7 +352,10 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
         # ゲートウェイからは足さない。足すのは disable_thinking を指定したモデルの思考 OFF だけ。
         if path.endswith(("/chat/completions", "/completions")):
             body = self._maybe_disable_thinking(srv, model, payload, body)
-        self._acquire_and_forward(srv, model, body)
+        # 会話の続きは、前回と同じインスタンス（その会話のプロンプトのキャッシュを持つ）へ回す。
+        self._acquire_and_forward(
+            srv, model, body, conversation_keys(payload.get("messages"))
+        )
 
     def _maybe_disable_thinking(self, srv, model, payload: dict, body: bytes) -> bytes:
         """mlx-vlm 宛のリクエストに reasoning_effort="none" を注入して思考を止める。
@@ -405,11 +409,14 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
             return
         self._acquire_and_forward(srv, model, body)
 
-    def _acquire_and_forward(self, srv, model, body: bytes) -> None:
+    def _acquire_and_forward(
+        self, srv, model, body: bytes, conversation: list[str] | None = None
+    ) -> None:
         """model を acquire し、現在のリクエストを担当インスタンスへ中継する。
 
         chat（JSON）と STT（multipart）の共通処理。model 検証・容量/起動エラーの
-        HTTP 変換・在席解放（release）をここに集約する。
+        HTTP 変換・在席解放（release）をここに集約する。conversation は chat の会話の照合キー
+        （同じ会話の続きを同じインスタンスへ回す。→ ModelManager.acquire）。
         """
         if not isinstance(model, str):
             send_error(self, 400, "'model' must be a string")
@@ -422,7 +429,10 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
             )
             return
         try:
-            addr, handle = srv.manager.acquire(model)
+            if conversation:
+                addr, handle = srv.manager.acquire(model, conversation)
+            else:
+                addr, handle = srv.manager.acquire(model)
         except KeyError:
             send_error(self, 404, f"model '{model}' is not configured in the gateway")
             return
