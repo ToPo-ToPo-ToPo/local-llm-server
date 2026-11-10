@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import sys
 import threading
 import time
 from dataclasses import dataclass, field, replace
-from typing import Protocol
+from typing import Protocol, Sequence
 
 from .backend_core import PromptCacheConfig, ServerConfig, backend_spec, infer_backend, parallel_supported
 from .gateway_errors import CapacityError, GatewayDraining
@@ -15,6 +17,43 @@ from .model_catalog import MTP_DRAFTERS, resolve_drafter
 
 _DRAFT_OFF = ("", "off", "none")
 _REPLICA_GRACE_S = 1.0
+_TALK_ACTIVE_S = 600.0  # この秒数以内に依頼のあった会話を「続いている会話」と数える
+_TALK_KEEP_S = 3600.0  # 会話の控えを持ち続ける秒数（過ぎたものは捨てる）
+_TALK_MAX = 256  # 1 インスタンスが持つ会話の控えの上限
+_MESSAGE_KEYS = ("role", "content", "tool_calls", "tool_call_id", "name")
+
+
+def conversation_keys(messages: object) -> list[str]:
+    """chat の messages から、会話の先頭 k 件ごとの照合キー（k = 1..n）を作る。
+
+    クライアントは履歴を後ろへ足していくので、同じ会話の次の依頼は、前の依頼の messages を
+    そのまま先頭に含む。前の依頼の最後のキー（全件のキー）が次の依頼のどこかのキーと一致すれば
+    「同じ会話の続き」と分かる（→ ModelManager.acquire の conversation）。
+    messages が配列でなければ空（会話として扱わない）。
+    """
+    if not isinstance(messages, list):
+        return []
+    digest = hashlib.blake2b(digest_size=16)
+    keys: list[str] = []
+    for message in messages:
+        if isinstance(message, dict):
+            message = {k: message[k] for k in _MESSAGE_KEYS if k in message}
+        try:
+            part = json.dumps(message, sort_keys=True, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            return []
+        digest.update(part.encode("utf-8", "surrogatepass"))
+        digest.update(b"\x00")
+        keys.append(digest.hexdigest())
+    return keys
+
+
+@dataclass
+class _Talk:
+    """インスタンスが受けた 1 つの会話の控え（最後の依頼の全件のキーで引く）。"""
+
+    last_used: float  # time.monotonic()
+    turns: int = 0  # この会話の続きを受けた回数（0 は 1 回きりの依頼）
 
 
 class ManagedServer(Protocol):
@@ -57,6 +96,9 @@ class _Instance:
     ready: bool = False
     inflight: int = 0  # このインスタンスの処理中リクエスト数（>0 の間は退避しない）
     last_used: float = 0.0  # time.monotonic()。LRU の基準
+    # このインスタンスが受けた会話（最後の依頼のキー → 控え）。プロンプトのキャッシュ（KV キャッシュ）は
+    # インスタンスごとなので、会話の続きを同じインスタンスへ回すために持つ。
+    talks: dict[str, _Talk] = field(default_factory=dict)
 
 
 @dataclass
@@ -299,11 +341,75 @@ class ModelManager:
             return int(config.parallel)
         return 1
 
-    def _route_locked(self, inst: _Instance) -> tuple[str, int]:
-        """インスタンス inst にリクエストを1つ割り当てる（_state 保持下で呼ぶ）。"""
+    def _route_locked(
+        self,
+        inst: _Instance,
+        conversation: Sequence[str] | None = None,
+        talk: _Talk | None = None,
+    ) -> tuple[str, int]:
+        """インスタンス inst にリクエストを1つ割り当てる（_state 保持下で呼ぶ）。
+
+        conversation があれば、この依頼を会話の控えとして inst に残す（talk は続きのときの前回の控え）。
+        """
+        now = time.monotonic()
         inst.inflight += 1
-        inst.last_used = time.monotonic()
+        inst.last_used = now
+        if conversation:
+            inst.talks.pop(conversation[-1], None)  # 入れ直して新しい順に保つ
+            inst.talks[conversation[-1]] = _Talk(now, talk.turns + 1 if talk else 0)
+            for key in [k for k, t in inst.talks.items() if now - t.last_used > _TALK_KEEP_S]:
+                del inst.talks[key]
+            while len(inst.talks) > _TALK_MAX:
+                del inst.talks[next(iter(inst.talks))]
         return (inst.config.host, inst.config.port)
+
+    @staticmethod
+    def _talks_locked(inst: _Instance) -> int:
+        """inst で続いている会話の数（1 回きりの依頼と、しばらく依頼の無い会話は数えない）。"""
+        now = time.monotonic()
+        return sum(
+            1
+            for talk in inst.talks.values()
+            if talk.turns > 0 and now - talk.last_used <= _TALK_ACTIVE_S
+        )
+
+    def _pick_locked(
+        self, mm: _Model, ready: list[_Instance], conversation: Sequence[str] | None
+    ) -> tuple[_Instance, _Talk | None]:
+        """依頼を回すインスタンスと、会話の続きならその前回の控えを返す（_state 保持下で呼ぶ）。
+
+        - 会話の続き: 前回の依頼を受けたインスタンス（その会話のプロンプトのキャッシュを持つ）へ回す。
+          そこが満杯でもそこへ回す（別のインスタンスへ回すと、会話の全体を計算し直すため）。
+          ただし、ほかの会話と同居していて、会話の数がそれより少ない空きインスタンスがあるときは、
+          そちらへ移す（計算し直しは 1 回で、以後はそこが担当になる）。
+        - 新しい会話・会話でない依頼: 最も空いているインスタンスへ。同じなら、続いている会話の少ないほうへ。
+        """
+        least = min(ready, key=lambda i: (i.inflight, self._talks_locked(i)))
+        if not conversation:
+            return least, None
+        home, depth = None, 0
+        for inst in ready:  # いちばん長く一致するインスタンスが、いちばん新しい続きを持つ
+            for d in range(len(conversation), depth, -1):
+                if conversation[d - 1] in inst.talks:
+                    home, depth = inst, d
+                    break
+        if home is None:
+            return least, None
+        key = conversation[depth - 1]
+        talk = home.talks.pop(key)
+        capacity = self._capacity(mm.config)
+        if home.inflight >= capacity:
+            others = self._talks_locked(home)
+            free = [
+                i
+                for i in ready
+                if i is not home
+                and i.inflight < capacity
+                and self._talks_locked(i) < others
+            ]
+            if free:
+                return min(free, key=self._talks_locked), talk
+        return home, talk
 
     def _running_instances_locked(self) -> list[tuple[_Model, _Instance]]:
         """起動中（server がある）の (model, instance) を全モデル横断で列挙（_state 保持下）。"""
@@ -352,14 +458,17 @@ class ModelManager:
                 file=sys.stderr,
             )
 
-    def acquire(self, model_id: str) -> tuple[tuple[str, int], _Instance]:
+    def acquire(
+        self, model_id: str, conversation: Sequence[str] | None = None
+    ) -> tuple[tuple[str, int], _Instance]:
         """model_id のインスタンスを（必要なら起動して）確保し、(内部アドレス, ハンドル) を返す。
 
         呼び出し側は転送後に必ず release(ハンドル) すること（inflight を戻すため）。ready な
-        インスタンスが複数あれば**最も空いているもの**へ振り分ける。最も空いているものすら満杯
-        （inflight >= capacity）だった＝リクエストが競合しているときは、max_resident とメモリの
-        範囲で**バックグラウンドで複製インスタンスを1つ増やす**（現在のリクエストは待たせず、その
-        まま最少負荷のインスタンスへ転送する）。
+        インスタンスが複数あれば、会話の続き（conversation = conversation_keys(messages)）は
+        **前回と同じインスタンス**へ、それ以外は**最も空いているもの**へ振り分ける（→ _pick_locked）。
+        最も空いているものすら満杯（inflight >= capacity）だった＝リクエストが競合しているときは、
+        max_resident とメモリの範囲で**バックグラウンドで複製インスタンスを1つ増やす**（現在の
+        リクエストは待たせず、そのまま振り分け先へ転送する）。
         未登録モデルは、dynamic 有効なら ID からバックエンドを推論して初回インスタンスを起動する
         （無効なら KeyError）。起動失敗は RuntimeError/TimeoutError、初回起動の空き枠が
         `load_timeout` 内に得られなければ CapacityError（→ 503）を投げる。
@@ -381,10 +490,10 @@ class ModelManager:
             )
             if ready:
                 assert mm is not None  # ready は mm から作るため必ず存在する
-                inst = min(ready, key=lambda i: i.inflight)
                 # 「最少負荷のインスタンスすら満杯」なら競合中 → 複製を検討（割当は前の値で判定）。
-                spawn = inst.inflight >= self._capacity(mm.config)
-                addr = self._route_locked(inst)
+                spawn = min(i.inflight for i in ready) >= self._capacity(mm.config)
+                inst, talk = self._pick_locked(mm, ready, conversation)
+                addr = self._route_locked(inst, conversation, talk)
                 mm.requests += 1
         if ready:
             if spawn:
@@ -410,8 +519,8 @@ class ModelManager:
                         i for i in mm.instances if i.ready and i.server is not None
                     ]
                     if ready:  # 待つ間に他スレッドが用意した
-                        inst = min(ready, key=lambda i: i.inflight)
-                        addr = self._route_locked(inst)
+                        inst, talk = self._pick_locked(mm, ready, conversation)
+                        addr = self._route_locked(inst, conversation, talk)
                         mm.requests += 1
                         return addr, inst
             try:
@@ -462,7 +571,7 @@ class ModelManager:
                     raise RuntimeError("gateway is shutting down")
                 inst.server = server
                 inst.ready = True
-                addr = self._route_locked(inst)
+                addr = self._route_locked(inst, conversation)
                 mm.requests += 1
                 mm.instances.append(inst)
             return addr, inst

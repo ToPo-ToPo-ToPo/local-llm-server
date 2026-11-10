@@ -632,6 +632,83 @@ def test_replica_spawns_on_concurrent_load(monkeypatch):
     mgr.release(h1); mgr.release(h2); mgr.release(h3)
 
 
+def _talk(*turns):
+    """会話の依頼の照合キー。turns は利用者の発話で、間に返事を挟んだ messages にする。"""
+    from local_llm_server.gateway_manager import conversation_keys
+    messages = [{"role": "system", "content": "共通のシステムプロンプト"}]
+    for i, text in enumerate(turns):
+        if i:
+            messages.append({"role": "assistant", "content": f"{turns[i - 1]} への返事"})
+        messages.append({"role": "user", "content": text})
+    return conversation_keys(messages)
+
+
+def _two_talks_on_two_instances(mgr):
+    """会話 X を inst1、会話 Y を inst2 が担当している状態を作り、(inst1, inst2) を返す。"""
+    _, hx = mgr.acquire("m1", _talk("x1"))            # X の 1 回目 → inst1
+    _, hy = mgr.acquire("m1", _talk("y1"))            # 満杯のところへ Y の 1 回目 → inst1（複製を起動）
+    assert _wait_instances(mgr, "m1", 2)
+    mgr.release(hx); mgr.release(hy)
+    inst1, inst2 = mgr._models["m1"].instances
+    _, hx = mgr.acquire("m1", _talk("x1", "x2"))      # X の続き → 担当の inst1
+    assert hx is inst1
+    _, hy = mgr.acquire("m1", _talk("y1", "y2"))      # Y の続き。inst1 は X で満杯、inst2 は会話なし → inst2 へ移す
+    assert hy is inst2
+    mgr.release(hx); mgr.release(hy)
+    return inst1, inst2
+
+
+def test_conversation_returns_to_the_instance_that_has_its_cache(monkeypatch):
+    # プロンプトのキャッシュはインスタンスごと。会話の続きを「最も空いているインスタンス」へ回すと、
+    # キャッシュを持たないほうへ回って会話の全体を計算し直す（実測: 16k トークンで 1.3 秒 → 13 秒）。
+    _patch_fake(monkeypatch)
+    mgr = gw.ModelManager(_configs(), max_resident=2)
+    inst1, inst2 = _two_talks_on_two_instances(mgr)
+    _, hy = mgr.acquire("m1", _talk("y1", "y2", "y3"))    # 両方アイドルでも、Y は inst2（先頭の inst1 ではない）
+    assert hy is inst2
+    _, hx = mgr.acquire("m1", _talk("x1", "x2", "x3"))    # Y が生成中でも、X は inst1
+    assert hx is inst1
+    mgr.release(hx)
+    _, hx = mgr.acquire("m1", _talk("x1", "x2", "x3"))    # 同じ依頼の出し直し（messages が同じ）も inst1
+    assert hx is inst1
+    mgr.release(hx); mgr.release(hy)
+    _, hx = mgr.acquire("m1", _talk("x1", "x2", "x3", "x4"))
+    _, hy = mgr.acquire("m1", _talk("y1", "y2", "y3", "y4"))
+    assert (hx, hy) == (inst1, inst2)
+    mgr.release(hx); mgr.release(hy)
+
+
+def test_conversation_shares_its_instance_when_no_instance_has_fewer(monkeypatch):
+    # 会話が 3 つでインスタンスが 2 つ。担当が満杯でも、空きインスタンスの会話の数が少なくなければ
+    # 移さない（移すと計算し直しになり、次は別の会話が押し出されて繰り返すため）。満杯のところへ相乗りする。
+    _patch_fake(monkeypatch)
+    mgr = gw.ModelManager(_configs(), max_resident=2)
+    inst1, inst2 = _two_talks_on_two_instances(mgr)
+    _, hz = mgr.acquire("m1", _talk("z1"))                # 新しい会話 Z → 空いているほう
+    home = hz
+    mgr.release(hz)
+    other_talk = _talk("x1", "x2", "x3") if home is inst1 else _talk("y1", "y2", "y3")
+    _, hb = mgr.acquire("m1", other_talk)                 # 同居している会話が生成中
+    assert hb is home
+    _, hz = mgr.acquire("m1", _talk("z1", "z2"))          # Z の続き: 満杯でも home のまま
+    assert hz is home
+    mgr.release(hb); mgr.release(hz)
+
+
+def test_request_without_conversation_goes_to_the_least_busy(monkeypatch):
+    # 会話でない依頼（messages の無いもの）と新しい会話は、これまでどおり最も空いているインスタンスへ。
+    _patch_fake(monkeypatch)
+    mgr = gw.ModelManager(_configs(), max_resident=2)
+    inst1, inst2 = _two_talks_on_two_instances(mgr)
+    _, hx = mgr.acquire("m1", _talk("x1", "x2", "x3"))    # inst1 が処理中
+    _, h = mgr.acquire("m1")
+    assert h is inst2
+    mgr.release(h)
+    _, h = mgr.acquire("m1", _talk("新しい会話"))
+    assert h is inst2
+    mgr.release(h); mgr.release(hx)
+
+
 def test_replica_capped_by_max_resident(monkeypatch):
     # 上限に達していてアイドルも無ければ、満杯でも複製しない（busy は止めない）。
     created = _patch_fake(monkeypatch)
@@ -908,6 +985,34 @@ def test_gateway_routes_by_model(monkeypatch):
     finally:
         server.shutdown(); server.server_close(); mgr.shutdown()
         for u in ups:
+            u.shutdown(); u.server_close()
+
+
+def test_gateway_sends_a_conversation_back_to_its_instance(monkeypatch):
+    # HTTP の入口が messages から会話を見分けて、続きを同じインスタンスへ回す（空いているほうへは回さない）。
+    from dataclasses import replace
+    up1, up2 = _make_upstream("inst1"), _make_upstream("inst2")
+    monkeypatch.setattr(gw, "LocalServer", lambda config, log_path=None: _FakeServer(config, log_path))
+    cfg = ServerConfig(backend="mlx", model="m1", host="127.0.0.1", port=up1.server_address[1])
+    mgr = gw.ModelManager([cfg], max_resident=2)
+    server = gw.GatewayServer(("127.0.0.1", 0), mgr, catalog=["m1"])
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        port = server.server_address[1]
+        talk = [{"role": "user", "content": "x1"}]
+        assert _post(port, "/v1/chat/completions", {"model": "m1", "messages": talk})[1]["backend"] == "inst1"
+        inst1 = mgr._models["m1"].instances[0]
+        cfg2 = replace(cfg, port=up2.server_address[1])
+        mgr._models["m1"].instances.append(gw._Instance(config=cfg2, server=_FakeServer(cfg2), ready=True))
+        inst1.inflight += 1                      # inst1 は別の依頼を処理中
+        talk += [{"role": "assistant", "content": "a1"}, {"role": "user", "content": "x2"}]
+        assert _post(port, "/v1/chat/completions", {"model": "m1", "messages": talk})[1]["backend"] == "inst1"
+        other = [{"role": "user", "content": "別の会話"}]
+        assert _post(port, "/v1/chat/completions", {"model": "m1", "messages": other})[1]["backend"] == "inst2"
+        inst1.inflight -= 1
+    finally:
+        server.shutdown(); server.server_close(); mgr.shutdown()
+        for u in (up1, up2):
             u.shutdown(); u.server_close()
 
 
