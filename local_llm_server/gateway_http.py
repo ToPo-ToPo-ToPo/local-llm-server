@@ -13,7 +13,7 @@ import sys
 import urllib.parse
 from http.server import BaseHTTPRequestHandler
 
-from . import image, multipart, video
+from . import anthropic_api, image, multipart, video
 from .backend_runtime import (
     llama_provision_info,
     sglang_provision_info,
@@ -99,6 +99,8 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
             return True  # 認証なし運用
         auth = self.headers.get("Authorization", "")
         token = auth[7:].strip() if auth.startswith("Bearer ") else ""
+        # Anthropic 形式のクライアントは x-api-key ヘッダで送る（Claude Code の ANTHROPIC_API_KEY）
+        token = token or self.headers.get("x-api-key", "").strip()
         # bytes で比較する（str の compare_digest は非 ASCII で TypeError → 500 になる）。
         if token and hmac.compare_digest(token.encode("utf-8"), key.encode("utf-8")):
             return True
@@ -223,6 +225,9 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         srv = self.server  # type: ignore[assignment]
         path = self._route_path()
+        # Anthropic 形式の入口（Claude Code など）。エラーも Anthropic の形で返す（proxy.send_error）。
+        anthropic = path.endswith(("/v1/messages", "/v1/messages/count_tokens"))
+        self.anthropic_errors = anthropic
         if not self._require_safe_browser_context():
             return
         # 更新の適用経路は、設定・Git・依存関係のエラーを同じターミナルへ返せる
@@ -299,6 +304,23 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
         if path.endswith("/admin/sessions/release"):
             self._handle_session_release(srv, payload)
             return
+        # トークン数の見積もりは持たない（Claude Code は 404 なら文字数からの概算に切り替える）
+        if path.endswith("/v1/messages/count_tokens"):
+            send_error(self, 404, "token counting is not supported by the gateway")
+            return
+        # Anthropic の Messages 要求は OpenAI の chat/completions 要求に変えてから、以降を
+        # chat と同じ道（画像縮小・思考 OFF・会話の振り分け）に通す。応答は forward で戻す。
+        transform: anthropic_api.MessagesResponse | None = None
+        if anthropic:
+            try:
+                payload = anthropic_api.to_chat_request(payload)
+            except anthropic_api.RequestError as exc:
+                send_error(self, 400, str(exc))
+                return
+            body = json.dumps(payload).encode("utf-8")
+            transform = anthropic_api.MessagesResponse(
+                payload.get("model") or srv.default_model, bool(payload.get("stream"))
+            )
         model = payload.get("model") or srv.default_model
         if not model:
             send_error(
@@ -350,11 +372,16 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
                 srv._media_slots.release()
         # 生成のパラメータ（温度・繰り返しの抑制など）はクライアントの指定をそのまま渡し、
         # ゲートウェイからは足さない。足すのは disable_thinking を指定したモデルの思考 OFF だけ。
-        if path.endswith(("/chat/completions", "/completions")):
+        if anthropic or path.endswith(("/chat/completions", "/completions")):
             body = self._maybe_disable_thinking(srv, model, payload, body)
         # 会話の続きは、前回と同じインスタンス（その会話のプロンプトのキャッシュを持つ）へ回す。
         self._acquire_and_forward(
-            srv, model, body, conversation_keys(payload.get("messages"))
+            srv,
+            model,
+            body,
+            conversation_keys(payload.get("messages")),
+            path="/v1/chat/completions" if anthropic else None,
+            transform=transform,
         )
 
     def _maybe_disable_thinking(self, srv, model, payload: dict, body: bytes) -> bytes:
@@ -410,13 +437,21 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
         self._acquire_and_forward(srv, model, body)
 
     def _acquire_and_forward(
-        self, srv, model, body: bytes, conversation: list[str] | None = None
+        self,
+        srv,
+        model,
+        body: bytes,
+        conversation: list[str] | None = None,
+        *,
+        path: str | None = None,
+        transform: anthropic_api.MessagesResponse | None = None,
     ) -> None:
         """model を acquire し、現在のリクエストを担当インスタンスへ中継する。
 
         chat（JSON）と STT（multipart）の共通処理。model 検証・容量/起動エラーの
         HTTP 変換・在席解放（release）をここに集約する。conversation は chat の会話の照合キー
         （同じ会話の続きを同じインスタンスへ回す。→ ModelManager.acquire）。
+        path・transform は /v1/messages 用（上流のパスと応答の変換。→ proxy.forward）。
         """
         if not isinstance(model, str):
             send_error(self, 400, "'model' must be a string")
@@ -463,7 +498,7 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
             send_error(self, 502, f"failed to start model '{model}'")
             return
         try:
-            forward(self, addr, body, srv.timeout_s)
+            forward(self, addr, body, srv.timeout_s, path=path, transform=transform)
         finally:
             srv.manager.release(handle)
 

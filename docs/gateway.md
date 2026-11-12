@@ -266,6 +266,39 @@ curl http://127.0.0.1:8799/v1/rerank -H "Content-Type: application/json" -d '{
 # → {"model": "...", "results": [{"index": 0, "relevance_score": 0.98}], "usage": {"total_tokens": 61}}
 ```
 
+## Anthropic 形式の入口（`/v1/messages`。Claude Code 向け）
+
+Anthropic Messages API の形（`POST /v1/messages`）でも受け付ける。Claude Code のように Anthropic 形式しか
+話さないクライアントを、変換プロキシを別に立てずにローカルのモデルへつなぐための入口。
+
+- **仕組み**: ゲートウェイの中で OpenAI 形式の chat/completions に変えてから、いつもの振り分け（`model` →
+  モデルサーバー）・画像の縮小・思考 OFF・会話の振り分けに通す。応答（ストリーミング含む）は Anthropic 形式に
+  戻して返す（`local_llm_server/anthropic_api.py`。外部ライブラリは使わない）。
+- **変換するもの**: `system`、`messages` の `text` / `image` / `tool_use` / `tool_result`、`tools`（`input_schema` →
+  `parameters`）、`tool_choice`、`max_tokens`・`temperature`・`top_p`・`top_k`・`stop_sequences`、
+  `thinking`（`disabled` なら `enable_thinking=false`、それ以外は `true`）。応答の思考は `thinking` ブロックで返す。
+- **捨てるもの**: `cache_control`・`metadata`・`anthropic-beta` ヘッダなど Anthropic にしか無い指定。サーバー側ツール
+  （`web_search_20250305` など `input_schema` を持たないもの）。履歴の `thinking` ブロック（ローカルのテンプレートには戻さない）。
+- **持たないもの**: `POST /v1/messages/count_tokens` は 404（Claude Code は文字数からの概算に切り替える）。
+- **認証**: `api_key` を設定していれば、`Authorization: Bearer <key>` に加えて `x-api-key: <key>` も受け付ける。
+- **エラー**: この入口のエラーは Anthropic の形（`{"type": "error", "error": {"type", "message"}}`）で返す。
+
+Claude Code（CLI）からつなぐ例（普段の `~/.claude/settings.json` には書かず、起動するシェルでだけ設定する）:
+
+```bash
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8799
+export ANTHROPIC_AUTH_TOKEN=local          # api_key 未設定なら何でもよい
+export ANTHROPIC_MODEL=ToPo-ToPo/Ornith-1.5-122B-mlx-4bit
+export ANTHROPIC_DEFAULT_OPUS_MODEL=$ANTHROPIC_MODEL
+export ANTHROPIC_DEFAULT_SONNET_MODEL=$ANTHROPIC_MODEL
+export ANTHROPIC_DEFAULT_HAIKU_MODEL=$ANTHROPIC_MODEL
+export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+claude
+```
+
+Anthropic は Claude 以外のモデルへのこの使い方をサポートしていない。動くかどうかはモデルのツール呼び出しの
+出来しだい。
+
 ## 画像入力の縮小（`image_max_edge`）
 
 長辺がこの px を超える画像は、**上流へ渡す前にゲートウェイが縮小する**（既定 1024px、`0` で無効。
