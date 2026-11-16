@@ -249,20 +249,8 @@ Windowsでも標準のuvで環境を作り、`uv run --frozen gw start`で手動
 `gw pull`と`./scripts/hf`は、hf-xetの独立したRust TLS経路を迂回する。
 このアプリ内でHF_HUB_DISABLE_XET=1を設定するが、TLS証明書検証は有効のまま。
 別途直接起動した`hf`や他アプリには適用されない。実験Strata Liteも同じ迂回を行う。
-Gitの更新通信とテンプレート取得curlには、このアプリの修正済みCAバンドルを指定する。
+Gitの更新通信には、このアプリの修正済みCAバンドルを指定する。
 企業独自CAを利用する環境ではCAの運用要件も個別に確認する。
-
-TLS検査用のチェーン資料を[説明サイト](https://emudhra.we-have-a-problem.com/)から取得した後、
-以下で正常対照と14ホストを検査できる。取得したスクリプトを実行する必要はない。
-
-```bash
-uv run --frozen python scripts/check_emudhra.py --reference-chains /path/to/chains.zip
-```
-
-各実装でjulialang.orgの成功を先に確認する。認証情報なし、リダイレクトなし、TLS検証有効で実施し、
-エラーの具体的理由と証明書指紋を記録する。DNS/タイムアウト、期限切れ、ホスト名不一致、CT要件だけの
-拒否を、侵害CA拒否とは混同しない。CI/Docker定義は本リポジトリに存在しないため、
-将来導入する際はPython・uv・CA・独自TLSをそれぞれ更新し、コンテナ内でも同じ検査を行う。
 
 VS Codeはリポジトリ内`.vscode`のPythonパスを使用する。以前に別Pythonを選択済みの場合は
 「Python: Select Interpreter」でも`.venv/bin/python`を選択する。PC共通設定は変更しない。
