@@ -10,10 +10,10 @@ import time
 from dataclasses import dataclass, field, replace
 from typing import Protocol, Sequence
 
-from .backend_core import PromptCacheConfig, ServerConfig, backend_spec, infer_backend, parallel_supported
+from .backend_core import PromptCacheConfig, ServerConfig, backend_spec, parallel_supported
 from .gateway_errors import CapacityError, GatewayDraining
 from .gateway_runtime import daemon_log_path
-from .model_catalog import MTP_DRAFTERS, resolve_drafter
+from .model_catalog import MTP_DRAFTERS, resolve_backend, resolve_drafter
 
 _DRAFT_OFF = ("", "off", "none")
 _REPLICA_GRACE_S = 1.0
@@ -262,12 +262,12 @@ class ModelManager:
     def _register_dynamic_locked(self, model_id: str) -> _Model:
         """未登録モデルを動的登録する（control＋state ロック保持下で呼ぶ）。
 
-        ID からバックエンドを推論し、内部ポートを割り当てて _Model を作る。MTP（mlx-vlm）は
+        ID（と取得済みのファイル。→ resolve_backend）からバックエンドを決め、内部ポートを割り当てて _Model を作る。MTP（mlx-vlm）は
         対応表から本体名で自動選択できるため、事前登録なしでも有効化する（下記
         `_dynamic_draft`）。parallel やマルチモーダルの mmproj 自動付与など他のオプションは
         付かない（個別チューニングが要るものだけ gateway.toml に事前登録する）。
         """
-        backend = infer_backend(model_id)
+        backend = resolve_backend(model_id)
         cfg = ServerConfig(
             backend=backend,
             model=model_id,
@@ -328,7 +328,7 @@ class ModelManager:
             mm = self._models.get(model_id)
         if mm is not None:
             return mm.config.backend
-        return infer_backend(model_id)
+        return resolve_backend(model_id)
 
     def _capacity(self, config: ServerConfig) -> int:
         """1 インスタンスが同時に捌けるリクエスト数。llama-cpp は parallel スロット、他は 1。

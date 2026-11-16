@@ -449,7 +449,14 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
             send_error(self, 503, f"gateway busy: {exc}")
             return
         except (RuntimeError, TimeoutError) as exc:
-            send_error(self, 502, f"failed to start model '{model}': {exc}")
+            detail = str(exc)
+            # 原因（ログの抜粋つき）はゲートウェイのログに必ず残す。応答に載せるのはローカルの
+            # クライアントにだけで、別PCからのクライアントには 1 行目（終了コードと原因候補）に
+            # 留める（ログにはローカルのパスやモデル内部の出力が含まれるため）。
+            print(f"Model startup failed for {model!r}: {detail}", file=sys.stderr)
+            if not self._client_is_loopback():
+                detail = detail.splitlines()[0] if detail else detail
+            send_error(self, 502, f"failed to start model '{model}': {detail}")
             return
         except Exception as exc:  # noqa: BLE001 - 起動系の OS/バックエンド例外を HTTP 境界で閉じる
             print(f"Model startup failed for {model!r}: {exc}", file=sys.stderr)

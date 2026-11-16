@@ -9,6 +9,7 @@ from __future__ import annotations
 import glob
 import json
 import os
+import re
 import struct
 import time
 
@@ -292,6 +293,74 @@ def ensure_cached(
     return complete[0]
 
 
+# 同梱コード（config.json の model_file）の先頭からこのバイト数だけ読んで流儀を判定する。
+_BUNDLED_CODE_SCAN_BYTES = 512 * 1024
+
+
+def bundled_mlx_code(snapshot: str) -> str | None:
+    """スナップショットがモデル定義のコードを同梱していれば、その流儀を返す。
+
+    mlx-lm も mlx-vlm も、config.json の ``model_file`` が指す .py をモデル定義として import する
+    （PLaMo 3 Translate など、上流に無いアーキテクチャを配る手段）。ただし求める形が違う:
+    mlx-lm は ``ModelArgs``、mlx-vlm は ``ModelConfig`` を持つことを前提にする。mlx-lm 用の
+    コードを mlx-vlm に渡すと ``module 'custom_model' has no attribute 'ModelConfig'`` で
+    ロードに失敗し、サーバーは終了コード 3 で落ちる。
+
+    - "mlx-lm"  … ``ModelArgs`` があり ``ModelConfig`` が無い（mlx-vlm では読めない）。
+    - "mlx-vlm" … ``ModelConfig`` がある。
+    - None      … 同梱コードが無い・読めない・どちらとも判定できない（ID からの推論に任せる）。
+    """
+    try:
+        with open(os.path.join(snapshot, "config.json"), encoding="utf-8") as fh:
+            cfg = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    model_file = cfg.get("model_file") if isinstance(cfg, dict) else None
+    if not isinstance(model_file, str) or not model_file.endswith(".py"):
+        return None
+    path = os.path.normpath(os.path.join(snapshot, model_file))
+    # model_file はスナップショットの中だけを見る（../ でキャッシュの外へ出さない）。
+    if os.path.commonpath([os.path.normpath(snapshot), path]) != os.path.normpath(snapshot):
+        return None
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            src = fh.read(_BUNDLED_CODE_SCAN_BYTES)
+    except OSError:
+        return None
+    has_config = re.search(r"^class\s+ModelConfig\b", src, re.MULTILINE) is not None
+    has_args = re.search(r"^class\s+ModelArgs\b", src, re.MULTILINE) is not None
+    if has_config:
+        return "mlx-vlm"
+    if has_args:
+        return "mlx-lm"
+    return None
+
+
+def cached_snapshot(repo: str, *, cache_root: str | None = None) -> str | None:
+    """ensure_cached と同じ選び方でスナップショットを返す。未取得・不完全なら None（例外にしない）。"""
+    try:
+        return ensure_cached(repo, cache_root=cache_root)
+    except ValueError:
+        return None
+
+
+def resolve_backend(model: str, *, cache_root: str | None = None) -> str:
+    """登録されていないモデルのバックエンドを、ID に加えて取得済みのファイルからも決める。
+
+    ID だけの推論（infer_backend）は "mlx" を含む ID をすべて mlx-vlm にする。取得済みの
+    スナップショットが mlx-lm 用のモデル定義を同梱していれば（bundled_mlx_code）、mlx-vlm では
+    読めないので mlx（mlx_lm.server）を選ぶ。同梱コードの実行に要る --trust-remote-code は
+    _build_mlx が付ける。
+    """
+    backend = infer_backend(model)
+    if backend != "mlx-vlm":
+        return backend
+    snap = cached_snapshot(model, cache_root=cache_root)
+    if snap is not None and bundled_mlx_code(snap) == "mlx-lm":
+        return "mlx"
+    return backend
+
+
 def mtp_status(
     model: str, drafter: str | None = None, *, cache_root: str | None = None
 ) -> str | None:
@@ -441,9 +510,9 @@ def discover_cached_models(
                      or infer_backend(repo) in ("whisper", "mlx-audio"))
             ):
                 cands = [repo]
-                backend = infer_backend(
-                    repo
-                )  # whisper → STT、tts → mlx-audio、mlx → mlx-vlm、他は OS 既定
+                # whisper → STT、tts → mlx-audio、mlx → mlx-vlm（mlx-lm 用のコード同梱なら mlx）、
+                # 他は OS 既定
+                backend = resolve_backend(repo, cache_root=root)
             else:
                 continue
             # MTP（高速化）の利用可否を本体ごとに付与する（ドラフターが揃っていれば "ready"）。

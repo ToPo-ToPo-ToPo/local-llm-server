@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import platform  # noqa: F401 - compatibility seam for callers/tests
+import re
 import subprocess
 import sys
 import tempfile  # noqa: F401 - compatibility seam used by runtime-dir callers/tests
@@ -322,7 +323,7 @@ def _build_mlx(config: ServerConfig) -> list[str]:
     """mlx_lm.server（テキスト専用。逐次処理。並列スロットの概念なし）。"""
     # 自動ダウンロードは行わない。事前に `hf download` 済みであることを起動前に確認する
     # （未取得ならここで案内付き ValueError）。
-    ensure_cached(config.model)
+    snapshot = ensure_cached(config.model)
     command = [
         sys.executable,
         "-m",
@@ -334,6 +335,15 @@ def _build_mlx(config: ServerConfig) -> list[str]:
         "--port",
         str(config.port),
     ]
+    # モデル定義を同梱する repo（PLaMo 3 Translate など）は、mlx_lm がその .py を import し、
+    # トークナイザーも同梱コードで組む。トークナイザー側は --trust-remote-code が無いと読めない。
+    # モデル定義の .py は mlx-lm / mlx-vlm とも許可なしで import するので、ここで許しても
+    # 取得済みの repo の外のコードを新たに実行することにはならない。
+    if (
+        _model_catalog.bundled_mlx_code(snapshot) == "mlx-lm"
+        and "--trust-remote-code" not in config.extra_args
+    ):
+        command.append("--trust-remote-code")
     if config.disable_thinking:
         command += ["--chat-template-args", '{"enable_thinking": false}']
     return command
@@ -348,7 +358,15 @@ def _build_mlx_vlm(config: ServerConfig) -> list[str]:
     クライアントがトップレベル enable_thinking で行う（llm.py 参照）。
     """
     # 自動ダウンロードは行わない。本体は事前に `hf download` 済みであることを確認する。
-    ensure_cached(config.model)
+    snapshot = ensure_cached(config.model)
+    # mlx-lm 用のモデル定義を同梱する repo は mlx-vlm では読めない（ModelConfig が無いと
+    # ロードに失敗し、終了コード 3 で落ちる）。起動する前に、直し方を添えて断る。
+    if _model_catalog.bundled_mlx_code(snapshot) == "mlx-lm":
+        raise ValueError(
+            f"'{config.model}' は mlx-lm 用のモデル定義（config.json の model_file）を同梱しており、"
+            " mlx-vlm では読み込めません。gateway.toml のこのモデルの [[models]] を"
+            ' backend = "mlx" にするか、登録を外してください（未登録なら自動で mlx を選びます）。'
+        )
     # 直接 mlx_vlm.server を起動せず、シム経由で起動する（_mlx_vlm_shims が上流の
     # 未修正部分を当ててから同じ引数で mlx_vlm.server を __main__ 実行する）。
     # site-packages を書き換えると手動更新の `uv sync` で消えるため。
@@ -634,6 +652,80 @@ models_match = _server_health.models_match
 parse_host_port = _server_health.parse_host_port
 
 
+# ── 起動失敗の診断 ─────────────────────────────────────────────────────────────
+# モデルサーバーが ready 前に落ちたとき、ログから原因候補を示す。(探す文字列, 原因候補)。
+# 上から順に照合して最初に当たったものを採る（具体的なものほど上に置く）。
+_OOM_HINT = "メモリ不足（他のモデルを止めるか、小さい量子化を使う）"
+_STARTUP_FAILURE_HINTS: tuple[tuple[str, str], ...] = (
+    ("has no attribute 'ModelConfig'",
+     'モデル同梱のコードが mlx-lm 用で、mlx-vlm では読めない（gateway.toml で backend = "mlx" にする）'),
+    ("trust_remote_code",
+     'モデルが同梱コードの実行を求めている（extra_args に "--trust-remote-code" を足す）'),
+    ("not supported",
+     "バックエンドがこのモデルのアーキテクチャに未対応（バックエンドの版を上げるか、別のバックエンドを指定する）"),
+    ("Insufficient Memory", _OOM_HINT),
+    ("OutOfMemory", _OOM_HINT),
+    ("out of memory", _OOM_HINT),
+    ("bad_alloc", _OOM_HINT),
+    ("No safetensors found", "重みファイルが無い（hf download で取り直す）"),
+    ("Missing parameters", "重みとモデル定義が合わない（ファイルの破損か、バックエンドの版の違い）"),
+    ("parameters not in model", "重みとモデル定義が合わない（ファイルの破損か、バックエンドの版の違い）"),
+    ("SafetensorError", "重みファイルが壊れている（hf download で取り直す）"),
+    ("FileNotFoundError", "必要なファイルが見つからない（モデルのパス・取得状況を確認する）"),
+    ("Address already in use", "内部ポートが他のプロセスに使われている"),
+)
+# エラーに載せるログの量（JSON 応答に収まる程度）。
+_STARTUP_LOG_TAIL_LINES = 12
+_STARTUP_LOG_READ_BYTES = 64 * 1024
+_STARTUP_ERROR_LINE = re.compile(r"^\s*(?:[\w.]+(?:Error|Exception)|ERROR\b|Error\b)[:\s-]")
+
+
+def _backend_versions(backend: str) -> str:
+    """原因の切り分けに使う、バックエンドのパッケージの版（入っていない物は出さない）。"""
+    from importlib import metadata
+
+    names = {"mlx": ("mlx-lm", "mlx"), "mlx-vlm": ("mlx-vlm", "mlx-lm", "mlx")}.get(backend, ())
+    found = []
+    for name in names:
+        try:
+            found.append(f"{name} {metadata.version(name)}")
+        except metadata.PackageNotFoundError:
+            continue
+    return ", ".join(found)
+
+
+def describe_early_exit(returncode: int, log_text: str, *, backend: str, log_path: str) -> str:
+    """ready 前に落ちたモデルサーバーの、原因の分かるエラーメッセージを組む。
+
+    終了コード・原因候補・ログ中のエラー行・バックエンドの版・ログの末尾を 1 つにまとめる。
+    uvicorn で動くサーバー（mlx-vlm など）はモデルのロードに失敗すると終了コード 3 で落ちるので、
+    コードだけでは原因が分からない。全文はログファイル（log_path）に残っている。
+    """
+    lines = [ln.rstrip() for ln in log_text.splitlines() if ln.strip()]
+    if returncode < 0:
+        head = f"server exited early (killed by signal {-returncode})"
+    else:
+        head = f"server exited early (code {returncode})"
+    hint = next((h for needle, h in _STARTUP_FAILURE_HINTS if needle in log_text), None)
+    if hint is None and returncode in (-9, 137):
+        hint = "強制終了された（メモリ不足で OS に止められた可能性が高い）"
+    if hint is None and returncode == 3:
+        hint = "サーバーの起動処理（モデルのロード）で失敗した"
+    errors = list(dict.fromkeys(
+        ln.strip() for ln in lines
+        if _STARTUP_ERROR_LINE.match(ln) and "Traceback (most recent call last)" not in ln
+    ))[-3:]
+    parts = [head + (f": {hint}" if hint else "")]
+    if errors:
+        parts.append("error: " + " | ".join(errors))
+    versions = _backend_versions(backend)
+    parts.append(f"backend: {backend}" + (f" ({versions})" if versions else ""))
+    parts.append(f"log: {log_path}")
+    if lines:
+        parts.append("--- log tail ---\n" + "\n".join(lines[-_STARTUP_LOG_TAIL_LINES:]))
+    return "\n".join(parts)
+
+
 class LocalServer:
     """ローカルLLMサーバーをサブプロセスとして管理する。"""
 
@@ -650,6 +742,8 @@ class LocalServer:
         # 必須引数——省略時に一時ファイルへ逃がすフォールバックは、誰にも掃除されない
         # ゴミを temp に落とすだけなので廃止した（実運用は常に daemon_log_path を渡す）。
         self.log_path = log_path
+        # 今回の起動が書き始めるログの位置（同じポートのログには追記されるので、前回分を除く）。
+        self._log_start = 0
 
     @property
     def base_url(self) -> str:
@@ -679,6 +773,10 @@ class LocalServer:
             # ログパス（ゲートウェイの daemon_log_path 等）は親ディレクトリが
             # 無いことがあるので作る（log_dir は呼び出し側が作る設計）。
             os.makedirs(os.path.dirname(self.log_path) or ".", exist_ok=True)
+            try:
+                self._log_start = os.path.getsize(self.log_path)
+            except OSError:
+                self._log_start = 0
             self._log_file = open(self.log_path, "a", encoding="utf-8")
             # 自動ダウンロードを完全に無効化する hard guard。バックエンド（mlx_lm / mlx_vlm /
             # transformers / tokenizers / ドラフター）はキャッシュのみを参照し、未取得ファイルが
@@ -797,14 +895,28 @@ class LocalServer:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if self._proc is not None and self._proc.poll() is not None:
-                raise RuntimeError(
-                    f"server exited early (code {self._proc.returncode})"
-                )
+                raise RuntimeError(self._early_exit_message(self._proc.returncode))
             if is_ready(self.config.base_url):
                 return
             time.sleep(interval)
         raise TimeoutError(
             f"server not ready within {timeout}s at {self.config.base_url}"
+        )
+
+    def _early_exit_message(self, returncode: int) -> str:
+        """今回の起動で書かれたログを読み、原因の分かるエラーメッセージにする。"""
+        text = ""
+        try:
+            if self._log_file is not None:
+                self._log_file.flush()
+            with open(self.log_path, "rb") as fh:
+                size = fh.seek(0, os.SEEK_END)
+                fh.seek(max(self._log_start, size - _STARTUP_LOG_READ_BYTES))
+                text = fh.read().decode("utf-8", errors="replace")
+        except OSError:
+            pass
+        return describe_early_exit(
+            returncode, text, backend=self.config.backend, log_path=self.log_path
         )
 
     def wait(self) -> int:

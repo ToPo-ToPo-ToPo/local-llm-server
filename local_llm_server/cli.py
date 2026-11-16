@@ -37,6 +37,7 @@ import tomllib
 
 from . import migrate, tls_policy
 from .daemon import load_gateway_config
+from . import model_catalog as _model_catalog
 from .server import (
     MTP_DRAFTERS,
     backend_spec,
@@ -915,7 +916,8 @@ def build_show_rows(model: str) -> list[tuple[str, str]]:
     import re
 
     repo, _selector = _split_model_spec(model)
-    backend = infer_backend(model)
+    # 取得済みなら同梱コードも見て決める（ゲートウェイの動的ロードと同じ判定）。
+    backend = _model_catalog.resolve_backend(model, cache_root=_hf_hub_cache())
     rows: list[tuple[str, str]] = [("モデル", model), ("バックエンド", backend)]
     m = re.search(r"(\d+(?:\.\d+)?)\s*[bB](?![a-zA-Z0-9])", repo.split("/", 1)[1])
     if m:
