@@ -81,7 +81,9 @@ backend = "mlx-vlm"
 - **遅延起動**: 各モデルは**初回リクエスト時に起動**し、2 回目以降は常駐して即応答する。
 - **動的ロード（`dynamic = true`）**: `[[models]]` に無いモデルもリクエストされた時点で起動・管理する。
   バックエンドは ID から推論（`whisper`/`parakeet`→whisper、`gguf`→llama-cpp、`mlx`→mlx-vlm、
-  他→OS 既定。→ [docs/llama-cpp.md](llama-cpp.md)）。
+  他→OS 既定。→ [docs/llama-cpp.md](llama-cpp.md)）。ただし取得済みの repo が mlx-lm 用のモデル定義を
+  同梱している（`config.json` の `model_file` が `ModelArgs` を持つ .py を指す。PLaMo 3 Translate など）
+  ときは、mlx-vlm では読めないので mlx（`mlx_lm.server --trust-remote-code`）を選ぶ。
   ロードされると一覧（`/v1/models`・`gw list`）に現れ、アンロードされると消える。すでにロード済みの
   モデルが再指定されたら**相乗り**（共有）する。**画像入力（mmproj 自動検出）と mlx-vlm の MTP（対応表に
   在る本体は `draft_model="auto"` を自動適用）は動的ロードでも効く**。一方 `parallel` や llama.cpp の MTP

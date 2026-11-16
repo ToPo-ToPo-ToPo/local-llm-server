@@ -61,6 +61,7 @@ internal_base_port = 9001   # 内部モデルサーバーの割当開始ポー�
 
 # 未登録モデルの動的ロード（既定 true）。指定された model をその場で起動・管理し、一覧（`gw list`）に
 # 現れる（アンロードで消える）。バックエンドは ID から推論（gguf→llama-cpp、mlx→mlx-vlm、他→OS 既定）。
+# mlx-lm 用のモデル定義を同梱する repo（PLaMo 3 Translate など）は、取得済みのファイルを見て mlx を選ぶ。
 # false にすると下の [[models]] に登録したものだけ提供する（旧挙動）。
 dynamic = true
 # disable_thinking = true   # 動的ロード時の既定（思考抑制）。事前登録は各 [[models]] が優先
