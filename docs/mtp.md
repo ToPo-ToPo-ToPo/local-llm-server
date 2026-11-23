@@ -140,3 +140,49 @@ ToPo-ToPo/gemma-4-31b-it-mlx-4bit
 
 一覧は `gw mtp`（引数なし）か `from local_llm_server import MTP_DRAFTERS` で参照、解決は
 `resolve_drafter(model, "auto")` で行う。未収録モデルは `draft_model` に HF id を明示する。
+
+## 対応表に入れていないもの: Inkling 2 Mini（DSpark）
+
+`thinkingmachines/Inkling-2-Mini` は、チェックポイントに DSpark ドラフター（`mtp.safetensors`。
+1 アンカー＋7 提案のブロック）を同梱している。mlx-vlm（main の f1618d6d 以降。→ pyproject）は
+本体と同じ repo をドラフターに指せば読み、draft kind も自動で直す。ただし **M2 Ultra では
+速くならなかった**ので、`"auto"` の対応表には載せていない（載せると動的ロードのたびに遅くなる）。
+
+実測（M2 Ultra 128GB・温度 0・reasoning_effort="none"・512 トークン生成。tok/s は生成のみ）:
+
+| プロンプト | DSpark なし | block 8（既定） | block 4 | block 2 |
+|---|---:|---:|---:|---:|
+| コード生成（42 トークン） | 24.29 | 24.11 | 24.31 | 22.90 |
+| JSON（46 トークン） | 24.23 | 19.67 | 20.40 | 21.52 |
+| 日本語の自由文（52 トークン） | 24.25 | 10.34 | 13.30 | 16.49 |
+| 長いコードの解説（11,039 トークン） | 21.12 | 21.28 | 21.00 | — |
+
+採択そのものは働いている（`mlx_vlm.generate` の集計: 1 から 100 まで数える 77.6%、コード 36.3%、
+日本語の自由文 7.6%）。それでも速くならないのは、この機材では 8 トークンをまとめて検証する 1 回が
+通常の 1 ステップの数倍かかり、採択で稼いだ分を相殺するため。上流の測定（M5 Max）では
++13〜51% 伸びているので、新しい世代の Mac では効く可能性がある。
+
+上の表は、ゲートウェイの mlx-vlm 向け高速化（→ [llama-cpp.md](llama-cpp.md#mlx-vlm-での高速化自動)）を
+入れる前の値。高速化と合わせて測り直すと、コード生成だけは 35.20 tok/s（DSpark なしは約 30 tok/s）と
+速くなるが、JSON は 26.24、日本語の自由文は 13.90 tok/s と遅くなる（block 4 でも 33.96 / 26.34 /
+19.27 tok/s）。なので既定では使わない。
+
+検証が重い理由（2026-11-23 の調査）: 1 系列で 8 トークンを検証する 1 回は 97〜100 ms で、生成の 1 歩
+（約 40 ms。同期して測った値）の 2.5 倍かかる。大きいのは専門家（MoE）で、mlx-vlm は Inkling の専門家の型
+（`ScaledQuantizedSwitchLinear`）を検証用の経路の対象外とし、トークンごとに 1 回ずつ通している（`tokenwise`）。
+そのため専門家の重みをトークン×専門家の組の数だけ読み直す（8 トークンで 52 ms、1 トークンは 8 ms）。
+実際の文章では連続 8 トークンが使う専門家はのべ 64 個中 28 個ほどなので、専門家ごとに 1 回だけ読む
+専用の計算（Strata の ragged `moe_mm` と同じ考え方。和の順番も MLX の行列×ベクトルと同じにして
+ビット一致）を試作したところ、8 トークンの専門家は 52 → 31〜36 ms になった。ただ検証全体では 5〜8% しか
+縮まず、DSpark の生成はコード 30.4 tok/s・日本語の自由文 14.4 tok/s と、DSpark なし（33.6 tok/s）に
+届かなかったので取り込んでいない（残りは層全体に薄く広がっている）。
+
+試すときは事前登録で明示する:
+
+```toml
+[[models]]
+model = "thinkingmachines/Inkling-2-Mini"
+backend = "mlx-vlm"
+draft_model = "thinkingmachines/Inkling-2-Mini"   # 同梱の DSpark
+# extra_args = ["--draft-block-size", "4"]        # 既定は 8
+```

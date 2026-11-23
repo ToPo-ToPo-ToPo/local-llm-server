@@ -874,7 +874,7 @@ requires-dist = [
     { name = "filelock", specifier = ">=4.2.1" },
     { name = "imageio-ffmpeg", specifier = ">=0.4.9" },
     { name = "mlx-lm", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'", specifier = ">=0.31.3" },
-    { name = "mlx-vlm", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'", specifier = ">=0.7.12" },
+    { name = "mlx-vlm", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'", git = "https://github.com/Blaizzy/mlx-vlm?rev=f1618d6d52be4ef25d3fe65270f7528a59c55df3" },
     { name = "mlx-whisper", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'", specifier = ">=0.4.3" },
     { name = "pillow", specifier = ">=13.0.0" },
     { name = "psutil", specifier = ">=5.9" },
@@ -1022,12 +1022,13 @@ wheels = [
 
 [[package]]
 name = "mlx-vlm"
-version = "0.7.12"
-source = { registry = "https://pypi.org/simple" }
+version = "0.8.0"
+source = { git = "https://github.com/Blaizzy/mlx-vlm?rev=f1618d6d52be4ef25d3fe65270f7528a59c55df3#f1618d6d52be4ef25d3fe65270f7528a59c55df3" }
 dependencies = [
     { name = "cryptography" },
     { name = "datasets" },
     { name = "fastapi" },
+    { name = "httpx" },
     { name = "jinja2" },
     { name = "llguidance" },
     { name = "miniaudio" },
@@ -1044,10 +1045,6 @@ dependencies = [
     { name = "transformers" },
     { name = "uvicorn" },
     { name = "websockets" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/34/d8/42c40e2d3ca9fafef53effc3f0ea303b5ba82f386a2d86f0e93757572f74/mlx_vlm-0.7.12.tar.gz", hash = "sha256:379eec215d144ae1b6bbe60602e10409ed74f50d88e26d93ba82dcb97b38b360", size = 2910902, upload-time = "2026-11-04T17:04:12.784Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/23/02/edff5808937aa072ee6ce4e4a8745d36ff1882578f26f2f1d2096029e535/mlx_vlm-0.7.12-py3-none-any.whl", hash = "sha256:0412a883ed5f0ee2fe65e6c050819ae586ac76f1811f94a373b6293e92568e37", size = 3640799, upload-time = "2026-11-04T17:04:10.366Z" },
 ]
 
 [[package]]

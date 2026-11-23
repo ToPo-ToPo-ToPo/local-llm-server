@@ -293,6 +293,17 @@ def ensure_cached(
     return complete[0]
 
 
+def snapshot_model_type(snapshot: str) -> str | None:
+    """スナップショットの config.json の model_type（小文字）。読めなければ None。"""
+    try:
+        with open(os.path.join(snapshot, "config.json"), encoding="utf-8") as fh:
+            cfg = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    value = cfg.get("model_type") if isinstance(cfg, dict) else None
+    return value.lower() if isinstance(value, str) else None
+
+
 # 同梱コード（config.json の model_file）の先頭からこのバイト数だけ読んで流儀を判定する。
 _BUNDLED_CODE_SCAN_BYTES = 512 * 1024
 

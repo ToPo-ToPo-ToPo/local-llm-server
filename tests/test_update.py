@@ -3,7 +3,23 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from local_llm_server import update
+import pytest
+
+from local_llm_server import migration_policy, update
+
+
+@pytest.fixture(autouse=True)
+def _fixed_installed_versions(monkeypatch):
+    """refresh_tool_env が読む「導入済みの版」を、試験を走らせている環境から切り離す。
+
+    実環境を読むと、開発用 venv に git から入れた依存（いまは mlx-vlm。→ pyproject の
+    [tool.uv.sources]）があるだけで installed_versions が直接 URL として断り、tool venv の
+    更新手順そのものを試せなくなる。直接 URL を断る挙動は tests/test_migration.py が確かめる。
+    """
+    monkeypatch.setattr(
+        migration_policy, "installed_versions",
+        lambda: {"certifi": "2026.10.23", "pip": "26.2.2", "mlx-vlm": "0.7.12"},
+    )
 
 
 # --- バージョン比較 --------------------------------------------------------

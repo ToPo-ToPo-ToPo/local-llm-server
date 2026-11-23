@@ -41,7 +41,11 @@ dependencies = [
     # 0.7.12 以上: 0.7.11 までの連続バッチは、束を作った最初の要求の温度・top_p・top_k・seed を
     # 後から入った要求にも使っていた（温度 0 の要求の最中に来た温度 0.6 の要求まで貪欲になる）。
     # 0.7.12 で設定の違う要求は別の束で生成されるようになった（ResponseGenerator._batch_key）。
-    "mlx-vlm>=0.7.12 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    # main の f1618d6d（0.8.0 の後）に固定する: Inkling 2 Mini（model_type=inkling2_loop。中段 12 層を
+    # 3 周する looped transformer）は 0.8.0 には無く、2026-11-20 の #2778 で入った。同梱の DSpark
+    # ドラフター（mtp.safetensors）と Inkling のツール呼び出しの解析（#2783）もここから。
+    # 次の PyPI 版が出たら [tool.uv.sources] の固定を外し、ここを >=その版 に戻す。
+    "mlx-vlm>=0.8.0 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
     # mlx-vlm 0.6.5+ が transformers>=5.14 を要求する（0.6.4 は <5.13 に固定していた）。
     # 5.18 以上: 埋め込みバックエンド（embed_server）が EmbeddingGemma 2（google/embeddinggemma-2）を
     # AutoModel で読むのに要る（EmbeddingGemma2Model は 5.18 から）。mlx-vlm 0.7.1 のチャット推論は
@@ -106,6 +110,10 @@ constraint-dependencies = ["litellm<0", "multidict>=6.9.1"]
 # wheel のみに絞れば後退はそこで打ち切られ、代わりに torchvision 側を vllm の固定に合わせて
 # 解決する。対象版は全て wheel 配布なので、Linux での実インストールにも影響しない。
 no-build-package = ["vllm", "sglang"]
+
+[tool.uv.sources]
+# mlx-vlm の PyPI 版に Inkling 2 Mini が入るまでの一時的な固定（→ dependencies の mlx-vlm）。
+mlx-vlm = { git = "https://github.com/Blaizzy/mlx-vlm", rev = "f1618d6d52be4ef25d3fe65270f7528a59c55df3" }
 
 [dependency-groups]
 dev = [
