@@ -46,6 +46,7 @@ uv run --frozen gw list       # 使えるモデル一覧（カタログ＋HF キ
 uv run --frozen gw stop       # 停止（再開は gw start か次回ログイン）
 uv run --frozen gw start      # 手動起動（初回は設定を自動生成。自動起動を無効にした場合の入口）
 uv run --frozen gw update     # 更新を取り込む（新版の確認は自動、適用はこのコマンドだけ）
+uv run --frozen gw claude --model <モデルID>  # ゲートウェイのモデルで Claude Code を起動（→ docs/gateway.md）
 ```
 
 設定は **`~/.config/local-llm-server/gateway.toml` の 1 箇所**（初回の `gw start` が自動生成。

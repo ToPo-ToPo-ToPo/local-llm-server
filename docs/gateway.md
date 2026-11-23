@@ -283,15 +283,34 @@ Anthropic Messages API の形（`POST /v1/messages`）でも受け付ける。Cl
 - **認証**: `api_key` を設定していれば、`Authorization: Bearer <key>` に加えて `x-api-key: <key>` も受け付ける。
 - **エラー**: この入口のエラーは Anthropic の形（`{"type": "error", "error": {"type", "message"}}`）で返す。
 
-Claude Code（CLI）からつなぐ例（普段の `~/.claude/settings.json` には書かず、起動するシェルでだけ設定する）:
+Claude Code（CLI）からつなぐには `gw claude` を使う。接続先と認証は `gateway.toml` から読み、
+必要な環境変数をそろえて `claude` を起動する（Claude Code 本体と `~/.claude` は書き換えない）:
 
 ```bash
+gw claude --model ToPo-ToPo/Ornith-1.5-35B-A3B-mlx-4bit   # 初回はモデルを指定（覚えておく）
+gw claude                                                 # 次からは前回のモデルで起動
+gw claude -p "このリポジトリの構成を説明して"                # --model 以外の引数は claude にそのまま渡す
+```
+
+- **モデル**: `--model` → 前回の `--model` → `gateway.toml` の `default_model` の順に決める。Claude Code が裏の
+  処理（要約・サブエージェント）に使うモデルも同じものにそろえ、別のモデルを読み込ませない。
+- **設定・履歴**: `~/.config/local-llm-server/claude-code`（`CLAUDE_CONFIG_DIR`）に分けて置く。普段の `claude`
+  やデスクトップアプリとは混ざらない。覚えたモデルも同じ場所（`gw-model`）。
+- **付随通信**: `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` で、更新確認やテレメトリなど Anthropic への
+  付随通信を止める。環境に `ANTHROPIC_API_KEY` があっても渡さない。
+- ゲートウェイが止まっていれば起動せずに `gw start` を案内する。
+
+手で設定する場合の環境変数（`gw claude` が設定しているもの）:
+
+```bash
+export CLAUDE_CONFIG_DIR=~/.config/local-llm-server/claude-code
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8799
 export ANTHROPIC_AUTH_TOKEN=local          # api_key 未設定なら何でもよい
-export ANTHROPIC_MODEL=ToPo-ToPo/Ornith-1.5-122B-mlx-4bit
+export ANTHROPIC_MODEL=ToPo-ToPo/Ornith-1.5-35B-A3B-mlx-4bit
 export ANTHROPIC_DEFAULT_OPUS_MODEL=$ANTHROPIC_MODEL
 export ANTHROPIC_DEFAULT_SONNET_MODEL=$ANTHROPIC_MODEL
 export ANTHROPIC_DEFAULT_HAIKU_MODEL=$ANTHROPIC_MODEL
+export CLAUDE_CODE_SUBAGENT_MODEL=$ANTHROPIC_MODEL
 export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
 claude
 ```
