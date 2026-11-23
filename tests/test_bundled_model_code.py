@@ -126,6 +126,16 @@ def test_describe_early_exit_signal_and_unknown():
     assert "モデルのロード" in msg and "--- log tail ---" not in msg
 
 
+def test_describe_early_exit_old_llama_cpp_names_pin():
+    """古い llama.cpp が新しいアーキテクチャの GGUF で落ちたら、pin の上げ方を示す（b12211 の実ログ）。"""
+    log = (
+        "0.00.200.780 E llama_model_load: error loading model: unknown model architecture: 'inkling2_loop'\n"
+        "0.00.200.973 E llama_model_load_from_file_impl: failed to load model\n"
+    )
+    msg = server.describe_early_exit(1, log, backend="llama-cpp", log_path="l")
+    assert "[llama_cpp] pin" in msg and "inkling2_loop" in msg
+
+
 def test_early_exit_reads_only_this_start(tmp_path, monkeypatch):
     # 同じポートのログは追記される。前回の起動のエラーを今回の原因として出さない。
     log = tmp_path / "server-9001.log"

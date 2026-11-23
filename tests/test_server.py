@@ -1318,6 +1318,51 @@ def test_user_override_of_thinking_markers_is_respected(monkeypatch, tmp_path):
     assert env["MLX_VLM_THINKING_START_TOKEN"] == "<custom>"
 
 
+def _inkling_like_snapshot(tmp_path, model_type):
+    snap = tmp_path / f"snap-{model_type}"
+    snap.mkdir()
+    (snap / "config.json").write_text(json.dumps({"model_type": model_type}))
+    return str(snap)
+
+
+@pytest.mark.parametrize("model_type,expected", [
+    ("inkling2_loop", True), ("inkling2", True), ("inkling", False), ("qwen3_5", False),
+])
+def test_inkling2_server_env_only_for_inkling2(monkeypatch, tmp_path, model_type, expected):
+    from local_llm_server import _inkling2_fast
+
+    snap = _inkling_like_snapshot(tmp_path, model_type)
+    monkeypatch.setattr(srv, "ensure_cached", lambda repo, **_kw: snap)
+    env = srv._inkling2_server_env("org/model")
+    assert env == (dict(_inkling2_fast.SERVER_ENV) if expected else {})
+
+
+def test_inkling2_server_env_is_empty_when_not_cached(monkeypatch):
+    def missing(repo, **_kw):
+        raise ValueError("not cached")
+
+    monkeypatch.setattr(srv, "ensure_cached", missing)
+    assert srv._inkling2_server_env("org/model") == {}
+
+
+def test_mlx_vlm_start_passes_inkling2_env_and_respects_user_values(monkeypatch, tmp_path):
+    # Inkling 2 のときだけ、生成の高速化の環境変数を足す。利用者が決めた値は上書きしない。
+    snap = _inkling_like_snapshot(tmp_path, "inkling2_loop")
+    monkeypatch.setattr(srv, "ensure_cached", lambda repo, **_kw: snap)
+    env = _capture_start_env(monkeypatch, tmp_path, "mlx-vlm",
+                             preset_env={"MLX_MAX_OPS_PER_BUFFER": "50"})
+    assert env["MLX_MAX_OPS_PER_BUFFER"] == "50"
+    assert env["MLX_MAX_MB_PER_BUFFER"] == "1000"
+    assert env["LOCAL_LLM_INKLING2_FAST"] == (
+        "gates,attention,prefill_bound,head,fused_residual,fused_router,fused_gates,step"
+    )
+
+
+def test_mlx_vlm_start_without_inkling2_has_no_inkling2_env(monkeypatch, tmp_path):
+    env = _capture_start_env(monkeypatch, tmp_path, "mlx-vlm")
+    assert "LOCAL_LLM_INKLING2_FAST" not in env
+
+
 def test_mlx_vlm_enables_prompt_cache_by_default(monkeypatch, tmp_path):
     # mlx-vlm は APC_ENABLED が無いとプロンプトキャッシュ管理を作らず、毎回フルに
     # プリフィルする（実測: 同一プロンプトの再送で 1623ms → 60ms の差）。既定で有効にする。
@@ -1464,3 +1509,65 @@ def test_build_command_rerank(stub_cache):
     cmd = build_command(ServerConfig("rerank", "cl-nagoya/ruri-v3-reranker-310m", port=9330))
     assert cmd[1:3] == ["-m", "local_llm_server.rerank_server"]
     assert "--model" in cmd and "cl-nagoya/ruri-v3-reranker-310m" in cmd and "9330" in cmd
+
+
+# --- mlx-vlm 0.8 の起動直後の読み込み（/v1/models は 200 でも推論は 503） ---
+
+
+def _preloading_upstream(states):
+    """/v1/models は常に 200、/health は states を順に返す（尽きたら最後の値）。"""
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class _H(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            if self.path == "/v1/models":
+                body = {"data": [{"id": "a/b"}]}
+            elif self.path == "/health":
+                state = states.pop(0) if len(states) > 1 else states[0]
+                if state is None:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                body = {"status": "healthy", "preload_in_progress": state}
+            else:
+                self.send_response(404)
+                self.end_headers()
+                return
+            data = json.dumps(body).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+    up = ThreadingHTTPServer(("127.0.0.1", 0), _H)
+    threading.Thread(target=up.serve_forever, daemon=True).start()
+    return up
+
+
+def test_preload_in_progress_reads_health():
+    from local_llm_server import server_health
+
+    for states, expected in (([True], True), ([False], False), ([None], False)):
+        up = _preloading_upstream(list(states))
+        try:
+            base = f"http://127.0.0.1:{up.server_address[1]}/v1"
+            assert server_health.preload_in_progress(base) is expected
+        finally:
+            up.shutdown()
+    assert server_health.preload_in_progress("http://127.0.0.1:9/v1") is False
+
+
+def test_wait_until_ready_waits_for_mlx_vlm_preload():
+    states = [True, True, True, False]
+    up = _preloading_upstream(states)
+    try:
+        cfg = ServerConfig(backend="mlx-vlm", model="a/b", port=up.server_address[1])
+        server = srv.LocalServer(cfg, os.devnull)
+        server.wait_until_ready(timeout=10, interval=0.01)
+        assert states == [False]  # 読み込み中の 3 回は待った
+    finally:
+        up.shutdown()

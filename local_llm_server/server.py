@@ -661,6 +661,11 @@ _STARTUP_FAILURE_HINTS: tuple[tuple[str, str], ...] = (
      'モデル同梱のコードが mlx-lm 用で、mlx-vlm では読めない（gateway.toml で backend = "mlx" にする）'),
     ("trust_remote_code",
      'モデルが同梱コードの実行を求めている（extra_args に "--trust-remote-code" を足す）'),
+    # llama.cpp は導入済みのビルドを使い続ける（→ provisioner.installed_builds）ので、新しい
+    # アーキテクチャ（例: Inkling 2 Mini の inkling2_loop は b12600 から）の GGUF は自動では読めない。
+    ("unknown model architecture",
+     ("導入済みの llama.cpp が古く、このモデルのアーキテクチャを知らない"
+      "（gateway.toml の [llama_cpp] pin を新しいビルド番号にする。導入済みの版は自動では上がらない）")),
     ("not supported",
      "バックエンドがこのモデルのアーキテクチャに未対応（バックエンドの版を上げるか、別のバックエンドを指定する）"),
     ("Insufficient Memory", _OOM_HINT),
@@ -724,6 +729,19 @@ def describe_early_exit(returncode: int, log_text: str, *, backend: str, log_pat
     if lines:
         parts.append("--- log tail ---\n" + "\n".join(lines[-_STARTUP_LOG_TAIL_LINES:]))
     return "\n".join(parts)
+
+
+def _inkling2_server_env(model: str) -> dict[str, str]:
+    """Inkling 2 系のモデルなら、生成を速くするための環境変数（→ _inkling2_fast.SERVER_ENV）。"""
+    from . import _inkling2_fast
+
+    try:
+        snapshot = ensure_cached(model)
+    except ValueError:
+        return {}
+    if not _inkling2_fast.is_inkling2(_model_catalog.snapshot_model_type(snapshot)):
+        return {}
+    return dict(_inkling2_fast.SERVER_ENV)
 
 
 class LocalServer:
@@ -812,6 +830,9 @@ class LocalServer:
                 # ツール呼び出しの生成中トークンを流す(シム側が読む。→ ServerConfig.stream_tool_calls)
                 if self.config.stream_tool_calls:
                     env["LOCAL_LLM_STREAM_TOOL_CALLS"] = "1"
+                # Inkling 2 Mini の生成の高速化（→ _inkling2_fast）。このモデルのときだけ、未設定の分だけ足す。
+                for key, value in _inkling2_server_env(self.config.model).items():
+                    env.setdefault(key, value)
                 # exact モード（gemma4 系などハイブリッド注意機構のモデルが該当。
                 # RotatingKVCache 層はブロック分割で再構成できないため、mlx-vlm は
                 # プレフィックス丸ごとのスナップショット方式に落とす）向けの既定。
@@ -896,7 +917,9 @@ class LocalServer:
         while time.monotonic() < deadline:
             if self._proc is not None and self._proc.poll() is not None:
                 raise RuntimeError(self._early_exit_message(self._proc.returncode))
-            if is_ready(self.config.base_url):
+            if is_ready(self.config.base_url) and not _server_health.preload_in_progress(
+                self.config.base_url
+            ):
                 return
             time.sleep(interval)
         raise TimeoutError(

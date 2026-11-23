@@ -18,6 +18,23 @@ def is_ready(base_url: str, timeout: float = 1.0) -> bool:
         return False
 
 
+def preload_in_progress(base_url: str, timeout: float = 1.0) -> bool:
+    """mlx-vlm（0.8 以降）が起動直後のモデル読み込み中かどうか（ルートの /health で見る）。
+
+    0.8 の mlx-vlm は /v1/models に 200 を返したあとも読み込みを続け、その間の推論
+    （POST）を 503 で断る。/v1/models だけで準備完了とすると、ゲートウェイがロード直後の
+    最初の依頼をそのまま 503 で返してしまうので、起動待ちではこれも見る。
+    /health が無い・読めないサーバー（llama-server など）は「読み込み中ではない」とみなす。
+    """
+    root = base_url.removesuffix("/v1")
+    try:
+        with urllib.request.urlopen(f"{root}/health", timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, OSError, ValueError):
+        return False
+    return isinstance(data, dict) and data.get("preload_in_progress") is True
+
+
 def list_models(base_url: str, timeout: float = 5.0) -> list[str]:
     try:
         with urllib.request.urlopen(f"{base_url}/models", timeout=timeout) as resp:

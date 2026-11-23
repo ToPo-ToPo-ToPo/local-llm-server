@@ -495,6 +495,24 @@ def _patch_d1_decisions() -> str:
     return "applied (native System One to HTTP decisions)"
 
 
+def _install_inkling2_fast() -> Optional[str]:
+    """Inkling 2 Mini の生成を速くする差し替え（→ _inkling2_fast）を、頼まれたときだけ当てる。
+
+    ゲートウェイは Inkling 2 系のモデルサーバーにだけ LOCAL_LLM_INKLING2_FAST を渡す（→ server.py）。
+    頼まれていなければ None。失敗しても速くならないだけなので、起動は止めない。
+    """
+    names = os.environ.get("LOCAL_LLM_INKLING2_FAST", "")
+    if not names or names.strip().lower() in ("off", "0", "none"):
+        return None
+    try:
+        from local_llm_server import _inkling2_fast
+
+        applied = _inkling2_fast.install(names.split(","))
+    except Exception as exc:
+        return f"failed: {exc!r}"
+    return ", ".join(applied) or "not found"
+
+
 def apply() -> None:
     """既知のパッチを全て適用する。失敗しても起動は止めない。"""
     decision = _patch_d1_decisions()
@@ -514,6 +532,9 @@ def apply() -> None:
     default = "on" if _default_stream_tool_calls() else "off"
     print(f"[local-llm-server shim] stream_tool_calls: {result}; default {default}; {flag}",
           file=sys.stderr, flush=True)
+    inkling2 = _install_inkling2_fast()
+    if inkling2 is not None:
+        print(f"[local-llm-server shim] inkling2 fast paths: {inkling2}", file=sys.stderr, flush=True)
 
 
 def main() -> None:
