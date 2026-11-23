@@ -27,7 +27,24 @@ import select
 import socket
 import threading
 import time
-from typing import Any, Callable
+from typing import Any, Callable, Protocol
+
+from .anthropic_api import error_body
+
+
+class ResponseTransform(Protocol):
+    """上流の応答をクライアントへ書き戻す前に変換するもの（例: anthropic_api.MessagesResponse）。
+
+    begin(上流のステータス, Content-Type) → (返すステータス, 返す Content-Type, 先頭に書くバイト列)
+    feed(上流のチャンク) → 書くバイト列 / finish(aborted) → 最後に書くバイト列。
+    aborted は上流の読み取りが途中で切れた（タイムアウト・切断）とき True。
+    """
+
+    def begin(self, status: int, content_type: str | None) -> tuple[int, str, bytes]: ...
+
+    def feed(self, chunk: bytes) -> bytes: ...
+
+    def finish(self, aborted: bool = False) -> bytes: ...
 
 # クライアント切断をこの間隔（秒）で監視する。
 _CLIENT_POLL_S = 0.25
@@ -90,11 +107,21 @@ def _client_disconnected(sock: Any) -> bool:
         return True
 
 
-def forward(handler: Any, addr: tuple[str, int], body: bytes, timeout_s: float | None) -> None:
+def forward(
+    handler: Any,
+    addr: tuple[str, int],
+    body: bytes,
+    timeout_s: float | None,
+    *,
+    path: str | None = None,
+    transform: ResponseTransform | None = None,
+) -> None:
     """handler の現在のリクエスト（command/path/headers）を上流 addr へ中継する。
 
     上流応答（ストリーミング含む）をそのままクライアントへ書き戻す。上流へ到達
-    できなければ 502 を返す。
+    できなければ 502 を返す。`path` を渡すと上流へはそのパスで送る（既定は受けたパスのまま）。
+    `transform` を渡すと、応答のステータス・Content-Type・本文をそれで変換してから書き戻す
+    （/v1/messages を chat/completions に載せ替えるときに使う）。
     `timeout_s`（gateway.toml の request_timeout）を渡すとソケットの無応答上限になり、
     上流が沈黙したまま `timeout_s` 秒を超えたら中継を打ち切る（枠を握り続けさせない保険）。
     トークンが届く限りタイムアウトは都度リセットされるので長時間生成は妨げない。
@@ -119,7 +146,7 @@ def forward(handler: Any, addr: tuple[str, int], body: bytes, timeout_s: float |
 
     try:
         conn = http.client.HTTPConnection(host, port, timeout=timeout_s)
-        conn.request(handler.command, handler.path, body=body or None, headers=headers)
+        conn.request(handler.command, path or handler.path, body=body or None, headers=headers)
     except OSError as exc:
         send_error(handler, 502, f"upstream {host}:{port} unreachable: {exc}")
         return
@@ -160,11 +187,19 @@ def forward(handler: Any, addr: tuple[str, int], body: bytes, timeout_s: float |
                 return
             raise
         try:
-            handler.send_response(resp.status)
+            status = resp.status
             ctype = resp.getheader("Content-Type")
+            prefix = b""
+            if transform is not None:
+                status, ctype, prefix = transform.begin(status, ctype)
+            handler.send_response(status)
             if ctype:
                 handler.send_header("Content-Type", ctype)
             handler.end_headers()
+            if prefix:
+                handler.wfile.write(prefix)
+                handler.wfile.flush()
+            aborted = False
             while True:
                 # read1: ソケットに届いた分だけ即返す（read(8192) は 8192 バイト溜まるまで
                 # ブロックするため、SSE のトークン逐次配信が全バッファリングされてしまう）。
@@ -175,11 +210,21 @@ def forward(handler: Any, addr: tuple[str, int], body: bytes, timeout_s: float |
                     # それ以外は監視係が切断検知で conn を閉じた際の中断。どちらも
                     # 応答ヘッダ送出済みでエラー本文は返せないため、中継を打ち切って
                     # conn.close()（finally）で上流へ切断を伝える。
+                    aborted = True
                     break
                 if not chunk:
                     break
+                if transform is not None:
+                    chunk = transform.feed(chunk)
+                    if not chunk:
+                        continue
                 handler.wfile.write(chunk)
                 handler.wfile.flush()
+            if transform is not None and not client_gone.is_set():
+                tail = transform.finish(aborted)
+                if tail:
+                    handler.wfile.write(tail)
+                    handler.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
             pass  # クライアント切断（書き込み時に検知）
     finally:
@@ -188,7 +233,14 @@ def forward(handler: Any, addr: tuple[str, int], body: bytes, timeout_s: float |
 
 
 def send_error(handler: Any, status: int, message: str) -> None:
-    """{"error": message} を JSON で返す。"""
+    """{"error": message} を JSON で返す。
+
+    Anthropic 形式の入口（/v1/messages）を処理中のハンドラ（`anthropic_errors` が真）には、
+    Anthropic のエラー形式 {"type": "error", "error": {"type", "message"}} で返す。
+    """
+    if getattr(handler, "anthropic_errors", False):
+        send_json(handler, status, error_body(status, message))
+        return
     send_json(handler, status, {"error": message})
 
 
