@@ -35,7 +35,7 @@ import sys
 import time
 import tomllib
 
-from . import migrate, tls_policy
+from . import claude_code, migrate, tls_policy
 from .daemon import load_gateway_config
 from . import model_catalog as _model_catalog
 from .server import (
@@ -1082,6 +1082,54 @@ def cmd_migrate(gcfg, args) -> int:
     return 0
 
 
+def _load_config_quietly(path: str):
+    """設定ファイルを読む。無い・読めないときは None（呼び出し側は既定値で続ける）。"""
+    if not os.path.isfile(path):
+        return None
+    try:
+        return load_config(path)
+    except (OSError, ValueError, tomllib.TOMLDecodeError):
+        return None
+
+
+def cmd_claude(gcfg, argv: list[str]) -> int:
+    """`gw claude [--model ID] [claude の引数...]`: ゲートウェイ経由で Claude Code を起動する。
+
+    モデルは --model（覚えておく）→ 前回の --model → gateway.toml の default_model の順。
+    それ以外の引数は claude にそのまま渡す（`gw claude -p "..."` など）。
+    """
+    try:
+        model, rest = claude_code.split_model_arg(argv)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    # 稼働中デーモンの記録（_RuntimeConfig）には api_key・default_model が無いので設定ファイルから読む
+    file_cfg = gcfg if hasattr(gcfg, "api_key") else _load_config_quietly(user_config_path())
+    cdir = claude_code.config_dir(user_config_path())
+    if model is not None:
+        claude_code.save_model(cdir, model)
+    else:
+        model = claude_code.read_saved_model(cdir) or getattr(file_cfg, "default_model", None)
+    if not model:
+        print(
+            "使うモデルを指定してください: gw claude --model <モデルID>"
+            "（使えるモデルは gw list。次からは省略できます）",
+            file=sys.stderr,
+        )
+        return 2
+    host, port, _ = _endpoint(gcfg)
+    base_url = f"http://{host}:{port}"
+    if not is_ready(f"{base_url}/v1"):
+        print(f"ゲートウェイが {base_url} で動いていません。先に gw start を実行してください。",
+              file=sys.stderr)
+        return 1
+    api_key = getattr(file_cfg, "api_key", None)
+    os.makedirs(cdir, exist_ok=True)
+    env = claude_code.build_env(os.environ, base_url=base_url, api_key=api_key,
+                                model=model, cdir=cdir)
+    return claude_code.launch(rest, env)
+
+
 def cmd_help(gcfg, args) -> int:
     """`gw help`: サブコマンド一覧（`gw -h` と同じ）を表示する。"""
     build_parser().print_help()
@@ -1126,6 +1174,9 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("update", help="新しいリリースタグがあれば追従して再起動する")
     mig = sub.add_parser("migrate", help="設定ファイルを現行スキーマへ移行する（通常は更新時に自動）")
     mig.add_argument("--dry-run", action="store_true", help="書き換えず、変更内容だけ表示する")
+    # 引数は main() が argparse を通さず claude にそのまま渡す（ここは一覧表示のためだけ）
+    sub.add_parser("claude", add_help=False,
+                   help="ゲートウェイのモデルで Claude Code を起動する（--model ID、残りは claude へ）")
     sub.add_parser("help", help="このコマンド一覧を表示する")
     return p
 
@@ -1196,6 +1247,13 @@ def main(argv: list[str] | None = None) -> int:
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)
         return 2
+    argv = sys.argv[1:] if argv is None else list(argv)
+    # `gw claude ...` の引数は claude のもの（-p や --resume など）。argparse に解釈させない
+    if argv[:1] == ["claude"]:
+        gcfg, code = _resolve_gcfg("claude")
+        if gcfg is None:
+            return code
+        return cmd_claude(gcfg, argv[1:])
     parser = build_parser()
     args = parser.parse_args(argv)
 
