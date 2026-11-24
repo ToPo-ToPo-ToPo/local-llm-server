@@ -104,17 +104,27 @@ gw pull unsloth/Qwen3.6-27B-GGUF:Q4_K_XL
 MTP のヘッドのような別ファイルも要るときや、取るファイルを自分で選びたいときは、同梱の `./scripts/hf`
 （`huggingface_hub` の `hf` CLI）でファイルを名指しする:
 
+repo の特定ファイルだけ取得（GGUF は巨大なので必要なファイルを名指しするのが確実）:
+
 ```bash
-# repo の特定ファイルだけ取得（GGUF は巨大なので必要なファイルを名指しするのが確実）
 ./scripts/hf download google/gemma-4-26B-A4B-it-qat-q4_0-gguf gemma-4-26B_q4_0-it.gguf gemma-4-26B-it-mmproj.gguf
+```
 
-# MTP（埋め込み）版は本体 GGUF だけでよい
+MTP（埋め込み）版は本体 GGUF だけでよい:
+
+```bash
 ./scripts/hf download unsloth/Qwen3.6-27B-MTP-GGUF Qwen3.6-27B-UD-Q4_K_XL.gguf
+```
 
-# vision を使う本体は mmproj も一緒に取得（同じ snapshot に並ぶ → 自動検出される）
+vision を使う本体は mmproj も一緒に取得（同じ snapshot に並ぶ → 自動検出される）:
+
+```bash
 ./scripts/hf download unsloth/Qwen3.6-27B-GGUF Qwen3.6-27B-UD-Q4_K_XL.gguf mmproj-F16.gguf
+```
 
-# 別ヘッド方式（gemma4 MTP）のドラフトヘッドも同様に取得
+別ヘッド方式（gemma4 MTP）のドラフトヘッドも同様に取得:
+
+```bash
 ./scripts/hf download unsloth/gemma-4-26B-A4B-it-qat-GGUF MTP/gemma-4-26B-A4B-it-F16-MTP.gguf
 ```
 
@@ -187,9 +197,16 @@ mlx-vlm でも llama.cpp でも動く。どちらも思考（`reasoning_content`
 
 ほかのモデルと同じ流れで使える（→ [README](../README.md#使い方)）。
 
+Inkling に対応した mlx-vlm を入れる（更新していない PC だけ）:
+
 ```bash
-gw update                                   # Inkling に対応した mlx-vlm を入れる（更新していない PC だけ）
-gw pull thinkingmachines/Inkling-2-Mini     # 公式の重みを取得する
+gw update
+```
+
+公式の重みを取得する:
+
+```bash
+gw pull thinkingmachines/Inkling-2-Mini
 ```
 
 リクエストの `model` に `thinkingmachines/Inkling-2-Mini` を書く。下の高速化は自動で入る。

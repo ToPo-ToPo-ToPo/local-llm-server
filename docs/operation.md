@@ -124,11 +124,28 @@ uv run --frozen gw start      # 手動起動（自動起動を無効にしてい
 使うモデルは先に `gw pull` で取得しておく。取得していないモデルを送ると、ゲートウェイは
 「ローカルキャッシュにありません」というエラーを返す。
 
+mlx 系（リポジトリ全体: 重み・config・トークナイザー）:
+
 ```bash
-gw pull thinkingmachines/Inkling-2-Mini            # mlx 系: リポジトリ全体（重み・config・トークナイザー）
-gw pull unsloth/Qwen3.6-27B-GGUF:Q4_K_XL           # GGUF: 本体 1 種と mmproj（画像入力用）だけ
-gw show thinkingmachines/Inkling-2-Mini            # 取得したものの中身と読み込み状態
-gw list                                            # 使えるモデルの一覧（取得済みのものも並ぶ）
+gw pull thinkingmachines/Inkling-2-Mini
+```
+
+GGUF（本体 1 種と mmproj（画像入力用）だけ）:
+
+```bash
+gw pull unsloth/Qwen3.6-27B-GGUF:Q4_K_XL
+```
+
+取得したものの中身と読み込み状態:
+
+```bash
+gw show thinkingmachines/Inkling-2-Mini
+```
+
+使えるモデルの一覧（取得済みのものも並ぶ）:
+
+```bash
+gw list
 ```
 
 `gw pull` がすること:

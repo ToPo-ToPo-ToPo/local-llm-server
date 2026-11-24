@@ -9,15 +9,38 @@
 
 ## インストール
 
-```bash
-git clone https://github.com/ToPo-ToPo-ToPo/local-llm-server
-cd local-llm-server
-uv sync --frozen
-uv run --frozen gw enable    # ログイン時に自動で起動するようにする
-uv run --frozen gw status
-```
-
 - [uv](https://docs.astral.sh/uv/) 0.13.6 以上が要る。Python は `.python-version` の版を uv が用意する。
+
+1. リポジトリを取得する。
+
+   ```bash
+   git clone https://github.com/ToPo-ToPo-ToPo/local-llm-server
+   ```
+
+2. 取得したフォルダに入る。
+
+   ```bash
+   cd local-llm-server
+   ```
+
+3. 環境を作る。
+
+   ```bash
+   uv sync --frozen
+   ```
+
+4. ログイン時に自動で起動するようにする。
+
+   ```bash
+   uv run --frozen gw enable
+   ```
+
+5. 動いているか確かめる。
+
+   ```bash
+   uv run --frozen gw status
+   ```
+
 - `gw enable` のあとは、どのディレクトリからでも `gw ...` で操作できる（`~/.local/bin/gw` にリンクを張る。
   PATH に無ければ知らせる）。
 - リポジトリの中で `uv run --frozen gw ...` と打っても同じ。以下は `gw ...` で書く。
@@ -30,17 +53,29 @@ uv run --frozen gw status
 ### 1. 動いているか確かめる
 
 ```bash
-gw status     # running なら動いている。接続先の URL も出る
+gw status
 ```
 
+- `running` なら動いている。接続先の URL も出る。
 - `gw enable` 済みなら、ログインのたびに自動で起動する。
-- 止めていたときは `gw start`。
+- 止めていたときは次で起動する。
+
+  ```bash
+  gw start
+  ```
 
 ### 2. モデルを取得する（`gw pull`）
 
+mlx で動かすモデル（リポジトリ全体を取得）:
+
 ```bash
-gw pull thinkingmachines/Inkling-2-Mini            # mlx で動かすモデル: リポジトリ全体を取得
-gw pull unsloth/Qwen3.6-27B-GGUF:Q4_K_XL           # GGUF: 「:量子化名」で 1 つを選ぶ
+gw pull thinkingmachines/Inkling-2-Mini
+```
+
+GGUF（「:量子化名」で 1 つを選ぶ）:
+
+```bash
+gw pull unsloth/Qwen3.6-27B-GGUF:Q4_K_XL
 ```
 
 - **自動ではダウンロードしない。** 使う前に一度だけ取得する。取得していないモデルを送ると
@@ -55,10 +90,13 @@ gw pull unsloth/Qwen3.6-27B-GGUF:Q4_K_XL           # GGUF: 「:量子化名」�
 
 ### 3. `model` に名前を書いて送る
 
+curl で送る:
+
 ```bash
-curl http://127.0.0.1:8799/v1/chat/completions -H 'Content-Type: application/json' \
-  -d '{"model": "thinkingmachines/Inkling-2-Mini", "messages": [{"role": "user", "content": "こんにちは"}]}'
+curl http://127.0.0.1:8799/v1/chat/completions -H 'Content-Type: application/json' -d '{"model": "thinkingmachines/Inkling-2-Mini", "messages": [{"role": "user", "content": "こんにちは"}]}'
 ```
+
+Python（OpenAI の SDK）で送る:
 
 ```python
 from openai import OpenAI
@@ -84,13 +122,52 @@ print(r.choices[0].message.content)
 
 ### 4. 様子を見る・管理する
 
+使えるモデルの一覧（取得済みのモデルも並ぶ）:
+
 ```bash
-gw list                      # 使えるモデルの一覧（取得済みのモデルも並ぶ）
-gw show <モデル名>            # モデルの中身（量子化・大きさ・画像入力・読み込み状態など）
-gw ps                        # いま読み込んでいるモデル
-gw log -f                    # ゲートウェイのログを追いかける
-gw stop / gw start / gw restart
-gw update                    # 新しい版を取り込む
+gw list
+```
+
+モデルの中身（量子化・大きさ・画像入力・読み込み状態など。名前は調べたいモデルに変える）:
+
+```bash
+gw show thinkingmachines/Inkling-2-Mini
+```
+
+いま読み込んでいるモデル:
+
+```bash
+gw ps
+```
+
+ゲートウェイのログを追いかける（Ctrl-C で止める）:
+
+```bash
+gw log -f
+```
+
+止める:
+
+```bash
+gw stop
+```
+
+起動する:
+
+```bash
+gw start
+```
+
+再起動する:
+
+```bash
+gw restart
+```
+
+新しい版を取り込む:
+
+```bash
+gw update
 ```
 
 - コマンドの一覧と細かい動き → [docs/operation.md](docs/operation.md#サブコマンド一覧)
