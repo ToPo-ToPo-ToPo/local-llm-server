@@ -131,7 +131,7 @@ gw list
 モデルの中身（量子化・大きさ・画像入力・読み込み状態など。名前は調べたいモデルに変える）:
 
 ```bash
-gw show thinkingmachines/Inkling-2-Mini
+gw show ToPo-ToPo/gemma-4-26B-A4B-it-mlx-4bit
 ```
 
 いま読み込んでいるモデル:
