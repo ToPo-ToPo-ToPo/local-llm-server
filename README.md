@@ -1,14 +1,13 @@
 # local-llm-server
 
-ローカルLLM（**mlx** / **mlx-vlm** / **llama.cpp** / **vLLM** / **SGLang**）と音声認識
-（**whisper** / STT）・音声合成（**mlx-audio** / TTS）・テキスト埋め込み（**embed**）・リランク（**rerank**。RAG）を束ねる**マルチモデルゲートウェイ**。1 プロセス起動するだけで、
-1 つの公開ポートに複数モデルを配信する。
-モデルの事前登録は不要——クライアントが指定した `model` をその場でロードする。
-特徴の全体像は [docs/features.md](docs/features.md)。
+複数のローカルモデルを、1 プロセス・1 つのポートの OpenAI 互換 API で配信するゲートウェイ。
+
+- **対応:** チャット（mlx / mlx-vlm / llama.cpp / vLLM / SGLang）、音声認識（whisper）、音声合成（mlx-audio）、
+  埋め込み（embed）、リランク（rerank。RAG の 2 段目）。
+- **事前登録は不要:** クライアントが指定した `model` を、その場で読み込む。
+- 特徴の全体像 → [docs/features.md](docs/features.md)
 
 ## インストール
-
-[uv](https://docs.astral.sh/uv/)（0.13.6 以上）を使う。Python は `.python-version` の版を uv が用意する。
 
 ```bash
 git clone https://github.com/ToPo-ToPo-ToPo/local-llm-server
@@ -18,54 +17,48 @@ uv run --frozen gw enable    # ログイン時に自動で起動するように�
 uv run --frozen gw status
 ```
 
-`gw enable` のあとは、どのディレクトリからでも `gw ...` で操作できる（`~/.local/bin/gw` にリンクを張る。
-PATH に無ければ知らせる）。リポジトリの中で `uv run --frozen gw ...` と打っても同じ。以下は `gw ...` で書く。
-環境の作り方・`uv sync` の使い分け・TLS の要件は [docs/operation.md](docs/operation.md)。
+- [uv](https://docs.astral.sh/uv/) 0.13.6 以上が要る。Python は `.python-version` の版を uv が用意する。
+- `gw enable` のあとは、どのディレクトリからでも `gw ...` で操作できる（`~/.local/bin/gw` にリンクを張る。
+  PATH に無ければ知らせる）。
+- リポジトリの中で `uv run --frozen gw ...` と打っても同じ。以下は `gw ...` で書く。
+- 環境の作り方・`uv sync` の使い分け・TLS の要件 → [docs/operation.md](docs/operation.md)
 
 ## 使い方
 
-ゲートウェイは裏で常駐し、1 つのポート（既定 `http://127.0.0.1:8799/v1`）で OpenAI 互換の API を出す。
-使う流れは「モデルを取得する → `model` に名前を書いて送る」の 2 つだけ。
+流れは「`gw pull` でモデルを取得する → `model` に名前を書いて送る」だけ。接続先は `http://127.0.0.1:8799/v1`（既定）。
 
-### 1. ゲートウェイが動いているか確かめる
+### 1. 動いているか確かめる
 
 ```bash
 gw status     # running なら動いている。接続先の URL も出る
 ```
 
-`gw enable` 済みならログインするたびに自動で起動する。止めていたときは `gw start` で起動する。
+- `gw enable` 済みなら、ログインのたびに自動で起動する。
+- 止めていたときは `gw start`。
 
 ### 2. モデルを取得する（`gw pull`）
 
-**ゲートウェイはモデルを自動ではダウンロードしない。** 使う前に一度だけ `gw pull` で取得する。
-
 ```bash
-gw pull thinkingmachines/Inkling-2-Mini            # mlx で動かすモデル: リポジトリ全体を取得する
+gw pull thinkingmachines/Inkling-2-Mini            # mlx で動かすモデル: リポジトリ全体を取得
 gw pull unsloth/Qwen3.6-27B-GGUF:Q4_K_XL           # GGUF: 「:量子化名」で 1 つを選ぶ
 ```
 
-- 名前は Hugging Face のリポジトリ ID（`組織/リポジトリ`）。モデルのページの上に出ている名前をそのまま使う。
-- 取得先は Hugging Face の共有キャッシュ（`~/.cache/huggingface/hub/`）。ほかのツールで取得したものも
-  そのまま使える。
-- GGUF のリポジトリは量子化ごとにファイルが分かれているので、使う 1 つ（と画像入力用の mmproj）だけを取る。
-  `:量子化名` を付けずに複数あると、候補を並べて止まる。
-- 途中で止めても、同じ `gw pull` をもう一度打てば続きから取得する。終わると、ゲートウェイが読めるかを
-  確かめてから `done` と表示する。
-- `gw pull` は取得するだけで、メモリには読み込まない。読み込むのは最初のリクエストのとき。
-- 取得していないモデルを送ると、ゲートウェイは「ローカルキャッシュにありません」というエラーを返す。
+- **自動ではダウンロードしない。** 使う前に一度だけ取得する。取得していないモデルを送ると
+  「ローカルキャッシュにありません」というエラーが返る。
+- **名前:** Hugging Face のリポジトリ ID（`組織/リポジトリ`）。モデルのページの上に出ている名前をそのまま使う。
+- **置き場所:** Hugging Face の共有キャッシュ（`~/.cache/huggingface/hub/`）。ほかのツールで取得したものもそのまま使える。
+- **GGUF:** 使う量子化 1 つと、画像入力用の mmproj だけを取る。`:量子化名` を付けずに量子化が複数あると、
+  候補を並べて止まる。
+- **中断:** 同じ `gw pull` をもう一度打てば、続きから取得する。
+- **完了:** ゲートウェイが読めるかを確かめてから `done` と表示する。
+- **読み込みはしない:** メモリに読み込むのは、最初のリクエストのとき。
 
 ### 3. `model` に名前を書いて送る
-
-`model` には、取得したときと同じ名前を書く。最初のリクエストでモデルを読み込み、しばらく使わなければ
-自動でメモリから外す（`idle_timeout`。既定は 20 分）。
 
 ```bash
 curl http://127.0.0.1:8799/v1/chat/completions -H 'Content-Type: application/json' \
   -d '{"model": "thinkingmachines/Inkling-2-Mini", "messages": [{"role": "user", "content": "こんにちは"}]}'
 ```
-
-OpenAI の SDK や、OpenAI 互換の API に繋げるアプリは、接続先を `http://127.0.0.1:8799/v1` にする
-（API キーは既定では不要。SDK が求めるなら適当な文字列でよい）。
 
 ```python
 from openai import OpenAI
@@ -78,11 +71,16 @@ r = client.chat.completions.create(
 print(r.choices[0].message.content)
 ```
 
-専用の接続クライアント [local-llm-client](https://github.com/ToPo-ToPo-ToPo/local-llm-client) も使える。
-
-どの仕組みで動かすかは、名前から自動で決まる。名前に `gguf` を含めば llama.cpp、`mlx` を含めば mlx-vlm、
-どちらも無ければ Apple Silicon の Mac では mlx-vlm（それ以外の PC では llama.cpp）。`whisper`（音声認識）や
-埋め込み・リランクのモデルも名前で振り分ける（→ [docs/gateway.md](docs/gateway.md)）。
+- `model` には、取得したときと同じ名前を書く。
+- 最初のリクエストで読み込み、しばらく使わなければ自動でメモリから外す（`idle_timeout`。既定は 20 分）。
+- OpenAI の SDK や OpenAI 互換のアプリは、接続先を `http://127.0.0.1:8799/v1` にする。
+- API キーは既定では不要。SDK が求めるなら適当な文字列でよい。
+- 専用の接続クライアントもある → [local-llm-client](https://github.com/ToPo-ToPo-ToPo/local-llm-client)
+- **動かす仕組みは名前で決まる:**
+  - `gguf` を含む → llama.cpp
+  - `mlx` を含む → mlx-vlm
+  - どちらも無い → Apple Silicon の Mac では mlx-vlm、それ以外の PC では llama.cpp
+  - 音声認識（`whisper` など）・埋め込み・リランクも名前で振り分ける → [docs/gateway.md](docs/gateway.md)
 
 ### 4. 様子を見る・管理する
 
@@ -92,31 +90,29 @@ gw show <モデル名>            # モデルの中身（量子化・大きさ�
 gw ps                        # いま読み込んでいるモデル
 gw log -f                    # ゲートウェイのログを追いかける
 gw stop / gw start / gw restart
-gw update                    # 新しい版を取り込む（自動では入れ替わらない）
+gw update                    # 新しい版を取り込む
 ```
 
-コマンドの一覧と細かい動きは [docs/operation.md](docs/operation.md#サブコマンド一覧)。
+- コマンドの一覧と細かい動き → [docs/operation.md](docs/operation.md#サブコマンド一覧)
+- **更新は手動:** 新しい版が出るとメニューバーの `gw` に「⬆」が出る。入れ替わるのは `gw update` を打ったときだけ。
 
 ### 設定
 
-設定は `~/.config/local-llm-server/gateway.toml` の 1 つだけ（初回の `gw start` が自動で作る）。
-同時に読み込むモデルの数・使わないときに外すまでの時間・LAN への公開などを変えられる
-（→ [docs/gateway.md](docs/gateway.md)）。たいていは変えなくてよい。更新で設定の項目が変わっても、
-次の起動で自動で書き換える（元の内容は `gateway.toml.bak` に残す）。
-
-**更新は手動**。新しい版が出るとメニューバーの `gw` に「⬆」が出るが、入れ替わるのは `gw update` を
-打ったときだけ。
+- 設定は `~/.config/local-llm-server/gateway.toml` の 1 つだけ。初回の `gw start` が自動で作る。
+- 同時に読み込むモデルの数・使わないときに外すまでの時間・LAN への公開などを変えられる。たいていは変えなくてよい
+  → [docs/gateway.md](docs/gateway.md)
+- 更新で設定の項目が変わっても、次の起動で自動で書き換える（元の内容は `gateway.toml.bak` に残す）。
 
 ## モデルごとの注意
 
-ほとんどのモデルは上の流れだけで使える。追加の注意があるものは、それぞれのドキュメントにまとめている。
+ほとんどのモデルは上の流れだけで使える。追加の注意があるもの:
 
-- Inkling 2 Mini（`thinkingmachines/Inkling-2-Mini`）: 推奨の設定と、自動で入る高速化
+- **Inkling 2 Mini**（`thinkingmachines/Inkling-2-Mini`）: 推奨の設定と、自動で入る高速化
   → [docs/llama-cpp.md](docs/llama-cpp.md#inkling-2-minimlx-vlm-と-llamacpp)
-- GGUF（llama.cpp）: 量子化の選び方・画像入力・VRAM に収まらない MoE → [docs/llama-cpp.md](docs/llama-cpp.md)
-- MTP（先読みで速くする仕組み）に対応するモデル: `gw pull` の最後に、追加で取るものが表示される
+- **GGUF（llama.cpp）:** 量子化の選び方・画像入力・VRAM に収まらない MoE → [docs/llama-cpp.md](docs/llama-cpp.md)
+- **MTP（先読みで速くする仕組み）に対応するモデル:** `gw pull` の最後に、追加で取るものが表示される
   → [docs/mtp.md](docs/mtp.md)
-- 音声認識・音声合成・埋め込み・リランク → [docs/gateway.md](docs/gateway.md)
+- **音声認識・音声合成・埋め込み・リランク** → [docs/gateway.md](docs/gateway.md)
 
 ## ドキュメント
 
