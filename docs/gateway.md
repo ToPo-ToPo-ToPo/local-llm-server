@@ -158,7 +158,7 @@ MTP（speculative decoding）による高速化は [mtp.md](mtp.md) を参照。
   `parakeet` を含めば動的ロードで自動的に whisper バックエンドへ振り分けられる。
 - **要件**: 音声デコードに ffmpeg を使う。PATH 上のシステム版を優先し、無ければ
   依存の `imageio-ffmpeg` 同梱版を使うため、macOS/Linux/Windows とも別途導入は必須ではない。本体重みは他の
-  mlx 同様に事前 DL 必須（`hf download <repo>`。ゲートウェイは `HF_HUB_OFFLINE=1` で起動するため、
+  mlx 同様に事前 DL 必須（`gw pull <repo>`。ゲートウェイは `HF_HUB_OFFLINE=1` で起動するため、
   未取得だとロード時にエラー）。
 
 ```bash
@@ -185,7 +185,7 @@ OpenAI SDK からもそのまま使える（`client.audio.transcriptions.create(
   `ref_audio`（参照音声からの声の複製）はファイルのパスで、ゲートウェイと同じマシンの絶対パスを渡す。
 - **モデル ID**: ID に `-tts` / `tts-` / `kokoro` を含めば、動的ロードで自動的にこのバックエンドへ
   振り分けられる（`mlx` を含んでもチャット用の mlx-vlm には回らない）。本体重みは他の mlx 同様に事前 DL
-  必須（`hf download <repo>`）。
+  必須（`gw pull <repo>`）。
 - **隔離 venv**: mlx-audio は本体と依存がぶつかる（setuptools・mlx・transformers の版）ので、本体の環境には
   入れず、管理ディレクトリの専用 venv（`~/.cache/local-llm-server/mlx-audio-venv`）へ導入して、その
   python からサーバを起動する（vLLM / SGLang と同じ仕組み）。gateway.toml に `backend = "mlx-audio"` の
@@ -226,7 +226,7 @@ curl http://127.0.0.1:8799/v1/audio/speech \
 - **接頭辞はクライアントが付ける**。OpenAI API に「問い合わせ用 / 文書用」の区別は無いので、モデルの作法
   （EmbeddingGemma 2 なら `task: search result | query: …` と `title: … | text: …`、e5 なら `query: ` / `passage: `）
   はアプリ側が `input` に含める。
-- **要件**: 本体重みは他の HF モデル同様に事前 DL 必須（`hf download google/embeddinggemma-2`。ゲートウェイは
+- **要件**: 本体重みは他の HF モデル同様に事前 DL 必須（`gw pull google/embeddinggemma-2`。ゲートウェイは
   `HF_HUB_OFFLINE=1` で起動するため、未取得だとロード時にエラー）。
 
 ```bash
@@ -254,7 +254,7 @@ RAG の 2 段目。生成はしない（分類モデル）。遅延起動・LRU�
   （`cl-nagoya/ruri-v3-reranker-310m`、`BAAI/bge-reranker-v2-m3`、`hotchpotch/japanese-reranker-*`）と、生成モデル型
   （`Qwen/Qwen3-Reranker-0.6B`。公式の prompt で yes / no の次トークンから関連度を出す）の両方を読める。
 - **実装**: 同梱の `local_llm_server.rerank_server`（transformers + torch。bfloat16 / mps、他は float32 / cpu）。
-  本体重みは事前 DL 必須（`hf download <repo>`）。
+  本体重みは事前 DL 必須（`gw pull <repo>`）。
 
 ```bash
 curl http://127.0.0.1:8799/v1/rerank -H "Content-Type: application/json" -d '{
