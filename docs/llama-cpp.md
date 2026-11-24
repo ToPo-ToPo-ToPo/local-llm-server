@@ -93,23 +93,39 @@ MTP ヘッドを除いた「本体」を選ぶ（1 つに定まらなければ�
 ## モデル（GGUF）を HF からダウンロード
 
 llama-cpp の `model`（repo-id）は、その GGUF が **HF キャッシュに DL 済み**である必要がある
-（mlx と違い `-hf` 自動DLには依存しない。未取得だと起動時にエラー）。`huggingface_hub` の `hf` CLI で取得する:
+（`-hf` の自動DLには依存しない。未取得だと起動時にエラー）。ふつうは `gw pull` で取得する。
+本体 1 種と mmproj（画像入力用）だけを選んで取り、量子化が複数あれば `:量子化名` で絞る
+（→ [operation.md](operation.md#モデルの取得と管理gw-pull--gw-list--gw-show)）:
 
 ```bash
-# huggingface_hub を入れる（uv なら）
-uv pip install -U huggingface_hub        # `hf` コマンドが入る
+gw pull unsloth/Qwen3.6-27B-GGUF:Q4_K_XL
+```
 
-# repo の特定ファイルだけ取得（GGUF は巨大なので必要なファイルを名指しするのが確実）
-hf download google/gemma-4-26B-A4B-it-qat-q4_0-gguf gemma-4-26B_q4_0-it.gguf gemma-4-26B-it-mmproj.gguf
+MTP のヘッドのような別ファイルも要るときや、取るファイルを自分で選びたいときは、同梱の `./scripts/hf`
+（`huggingface_hub` の `hf` CLI）でファイルを名指しする:
 
-# MTP（埋め込み）版は本体 GGUF だけでよい
-hf download unsloth/Qwen3.6-27B-MTP-GGUF Qwen3.6-27B-UD-Q4_K_XL.gguf
+repo の特定ファイルだけ取得（GGUF は巨大なので必要なファイルを名指しするのが確実）:
 
-# vision を使う本体は mmproj も一緒に取得（同じ snapshot に並ぶ → 自動検出される）
-hf download unsloth/Qwen3.6-27B-GGUF Qwen3.6-27B-UD-Q4_K_XL.gguf mmproj-F16.gguf
+```bash
+./scripts/hf download google/gemma-4-26B-A4B-it-qat-q4_0-gguf gemma-4-26B_q4_0-it.gguf gemma-4-26B-it-mmproj.gguf
+```
 
-# 別ヘッド方式（gemma4 MTP）のドラフトヘッドも同様に取得
-hf download unsloth/gemma-4-26B-A4B-it-qat-GGUF MTP/gemma-4-26B-A4B-it-F16-MTP.gguf
+MTP（埋め込み）版は本体 GGUF だけでよい:
+
+```bash
+./scripts/hf download unsloth/Qwen3.6-27B-MTP-GGUF Qwen3.6-27B-UD-Q4_K_XL.gguf
+```
+
+vision を使う本体は mmproj も一緒に取得（同じ snapshot に並ぶ → 自動検出される）:
+
+```bash
+./scripts/hf download unsloth/Qwen3.6-27B-GGUF Qwen3.6-27B-UD-Q4_K_XL.gguf mmproj-F16.gguf
+```
+
+別ヘッド方式（gemma4 MTP）のドラフトヘッドも同様に取得:
+
+```bash
+./scripts/hf download unsloth/gemma-4-26B-A4B-it-qat-GGUF MTP/gemma-4-26B-A4B-it-F16-MTP.gguf
 ```
 
 - 取得先は共有キャッシュ `~/.cache/huggingface/hub/`（`HF_HOME` / `HF_HUB_CACHE` で変更可）。本サーバーは
@@ -176,6 +192,37 @@ mlx-vlm でも llama.cpp でも動く。どちらも思考（`reasoning_content`
 動作確認は b12631）。導入済みのビルドは自動では上がらないので、古いビルドが入っている PC では
 `unknown model architecture: 'inkling2_loop'` で起動に失敗する。そのときは `[llama_cpp]` の
 `pin` を新しいビルド番号にする（起動失敗のエラーにもこの直し方が出る）。
+
+### 導入と使い方
+
+ほかのモデルと同じ流れで使える（→ [README](../README.md#使い方)）。
+
+Inkling に対応した mlx-vlm を入れる（更新していない PC だけ）:
+
+```bash
+gw update
+```
+
+公式の重みを取得する:
+
+```bash
+gw pull thinkingmachines/Inkling-2-Mini
+```
+
+リクエストの `model` に `thinkingmachines/Inkling-2-Mini` を書く。下の高速化は自動で入る。
+
+- **推奨の設定:** `temperature` 1.0（同梱の generation_config.json。top_p・top_k の指定は無い）。
+- **考える深さ:** リクエストの `reasoning_effort`（`none`〜`max`。既定は 0.9＝high）で変える。
+  ツールを何手も使う作業は既定のまま、会話やロールプレイは `"low"` が向く。`none` でも考える過程は
+  完全には止まらない。考える過程は `reasoning_content`、本文は `content` に分かれて返る。
+- **`max_tokens`:** 考える過程の分もトークンを使うので、少なすぎると本文の途中で切れる。
+- **`seed`:** mlx-vlm 0.8 は送らないと毎回 0 を使うので、温度を上げても同じ会話には同じ返事が返る。
+  毎回違う返事が欲しいときは、リクエストごとに違う `seed` を送る。
+- **高速化を止める:** ゲートウェイを起動する環境で `LOCAL_LLM_INKLING2_FAST=off` にして `gw restart`。
+- llama.cpp で動かすときは `ggml-org/Inkling-2-Mini-GGUF`（量子化が複数あるので
+  `ggml-org/Inkling-2-Mini-GGUF:IQ4_NL` のように選ぶ）。
+
+### mlx-vlm と llama.cpp のどちらを使うか
 
 **Apple Silicon では mlx-vlm を使う。** 公式の重み（専門家は NVFP4/MXFP8、ほかは bf16）をそのまま読み、
 下の高速化が自動で当たる。M2 Ultra で比べたところ、読み込み・生成とも llama.cpp
@@ -334,10 +381,6 @@ top_p 0.95・top_k 64、Qwen と Ornith は top_p 0.95・top_k 20）、毎回違
 ほかに、ツール結果を返す 2 往復目（非ストリーミング・ストリーミング）、ストリーミングでの考える過程と
 本文の分離、画像入力、同時 3 件、長い文脈（約 2.4 万・7.3 万トークンの中に埋めた情報の取り出し）、
 続きの会話での KV キャッシュの使い回し（使い回しても答えが変わらないこと）が正しく動くことを確かめた。
-
-`model` に書く名前は、mlx-vlm なら `thinkingmachines/Inkling-2-Mini`、llama.cpp なら
-`ggml-org/Inkling-2-Mini-GGUF`（量子化が複数あるので `ggml-org/Inkling-2-Mini-GGUF:IQ4_NL` のように選ぶ。
-取得済みが 1 つならそのままでよい）。どちらも事前登録なしで動的ロードできる。
 
 ## 並列スロット（parallel）
 
