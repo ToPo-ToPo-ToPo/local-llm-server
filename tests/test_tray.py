@@ -12,6 +12,7 @@ from local_llm_server.tray import (
     format_rows,
     merge_update_info,
     parse_update_event,
+    sync_info_rows,
     update_menu_label,
 )
 
@@ -42,6 +43,9 @@ def test_icon_is_static_with_no_periodic_work():
     # 更新項目だけは in-place で反映し、初回確認に二度の操作が要らないようにする。
     assert "applyStatus" not in src
     assert "applyUpdateState_" in src
+    # 取得後はモデル行もその場で揃える（次に開くまで古い行が残る不具合の回帰ガード）。
+    apply_body = re.search(r"def _apply_update_state.*?(?=\n    def )", src, re.S).group(0)
+    assert "sync_info_rows(" in apply_body
     assert "refresh_updates=True" in src
     assert "performSelectorOnMainThread" in src  # ボタン題字・更新項目はメインスレッドで触る
     # 自動有効化を切る（既定 True だとアクション項目まで無効化されクリック無反応・実測）。
@@ -92,6 +96,48 @@ def test_menu_action_items_are_enabled_and_wired():
         it = menu.itemAtIndex_(i)
         assert it.isEnabled() is True, f"{it.title()} が無効（クリック不可）"
         assert it.target() is not None and it.action() is not None
+
+
+def test_open_menu_rows_follow_the_fetched_state():
+    """開いているメニューの情報行を、取得した今の状態に揃える（実 AppKit）。
+
+    メニューは開く瞬間にキャッシュから組むので、モデルを読み込んだ直後に開くと「未ロード」の
+    ままだった（次に開くまで直らない）。取得後に sync_info_rows で揃え、行の数が変われば先頭の
+    情報行だけを足し引きし、下のアクション項目は動かさないことを確かめる。"""
+    try:
+        import AppKit
+    except ImportError:
+        import pytest
+        pytest.skip("pyobjc 不在（macOS 以外）")
+
+    def info(text):
+        it = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(text, None, "")
+        it.setEnabled_(False)
+        return it
+
+    menu = AppKit.NSMenu.alloc().init()
+    menu.setAutoenablesItems_(False)
+    items = []
+    for text in format_rows({"models": []}, "127.0.0.1", 8799):
+        items.append(info(text))
+        menu.addItem_(items[-1])
+    menu.addItem_(AppKit.NSMenuItem.separatorItem())
+    action = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("ログを開く", "openLog:", "")
+    menu.addItem_(action)
+
+    def titles():
+        return [menu.itemAtIndex_(i).title() for i in range(menu.numberOfItems())]
+
+    first = items[0]
+    loaded = {"models": [{"model": "a/b", "loaded": True}, {"model": "c/d", "loaded": True, "inflight": 1}]}
+    items = sync_info_rows(menu, items, format_rows(loaded, "127.0.0.1", 8799), info)
+    assert titles() == ["http://127.0.0.1:8799/v1", "a/b — 待機", "c/d — 処理中 1", "", "ログを開く"]
+    assert items[0] is first  # 同じ数の分は作り直さず文字だけ変える
+    assert all(it.isEnabled() is False for it in items)
+
+    items = sync_info_rows(menu, items, format_rows({"models": []}, "127.0.0.1", 8799), info)
+    assert titles() == ["http://127.0.0.1:8799/v1", "モデル未ロード（初回リクエストでロード）", "", "ログを開く"]
+    assert menu.itemAtIndex_(menu.numberOfItems() - 1) is action  # アクション項目はそのまま
 
 
 def test_rows_show_url_and_loaded_models():

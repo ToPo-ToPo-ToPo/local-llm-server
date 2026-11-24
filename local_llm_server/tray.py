@@ -12,9 +12,10 @@ Ollama がメニューバーのアイコンで「動いている」を伝える�
   - 状態（接続先 URL・ロード中モデル）は**メニューを開くたびに**取得する（常駐中の
     ポーリングは無い——CPU を使うのはメニューを開いたときとパイプイベントのときだけ）。
     開く動作は取得を**待たない**: menuWillOpen で表示直前にキャッシュから即描画し、
-    取得は裏でキャッシュを更新する。**開いているメニュー全体は作り直さず**、安全に変更できる
-    更新項目の title/action だけをその場で反映する——removeAllItems で作り直すとクリックの
-    action 送出と競合してクリックを飲み込むため（実測。モデル行は次のオープン時に反映）
+    取得は裏でキャッシュを更新する。**開いているメニュー全体は作り直さず**、情報行（接続先・
+    モデル行）と更新項目だけをその場で揃える——removeAllItems で作り直すとクリックの
+    action 送出と競合してクリックを飲み込むため（実測）。情報行は文字を書き換え、
+    ロード中のモデルの数が変わったときだけ先頭の情報行を足し引きする（→ sync_info_rows）
   - できる操作は ログを開く / ゲートウェイを停止（gw stop 相当）の 2 つだけ。
     「アイコンだけ隠す」は置かない——**アイコンの有無＝デーモンの生死**という対応を
     例外なく保つ（隠せると「動いているのに出ていない」状態が生まれ、対応が崩れる）
@@ -74,6 +75,28 @@ def format_rows(admin: dict | None, host: str, port: int) -> list[str]:
         state = f"処理中 {busy}" if busy else "待機"
         rows.append(f"{m.get('model', '?')} — {state}")
     return rows
+
+
+def sync_info_rows(menu, items: list, rows: list[str], make_item) -> list:
+    """開いているメニューの先頭の情報行（``items``）を ``rows`` に揃える（作り直さない）。
+
+    メニューは開く瞬間にキャッシュから組むので、モデル行はその時点で古いことがある（読み込み・
+    退避の直後）。裏の取得が終わったらここで今の状態に揃え、1 回目に開いたときから正しく見せる。
+    行の数が同じなら文字だけ書き換える。数が変わったときだけ、先頭の情報行の範囲で末尾を
+    足し引きする（下のアクション項目には触れない）。``make_item(text)`` は情報行を 1 つ作る。
+    揃えた後の情報行の一覧を返す。
+    """
+    while len(items) > len(rows):
+        menu.removeItem_(items.pop())
+    for i, text in enumerate(rows):
+        if i < len(items):
+            if items[i].title() != text:
+                items[i].setTitle_(text)
+        else:
+            item = make_item(text)
+            menu.insertItem_atIndex_(item, i)
+            items.append(item)
+    return items
 
 
 def parse_update_event(line: str) -> tuple[str, str] | None:
@@ -247,8 +270,8 @@ def run_app(host: str, port: int, fd: int | None) -> int:
 
     # 状態キャッシュ: メニューは**開く前**（menuWillOpen）にキャッシュから組み立てる。
     # 開いている最中のメニューを removeAllItems で作り直すと、クリックの action 送出と
-    # 競合してクリックが飲み込まれる（実測）。そこで全体の鮮度は次に開いたときに反映し、
-    # 更新項目だけを属性変更でその場に反映する（起動時とオープン毎に温め、定期処理は無い）。
+    # 競合してクリックが飲み込まれる（実測）。そこで取得が終わったら情報行と
+    # 更新項目だけをその場で揃える（起動時とオープン毎に温め、定期処理は無い）。
     fetch_state: dict = {"admin": None, "fetched_once": False, "inflight": False}
 
     class _TrayDelegate(NSObject):
@@ -276,8 +299,8 @@ def run_app(host: str, port: int, fd: int | None) -> int:
     def _refresh_cache() -> None:
         """裏スレッドで状態を取得し、キャッシュと更新項目を反映する。
 
-        メニュー全体は作り直さず、更新項目だけをメインスレッドで属性変更するのでクリックと
-        競合しない。モデル行等は次の _rebuild_menu が読む。連打で取得を積まないよう in-flight は 1 本。
+        メニュー全体は作り直さず、情報行と更新項目だけをメインスレッドで揃えるのでクリックと
+        競合しない（→ _apply_update_state）。連打で取得を積まないよう in-flight は 1 本。
         """
         if fetch_state["inflight"]:
             return
@@ -301,12 +324,16 @@ def run_app(host: str, port: int, fd: int | None) -> int:
 
         threading.Thread(target=_work, daemon=True).start()
 
-    def _add_info(menu, text: str):
+    def _info_item(text: str):
         # 情報行（クリック不可・グレー表示）。autoenablesItems=False にしたので、
         # グレーにするには明示的に disabled にする（アクション項目は enabled のまま）。
         item = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
             text, None, "")
         item.setEnabled_(False)
+        return item
+
+    def _add_info(menu, text: str):
+        item = _info_item(text)
         menu.addItem_(item)
         return item
 
@@ -319,12 +346,15 @@ def run_app(host: str, port: int, fd: int | None) -> int:
         return item
 
     update_item_state: dict = {"item": None}
+    # メニュー先頭の情報行（接続先 URL・モデル行）。取得が終わったらその場で揃える。
+    row_items: list = []
 
     def _apply_update_state() -> None:
-        """取得済みの更新状態を、メニュー再構築なしで更新項目とアイコンへ反映する。"""
+        """取得済みの状態を、メニュー再構築なしで情報行・更新項目・アイコンへ反映する。"""
         admin = fetch_state["admin"]
         if admin is None:
             return
+        sync_info_rows(menu, row_items, format_rows(admin, host, port), _info_item)
         merged = merge_update_info(update_info, admin)
         update_info.update(merged)
         button.setTitle_(_UPDATE_MARK if merged.get("kind") else base_title)
@@ -345,11 +375,10 @@ def run_app(host: str, port: int, fd: int | None) -> int:
         if admin is None and not fetch_state["fetched_once"]:
             # 一度も取得できていない（初回オープン直後など）。未ロードと断言せず
             # 「取得中」を出す——裏の取得が終わればこのまま差し替わる。
-            _add_info(menu, f"http://{host}:{port}/v1")
-            _add_info(menu, "状態を取得中…")
+            rows = [f"http://{host}:{port}/v1", "状態を取得中…"]
         else:
-            for row in format_rows(admin, host, port):
-                _add_info(menu, row)
+            rows = format_rows(admin, host, port)
+        row_items[:] = [_add_info(menu, row) for row in rows]
         menu.addItem_(AppKit.NSMenuItem.separatorItem())
         # 更新項目は状態で出し分ける（update_menu_label）が、常にグレーの情報行。
         # 適用操作は `gw update` のみに固定し、アイコンは確認・通知だけを担う。
