@@ -9,7 +9,7 @@
 
 ## インストール
 
-- [uv](https://docs.astral.sh/uv/) 0.13.6 以上が要る。Python は `.python-version` の版を uv が用意する。
+- [uv](https://docs.astral.sh/uv/) 0.13.6 以上が要る。Python は `.python-version` のバージョンを uv が用意する。
 
 1. リポジトリを取得する。
 
@@ -164,14 +164,14 @@ gw start
 gw restart
 ```
 
-新しい版を取り込む:
+新しいバージョンを取り込む:
 
 ```bash
 gw update
 ```
 
 - コマンドの一覧と細かい動き → [docs/operation.md](docs/operation.md#サブコマンド一覧)
-- **更新は手動:** 新しい版が出るとメニューバーの `gw` に「⬆」が出る。入れ替わるのは `gw update` を打ったときだけ。
+- **更新は手動:** 新しいバージョンが出るとメニューバーの `gw` に「⬆」が出る。入れ替わるのは `gw update` を打ったときだけ。
 
 ### 設定
 
