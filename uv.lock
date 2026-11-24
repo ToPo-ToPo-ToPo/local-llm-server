@@ -874,7 +874,7 @@ requires-dist = [
     { name = "filelock", specifier = ">=4.2.1" },
     { name = "imageio-ffmpeg", specifier = ">=0.4.9" },
     { name = "mlx-lm", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'", specifier = ">=0.31.3" },
-    { name = "mlx-vlm", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'", git = "https://github.com/Blaizzy/mlx-vlm?rev=f1618d6d52be4ef25d3fe65270f7528a59c55df3" },
+    { name = "mlx-vlm", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'", specifier = ">=0.8.1" },
     { name = "mlx-whisper", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'", specifier = ">=0.4.3" },
     { name = "pillow", specifier = ">=13.0.0" },
     { name = "psutil", specifier = ">=5.9" },
@@ -1022,8 +1022,8 @@ wheels = [
 
 [[package]]
 name = "mlx-vlm"
-version = "0.8.0"
-source = { git = "https://github.com/Blaizzy/mlx-vlm?rev=f1618d6d52be4ef25d3fe65270f7528a59c55df3#f1618d6d52be4ef25d3fe65270f7528a59c55df3" }
+version = "0.8.1"
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "cryptography" },
     { name = "datasets" },
@@ -1045,6 +1045,10 @@ dependencies = [
     { name = "transformers" },
     { name = "uvicorn" },
     { name = "websockets" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/2f/a6/92a632ff2df0d6d780a0e75db1edd7353051f84fe83e47e6705b237cdb2b/mlx_vlm-0.8.1.tar.gz", hash = "sha256:4cf5387abb2fe14362740fe9db072ac546fbc1244854b861ec619c903c109e9f", size = 3158185, upload-time = "2026-11-23T20:24:48.738Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/9e/01/31a455f1bcac38ec3bf247beb964edf080531fe62db6610e19dfec0e21b0/mlx_vlm-0.8.1-py3-none-any.whl", hash = "sha256:00e8b08357f6d86a528039cf97392df3c3f950bb1b83494fd3d331fdf819c3af", size = 3929288, upload-time = "2026-11-23T20:24:46.984Z" },
 ]
 
 [[package]]

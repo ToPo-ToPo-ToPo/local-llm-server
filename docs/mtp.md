@@ -144,7 +144,7 @@ ToPo-ToPo/gemma-4-31b-it-mlx-4bit
 ## 対応表に入れていないもの: Inkling 2 Mini（DSpark）
 
 `thinkingmachines/Inkling-2-Mini` は、チェックポイントに DSpark ドラフター（`mtp.safetensors`。
-1 アンカー＋7 提案のブロック）を同梱している。mlx-vlm（main の f1618d6d 以降。→ pyproject）は
+1 アンカー＋7 提案のブロック）を同梱している。mlx-vlm（0.8.1 以降）は
 本体と同じ repo をドラフターに指せば読み、draft kind も自動で直す。ただし **M2 Ultra では
 速くならなかった**ので、`"auto"` の対応表には載せていない（載せると動的ロードのたびに遅くなる）。
 

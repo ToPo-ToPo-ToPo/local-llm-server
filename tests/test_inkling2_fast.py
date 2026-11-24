@@ -54,8 +54,7 @@ def test_shim_survives_a_failing_install(monkeypatch):
 # --- 小さな Inkling 2 で、差し替えの前後の一致を確かめる（Apple Silicon のみ） ---
 
 
-@pytest.fixture
-def tiny():
+def _make_tiny(loop: bool):
     mx = pytest.importorskip("mlx.core")
     if not mx.metal.is_available():
         pytest.skip("Metal が無い")
@@ -65,23 +64,55 @@ def tiny():
     from mlx_vlm.models.inkling2.config import TextConfig
 
     # 実物と同じ形（スライド窓と全体注意の混在・中段を 3 周）を小さくしたもの。
-    # 読み込み 40 トークンはスライド窓（16）より長く、循環するキャッシュも通る。
+    # 読み込み 40 トークンはスライド窓（16）より長い。中段を周回する Inkling 2 Mini（loop）の
+    # キャッシュは時刻順の AttentionSinkKVCache、周回しないものは循環する RotatingKVCache になる。
+    extra = dict(loop_config=dict(core_start=2, core_end=4, num_passes=3, gate_rank=16)) if loop else {}
     cfg = TextConfig.from_dict(dict(
-        model_type="inkling2_loop_text", hidden_size=128, num_hidden_layers=6, vocab_size=256,
+        model_type="inkling2_loop_text" if loop else "inkling2_text", hidden_size=128,
+        num_hidden_layers=6, vocab_size=256,
         unpadded_vocab_size=250, num_attention_heads=4, num_key_value_heads=2, head_dim=32,
         swa_head_dim=32, swa_num_attention_heads=4, swa_num_key_value_heads=2, d_rel=8,
         rel_extent=64, sliding_window_size=16, local_layer_ids=[0, 1, 2, 4], n_routed_experts=8,
-        num_experts_per_tok=2, intermediate_size=64, n_layers_per_attn_res_block=2,
-        loop_config=dict(core_start=2, core_end=4, num_passes=3, gate_rank=16),
+        num_experts_per_tok=2, intermediate_size=64, n_layers_per_attn_res_block=2, **extra,
     ))
     mx.random.seed(0)
     model = language.LanguageModel(cfg)
     model.update(mu.tree_map(
         lambda p: (mx.random.normal(p.shape) * 0.1).astype(mx.bfloat16), model.parameters()))
     model.eval()  # 実モデルと同じく推論の状態にする（学習中は差し替えも mlx-vlm の速い経路も使われない）
+    return model
+
+
+@pytest.fixture
+def tiny():
+    model = _make_tiny(loop=True)
     fast.uninstall()
     yield model
     fast.uninstall()
+
+
+@pytest.fixture
+def tiny_plain():
+    model = _make_tiny(loop=False)
+    fast.uninstall()
+    yield model
+    fast.uninstall()
+
+
+def _count_compiled_steps(monkeypatch):
+    """コンパイルした経路で済んだステップの数を数える（通常の経路に逃げたものは数えない）。"""
+    from local_llm_server import _inkling2_step
+
+    used = []
+    original = _inkling2_step._Engine.__call__
+
+    def counted(self, inputs, cache):
+        logits = original(self, inputs, cache)
+        used.append(logits is not None)
+        return logits
+
+    monkeypatch.setattr(_inkling2_step._Engine, "__call__", counted)
+    return used
 
 
 def _logits(model, batch=1, steps=24, tail=False):
@@ -139,15 +170,39 @@ def test_head_matches_the_fp32_copy(tiny):
     np.testing.assert_allclose(_logits(tiny), before, rtol=0, atol=1e-4)
 
 
-def test_step_matches_and_keeps_the_cache_usable(tiny):
+@pytest.mark.parametrize("model", ["tiny", "tiny_plain"])
+def test_step_matches_and_keeps_the_cache_usable(model, request, monkeypatch):
     """丸ごとコンパイルしたステップは元の計算とほぼ一致し（読み込み 40 トークンは窓 16 より長く、
-    24 ステップで窓が何周も回る）、そのあとの通常の経路でも同じキャッシュをそのまま使える。"""
+    24 ステップで窓が何周も回る）、そのあとの通常の経路でも同じキャッシュをそのまま使える。
+    時刻順の窓（tiny）と循環する窓（tiny_plain）の両方で確かめる。"""
     import numpy as np
 
+    tiny = request.getfixturevalue(model)
     before = _logits(tiny, tail=True)
     assert fast.install(["step"]) == ["step"]
+    used = _count_compiled_steps(monkeypatch)
     after = _logits(tiny, tail=True)
-    assert tiny.__dict__["_inkling2_engine"].fns  # 通常の経路に逃げず、コンパイルした経路を通った
+    # 循環する窓は、読み込み直後（窓より長い）の 1 ステップだけ通常の経路に任せる
+    assert sum(used) >= len(used) - 1 and sum(used) >= 23
+    np.testing.assert_allclose(after, before, rtol=0, atol=1e-2)
+    assert np.array_equal(after.argmax(-1), before.argmax(-1))
+
+
+def test_step_compacts_the_sliding_window_like_mlx_vlm(tiny, monkeypatch):
+    """時刻順の窓は「窓 + 余り」の配列に固定し、いっぱいになったら直近の窓だけを残して詰め直す。
+    余りを 3 にして 24 ステップの間に何度も詰め直させ、毎ステップコンパイルした経路を通り、
+    計算が一致し、続きの通常の経路（DSpark の検証や次の読み込み）もそのキャッシュで正しく動くことを見る。"""
+    import numpy as np
+
+    from local_llm_server import _inkling2_step
+
+    before = _logits(tiny, tail=True)
+    monkeypatch.setattr(_inkling2_step, "_WINDOW_SLACK", 3)
+    assert fast.install(["step"]) == ["step"]
+    used = _count_compiled_steps(monkeypatch)
+    after = _logits(tiny, tail=True)
+    assert used == [True] * 24
+    assert len(tiny.__dict__["_inkling2_engine"].fns) == 1  # 形が変わらず、作り直していない
     np.testing.assert_allclose(after, before, rtol=0, atol=1e-2)
     assert np.array_equal(after.argmax(-1), before.argmax(-1))
 

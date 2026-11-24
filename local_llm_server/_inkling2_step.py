@@ -8,14 +8,22 @@
   グラフを組む時間（約 7 ms/ステップ）と、細かい要素ごとの演算の起動が減る。CPU が他の仕事で
   混んでいるときほど効く（M2 Ultra の実測: 空いているとき +4%、他の計算が 5 コア使っているとき +17%）。
 
-``step`` は mlx-vlm のキャッシュ（KVCache / RotatingKVCache + ArraysCache）をそのまま使い続け、
-各ステップでその配列を入力に渡し、更新後の配列を書き戻す（続きの会話の再利用や、読み込み・
-DSpark の検証が使う通常の経路と食い違わない）。形を変えないため、全体注意の KV は容量を 2 の冪
-（最小 4,096）まで、スライド窓の KV は窓の大きさまで先に広げ、書く位置と有効な長さは配列で渡す。
-注意のマスクは mlx-vlm の _mask_v2_kernel と同じ式で、その配列から作る。
+``step`` は mlx-vlm のキャッシュをそのまま使い続け、各ステップでその配列を入力に渡し、更新後の
+配列を書き戻す（続きの会話の再利用や、読み込み・DSpark の検証が使う通常の経路と食い違わない）。
+キャッシュは 2 通りある:
+
+- 中段を何周もする Inkling 2 Mini（loop_config あり。mlx-vlm 0.8.1 以降）: AttentionSinkKVCache
+  + ArraysCache。鍵は時刻順に並び、``_end`` の次の行を sink の零の行に使う。スライド窓の層は
+  配列がいっぱいになったら直近の窓だけを残して詰め直す。
+- それ以外: KVCache / RotatingKVCache（循環する窓）+ ArraysCache。
+
+形を変えないため、全体注意の KV は容量を 2 の冪（最小 4,096）まで先に広げる。スライド窓の KV は、
+循環する窓なら窓の大きさまで、時刻順の窓なら「窓 + _WINDOW_SLACK」まで広げ、いっぱいになったら
+mlx-vlm と同じく直近の窓だけを残して詰め直す（_WINDOW_SLACK ステップに 1 回）。書く位置と有効な
+長さは配列で渡し、注意のマスクは mlx-vlm の _mask_v2_kernel と同じ式でその配列から作る。
 
 計算は mlx-vlm とほぼ同じだが、ビット一致はしない: 注意の SDPA に渡す鍵の本数（容量まで）と、
-スライド窓の鍵の並び（循環したまま）が違い、和の順番が変わる（それ以外の部分は一致を確かめた）。
+循環する窓の鍵の並び（循環したまま）が違い、和の順番が変わる（それ以外の部分は一致を確かめた）。
 """
 
 from __future__ import annotations
@@ -24,6 +32,9 @@ from functools import lru_cache
 from typing import Any
 
 _MIN_CAPACITY = 4096
+# 時刻順のスライド窓（AttentionSinkKVCache）を、窓の大きさよりこれだけ大きい配列に固定する。
+# 詰め直しはこのステップ数に 1 回。大きいほど詰め直しは減るが、SDPA が見る鍵（伏せた分も含む）が増える。
+_WINDOW_SLACK = 256
 
 _HEAD_SRC = r"""
     uint lane = thread_index_in_simdgroup;
@@ -272,8 +283,12 @@ class _Engine:
 
     def __init__(self, lm, cache_types):
         self.lm = lm
-        self.kv_full, self.kv_rotating, self.conv_type = cache_types
+        self.kv_full, self.kv_rotating, self.conv_type, self.kv_sink = cache_types
         self.fns = {}
+
+    def _is_full(self, kv) -> bool:
+        """全体注意（時刻順で、位置 offset に書く）か。"""
+        return type(kv) is self.kv_full or (type(kv) is self.kv_sink and kv.max_size is None)
 
     def eligible(self, inputs, inputs_embeds, cache, kw) -> bool:
         if inputs is None or inputs_embeds is not None or not cache or tuple(inputs.shape) != (1, 1):
@@ -296,6 +311,10 @@ class _Engine:
             if type(kv) is self.kv_rotating:
                 if kv.keep != 0:
                     return False
+            elif type(kv) is self.kv_sink:
+                # 全体注意は詰め直さないので、物理の位置と通算の位置が一致しているはず
+                if kv.max_size is None and kv._end != kv.offset:
+                    return False
             elif type(kv) is not self.kv_full:
                 return False
             if kv.keys is None or (offset is not None and kv.offset != offset):
@@ -304,32 +323,33 @@ class _Engine:
         return True
 
     def _prepare(self, cache):
-        """形をそろえる。戻り値は (全体注意の容量, 位置, スライド窓の書く枠)。そろえられなければ None。"""
+        """形をそろえる。戻り値は (全体注意の容量, 位置, スライド窓の meta)。そろえられなければ None。
+
+        スライド窓の meta は (書く枠, 有効な長さ, 枠の数)。途中で None を返しても、それまでに
+        広げた・詰め直したキャッシュは mlx-vlm の通常の経路でもそのまま使える形にしてある。
+        """
         pos = cache[0][0].offset
         need = _capacity(pos + 1)
-        cap, slot = 0, None
+        cap, window = 0, None
         for entry in cache:
             kv = entry[0]
-            if type(kv) is self.kv_full:
+            if self._is_full(kv):
                 cap = max(cap, need, kv.keys.shape[2])
                 continue
-            w = kv.max_size
-            if kv.keys.shape[2] > w:
-                return None  # 読み込み直後で窓より長い。1 回だけ通常の経路に任せると窓の形になる
-            if kv.keys.shape[2] < w:
-                if kv._idx != kv.offset or kv.offset >= w:
+            if type(kv) is self.kv_sink:
+                meta = _fit_sink_window(kv)
+            else:
+                meta = _fit_rotating_window(kv, pos)
+                if meta is None:
                     return None
-                # まだ育ちきっていない窓を最終の大きさに先に広げる（RotatingKVCache が育つのと同じ形）
-                kv.keys, kv.values = _grow(kv.keys, w), _grow(kv.values, w)
-            s = kv.keep if kv._idx == w else kv._idx
-            if slot is not None and s != slot:
+            if window is not None and meta != window:
                 return None
-            slot = s
+            window = meta
         for entry in cache:
             kv = entry[0]
-            if type(kv) is self.kv_full and kv.keys.shape[2] != cap:
+            if self._is_full(kv) and kv.keys.shape[2] != cap:
                 kv.keys, kv.values = _grow(kv.keys, cap), _grow(kv.values, cap)
-        return cap, pos, slot
+        return cap, pos, window
 
     def _build(self, kinds):
         import mlx.core as mx
@@ -357,15 +377,15 @@ class _Engine:
         prepared = self._prepare(cache)
         if prepared is None:
             return None
-        cap, pos, slot = prepared
-        kinds = tuple((type(e[0]) is self.kv_full, len(e[1].cache)) for e in cache)
-        window = next((e[0].max_size for e in cache if type(e[0]) is self.kv_rotating), 1)
-        key = (kinds, cap, window)
+        cap, pos, window = prepared
+        kinds = tuple((self._is_full(e[0]), len(e[1].cache)) for e in cache)
+        window = window or (0, 1, 1)  # スライド窓の層が無い
+        key = (kinds, cap, window[2])
         fn = self.fns.get(key)
         if fn is None:
             fn = self.fns[key] = self._build(kinds)
         full_meta = mx.array([pos, pos + 1, max(cap, 1)], mx.int32)
-        window_meta = mx.array([slot or 0, min(pos + 1, window), window], mx.int32)
+        window_meta = mx.array(window, mx.int32)
         state = []
         for entry in cache:
             state += [entry[0].keys, entry[0].values, *entry[1].cache]
@@ -379,8 +399,48 @@ class _Engine:
             i += 2 + n
             if type(kv) is self.kv_rotating:
                 kv._idx = (kv.keep if kv._idx == kv.max_size else kv._idx) + 1
+            elif type(kv) is self.kv_sink:
+                kv._end += 1
+                kv._written = max(kv._written, kv._end)
             kv.offset += 1
         return logits
+
+
+def _fit_rotating_window(kv, pos):
+    """循環する窓（RotatingKVCache）を窓の大きさにそろえ、meta を返す。そろえられなければ None。"""
+    w = kv.max_size
+    if kv.keys.shape[2] > w:
+        return None  # 読み込み直後で窓より長い。1 回だけ通常の経路に任せると窓の形になる
+    if kv.keys.shape[2] < w:
+        if kv._idx != kv.offset or kv.offset >= w:
+            return None
+        # まだ育ちきっていない窓を最終の大きさに先に広げる（RotatingKVCache が育つのと同じ形）
+        kv.keys, kv.values = _grow(kv.keys, w), _grow(kv.values, w)
+    slot = kv.keep if kv._idx == w else kv._idx
+    return (slot, min(pos + 1, w), w)
+
+
+def _fit_sink_window(kv):
+    """時刻順の窓（AttentionSinkKVCache）を「窓 + _WINDOW_SLACK」の配列にそろえ、meta を返す。
+
+    行 0.._end-1 は時刻順に並んだ本物のトークンなので、_end に書けば「何トークン前か」は
+    _end - 行 で求まる（窓より前の行はマスクの SLIDING が伏せる）。_end より後ろの行は捨てた
+    下書きが残っていてもよい（有効な長さ _end + 1 より後ろとして伏せる）。
+
+    書く場所が無くなったら（読み込みで窓より長くなった直後も含む）、mlx-vlm の update_and_fetch と
+    同じく直近の窓（size() 行）だけを先頭に残して詰め直す。残りは零にし、_written もそこまでに戻す。
+    """
+    size = kv.max_size + _WINDOW_SLACK
+    end = kv._end
+    if kv.keys.shape[2] > size or end >= size:
+        keep = kv.size()
+        rows = slice(end - keep, end)
+        kv.keys = _grow(kv.keys[..., rows, :], size)
+        kv.values = _grow(kv.values[..., rows, :], size)
+        kv._end = kv._written = keep
+    elif kv.keys.shape[2] < size:
+        kv.keys, kv.values = _grow(kv.keys, size), _grow(kv.values, size)
+    return (kv._end, kv._end + 1, size)
 
 
 def install_step(language) -> bool:
@@ -397,7 +457,13 @@ def install_step(language) -> bool:
     if getattr(original_call, "_inkling2_step", False):
         return True
     original_attention = attention.__call__
-    cache_types = (language.KVCache, language.RotatingKVCache, language.ArraysCache)
+    # AttentionSinkKVCache は mlx-vlm 0.8.1 から（中段を何周もする Inkling 2 Mini のキャッシュ）
+    cache_types = (
+        language.KVCache,
+        language.RotatingKVCache,
+        language.ArraysCache,
+        getattr(language, "AttentionSinkKVCache", None),
+    )
 
     def attention_call(self, x, key_input=None, value_input=None, cache=None, conv_mask=None):
         if cache is not None and isinstance(cache[0], _FixedKV):
